@@ -1,0 +1,36 @@
+.venv/
+__pycache__/
+*.pyc
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+
+# Runtime-local state and generated files
+.runtime/
+.airsim_agent/
+*.log
+
+# Captured simulator images are served locally and can be regenerated.
+captures/
+
+# Downloadable model weights (re-fetch via ultralytics).
+*.pt
+
+# Runtime state, logs and caches (may contain local API keys / credentials).
+src/data/
+src/ui/static/tile_cache/
+logs/
+
+# Third-party source clones are vendored locally, not tracked.
+third_party/
+
+# Pytest suites are not part of the runtime artifact.
+tests/
+
+# One-off debug probes and dev-phase verification scripts.
+scripts/manual/
+scripts/verify_p*.py
+
+# Internal development tracking/handoff docs.
+docs/dev_task_list.md
+docs/px4_agent_handoff.md

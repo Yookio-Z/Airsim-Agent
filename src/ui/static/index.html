@@ -1,0 +1,787 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>AirSim VLA Agent 指挥官</title>
+    <link rel="stylesheet" href="/styles.css">
+    <link rel="stylesheet" href="/lib/maplibre-gl.css" />
+    <script src="/lib/maplibre-gl.js"></script>
+  </head>
+  <body>
+    <div id="notice" class="notice" hidden></div>
+
+    <div id="appShell" class="app-shell">
+      <main class="map-column" aria-label="mission map">
+        <section class="map-stage">
+          <div id="missionMap" class="mission-map"></div>
+
+          <!-- 顶部 HUD 状态条 -->
+          <div class="top-hud">
+            <div class="hud-connection" id="hudConnection" title="连接状态">
+              <span class="hud-dot" id="connectionDot"></span>
+              <span id="connectionText">OFFLINE</span>
+            </div>
+            <div class="hud-metrics">
+              <div class="hud-item"><small>HDG</small><strong id="metricHeading">0°</strong></div>
+              <div class="hud-item"><small>ALT Δ</small><strong id="metricAltDiff">--</strong></div>
+              <div class="hud-item"><small>BRG</small><strong id="metricBearing">--</strong></div>
+              <div class="hud-item"><small>DIST PREV</small><strong id="metricDistPrev">--</strong></div>
+              <div class="hud-item"><small>HOME DIST</small><strong id="metricMaxRange">--</strong></div>
+              <div class="hud-item"><small>TILT</small><strong id="metricTilt">--</strong></div>
+            </div>
+            <div class="hud-vehicle" id="hudVehicle" title="飞行器状态">
+              <span id="vehicleState">DISARMED</span>
+              <span class="hud-coords" id="metricPosition">N 0.0 / E 0.0 / D 0.0</span>
+            </div>
+          </div>
+
+          <!-- 左侧浮动工具栏 -->
+          <div class="map-toolbar" role="toolbar" aria-label="飞行控制">
+            <button class="tool-btn" data-tool="drone_arm" title="解锁 (Arm)">⏻</button>
+            <button class="tool-btn" data-tool="drone_takeoff" data-params='{"altitude":3}' title="起飞 (Takeoff)">↑</button>
+            <button class="tool-btn" data-control="hover" title="悬停 (Hold)">Ⅱ</button>
+            <button class="tool-btn" data-control="land" title="降落 (Land)">⌄</button>
+            <button class="tool-btn" data-control="return_home" data-testid="control-return-home" title="返航(Return home)">
+              <svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.1" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M3 11.5 12 4l9 7.5"/><path d="M5.5 10.5V20h13v-9.5"/><path d="M9 20v-5.5h6V20"/></svg>
+            </button>
+            <button class="tool-btn danger" data-control="emergency_stop" title="紧急停止 (Stop)">!</button>
+          </div>
+
+          <section id="cameraViewer" class="camera-viewer" aria-label="无人机摄像头视频流" data-state="idle" hidden>
+            <header id="cameraViewerDragHandle" class="camera-viewer-drag-handle">
+              <div>
+                <strong>Camera Stream</strong>
+                <span id="cameraSnapshotStatus">等待画面</span>
+              </div>
+              <div class="camera-viewer-actions">
+                <button id="cameraViewerNewWindow" type="button" title="新建摄像头窗口" aria-label="新建摄像头窗口">+</button>
+                <button id="cameraStreamToggle" type="button" title="暂停视频流" aria-label="暂停视频流" aria-pressed="true">
+                  <svg class="camera-stream-pause-icon" width="15" height="15" viewBox="0 0 24 24" fill="currentColor" aria-hidden="true"><rect x="6" y="4" width="4" height="16" rx="1"/><rect x="14" y="4" width="4" height="16" rx="1"/></svg>
+                  <svg class="camera-stream-play-icon" width="15" height="15" viewBox="0 0 24 24" fill="currentColor" aria-hidden="true"><polygon points="6 4 20 12 6 20 6 4"/></svg>
+                </button>
+                <button id="cameraViewerRefresh" type="button" title="刷新画面" aria-label="刷新画面">
+                  <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 12a9 9 0 1 1-2.64-6.36"/><polyline points="21 3 21 9 15 9"/></svg>
+                </button>
+                <button id="cameraViewerClose" type="button" title="关闭画面" aria-label="关闭画面">×</button>
+              </div>
+            </header>
+            <div class="camera-viewer-controls">
+              <label>
+                <span>摄像头</span>
+                <select id="cameraViewerCamera" aria-label="选择摄像头">
+                  <option value="0">0 · 前视</option>
+                  <option value="1">1 · 前右</option>
+                  <option value="2">2 · 前左</option>
+                  <option value="3">3 · 下视</option>
+                  <option value="4">4 · 后视</option>
+                </select>
+              </label>
+              <label>
+                <span>图像</span>
+                <select id="cameraViewerImageType" aria-label="选择图像类型">
+                  <option value="scene">Scene</option>
+                  <option value="depth">Depth</option>
+                  <option value="segmentation">Segmentation</option>
+                  <option value="infrared">Infrared</option>
+                </select>
+              </label>
+              <span id="cameraLiveIndicator" class="camera-live-indicator"><i></i>LIVE</span>
+            </div>
+            <div class="camera-frame">
+              <img id="cameraImage" alt="无人机摄像头画面" hidden>
+              <div id="cameraPlaceholder" class="camera-placeholder">暂无画面</div>
+            </div>
+            <div id="cameraMeta" class="camera-meta">AirSim · camera 0</div>
+          </section>
+
+          <div id="waypointPanel" class="waypoint-panel">
+            <header class="waypoint-panel-head">
+              <div class="waypoint-panel-title">
+                <strong>航点</strong>
+                <div class="waypoint-actions">
+                  <button data-waypoint-action="deploy_start" title="上传并开始航线" aria-label="上传并开始航线">
+                    <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M4 17v2a2 2 0 0 0 2 2h5"/><polyline points="8 8 12 4 16 8"/><line x1="12" y1="4" x2="12" y2="15"/><polygon points="15 14 21 17.5 15 21 15 14" fill="currentColor" stroke="none"/></svg>
+                  </button>
+                  <button data-waypoint-action="clear_vehicle" title="删除本地航点并清空飞控任务" aria-label="删除本地航点并清空飞控任务" class="danger">
+                    <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="3 6 5 6 21 6"/><path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"/></svg>
+                  </button>
+                </div>
+              </div>
+              <button id="waypointPanelToggle" class="icon-button" title="折叠/展开" type="button">⌃</button>
+            </header>
+            <div class="waypoint-panel-body">
+              <div id="waypointList" class="waypoint-list"></div>
+              <div id="waypointProperties" class="waypoint-properties hidden">
+                <header>航点属性</header>
+                <label>
+                  类型
+                  <select id="wpPropType">
+                    <option value="waypoint">航点</option>
+                    <option value="takeoff">起飞</option>
+                    <option value="land">降落</option>
+                    <option value="rtl">返航</option>
+                  </select>
+                </label>
+                <label>
+                  高度 (m)
+                  <input id="wpPropAlt" type="number" step="0.5" />
+                </label>
+                <label>
+                  速度 (m/s)
+                  <input id="wpPropSpeed" type="number" step="0.5" />
+                </label>
+                <label>
+                  悬停 (s)
+                  <input id="wpPropHold" type="number" step="0.5" />
+                </label>
+                <label>
+                  接受半径 (m)
+                  <input id="wpPropAccept" type="number" step="0.5" />
+                </label>
+              </div>
+            </div>
+          </div>
+          <div class="map-hud">
+            <span id="mapStatus">点击地图添加航点</span>
+            <span id="operationChannel">等待连接</span>
+            <span id="canvasScale">瓦片地图</span>
+          </div>
+
+          <!-- 左下角控件：缩放 + 曲线图 + 设置，曲线图铺满右侧 -->
+          <div class="map-bottom-left">
+            <div class="bottom-tool-column">
+              <button data-zoom="in" title="放大">+</button>
+              <button data-zoom="out" title="缩小">−</button>
+              <button id="profileToggle" title="展开/折叠高度剖面" data-collapsed="false">
+                <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="3 17 9 11 13 15 21 7"/></svg>
+              </button>
+              <button id="cameraViewBtn" title="显示摄像头视频流" aria-label="显示摄像头视频流" aria-pressed="false">
+                <svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M23 7l-7 5 7 5V7z"/><rect x="1" y="5" width="15" height="14" rx="2" ry="2"/></svg>
+              </button>
+              <button id="mapSettingsBtn" class="map-settings-btn" title="系统设置">⚙</button>
+            </div>
+            <div class="mission-profile-wrapper">
+              <div id="missionProfile" class="mission-profile">
+                <canvas id="profileCanvas" width="600" height="100"></canvas>
+              </div>
+            </div>
+          </div>
+        </section>
+      </main>
+
+      <div class="v-resizer" data-splitter="right" title="拖拽调整 AI 面板宽度"></div>
+
+      <aside class="agent-column" aria-label="AI commander" id="agentColumn">
+        <header class="agent-header">
+          <div class="header-left">
+            <button id="sessionNavBtn" class="header-label sessions-toggle" title="会话列表">CHAT</button>
+            <span id="currentSessionLabel" class="current-session-label" title="当前会话"></span>
+          </div>
+          <div class="header-actions">
+            <button id="newSessionBtn" class="header-btn" title="新建对话">＋</button>
+            <button id="settingsOpen" class="header-btn" title="Agent 设置">⚙</button>
+          </div>
+        </header>
+
+        <div id="sessionsPanel" class="sessions-panel" hidden>
+          <header class="sessions-head">
+            <strong>SESSIONS</strong>
+          </header>
+          <div id="sessionsList" class="sessions-list"></div>
+        </div>
+
+        <div id="chatThread" class="chat-thread"></div>
+
+        <form id="commandForm" class="agent-composer">
+          <div class="composer-box">
+            <textarea id="commandInput" data-testid="command-input" rows="1" placeholder="Command the aircraft..."></textarea>
+            <div id="imagePreview" class="image-preview-strip" hidden></div>
+            <input id="imageInput" type="file" accept="image/png,image/jpeg,image/webp,image/gif" multiple hidden>
+            <div class="composer-bottom">
+              <div class="composer-left-actions">
+                <button id="attachImageBtn" class="composer-icon-button" type="button" title="添加图片（也可直接粘贴）" aria-label="添加图片">＋</button>
+                <div class="mode-toggle" role="group" aria-label="Command mode">
+                  <button id="chatModeBtn" class="mode-chip active" data-command-mode="chat" type="button">Chat</button>
+                  <button id="executeModeBtn" class="mode-chip" data-command-mode="execute" type="button">Execute</button>
+                </div>
+              </div>
+              <div class="model-dropdown">
+                <button id="modelSelectorBtn" class="model-selector" type="button" title="选择模型">
+                  <span id="modelSelectorLabel">DeepSeek</span>
+                  <svg width="10" height="6" viewBox="0 0 10 6" fill="none"><path d="M1 1L5 5L9 1" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/></svg>
+                </button>
+                <div id="modelSelectorMenu" class="model-selector-menu" hidden></div>
+              </div>
+              <span id="contextUsage" class="context-usage" title="模型上下文估算">CTX --</span>
+              <select id="modelSelector" class="model-selector-native" hidden></select>
+              <button class="send-button" data-testid="send-command" type="submit" title="发送 (Enter)">↑</button>
+            </div>
+          </div>
+        </form>
+
+        <!-- Agent 设置抽屉：嵌入 AI 面板内部，与 AI 面板严格对齐 -->
+        <aside id="agentSettingsDrawer" class="settings-drawer agent-settings" hidden>
+      <header class="settings-head">
+        <strong>Agent 设置</strong>
+        <button id="agentSettingsClose" class="icon-button" title="关闭">×</button>
+      </header>
+
+      <nav class="settings-tabs" aria-label="agent settings tabs">
+        <button class="active" data-settings-tab="plan" title="任务计划：当前生成的任务链路">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M9 11l3 3L22 4"/><path d="M21 12v7a2 2 0 01-2 2H5a2 2 0 01-2-2V5a2 2 0 012-2h11"/></svg>
+          <span>任务计划</span>
+        </button>
+        <button data-settings-tab="events" title="事件日志：运行过程中产生的关键事件">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M13 2L3 14h9l-1 8 10-12h-9l1-8z"/></svg>
+          <span>事件日志</span>
+        </button>
+        <button data-settings-tab="tools" title="工具">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M14.7 6.3a1 1 0 000 1.4l1.6 1.6a1 1 0 001.4 0l3.77-3.77a6 6 0 01-7.94 7.94l-6.91 6.91a2.12 2.12 0 01-3-3l6.91-6.91a6 6 0 017.94-7.94l-3.76 3.76z"/></svg>
+          <span>工具</span>
+        </button>
+        <button data-settings-tab="memory" title="记忆">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><ellipse cx="12" cy="5" rx="9" ry="3"/><path d="M3 5V19A9 3 0 0 0 21 19V5"/><path d="M3 12A9 3 0 0 0 21 12"/></svg>
+          <span>记忆</span>
+        </button>
+        <button data-settings-tab="llm" title="模型">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="11" width="18" height="10" rx="2"/><path d="M7 11V7a5 5 0 0110 0v4"/><circle cx="12" cy="16" r="1"/></svg>
+          <span>模型</span>
+        </button>
+        <button data-settings-tab="skills" title="技能">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M19 11a2 2 0 012 2v4a2 2 0 01-2 2h-1.8a2 2 0 00-1.4.6l-3 3a2 2 0 01-2.8 0l-3-3a2 2 0 00-1.4-.6H5a2 2 0 01-2-2v-4a2 2 0 012-2h1.8a2 2 0 001.4-.6l3-3a2 2 0 012.8 0l3 3a2 2 0 001.4.6H19z"/><circle cx="12" cy="15" r="1"/></svg>
+          <span>技能</span>
+        </button>
+      </nav>
+
+      <section class="settings-panel active" data-settings-panel="plan">
+        <div class="settings-card">
+          <header>
+            <strong>任务计划</strong>
+            <span id="plannerBadge">planner</span>
+          </header>
+          <p class="settings-help">当前一次 Execute 的临时计划、路由、风险与进度；任务结束后由会话消息和记忆保存摘要，不是任务历史库。</p>
+          <div id="planSummary" class="plan-summary">等待任务指令</div>
+          <div id="approvalDialog" class="approval-dialog hidden"></div>
+          <div class="task-run-panel">
+            <header>
+              <strong>最近任务记录</strong>
+              <span>可复盘</span>
+            </header>
+            <div id="taskRunList" class="compact-list task-run-list"></div>
+          </div>
+        </div>
+      </section>
+
+      <section class="settings-panel" data-settings-panel="events">
+        <div class="settings-card">
+          <header>
+            <strong>执行事件</strong>
+            <button class="text-action" data-control="clear_events">清空</button>
+          </header>
+          <p class="settings-help">当前服务进程中的运行审计与诊断流水，例如路由、工具、审批、校验和错误；重启后不会作为长期记忆恢复。</p>
+          <div id="eventList" class="event-list"></div>
+        </div>
+      </section>
+
+      <section class="settings-panel" data-settings-panel="tools">
+        <div class="settings-card">
+          <header>
+            <strong>工具层</strong>
+            <span><b id="toolCount">0</b> tool cards</span>
+          </header>
+          <p class="settings-help">Agent 可调用的原子操作和异步操作入口。异步工具只负责启动，Agent 统一负责 task_id 的查询、超时和取消。</p>
+          <div id="toolList" class="compact-list"></div>
+        </div>
+      </section>
+
+      <section class="settings-panel" data-settings-panel="memory">
+        <div class="settings-card">
+          <header>
+            <strong>记忆层</strong>
+            <span><b id="memoryCount">0</b> items</span>
+          </header>
+          <p class="settings-help">会话上下文与 Agent 经验分开管理：会话保存完整消息；模型使用最近消息；任务经验跨会话保存成功、风险和待评审 Skill 候选。</p>
+          <div id="memoryList" class="compact-list"></div>
+        </div>
+      </section>
+
+      <section class="settings-panel" data-settings-panel="llm">
+        <div class="settings-card">
+          <header>
+            <strong>LLM 模型配置</strong>
+            <button class="text-action" id="addModelBtn">+ 添加模型</button>
+          </header>
+          <p class="settings-help">支持 OpenAI-compatible Chat Completions 与 Anthropic Messages API。默认按模型 ID 自动识别图像输入与上下文窗口，识别不准确时可手动覆盖。</p>
+          <div id="modelConfigList" class="model-config-list"></div>
+        </div>
+      </section>
+
+      <section class="settings-panel" data-settings-panel="skills">
+        <div class="settings-card">
+          <header>
+            <strong>Skill 技能层</strong>
+            <div class="settings-header-actions">
+              <span id="skillCount">0 skills</span>
+              <button id="importSkillBtn" class="text-action" type="button">导入</button>
+              <button id="addSkillBtn" class="text-action" type="button">+ 新建</button>
+              <input id="skillImportInput" type="file" accept=".md,text/markdown" hidden>
+            </div>
+          </header>
+          <p class="settings-help">Skill 是 Markdown 规程文档（SKILL.md）：frontmatter 的 name/description 决定模型何时使用。编辑后由运行时加载，可按后端能力筛选。</p>
+          <div id="skillList" class="skill-list"></div>
+        </div>
+      </section>
+    </aside>
+      </aside>
+    </div>
+
+    <!-- 系统设置模态框：应用设置 + 飞控设置 -->
+    <div id="systemSettingsModal" class="modal-overlay" hidden>
+      <div class="modal-card system-settings-card">
+        <header class="modal-head">
+          <div>
+            <strong>设置</strong>
+            <span>应用设置与飞控设置</span>
+          </div>
+          <button id="systemSettingsClose" class="icon-button" title="关闭">×</button>
+        </header>
+
+        <div class="system-settings-body">
+          <aside class="system-settings-sidebar">
+            <div class="sidebar-head">
+              <strong>Settings</strong>
+            </div>
+            <nav id="systemSettingsNav" class="system-settings-nav" aria-label="系统设置导航">
+              <span class="nav-group-label">Application Settings</span>
+              <button type="button" data-system-section="general">通用</button>
+              <button type="button" data-system-section="map_telemetry">地图与遥测</button>
+              <button type="button" data-system-section="operations">安全与数据</button>
+              <button class="active" type="button" data-system-section="links">通信链路</button>
+              <button type="button" data-system-section="camera">摄像头</button>
+              <span class="nav-group-label vehicle-nav-label">Vehicle Settings <b id="vehicleSettingsSource">OFFLINE</b></span>
+              <button class="vehicle-only" type="button" data-system-section="vehicle">概况</button>
+              <button class="vehicle-only" type="button" data-system-section="airframe">机架</button>
+              <button class="vehicle-only" type="button" data-system-section="sensors">传感器</button>
+              <button class="vehicle-only" type="button" data-system-section="radio">遥控器</button>
+              <button class="vehicle-only" type="button" data-system-section="flight_modes">飞行模式</button>
+              <button class="vehicle-only" type="button" data-system-section="power">电源</button>
+              <button class="vehicle-only" type="button" data-system-section="actuators">Actuators</button>
+              <button class="vehicle-only" type="button" data-system-section="safety">安全</button>
+              <button class="vehicle-only" type="button" data-system-section="pid_tuning">PID Tuning</button>
+              <button class="vehicle-only" type="button" data-system-section="waveforms">波形</button>
+              <button class="vehicle-only" type="button" data-system-section="flight_behavior">Flight Behavior</button>
+              <button class="vehicle-only" type="button" data-system-section="parameters">参数</button>
+              <button class="vehicle-only" type="button" data-system-section="firmware">固件</button>
+            </nav>
+          </aside>
+
+          <div class="system-settings-main">
+            <section class="system-settings-panel" data-system-panel="general">
+              <header class="system-panel-head">
+                <div>
+                  <strong>通用</strong>
+                  <span>界面显示与操作密度，不改变飞控参数</span>
+                </div>
+                <button type="button" class="primary application-settings-save">保存</button>
+              </header>
+              <div class="application-settings-grid">
+                <label><span>语言</span><select id="appLanguage"><option value="zh-CN">简体中文</option></select></label>
+                <label><span>主题</span><select id="appTheme"><option value="dark">深色</option></select></label>
+                <label><span>界面密度</span><select id="appDensity"><option value="comfortable">舒适</option><option value="compact">紧凑</option></select></label>
+              </div>
+            </section>
+
+            <section class="system-settings-panel" data-system-panel="map_telemetry">
+              <header class="system-panel-head">
+                <div>
+                  <strong>地图与遥测</strong>
+                  <span>地图图层、跟随策略、刷新频率与曲线采样</span>
+                </div>
+                <button type="button" class="primary application-settings-save">保存</button>
+              </header>
+              <div class="application-settings-grid">
+                <label><span>默认地图</span><select id="appMapLayer"><option value="satellite">卫星影像</option><option value="street">街道地图</option></select></label>
+                <label><span>飞行界面刷新</span><select id="appTelemetryRefresh"><option value="100">100 ms</option><option value="250">250 ms</option><option value="500">500 ms</option><option value="1000">1 s</option></select></label>
+                <label><span>飞控仪表刷新</span><select id="appSetupRefresh"><option value="50">50 ms</option><option value="100">100 ms</option><option value="200">200 ms</option><option value="500">500 ms</option></select></label>
+                <label><span>曲线时间窗</span><select id="appHistorySeconds"><option value="30">30 s</option><option value="60">60 s</option><option value="120">120 s</option><option value="300">5 min</option></select></label>
+                <label class="setting-toggle-row"><span>地图跟随飞行器</span><input id="appFollowVehicle" type="checkbox"></label>
+                <label class="setting-toggle-row"><span>显示历史航迹</span><input id="appShowTrack" type="checkbox"></label>
+                <label class="setting-toggle-row"><span>真实飞行只用可靠 GPS</span><input id="appRequireGps" type="checkbox"></label>
+              </div>
+            </section>
+
+            <section class="system-settings-panel" data-system-panel="operations">
+              <header class="system-panel-head">
+                <div>
+                  <strong>安全与数据</strong>
+                  <span>真实飞控确认、航点部署条件与 Agent 数据策略</span>
+                </div>
+                <button type="button" class="primary application-settings-save">保存</button>
+              </header>
+              <div class="application-settings-grid">
+                <label class="setting-toggle-row" title="真实飞控的解锁、起飞、任务启动和紧急操作始终要求确认"><span>真实飞控高风险操作确认（强制）</span><input id="appConfirmRealVehicle" type="checkbox" checked disabled></label>
+                <label class="setting-toggle-row"><span>全局航点要求可靠 GPS</span><input id="appRequireMissionGps" type="checkbox"></label>
+                <label class="setting-toggle-row"><span>显示模型上下文用量</span><input id="appShowContext" type="checkbox"></label>
+                <label class="setting-toggle-row"><span>自动识别图像模型</span><input id="appAutoMultimodal" type="checkbox"></label>
+                <label><span>地图异常跳变阈值</span><input id="appMaxMapJump" type="number" min="10" max="5000" step="10"><small>米，仅影响显示可信度</small></label>
+              </div>
+            </section>
+
+            <section class="system-settings-panel active" data-system-panel="links">
+              <header class="system-panel-head">
+                <div>
+                  <strong>通信链路</strong>
+                  <span>USB 自动识别优先，UDP/SITL 只作为备用链路</span>
+                </div>
+                <label class="toggle-switch small" title="启动时自动连接">
+                  <input id="autoConnectToggle" type="checkbox" checked>
+                  <span class="toggle-track"></span>
+                </label>
+              </header>
+
+              <div class="link-settings-layout">
+                <aside class="links-list-column">
+                  <div class="settings-section-head">
+                    <strong>连接预设</strong>
+                    <span id="detectedLinkCount">0 detected</span>
+                  </div>
+                  <div id="connectionsList" class="connections-list"></div>
+                  <button id="addConnectionBtn" class="sidebar-add" type="button">+ 添加连接</button>
+                </aside>
+
+                <form id="connectionDetailForm" class="connection-detail-form">
+                  <input type="hidden" id="connectionDetailId">
+                  <div class="detail-header">
+                    <div class="detail-status" id="connectionDetailStatus">
+                      <span class="status-dot"></span>
+                      <span class="status-text">未连接</span>
+                    </div>
+                    <div class="detail-actions">
+                      <button type="button" id="connectionDetailConnect" class="primary">连接</button>
+                      <button type="button" id="connectionDetailDelete" class="danger-text">删除</button>
+                    </div>
+                  </div>
+
+                  <div id="connectionActualLink" class="actual-link-card" hidden></div>
+
+                  <div class="form-row">
+                    <label for="connectionDetailName">名称</label>
+                    <input type="text" id="connectionDetailName" placeholder="如 PX4 MAVLink" required>
+                  </div>
+                  <div class="form-row">
+                    <label for="connectionDetailType">类型</label>
+                    <select id="connectionDetailType">
+                      <option value="auto">自动</option>
+                      <option value="serial">Serial</option>
+                      <option value="udp">UDP</option>
+                      <option value="tcp">TCP</option>
+                      <option value="airsim">AirSim</option>
+                      <option value="px4_ros2">PX4 ROS2 Gateway</option>
+                    </select>
+                  </div>
+                  <div class="form-row connection-type-fields" id="serialFieldsDetail">
+                    <label for="connectionDetailPort">串口</label>
+                    <input type="text" id="connectionDetailPort" placeholder="COM3 或 /dev/ttyACM0">
+                  </div>
+                  <div class="form-row connection-type-fields" id="udpFieldsDetail">
+                    <label for="connectionDetailHost">PX4 主机地址</label>
+                    <input type="text" id="connectionDetailHost" placeholder="127.0.0.1 或设备 IP">
+                  </div>
+                  <div class="form-row connection-type-fields" id="tcpFieldsDetail">
+                    <label for="connectionDetailAddress">服务器地址</label>
+                    <input type="text" id="connectionDetailAddress" placeholder="127.0.0.1">
+                  </div>
+                  <div class="form-row connection-type-fields" id="portFieldsDetail">
+                    <label for="connectionDetailPortNumber">端口 / 波特率</label>
+                    <input type="text" id="connectionDetailPortNumber" placeholder="14540 或 57600">
+                  </div>
+                  <div class="form-row connection-type-fields" id="remotePortFieldsDetail">
+                    <label for="connectionDetailRemotePort">PX4 远端端口</label>
+                    <input type="text" id="connectionDetailRemotePort" placeholder="18570（可留空）">
+                  </div>
+                  <div class="form-row connection-type-fields" id="realVehicleFieldsDetail">
+                    <label for="connectionDetailRealVehicle">真实飞控</label>
+                    <label class="toggle-switch small" title="真实飞控连接启用高风险操作审批">
+                      <input id="connectionDetailRealVehicle" type="checkbox">
+                      <span class="toggle-track"></span>
+                    </label>
+                  </div>
+
+                  <div class="detail-footer">
+                    <button type="button" id="connectionDetailCancel" class="secondary">取消</button>
+                    <button type="submit" class="primary">保存设置</button>
+                  </div>
+                </form>
+              </div>
+            </section>
+
+            <section class="system-settings-panel" data-system-panel="vehicle">
+              <header class="system-panel-head">
+                <div>
+                  <strong>概况</strong>
+                  <span>QGC 风格配置摘要：机架、传感器、遥控器、飞行模式、电源与安全状态</span>
+                </div>
+                <button type="button" id="refreshFirmwareInfoBtn" class="secondary">刷新固件信息</button>
+              </header>
+              <div id="vehicleInfoPanel" class="vehicle-info-panel"></div>
+              <section class="detected-links-panel">
+                <div class="settings-section-head">
+                  <strong>检测到的 MAVLink 串口</strong>
+                  <span id="detectedMavlinkLinksCount">0</span>
+                </div>
+                <div id="detectedMavlinkLinks" class="detected-links-list"></div>
+              </section>
+            </section>
+
+            <section class="system-settings-panel" data-system-panel="airframe">
+              <header class="system-panel-head">
+                <div>
+                  <strong>机架</strong>
+                  <span>PX4 机型、Autostart、系统 ID 与固件识别，只读查看</span>
+                </div>
+              </header>
+              <div id="vehicleAirframePanel" class="vehicle-setup-panel"></div>
+            </section>
+
+            <section class="system-settings-panel" data-system-panel="sensors">
+              <header class="system-panel-head">
+                <div>
+                  <strong>传感器</strong>
+                  <span>陀螺仪、加速度计、磁罗盘、气压计、GPS 与实时 IMU/姿态</span>
+                </div>
+              </header>
+              <div id="vehicleSensorsPanel" class="vehicle-setup-panel"></div>
+            </section>
+
+            <section class="system-settings-panel" data-system-panel="radio">
+              <header class="system-panel-head">
+                <div>
+                  <strong>遥控器</strong>
+                  <span>RC 通道、RSSI 与输入有效性，只读查看</span>
+                </div>
+              </header>
+              <div id="vehicleRadioPanel" class="vehicle-setup-panel"></div>
+            </section>
+
+            <section class="system-settings-panel" data-system-panel="flight_modes">
+              <header class="system-panel-head">
+                <div>
+                  <strong>飞行模式</strong>
+                  <span>当前模式与 COM_FLTMODE 参数映射，只读查看</span>
+                </div>
+              </header>
+              <div id="vehicleFlightModesPanel" class="vehicle-setup-panel"></div>
+            </section>
+
+            <section class="system-settings-panel" data-system-panel="power">
+              <header class="system-panel-head">
+                <div>
+                  <strong>电源</strong>
+                  <span>电池、电源模块、系统电压与电流状态</span>
+                </div>
+              </header>
+              <div id="vehiclePowerPanel" class="vehicle-setup-panel"></div>
+            </section>
+
+            <section class="system-settings-panel" data-system-panel="actuators">
+              <header class="system-panel-head">
+                <div>
+                  <strong>Actuators</strong>
+                  <span>执行器/电机输出 PWM，只读查看</span>
+                </div>
+              </header>
+              <div id="vehicleActuatorsPanel" class="vehicle-setup-panel"></div>
+            </section>
+
+            <section class="system-settings-panel" data-system-panel="safety">
+              <header class="system-panel-head">
+                <div>
+                  <strong>安全</strong>
+                  <span>解锁、失控保护、电池保护与返航相关参数摘要</span>
+                </div>
+              </header>
+              <div id="vehicleSafetyPanel" class="vehicle-setup-panel"></div>
+            </section>
+
+            <section class="system-settings-panel" data-system-panel="pid_tuning">
+              <header class="system-panel-head">
+                <div>
+                  <strong>PID Tuning</strong>
+                  <span>参考 QGC 的实时曲线视图，当前只读显示 Response / Setpoint</span>
+                </div>
+              </header>
+              <div id="vehiclePidPanel" class="vehicle-setup-panel"></div>
+            </section>
+
+            <section class="system-settings-panel" data-system-panel="waveforms">
+              <header class="system-panel-head">
+                <div>
+                  <strong>波形</strong>
+                  <span>多通道实时 MAVLink 数据曲线，可选择姿态、IMU、电池、RC 与输出通道</span>
+                </div>
+              </header>
+              <div id="vehicleWaveformPanel" class="vehicle-setup-panel"></div>
+            </section>
+
+            <section class="system-settings-panel" data-system-panel="flight_behavior">
+              <header class="system-panel-head">
+                <div>
+                  <strong>Flight Behavior</strong>
+                  <span>MPC/NAV/COM 关键飞行行为参数摘要，只读查看</span>
+                </div>
+              </header>
+              <div id="vehicleFlightBehaviorPanel" class="vehicle-setup-panel"></div>
+            </section>
+
+            <section class="system-settings-panel" data-system-panel="parameters">
+              <header class="system-panel-head">
+                <div>
+                  <strong>参数</strong>
+                  <span>PX4 MAVLink 参数，可搜索、分组查看，并逐项写入 PARAM_SET</span>
+                </div>
+                <div class="parameter-actions">
+                  <input id="vehicleParameterSearch" type="search" placeholder="搜索参数名或值">
+                  <button type="button" id="refreshVehicleParametersBtn" class="secondary">刷新参数</button>
+                </div>
+              </header>
+              <div id="vehicleParameterSummary" class="parameter-summary"></div>
+              <div id="vehicleParametersPanel" class="parameter-panel"></div>
+            </section>
+
+            <section class="system-settings-panel" data-system-panel="firmware">
+              <header class="system-panel-head">
+                <div>
+                  <strong>固件</strong>
+                  <span>AUTOPILOT_VERSION、PX4 版本、Git hash、Vendor/Product 与能力标志</span>
+                </div>
+              </header>
+              <div id="vehicleFirmwarePanel" class="vehicle-setup-panel"></div>
+            </section>
+
+            <section class="system-settings-panel" data-system-panel="camera">
+              <header class="camera-settings-head">
+                <div>
+                  <strong id="cameraSettingsTitle">摄像头</strong>
+                  <span>当前图像源：AirSim</span>
+                </div>
+                <div class="camera-settings-actions">
+                  <button type="button" id="cameraCaptureFromSettingsBtn" class="secondary">查看画面</button>
+                  <button type="button" id="cameraSaveSettingsBtn" class="primary">保存</button>
+                </div>
+              </header>
+              <div class="camera-settings-grid">
+                <div class="form-row">
+                  <label for="cameraSource">图像源</label>
+                  <select id="cameraSource">
+                    <option value="airsim">AirSim</option>
+                  </select>
+                </div>
+                <div class="form-row">
+                  <label for="cameraName">相机 ID</label>
+                  <input type="text" id="cameraName" placeholder="0">
+                </div>
+                <div class="form-row">
+                  <label for="cameraVehicle">车辆名</label>
+                  <input type="text" id="cameraVehicle" placeholder="留空使用第一架">
+                </div>
+                <div class="form-row">
+                  <label for="cameraImageType">图像类型</label>
+                  <select id="cameraImageType">
+                    <option value="scene">Scene</option>
+                    <option value="depth">Depth</option>
+                    <option value="segmentation">Segmentation</option>
+                    <option value="infrared">Infrared</option>
+                  </select>
+                </div>
+                <div class="form-row">
+                  <label for="cameraTimeout">超时 (s)</label>
+                  <input type="number" id="cameraTimeout" min="3" max="120" step="1" placeholder="30">
+                </div>
+                <label class="form-row camera-save-toggle">
+                  <span>保存图片</span>
+                  <span class="toggle-switch small" title="保存到 captures 目录">
+                    <input id="cameraAutoSave" type="checkbox">
+                    <span class="toggle-track"></span>
+                  </span>
+                </label>
+              </div>
+            </section>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <div id="settingsBackdrop" class="settings-backdrop" hidden></div>
+
+    <aside id="skillModal" class="modal-overlay" hidden>
+      <div class="modal-card">
+        <header class="modal-head">
+          <div>
+            <strong id="skillModalTitle">编辑 Skill</strong>
+            <span id="skillModalSubtitle">skill:id</span>
+          </div>
+          <button id="skillModalClose" class="icon-button" type="button" title="关闭">×</button>
+        </header>
+        <!-- 表单由 JS 按当前 Skill 动态生成，仅保留容器 -->
+        <form id="skillForm" class="modal-body"></form>
+      </div>
+    </aside>
+
+    <aside id="modelModal" class="modal-overlay" hidden>
+      <div class="modal-card">
+        <header class="modal-head">
+          <div>
+            <strong id="modelModalTitle">添加模型</strong>
+            <span>配置自定义 API 模型</span>
+          </div>
+          <button id="modelModalClose" class="icon-button" type="button" title="关闭">×</button>
+        </header>
+        <form id="modelForm" class="modal-body">
+          <input type="hidden" id="modelEditId">
+          <div class="form-row">
+            <label for="modelName">显示名称</label>
+            <input type="text" id="modelName" placeholder="如 OpenAI GPT-4" required>
+          </div>
+          <div class="form-row">
+            <label for="modelProvider">Provider</label>
+            <input type="text" id="modelProvider" placeholder="如 openai, deepseek, anthropic" required>
+          </div>
+          <div class="form-row">
+            <label for="modelModelId">模型 ID</label>
+            <input type="text" id="modelModelId" placeholder="如 gpt-4, deepseek-chat, claude-3-opus-20240229" required>
+          </div>
+          <div class="form-row">
+            <label for="modelApiType">API 类型</label>
+            <select id="modelApiType">
+              <option value="openai">OpenAI 兼容</option>
+              <option value="anthropic">Anthropic</option>
+            </select>
+          </div>
+          <div class="form-row">
+            <label for="modelBaseUrl">Base URL</label>
+            <input type="url" id="modelBaseUrl" placeholder="https://api.openai.com/v1">
+          </div>
+          <div class="form-row">
+            <label for="modelApiKey">API Key</label>
+            <div class="secret-input-row">
+              <input type="password" id="modelApiKey" placeholder="未修改时保留现有密钥">
+              <button type="button" id="modelRevealKey" class="secondary">显示</button>
+            </div>
+          </div>
+          <div class="modal-actions">
+            <button type="button" id="modelModalCancel" class="secondary">取消</button>
+            <button type="submit" class="primary">保存</button>
+          </div>
+        </form>
+      </div>
+    </aside>
+
+    <script
+      src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"
+      integrity="sha256-20nQCchB9co0qIjJZRGuk2/Z9VM+kNiyxNV1lvTlZBo="
+      crossorigin=""
+    ></script>
+    <script src="/app.js"></script>
+  </body>
+</html>

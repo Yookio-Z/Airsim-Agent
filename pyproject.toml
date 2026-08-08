@@ -1,0 +1,83 @@
+[project]
+name = "airsim-controller"
+version = "0.1.0"
+description = "UAV agent and ground-station control runtime for AirSim, PX4, and future ROS-backed vehicles"
+requires-python = ">=3.10"
+authors = [
+    { name = "AirSim Controller Team" }
+]
+keywords = ["airsim", "drone", "uav", "simulation", "robotics"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Developers",
+    "Intended Audience :: Science/Research",
+    "Topic :: Scientific/Engineering",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+]
+
+dependencies = [
+    "airsim>=1.8.0",
+    "backports.ssl_match_hostname>=3.7.0.1",
+    "mcp>=1.6.0",
+    "numpy>=1.20.0",
+    "opencv-python-headless>=4.8.0",
+    "pillow>=10.0.0",
+    "pydantic-settings>=2.0",
+    "pymavlink>=2.4.0",
+    "pyserial>=3.5",
+    "ultralytics>=8.0.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=7.0",
+    "pytest-asyncio>=0.21.0",
+    "black>=22.0",
+    "flake8>=4.0",
+    "mypy>=0.950",
+]
+
+[project.scripts]
+airsim-mcp-airsim = "src.server_airsim:main"
+airsim-mcp-px4 = "src.server_px4:main"
+airsim-mcp-px4-ros2 = "src.server_px4_ros2:main"
+airsim-agent-ui = "src.ui.server:main"
+
+[project.urls]
+Homepage = "https://github.com/yourusername/airsim-controller"
+Repository = "https://github.com/yourusername/airsim-controller"
+Documentation = "https://github.com/yourusername/airsim-controller/blob/main/README.md"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src"]
+
+[tool.black]
+line-length = 100
+target-version = ['py310']
+
+[tool.mypy]
+python_version = "3.10"
+warn_return_any = true
+warn_unused_configs = true
+disallow_untyped_defs = true
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+python_files = ["test_*.py"]
+python_classes = ["Test*"]
+python_functions = ["test_*"]
+
+[tool.uv.extra-build-dependencies]
+airsim = [
+    "numpy",
+    "msgpack-rpc-python",
+    "backports.ssl_match_hostname"
+]

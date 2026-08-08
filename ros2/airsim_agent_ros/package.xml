@@ -1,0 +1,21 @@
+<?xml version="1.0"?>
+<package format="3">
+  <name>airsim_agent_ros</name>
+  <version>0.1.0</version>
+  <description>ROS2 Provider Gateway for the AirSim Agent ground station.</description>
+  <maintainer email="dev@example.com">AirSim Agent Team</maintainer>
+  <license>MIT</license>
+
+  <buildtool_depend>ament_python</buildtool_depend>
+
+  <exec_depend>rclpy</exec_depend>
+  <exec_depend>px4_msgs</exec_depend>
+  <exec_depend>sensor_msgs</exec_depend>
+
+  <test_depend>ament_lint_auto</test_depend>
+  <test_depend>ament_lint_common</test_depend>
+
+  <export>
+    <build_type>ament_python</build_type>
+  </export>
+</package>
