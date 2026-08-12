@@ -847,7 +847,7 @@ class AirSimController(FlightController):
         except Exception:
             return self._vehicles or [""]
 
-    def set_mode(self, mode: str) -> bool:
+    def set_mode(self, mode: str, vehicle_name: str = "") -> bool:
         logger.warning("AirSim does not support flight modes")
         return False
 

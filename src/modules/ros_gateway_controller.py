@@ -15,13 +15,28 @@ from src.modules.flight_controller import ConnectionInfo, DroneStatus, FlightCon
 class RosGatewayController(FlightController):
     """Controls PX4 through a ROS2 gateway running in WSL or onboard."""
 
-    def __init__(self, base_url: str = "", timeout_sec: float | None = None) -> None:
+    def __init__(
+        self,
+        base_url: str = "",
+        endpoints: dict[str, str] | None = None,
+        timeout_sec: float | None = None,
+    ) -> None:
         timeout = float(timeout_sec if timeout_sec is not None else config.ros_bridge_timeout_sec)
-        bridge_config = RosProviderBridgeConfig(
-            base_url=(base_url or config.ros_bridge_url or "").strip(),
-            timeout_sec=timeout,
+        # 多机（多 gateway）：{vehicle_name: base_url}；单端点时用默认名 px4_ros2
+        self._endpoints: dict[str, RosProviderBridgeClient] = {}
+        self._default_name = "px4_ros2"
+        if endpoints:
+            self._default_name = next(iter(endpoints))
+            for name, url in endpoints.items():
+                self._endpoints[str(name)] = RosProviderBridgeClient(
+                    RosProviderBridgeConfig(base_url=str(url).strip(), timeout_sec=timeout)
+                )
+        self.client = RosProviderBridgeClient(
+            RosProviderBridgeConfig(
+                base_url=(base_url or config.ros_bridge_url or "").strip(),
+                timeout_sec=timeout,
+            )
         )
-        self.client = RosProviderBridgeClient(bridge_config)
         self._connected = False
         self.last_error = ""
         self._last_connection_info: dict[str, Any] = {
@@ -31,6 +46,31 @@ class RosGatewayController(FlightController):
             "connected": False,
             "real_vehicle": False,
         }
+
+    def _resolve_clients(self, vehicle_name: str = "") -> list[RosProviderBridgeClient]:
+        """Map vehicle_name onto gateway clients (same semantics as MAVLink multi-system)."""
+        if not self._endpoints:
+            return [self.client]
+        names = list(self._endpoints.keys())
+        if not vehicle_name:
+            return [self._endpoints[self._default_name]]
+        name = str(vehicle_name).strip().lower()
+        if name == "all":
+            return list(self._endpoints.values())
+        for key, client in self._endpoints.items():
+            if name in {str(key).lower(), f"px4_ros2_{key}".lower()}:
+                return [client]
+        return [self._endpoints[self._default_name]]
+
+    def _run_all(self, vehicle_name: str, action) -> bool:
+        """Execute action(client) for each resolved gateway; all must succeed."""
+        clients = self._resolve_clients(vehicle_name)
+        ok = True
+        for client in clients:
+            if not self._ok(action(client)):
+                ok = False
+                break
+        return ok
 
     @property
     def backend_name(self) -> str:
@@ -84,28 +124,28 @@ class RosGatewayController(FlightController):
         }
 
     def arm(self, vehicle_name: str = "") -> bool:
-        return self._ok(self.client.px4_arm(True))
+        return self._run_all(vehicle_name, lambda client: client.px4_arm(True))
 
     def disarm(self, vehicle_name: str = "") -> bool:
-        return self._ok(self.client.px4_arm(False))
+        return self._run_all(vehicle_name, lambda client: client.px4_arm(False))
 
     def takeoff(self, altitude: float = 3.0, vehicle_name: str = "") -> bool:
         altitude_m = abs(float(altitude))
-        return self._ok(
-            self.client.px4_takeoff(
+        return self._run_all(vehicle_name, lambda client: self._ok(
+            client.px4_takeoff(
                 {
                     "altitude_m": altitude_m,
                     "wait": True,
                     "timeout_sec": max(25.0, altitude_m * 8.0),
                 }
             )
-        )
+        ))
 
     def land(self, vehicle_name: str = "") -> bool:
-        return self._ok(self.client.px4_land({"wait": False}))
+        return self._run_all(vehicle_name, lambda client: client.px4_land({"wait": False}))
 
     def hover(self, vehicle_name: str = "") -> bool:
-        return self._ok(self.client.px4_hold({}))
+        return self._run_all(vehicle_name, lambda client: client.px4_hold({}))
 
     def move_to_position(
         self,
@@ -128,8 +168,8 @@ class RosGatewayController(FlightController):
             timeout_sec = max(15.0, min(120.0, distance / speed + 12.0))
         except Exception:
             pass
-        return self._ok(
-            self.client.px4_local_setpoint(
+        return self._run_all(vehicle_name, lambda client: self._ok(
+            client.px4_local_setpoint(
                 {
                     **target,
                     "velocity": speed,
@@ -137,7 +177,7 @@ class RosGatewayController(FlightController):
                     "timeout_sec": timeout_sec,
                 }
             )
-        )
+        ))
 
     def move_by_velocity(
         self,
@@ -147,8 +187,8 @@ class RosGatewayController(FlightController):
         duration: float = 0.0,
         vehicle_name: str = "",
     ) -> bool:
-        return self._ok(
-            self.client.px4_velocity(
+        return self._run_all(vehicle_name, lambda client: self._ok(
+            client.px4_velocity(
                 {
                     "vx": float(vx),
                     "vy": float(vy),
@@ -156,21 +196,22 @@ class RosGatewayController(FlightController):
                     "duration_sec": max(0.0, float(duration)),
                 }
             )
-        )
+        ))
 
     def move_on_path(self, waypoints: list[dict], velocity: float = 2.0, vehicle_name: str = "") -> bool:
-        return self._ok(
-            self.client.px4_path(
+        return self._run_all(vehicle_name, lambda client: self._ok(
+            client.px4_path(
                 {
                     "waypoints": list(waypoints),
                     "velocity": max(0.1, float(velocity)),
                     "wait": True,
                 }
             )
-        )
+        ))
 
     def get_status(self, vehicle_name: str = "") -> DroneStatus:
-        result = self.client.px4_status()
+        client = self._resolve_clients(vehicle_name)[0]
+        result = client.px4_status()
         if not result.ok:
             self.last_error = result.message
             return DroneStatus(extra={"status": "error", "message": result.message, **result.data})
@@ -211,6 +252,8 @@ class RosGatewayController(FlightController):
         )
 
     def list_vehicles(self) -> list[str]:
+        if self._endpoints:
+            return [f"px4_ros2_{name}" for name in self._endpoints]
         return ["px4_ros2"]
 
     def get_connection_info(self) -> dict[str, Any]:
@@ -223,19 +266,19 @@ class RosGatewayController(FlightController):
             "backend": self.backend_name,
         }
 
-    def set_mode(self, mode: str) -> bool:
-        return self._ok(self.client.px4_set_mode({"mode": str(mode)}))
+    def set_mode(self, mode: str, vehicle_name: str = "") -> bool:
+        return self._run_all(vehicle_name, lambda client: client.px4_set_mode({"mode": str(mode)}))
 
     def rotate_to_heading(self, heading_deg: float, timeout: float = 30.0, vehicle_name: str = "") -> bool:
-        return self._ok(
-            self.client.px4_rotate_to(
+        return self._run_all(vehicle_name, lambda client: self._ok(
+            client.px4_rotate_to(
                 {
                     "heading_deg": float(heading_deg) % 360.0,
                     "timeout_sec": max(0.0, float(timeout)),
                     "wait": True,
                 }
             )
-        )
+        ))
 
     def _ok(self, result: ProviderResult) -> bool:
         self.last_error = "" if result.ok else (result.message or result.status)

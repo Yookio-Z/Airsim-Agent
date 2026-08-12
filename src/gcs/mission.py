@@ -137,6 +137,7 @@ class MissionPlanDraft:
 
     id: str = field(default_factory=_mission_id)
     name: str = "Untitled mission"
+    vehicle: str = ""
     home: GeoPoint | None = None
     items: list[MissionItem] = field(default_factory=list)
     total_distance_m: float = 0.0
@@ -172,6 +173,7 @@ class MissionPlanDraft:
         return {
             "id": self.id,
             "name": self.name,
+            "vehicle": self.vehicle,
             "home": self.home.to_dict() if self.home else None,
             "items": [item.to_dict() for item in self.items],
             "total_distance_m": self.total_distance_m,
@@ -187,6 +189,7 @@ class MissionPlanDraft:
         plan = cls(
             id=str(data.get("id") or _mission_id()),
             name=str(data.get("name") or "Untitled mission"),
+            vehicle=str(data.get("vehicle") or ""),
             home=GeoPoint.from_dict(data.get("home")),
             items=[MissionItem.from_dict(x) for x in (data.get("items") or []) if isinstance(x, dict)],
             metadata=dict(data.get("metadata") or {}),

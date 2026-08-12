@@ -3701,6 +3701,7 @@ function buildMissionDraftFromItems(items) {
   })();
   return {
     name: "UI mission",
+    vehicle: document.getElementById("missionVehicle")?.value || "",
     home,
     items: items.map((it) => ({
       id: it.id,

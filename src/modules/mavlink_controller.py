@@ -82,6 +82,10 @@ class MavlinkController(FlightController):
         self._setpoint_hz = max(2.0, setpoint_hz or config.offboard_setpoint_hz)
         self._mavlink: Any | None = None
         self._connected = False
+        # 多机（QGC 模式）：按 MAVLink system id 分表；单机时只有 sysid=0 一张表
+        self._systems: dict[int, dict[str, Any]] = {}
+        self._systems_history: dict[int, dict[str, deque]] = {}
+        self._selected_sysid = 0
         self._telemetry: dict[str, Any] = {}
         self._position = {"x": 0.0, "y": 0.0, "z": 0.0}
         self._velocity = {"vx": 0.0, "vy": 0.0, "vz": 0.0}
@@ -113,6 +117,12 @@ class MavlinkController(FlightController):
             "rc": deque(maxlen=2400),
             "servo": deque(maxlen=2400),
         }
+        # 默认表（sysid=0）：单机路径与 __init__ 赋值顺序兼容
+        self._systems[0] = self._new_system_table()
+        self._systems_history[0] = self._telemetry_history
+        self._telemetry = {}
+        self._position = {"x": 0.0, "y": 0.0, "z": 0.0}
+        self._velocity = {"vx": 0.0, "vy": 0.0, "vz": 0.0}
         self._parameter_component_counts: dict[int, int] = {}
         self._parameter_component_indices: dict[int, set[int]] = {}
         self._parameter_download_state = "not_requested"
@@ -125,6 +135,130 @@ class MavlinkController(FlightController):
     @property
     def backend_name(self) -> str:
         return "mavlink"
+
+    # ── 多机分表（QGC 模式）：sysid → per-system 状态表 ──
+
+    def _new_system_table(self) -> dict[str, Any]:
+        return {
+            "telemetry": {},
+            "position": {"x": 0.0, "y": 0.0, "z": 0.0},
+            "velocity": {"vx": 0.0, "vy": 0.0, "vz": 0.0},
+            "gps_origin": None,
+            "last_heartbeat": 0.0,
+            "last_local_position": 0.0,
+            "last_global_position": 0.0,
+            "autopilot": None,
+            "vehicle_type": None,
+            "firmware_info": {},
+        }
+
+    def _system_table(self, sysid: int) -> dict[str, Any]:
+        table = self._systems.setdefault(int(sysid), self._new_system_table())
+        if int(sysid) not in self._systems_history:
+            base = getattr(self, "_telemetry_history", None)
+            self._systems_history[int(sysid)] = (
+                {key: deque(maxlen=queue.maxlen) for key, queue in base.items()} if base else {}
+            )
+        return table
+
+    @property
+    def _active_sysid(self) -> int:
+        if self._selected_sysid in self._systems:
+            return self._selected_sysid
+        if self._systems:
+            return next(iter(self._systems))
+        return 0
+
+    def _target_sysid(self) -> int:
+        """命令上下文的目标机：target_system 已设置时用它，否则 active 机。"""
+        if self._mavlink is not None:
+            sysid = getattr(self._mavlink, "target_system", 0) or 0
+            if sysid in self._systems:
+                return sysid
+        return self._active_sysid
+
+    def _telemetry_for_target(self) -> dict[str, Any]:
+        return self._system_table(self._target_sysid())["telemetry"]
+
+    @property
+    def _telemetry(self) -> dict[str, Any]:
+        return self._system_table(self._active_sysid)["telemetry"]
+
+    @_telemetry.setter
+    def _telemetry(self, value: dict[str, Any]) -> None:
+        self._system_table(self._active_sysid)["telemetry"] = value
+
+    @property
+    def _position(self) -> dict[str, float]:
+        return self._system_table(self._active_sysid)["position"]
+
+    @_position.setter
+    def _position(self, value: dict[str, float]) -> None:
+        self._system_table(self._active_sysid)["position"] = value
+
+    @property
+    def _velocity(self) -> dict[str, float]:
+        return self._system_table(self._active_sysid)["velocity"]
+
+    @_velocity.setter
+    def _velocity(self, value: dict[str, float]) -> None:
+        self._system_table(self._active_sysid)["velocity"] = value
+
+    @property
+    def _gps_origin(self) -> dict[str, float] | None:
+        return self._system_table(self._active_sysid)["gps_origin"]
+
+    @_gps_origin.setter
+    def _gps_origin(self, value: dict[str, float] | None) -> None:
+        self._system_table(self._active_sysid)["gps_origin"] = value
+
+    @property
+    def _last_heartbeat(self) -> float:
+        return self._system_table(self._active_sysid)["last_heartbeat"]
+
+    @_last_heartbeat.setter
+    def _last_heartbeat(self, value: float) -> None:
+        self._system_table(self._active_sysid)["last_heartbeat"] = value
+
+    @property
+    def _last_local_position(self) -> float:
+        return self._system_table(self._active_sysid)["last_local_position"]
+
+    @_last_local_position.setter
+    def _last_local_position(self, value: float) -> None:
+        self._system_table(self._active_sysid)["last_local_position"] = value
+
+    @property
+    def _last_global_position(self) -> float:
+        return self._system_table(self._active_sysid)["last_global_position"]
+
+    @_last_global_position.setter
+    def _last_global_position(self, value: float) -> None:
+        self._system_table(self._active_sysid)["last_global_position"] = value
+
+    @property
+    def _autopilot(self) -> int | None:
+        return self._system_table(self._active_sysid)["autopilot"]
+
+    @_autopilot.setter
+    def _autopilot(self, value: int | None) -> None:
+        self._system_table(self._active_sysid)["autopilot"] = value
+
+    @property
+    def _vehicle_type(self) -> int | None:
+        return self._system_table(self._active_sysid)["vehicle_type"]
+
+    @_vehicle_type.setter
+    def _vehicle_type(self, value: int | None) -> None:
+        self._system_table(self._active_sysid)["vehicle_type"] = value
+
+    @property
+    def _firmware_info(self) -> dict[str, Any]:
+        return self._system_table(self._active_sysid)["firmware_info"]
+
+    @_firmware_info.setter
+    def _firmware_info(self, value: dict[str, Any]) -> None:
+        self._system_table(self._active_sysid)["firmware_info"] = value
 
     @property
     def is_connected(self) -> bool:
@@ -271,40 +405,45 @@ class MavlinkController(FlightController):
         msg_type = msg.get_type()
         if msg_type == "BAD_DATA":
             return
+        try:
+            sysid = int(msg.get_srcSystem() or 0)
+        except Exception:
+            sysid = 0
+        table = self._system_table(sysid)
         msg_dict = msg.to_dict()
 
         if msg_type == "HEARTBEAT":
             if not self._is_vehicle_heartbeat(msg):
                 self._telemetry["GCS_HEARTBEAT"] = msg_dict
                 return
-            self._last_heartbeat = time.time()
-            self._autopilot = msg_dict.get("autopilot")
-            self._vehicle_type = msg_dict.get("type")
-            if self._mavlink is not None:
-                self._mavlink.target_system = msg.get_srcSystem()
-                self._mavlink.target_component = msg.get_srcComponent()
+            table["last_heartbeat"] = time.time()
+            table["autopilot"] = msg_dict.get("autopilot")
+            table["vehicle_type"] = msg_dict.get("type")
+            # 多机（QGC 模式）：不再重定向 target_system —— 命令按 vehicle_name 显式设置
+            if self._selected_sysid == 0 or self._selected_sysid not in self._systems:
+                self._selected_sysid = sysid
             base_mode = int(msg_dict.get("base_mode", 0) or 0)
             msg_dict["armed"] = bool(base_mode & mavutil.mavlink.MAV_MODE_FLAG_SAFETY_ARMED)
             msg_dict["mode"] = self._mode_from_heartbeat_msg(msg)
 
         elif msg_type == "LOCAL_POSITION_NED":
-            self._last_local_position = time.time()
-            self._position = {
+            table["last_local_position"] = time.time()
+            table["position"] = {
                 "x": float(msg_dict.get("x", 0.0) or 0.0),
                 "y": float(msg_dict.get("y", 0.0) or 0.0),
                 "z": float(msg_dict.get("z", 0.0) or 0.0),
             }
-            self._velocity = {
+            table["velocity"] = {
                 "vx": float(msg_dict.get("vx", 0.0) or 0.0),
                 "vy": float(msg_dict.get("vy", 0.0) or 0.0),
                 "vz": float(msg_dict.get("vz", 0.0) or 0.0),
             }
             now = time.time()
-            self._append_history("position", {"t": now, **dict(self._position)})
-            self._append_history("velocity", {"t": now, **dict(self._velocity)})
+            self._append_history("position", {"t": now, **dict(table["position"])}, sysid=sysid)
+            self._append_history("velocity", {"t": now, **dict(table["velocity"])}, sysid=sysid)
 
         elif msg_type == "GLOBAL_POSITION_INT":
-            self._last_global_position = time.time()
+            table["last_global_position"] = time.time()
             msg_dict["lat"] = float(msg_dict.get("lat", 0) or 0) / 1e7
             msg_dict["lon"] = float(msg_dict.get("lon", 0) or 0) / 1e7
             msg_dict["alt"] = float(msg_dict.get("alt", 0) or 0) / 1000.0
@@ -314,11 +453,11 @@ class MavlinkController(FlightController):
             msg_dict["vz"] = float(msg_dict.get("vz", 0) or 0) / 100.0
             raw_hdg = float(msg_dict.get("hdg", 0) or 0)
             msg_dict["hdg"] = 0.0 if raw_hdg >= 65535 else raw_hdg / 100.0
-            self._update_position_from_global(msg_dict)
+            self._update_position_from_global(msg_dict, sysid=sysid)
 
         elif msg_type == "VFR_HUD":
             # 空速/地速/高度/爬升率（m/s, m）
-            self._telemetry["VFR_HUD"] = {
+            table["telemetry"]["VFR_HUD"] = {
                 "airspeed": float(msg_dict.get("airspeed", 0.0) or 0.0),
                 "groundspeed": float(msg_dict.get("groundspeed", 0.0) or 0.0),
                 "alt": float(msg_dict.get("alt", 0.0) or 0.0),
@@ -326,8 +465,8 @@ class MavlinkController(FlightController):
                 "heading": float(msg_dict.get("heading", 0.0) or 0.0),
                 "throttle": float(msg_dict.get("throttle", 0) or 0),
             }
-            if not self._velocity:
-                self._velocity = {
+            if not table["velocity"]:
+                table["velocity"] = {
                     "vx": 0.0,
                     "vy": 0.0,
                     "vz": -float(msg_dict.get("climb", 0.0) or 0.0),
@@ -362,7 +501,7 @@ class MavlinkController(FlightController):
             msg_dict["rollspeed_deg_s"] = math.degrees(float(msg_dict.get("rollspeed", 0.0) or 0.0))
             msg_dict["pitchspeed_deg_s"] = math.degrees(float(msg_dict.get("pitchspeed", 0.0) or 0.0))
             msg_dict["yawspeed_deg_s"] = math.degrees(float(msg_dict.get("yawspeed", 0.0) or 0.0))
-            target = self._telemetry.get("ATTITUDE_TARGET") or {}
+            target = table["telemetry"].get("ATTITUDE_TARGET") or {}
             self._append_history("attitude", {
                 "t": time.time(),
                 "roll": msg_dict["roll_deg"],
@@ -459,15 +598,48 @@ class MavlinkController(FlightController):
 
         elif msg_type == "AUTOPILOT_VERSION":
             msg_dict = self._decode_autopilot_version(msg_dict)
-            self._firmware_info = dict(msg_dict)
+            table["firmware_info"] = dict(msg_dict)
 
         elif msg_type == "PARAM_VALUE":
             msg_dict = self._record_parameter_value(msg, msg_dict)
 
-        self._telemetry[msg_type] = msg_dict
+        table["telemetry"][msg_type] = msg_dict
 
-    def _append_history(self, key: str, entry: dict[str, Any]) -> None:
-        history = self._telemetry_history.get(key)
+    def _resolve_sysids(self, vehicle_name: str = "") -> list[int]:
+        """Map tool-level vehicle_name onto MAVLink system ids (QGC 模式).
+
+        ""   -> 默认机（第一架，绝不隐式广播）
+        "all" -> 链路上所有 system
+        名称  -> px4_sys1 / sys1 / 1 解析到对应 system
+        """
+        systems = sorted(
+            sysid for sysid in self._systems if self._systems[sysid]["last_heartbeat"]
+        )
+        if not systems:
+            systems = sorted(self._systems.keys()) or [0]
+        if not vehicle_name:
+            if len(systems) <= 1:
+                return systems or [0]
+            return [systems[0]]
+        name = str(vehicle_name).strip().lower()
+        if name == "all":
+            return systems or [0]
+        for sysid in systems:
+            if name in {f"px4_sys{sysid}", f"sys{sysid}", str(sysid)}:
+                return [sysid]
+        return systems[:1] or [0]
+
+    def _set_target(self, sysid: int) -> None:
+        """命令执行前把 MAVLink target 指向目标 system。"""
+        if self._mavlink is not None:
+            try:
+                self._mavlink.target_system = int(sysid)
+                self._mavlink.target_component = 1
+            except Exception:
+                pass
+
+    def _append_history(self, key: str, entry: dict[str, Any], sysid: int = 0) -> None:
+        history = self._systems_history.setdefault(int(sysid), {}).get(key)
         if history is not None:
             history.append(entry)
 
@@ -560,23 +732,24 @@ class MavlinkController(FlightController):
         data["valid_outputs"] = [value for value in outputs if value is not None]
         return data
 
-    def _update_position_from_global(self, gps: dict[str, Any]) -> None:
+    def _update_position_from_global(self, gps: dict[str, Any], sysid: int = 0) -> None:
         # Prefer LOCAL_POSITION_NED. GLOBAL_POSITION_INT is only a fallback.
-        if time.time() - self._last_local_position < 2.0:
+        table = self._system_table(sysid)
+        if time.time() - table["last_local_position"] < 2.0:
             return
 
         lat = float(gps.get("lat", 0.0) or 0.0)
         lon = float(gps.get("lon", 0.0) or 0.0)
         if self._outdoor and lat and lon:
-            if self._gps_origin is None:
-                self._gps_origin = {"lat": lat, "lon": lon}
+            if table["gps_origin"] is None:
+                table["gps_origin"] = {"lat": lat, "lon": lon}
             earth_radius_m = 6371000.0
-            dlat = math.radians(lat - self._gps_origin["lat"])
-            dlon = math.radians(lon - self._gps_origin["lon"])
-            self._position["x"] = dlat * earth_radius_m
-            self._position["y"] = dlon * earth_radius_m * math.cos(math.radians(self._gps_origin["lat"]))
-        self._position["z"] = -abs(float(gps.get("relative_alt", 0.0) or 0.0))
-        self._velocity = {
+            dlat = math.radians(lat - table["gps_origin"]["lat"])
+            dlon = math.radians(lon - table["gps_origin"]["lon"])
+            table["position"]["x"] = dlat * earth_radius_m
+            table["position"]["y"] = dlon * earth_radius_m * math.cos(math.radians(table["gps_origin"]["lat"]))
+        table["position"]["z"] = -abs(float(gps.get("relative_alt", 0.0) or 0.0))
+        table["velocity"] = {
             "vx": float(gps.get("vx", 0.0) or 0.0),
             "vy": float(gps.get("vy", 0.0) or 0.0),
             "vz": float(gps.get("vz", 0.0) or 0.0),
@@ -634,6 +807,20 @@ class MavlinkController(FlightController):
                 logger.debug(f"Failed to request MAVLink message interval for {msg_id}")
 
     def arm(self, vehicle_name: str = "") -> bool:
+        """多机：vehicle_name（""=默认机 / all=全部 / px4_sysN）解析后逐机执行。"""
+        targets = self._resolve_sysids(vehicle_name)
+        if not targets:
+            self._last_action_error = "no MAVLink system available"
+            return False
+        ok = True
+        for sysid in targets:
+            self._set_target(sysid)
+            if not self._arm_one():
+                ok = False
+                break
+        return ok
+
+    def _arm_one(self) -> bool:
         self._last_action_error = ""
         if not self.is_connected:
             self._last_action_error = "MAVLink is not connected"
@@ -669,6 +856,20 @@ class MavlinkController(FlightController):
         return armed
 
     def disarm(self, vehicle_name: str = "") -> bool:
+        """多机：vehicle_name（""=默认机 / all=全部 / px4_sysN）解析后逐机执行。"""
+        targets = self._resolve_sysids(vehicle_name)
+        if not targets:
+            self._last_action_error = "no MAVLink system available"
+            return False
+        ok = True
+        for sysid in targets:
+            self._set_target(sysid)
+            if not self._disarm_one():
+                ok = False
+                break
+        return ok
+
+    def _disarm_one(self) -> bool:
         self._last_action_error = ""
         if not self.is_connected:
             self._last_action_error = "MAVLink is not connected"
@@ -701,6 +902,20 @@ class MavlinkController(FlightController):
         return disarmed
 
     def takeoff(self, altitude: float = 3.0, vehicle_name: str = "") -> bool:
+        """多机：vehicle_name（""=默认机 / all=全部 / px4_sysN）解析后逐机执行。"""
+        targets = self._resolve_sysids(vehicle_name)
+        if not targets:
+            self._last_action_error = "no MAVLink system available"
+            return False
+        ok = True
+        for sysid in targets:
+            self._set_target(sysid)
+            if not self._takeoff_one(altitude):
+                ok = False
+                break
+        return ok
+
+    def _takeoff_one(self, altitude: float = 3.0) -> bool:
         self._last_action_error = ""
         if not self.is_connected:
             self._last_action_error = "MAVLink is not connected"
@@ -823,6 +1038,20 @@ class MavlinkController(FlightController):
         return False
 
     def land(self, vehicle_name: str = "") -> bool:
+        """多机：vehicle_name（""=默认机 / all=全部 / px4_sysN）解析后逐机执行。"""
+        targets = self._resolve_sysids(vehicle_name)
+        if not targets:
+            self._last_action_error = "no MAVLink system available"
+            return False
+        ok = True
+        for sysid in targets:
+            self._set_target(sysid)
+            if not self._land_one():
+                ok = False
+                break
+        return ok
+
+    def _land_one(self) -> bool:
         if not self.is_connected:
             return False
         mode_ok = self.set_mode("LAND")
@@ -845,6 +1074,20 @@ class MavlinkController(FlightController):
         return mode_ok or ack_ok
 
     def hover(self, vehicle_name: str = "") -> bool:
+        """多机：vehicle_name（""=默认机 / all=全部 / px4_sysN）解析后逐机执行。"""
+        targets = self._resolve_sysids(vehicle_name)
+        if not targets:
+            self._last_action_error = "no MAVLink system available"
+            return False
+        ok = True
+        for sysid in targets:
+            self._set_target(sysid)
+            if not self._hover_one():
+                ok = False
+                break
+        return ok
+
+    def _hover_one(self) -> bool:
         if not self.is_connected:
             return False
         if self._current_altitude_m() < 0.5:
@@ -872,6 +1115,27 @@ class MavlinkController(FlightController):
         z: float,
         velocity: float = 2.0,
         vehicle_name: str = "",
+        arrival_threshold_m: float | None = None,
+    ) -> bool:
+        """多机：vehicle_name（""=默认机 / all=全部 / px4_sysN）解析后逐机执行。"""
+        targets = self._resolve_sysids(vehicle_name)
+        if not targets:
+            self._last_action_error = "no MAVLink system available"
+            return False
+        ok = True
+        for sysid in targets:
+            self._set_target(sysid)
+            if not self._move_to_position_one(x, y, z, velocity, arrival_threshold_m):
+                ok = False
+                break
+        return ok
+
+    def _move_to_position_one(
+        self,
+        x: float,
+        y: float,
+        z: float,
+        velocity: float = 2.0,
         arrival_threshold_m: float | None = None,
     ) -> bool:
         if not self.is_connected:
@@ -924,6 +1188,20 @@ class MavlinkController(FlightController):
         return False
 
     def move_by_velocity(self, vx: float, vy: float, vz: float, duration: float = 0.0, vehicle_name: str = "") -> bool:
+        """多机：vehicle_name（""=默认机 / all=全部 / px4_sysN）解析后逐机执行。"""
+        targets = self._resolve_sysids(vehicle_name)
+        if not targets:
+            self._last_action_error = "no MAVLink system available"
+            return False
+        ok = True
+        for sysid in targets:
+            self._set_target(sysid)
+            if not self._move_by_velocity_one(vx, vy, vz, duration):
+                ok = False
+                break
+        return ok
+
+    def _move_by_velocity_one(self, vx: float, vy: float, vz: float, duration: float = 0.0) -> bool:
         if not self.is_connected:
             return False
         velocity = self._limit_velocity({"vx": float(vx), "vy": float(vy), "vz": float(vz)})
@@ -938,6 +1216,20 @@ class MavlinkController(FlightController):
         return streamed and self._finish_offboard_position_hold(dict(self._position))
 
     def move_on_path(self, waypoints: list[dict], velocity: float = 2.0, vehicle_name: str = "") -> bool:
+        """多机：vehicle_name（""=默认机 / all=全部 / px4_sysN）解析后逐机执行。"""
+        targets = self._resolve_sysids(vehicle_name)
+        if not targets:
+            self._last_action_error = "no MAVLink system available"
+            return False
+        ok = True
+        for sysid in targets:
+            self._set_target(sysid)
+            if not self._move_on_path_one(waypoints, velocity):
+                ok = False
+                break
+        return ok
+
+    def _move_on_path_one(self, waypoints: list[dict], velocity: float = 2.0) -> bool:
         if not self.is_connected:
             self._last_path_error = {"stage": "move_on_path", "message": "not connected"}
             return False
@@ -978,22 +1270,26 @@ class MavlinkController(FlightController):
             return DroneStatus(mode="DISCONNECTED")
 
         self.update_telemetry(timeout=0.08)
-        return self._status_from_current_telemetry()
+        sysids = self._resolve_sysids(vehicle_name)
+        sysid = sysids[0] if sysids else self._active_sysid
+        return self._status_from_current_telemetry(sysid=sysid)
 
-    def _status_from_current_telemetry(self) -> DroneStatus:
+    def _status_from_current_telemetry(self, sysid: int | None = None) -> DroneStatus:
+        table = self._system_table(sysid if sysid is not None else self._active_sysid)
         with self._lock:
-            gps = dict(self._telemetry.get("GLOBAL_POSITION_INT", {}) or {})
-            att = dict(self._telemetry.get("ATTITUDE", {}) or {})
-            heartbeat = dict(self._telemetry.get("HEARTBEAT", {}) or {})
-            sys_status = dict(self._telemetry.get("SYS_STATUS", {}) or {})
-            ext = dict(self._telemetry.get("EXTENDED_SYS_STATE", {}) or {})
-            gps_raw = dict(self._telemetry.get("GPS_RAW_INT", {}) or {})
-            home_position = dict(self._telemetry.get("HOME_POSITION", {}) or {})
-            position = dict(self._position)
-            velocity = dict(self._velocity)
-            last_heartbeat = self._last_heartbeat
-            autopilot = self._autopilot
-            vehicle_type = self._vehicle_type
+            telemetry = table["telemetry"]
+            gps = dict(telemetry.get("GLOBAL_POSITION_INT", {}) or {})
+            att = dict(telemetry.get("ATTITUDE", {}) or {})
+            heartbeat = dict(telemetry.get("HEARTBEAT", {}) or {})
+            sys_status = dict(telemetry.get("SYS_STATUS", {}) or {})
+            ext = dict(telemetry.get("EXTENDED_SYS_STATE", {}) or {})
+            gps_raw = dict(telemetry.get("GPS_RAW_INT", {}) or {})
+            home_position = dict(telemetry.get("HOME_POSITION", {}) or {})
+            position = dict(table["position"])
+            velocity = dict(table["velocity"])
+            last_heartbeat = table["last_heartbeat"]
+            autopilot = table["autopilot"]
+            vehicle_type = table["vehicle_type"]
             mav = self._mavlink
 
         landed_state = ext.get("landed_state")
@@ -1012,8 +1308,8 @@ class MavlinkController(FlightController):
             }
 
         heartbeat_age = time.time() - last_heartbeat if last_heartbeat else math.inf
-        local_position_age = time.time() - self._last_local_position if self._last_local_position else math.inf
-        global_position_age = time.time() - self._last_global_position if self._last_global_position else math.inf
+        local_position_age = time.time() - table["last_local_position"] if table["last_local_position"] else math.inf
+        global_position_age = time.time() - table["last_global_position"] if table["last_global_position"] else math.inf
         gps_fix_type = gps_raw.get("fix_type")
         try:
             gps_fix_level = int(gps_fix_type or 0)
@@ -1059,8 +1355,8 @@ class MavlinkController(FlightController):
             "active_link": self.get_connection_info(),
             "parameter_status": self.get_parameter_status(),
         }
-        if self._firmware_info:
-            extra["firmware"] = dict(self._firmware_info)
+        if table["firmware_info"]:
+            extra["firmware"] = dict(table["firmware_info"])
         if mav is not None:
             extra["gcs_source_system"] = getattr(mav, "source_system", None)
             extra["gcs_source_component"] = getattr(mav, "source_component", None)
@@ -2092,9 +2388,31 @@ class MavlinkController(FlightController):
         return sorted(names)
 
     def list_vehicles(self) -> list[str]:
-        return ["px4_drone"] if self.is_connected else []
+        if not self.is_connected:
+            return []
+        # 只列有真实心跳的 system（排除 __init__ 的 sysid=0 空表）
+        names = [
+            f"px4_sys{sysid}"
+            for sysid in sorted(self._systems)
+            if self._systems[sysid]["last_heartbeat"]
+        ]
+        return names or ["px4_drone"]
 
-    def set_mode(self, mode: str) -> bool:
+    def set_mode(self, mode: str, vehicle_name: str = "") -> bool:
+        """多机：vehicle_name 解析后逐机执行。"""
+        targets = self._resolve_sysids(vehicle_name)
+        if not targets:
+            self._last_action_error = "no MAVLink system available"
+            return False
+        ok = True
+        for sysid in targets:
+            self._set_target(sysid)
+            if not self._set_mode_one(mode):
+                ok = False
+                break
+        return ok
+
+    def _set_mode_one(self, mode: str) -> bool:
         if not self.is_connected:
             return False
         requested = (mode or "").strip().upper().replace("-", "_")
@@ -2173,7 +2491,20 @@ class MavlinkController(FlightController):
         ok = self.move_to_position(target["x"], target["y"], target["z"], self._max_velocity)
         return f"Success: Reached GPS target" if ok else "Failed: GPS target timeout"
 
-    def upload_mission(self, waypoints: list[dict[str, Any]]) -> dict[str, Any]:
+    def upload_mission(self, waypoints: list[dict[str, Any]], vehicle_name: str = "") -> dict[str, Any]:
+        """多机：vehicle_name 解析后逐机执行（返回最后目标的结果）。"""
+        targets = self._resolve_sysids(vehicle_name)
+        if not targets:
+            return {"status": "error", "message": "no MAVLink system available"}
+        last: dict = {}
+        for sysid in targets:
+            self._set_target(sysid)
+            last = self._upload_mission_one(waypoints)
+            if not (last or {}).get("status") == "ok":
+                break
+        return last
+
+    def _upload_mission_one(self, waypoints: list[dict[str, Any]], vehicle_name: str = "") -> dict[str, Any]:
         """Upload a MAVLink waypoint mission to the active PX4 vehicle."""
 
         if not self.is_connected:
@@ -2263,7 +2594,20 @@ class MavlinkController(FlightController):
             "last_request_type": last_request_type,
         }
 
-    def download_mission(self) -> dict[str, Any]:
+    def download_mission(self, vehicle_name: str = "") -> dict[str, Any]:
+        """多机：vehicle_name 解析后逐机执行（返回最后目标的结果）。"""
+        targets = self._resolve_sysids(vehicle_name)
+        if not targets:
+            return {"status": "error", "message": "no MAVLink system available"}
+        last: dict = {}
+        for sysid in targets:
+            self._set_target(sysid)
+            last = self._download_mission_one()
+            if not (last or {}).get("status") == "ok":
+                break
+        return last
+
+    def _download_mission_one(self, vehicle_name: str = "") -> dict[str, Any]:
         """Download the current vehicle mission as backend-neutral items."""
 
         if not self.is_connected:
@@ -2299,7 +2643,20 @@ class MavlinkController(FlightController):
             "mission": {"items": items},
         }
 
-    def clear_mission(self, wait_ack: bool = True) -> dict[str, Any]:
+    def clear_mission(self, wait_ack: bool = True, vehicle_name: str = "") -> dict[str, Any]:
+        """多机：vehicle_name 解析后逐机执行（返回最后目标的结果）。"""
+        targets = self._resolve_sysids(vehicle_name)
+        if not targets:
+            return {"status": "error", "message": "no MAVLink system available"}
+        last: dict = {}
+        for sysid in targets:
+            self._set_target(sysid)
+            last = self._clear_mission_one(wait_ack)
+            if not (last or {}).get("status") == "ok":
+                break
+        return last
+
+    def _clear_mission_one(self, wait_ack: bool = True, vehicle_name: str = "") -> dict[str, Any]:
         """Clear all vehicle mission items."""
 
         if not self.is_connected:
@@ -2318,7 +2675,20 @@ class MavlinkController(FlightController):
             "ack": ack,
         }
 
-    def start_mission(self) -> dict[str, Any]:
+    def start_mission(self, vehicle_name: str = "") -> dict[str, Any]:
+        """多机：vehicle_name 解析后逐机执行（返回最后目标的结果）。"""
+        targets = self._resolve_sysids(vehicle_name)
+        if not targets:
+            return {"status": "error", "message": "no MAVLink system available"}
+        last: dict = {}
+        for sysid in targets:
+            self._set_target(sysid)
+            last = self._start_mission_one()
+            if not (last or {}).get("status") == "ok":
+                break
+        return last
+
+    def _start_mission_one(self, vehicle_name: str = "") -> dict[str, Any]:
         """Start the uploaded mission. The vehicle must satisfy PX4 mission preconditions."""
 
         if not self.is_connected:
@@ -2370,7 +2740,20 @@ class MavlinkController(FlightController):
             "progress": progress,
         }
 
-    def get_mission_progress(self) -> dict[str, Any]:
+    def get_mission_progress(self, vehicle_name: str = "") -> dict[str, Any]:
+        """多机：vehicle_name 解析后逐机执行（返回最后目标的结果）。"""
+        targets = self._resolve_sysids(vehicle_name)
+        if not targets:
+            return {"status": "error", "message": "no MAVLink system available"}
+        last: dict = {}
+        for sysid in targets:
+            self._set_target(sysid)
+            last = self._get_mission_progress_one()
+            if not (last or {}).get("status") == "ok":
+                break
+        return last
+
+    def _get_mission_progress_one(self, vehicle_name: str = "") -> dict[str, Any]:
         """Return current mission execution progress from MAVLink telemetry."""
 
         if not self.is_connected:
@@ -2821,14 +3204,16 @@ class MavlinkController(FlightController):
         return message
 
     def _link_is_stale(self, max_age_s: float = 5.0) -> bool:
-        if not self._last_heartbeat:
+        last_heartbeat = self._system_table(self._target_sysid())["last_heartbeat"]
+        if not last_heartbeat:
             return True
-        return time.time() - self._last_heartbeat > max_age_s
+        return time.time() - last_heartbeat > max_age_s
 
     def _stale_link_message(self) -> str:
-        if not self._last_heartbeat:
+        last_heartbeat = self._system_table(self._target_sysid())["last_heartbeat"]
+        if not last_heartbeat:
             return "No PX4 MAVLink heartbeat has been received yet."
-        age = time.time() - self._last_heartbeat
+        age = time.time() - last_heartbeat
         return f"PX4 MAVLink heartbeat is lost (last heartbeat {age:.1f}s ago); reconnect the flight controller."
 
     def _wait_vehicle_heartbeat(
@@ -2938,7 +3323,7 @@ class MavlinkController(FlightController):
         return True
 
     def _current_mode(self) -> str:
-        heartbeat = self._telemetry.get("HEARTBEAT", {})
+        heartbeat = self._telemetry_for_target().get("HEARTBEAT", {})
         mode = str(heartbeat.get("mode") or "")
         if mode == "AUTO.LOITER":
             return "LOITER"
@@ -3009,20 +3394,21 @@ class MavlinkController(FlightController):
         return aliases.get(mode, mode)
 
     def _is_px4(self) -> bool:
-        return self._autopilot == mavutil.mavlink.MAV_AUTOPILOT_PX4
+        return self._system_table(self._target_sysid())["autopilot"] == mavutil.mavlink.MAV_AUTOPILOT_PX4
 
     def _is_armed(self) -> bool:
         self.update_telemetry(timeout=0.1)
-        return bool((self._telemetry.get("HEARTBEAT") or {}).get("armed", False))
+        return bool((self._telemetry_for_target().get("HEARTBEAT") or {}).get("armed", False))
 
     def _current_altitude_m(self) -> float:
-        return abs(float(self._position.get("z", 0.0) or 0.0))
+        return abs(float(self._system_table(self._target_sysid())["position"].get("z", 0.0) or 0.0))
 
     def _distance_to(self, target: dict[str, float]) -> float:
+        position = self._system_table(self._target_sysid())["position"]
         return math.sqrt(
-            (self._position["x"] - target["x"]) ** 2
-            + (self._position["y"] - target["y"]) ** 2
-            + (self._position["z"] - target["z"]) ** 2
+            (position["x"] - target["x"]) ** 2
+            + (position["y"] - target["y"]) ** 2
+            + (position["z"] - target["z"]) ** 2
         )
 
     def _limit_velocity(self, velocity: dict[str, float]) -> dict[str, float]:

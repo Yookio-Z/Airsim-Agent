@@ -123,7 +123,7 @@ class FlightController(ABC):
         """列出可用无人机"""
 
     @abstractmethod
-    def set_mode(self, mode: str) -> bool:
+    def set_mode(self, mode: str, vehicle_name: str = "") -> bool:
         """设置飞行模式"""
 
     @abstractmethod

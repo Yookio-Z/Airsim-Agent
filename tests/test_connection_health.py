@@ -350,6 +350,13 @@ def test_vehicle_setup_snapshot_exposes_qgc_style_diagnostics():
     controller._last_heartbeat = time.time()
     controller._real_vehicle = True
     controller._active_connection_details = {"url": "serial:COM3:115200", "system_id": 1, "component_id": 1}
+    controller._handle_message(_Message("HEARTBEAT", {
+        "autopilot": 8,
+        "type": 2,
+        "base_mode": 129,
+        "custom_mode": 4,
+        "system_status": 4,
+    }))
     controller._handle_message(_Message("SYS_STATUS", {
         "onboard_control_sensors_present": sensor_mask,
         "onboard_control_sensors_enabled": sensor_mask,
@@ -420,6 +427,13 @@ def test_vehicle_telemetry_snapshot_is_lightweight_live_subset():
     controller._mavlink = _Link()
     controller._last_heartbeat = time.time()
     controller._active_connection_details = {"url": "serial:COM3:115200", "system_id": 1, "component_id": 1}
+    controller._handle_message(_Message("HEARTBEAT", {
+        "autopilot": 8,
+        "type": 2,
+        "base_mode": 129,
+        "custom_mode": 4,
+        "system_status": 4,
+    }))
     controller._handle_message(_Message("ATTITUDE", {
         "roll": 0.1,
         "pitch": -0.05,
