@@ -110,3 +110,37 @@ def test_rtsp_controller_status_reports_stream() -> None:
     assert status.extra["stream_url"] == "rtsp://host/stream"
     assert status.extra["connection_error"]
     assert controller.list_vehicles() == ["rtsp"]
+
+
+# ── local camera source ──
+
+
+def test_local_camera_source_reads_frames(monkeypatch) -> None:
+    import cv2 as cv2_module
+
+    from src.modules.frame_source import CameraFrameSource
+
+    monkeypatch.setattr(cv2_module, "VideoCapture", lambda index: _FakeVideoCapture(_bgr_frame()))
+    source = CameraFrameSource(index=0)
+    assert source.open() is True
+    frame = source.get_frame()
+    assert frame is not None
+    assert frame.shape == (120, 160, 3)
+    assert source.last_error == ""
+    source.close()
+    assert source.is_open is False
+
+
+def test_local_camera_controller_captures_jpeg(monkeypatch) -> None:
+    import cv2 as cv2_module
+
+    from src.modules.rtsp_camera_controller import LocalCameraController
+
+    monkeypatch.setattr(cv2_module, "VideoCapture", lambda index: _FakeVideoCapture(_bgr_frame()))
+    controller = LocalCameraController(index=0)
+    info = controller.connect()
+    assert info.connected is True
+    assert controller.list_vehicles() == ["local"]
+    raw = controller.capture_image(timeout=2.0)
+    assert raw is not None and raw[:2] == b"\xff\xd8"
+    assert controller.capture_image(image_type="depth") is None

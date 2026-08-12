@@ -120,6 +120,87 @@ class RtspFrameSource:
                 return None
 
 
+class CameraFrameSource:
+    """Local camera (webcam / USB camera) via cv2.VideoCapture(index).
+
+    Useful for testing the video pipeline without AirSim or an RTSP stream:
+    the UI camera panel can show the workstation camera directly.
+    """
+
+    def __init__(self, index: int = 0, stale_after_sec: float = 3.0) -> None:
+        self.index = int(index)
+        self.stale_after_sec = max(0.5, float(stale_after_sec))
+        self._capture: Any | None = None
+        self._lock = threading.RLock()
+        self._last_frame_ts = 0.0
+        self._last_error = ""
+
+    @property
+    def is_open(self) -> bool:
+        with self._lock:
+            return self._capture is not None and bool(getattr(self._capture, "isOpened", lambda: False)())
+
+    @property
+    def last_error(self) -> str:
+        return self._last_error
+
+    def open(self) -> bool:
+        import cv2
+
+        with self._lock:
+            self.close()
+            self._last_error = ""
+            try:
+                capture = cv2.VideoCapture(self.index)
+                if not capture.isOpened():
+                    capture.release()
+                    self._last_error = f"无法打开本地摄像头 #{self.index}"
+                    return False
+                ok, frame = capture.read()
+                if not ok or frame is None:
+                    capture.release()
+                    self._last_error = f"本地摄像头 #{self.index} 无画面"
+                    return False
+                self._capture = capture
+                self._last_frame_ts = time.time()
+                return True
+            except Exception as exc:
+                self._last_error = f"camera open failed: {exc}"
+                return False
+
+    def close(self) -> None:
+        with self._lock:
+            if self._capture is not None:
+                try:
+                    self._capture.release()
+                except Exception:
+                    pass
+                self._capture = None
+
+    def get_frame(self) -> np.ndarray | None:
+        import cv2
+
+        with self._lock:
+            if self._capture is None:
+                return None
+            try:
+                ok, frame = self._capture.read()
+                if not ok or frame is None:
+                    if time.time() - self._last_frame_ts > self.stale_after_sec:
+                        self._last_error = "本地摄像头停滞，正在重连"
+                        self.close()
+                        self.open()
+                    return None
+                self._last_frame_ts = time.time()
+                self._last_error = ""
+                if frame.ndim == 3 and frame.shape[2] == 3:
+                    return cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+                return frame
+            except Exception as exc:
+                self._last_error = f"camera read failed: {exc}"
+                return None
+
+
 class AirSimFrameSource:
     """AirSim RPC frames (Scene camera) as a FrameSource.
 

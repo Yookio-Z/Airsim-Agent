@@ -213,7 +213,7 @@ class ToolRuntime:
 
     def _camera_source_enabled(self) -> bool:
         settings = self._camera_settings()
-        return str(settings.get("source") or "").lower() in {"airsim", "rtsp"}
+        return str(settings.get("source") or "").lower() in {"airsim", "rtsp", "local"}
 
     def _camera_capabilities(self, capabilities: dict[str, Any]) -> dict[str, Any]:
         merged = dict(capabilities or {})
@@ -232,6 +232,12 @@ class ToolRuntime:
             merged["camera_source"] = "rtsp"
             merged["camera_url"] = settings.get("url", "")
             merged["image_capture_via"] = "rtsp_stream"
+        elif source == "local":
+            merged["image_capture"] = True
+            merged["depth_perception"] = False
+            merged["camera_source"] = "local"
+            merged["camera_index"] = settings.get("camera_name", "0")
+            merged["image_capture_via"] = "local_camera"
         return merged
 
     def _camera_tool_spec(self, name: str) -> ToolSpec | None:
@@ -268,6 +274,8 @@ class ToolRuntime:
         source = str(settings.get("source") or "").lower()
         if source == "rtsp":
             return self._ensure_rtsp_camera_tools(settings)
+        if source == "local":
+            return self._ensure_local_camera_tools(settings)
         if source != "airsim":
             return None, "camera source is not AirSim"
 
@@ -358,6 +366,49 @@ class ToolRuntime:
             info = controller.connect()
             if not info.connected:
                 self.camera_error = controller.last_error or "rtsp camera source is not connected"
+                return None, self.camera_error
+
+            collector = ToolCollector()
+            self._register_rtsp_camera_tools(collector, controller)
+            self.camera_controller = controller
+            self.camera_collector = collector
+            self.camera_error = ""
+            return collector, ""
+        except Exception as exc:
+            self.camera_error = str(exc)
+            return None, self.camera_error
+
+    def _ensure_local_camera_tools(self, settings: dict[str, Any]) -> tuple[ToolCollector | None, str]:
+        """Camera tool set for a local webcam / USB camera (pipeline testing)."""
+        try:
+            index = int(settings.get("camera_name") or 0)
+        except (TypeError, ValueError):
+            index = 0
+        key = f"local:{index}"
+
+        if self.camera_key != key:
+            if self.camera_controller is not None:
+                try:
+                    self.camera_controller.disconnect()
+                except Exception:
+                    pass
+            self.camera_controller = None
+            self.camera_collector = None
+            self.camera_key = key
+
+        if self.camera_controller is not None and self.camera_collector is not None:
+            if bool(getattr(self.camera_controller, "is_connected", False)):
+                return self.camera_collector, ""
+            self.camera_controller = None
+            self.camera_collector = None
+
+        try:
+            from src.modules.rtsp_camera_controller import LocalCameraController
+
+            controller = LocalCameraController(index)
+            info = controller.connect()
+            if not info.connected:
+                self.camera_error = controller.last_error or "local camera is not available"
                 return None, self.camera_error
 
             collector = ToolCollector()
@@ -530,7 +581,7 @@ class ToolRuntime:
 
         try:
             controller = self.camera_controller
-            if source == "rtsp":
+            if source in {"rtsp", "local"}:
                 image_type = 0  # real cameras: scene only
             else:
                 import airsim
@@ -546,7 +597,7 @@ class ToolRuntime:
                 }
                 image_type = type_map.get(image_type_name, airsim.ImageType.Scene)
             names = [vehicle_name] if vehicle_name else list(getattr(controller, "_vehicles", []) or [])
-            if not names and source == "rtsp":
+            if not names and source in {"rtsp", "local"}:
                 names = [""]
             if not names:
                 return False, b"", "text/plain; charset=utf-8", {

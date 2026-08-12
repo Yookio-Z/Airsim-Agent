@@ -13,7 +13,7 @@ from typing import Any
 
 from src.logging_config import get_logger
 from src.modules.flight_controller import DroneStatus
-from src.modules.frame_source import RtspFrameSource
+from src.modules.frame_source import CameraFrameSource, RtspFrameSource
 
 logger = get_logger(__name__)
 
@@ -101,3 +101,24 @@ class RtspCameraController:
             return None
         self.last_error = ""
         return buffer.tobytes()
+
+
+class LocalCameraController(RtspCameraController):
+    """Local webcam / USB camera source (cv2.VideoCapture(index)).
+
+    Reuses the RTSP controller's capture/encode/status contract; only the
+    frame source differs. Useful for testing the video pipeline on the
+    workstation itself.
+    """
+
+    backend_name = "local"
+
+    def __init__(self, index: int = 0, stale_after_sec: float = 3.0) -> None:
+        self.url = f"camera:{int(index)}"
+        self.is_connected = False
+        self.last_error = ""
+        self._source = CameraFrameSource(int(index), stale_after_sec=stale_after_sec)
+        self._lock = threading.RLock()
+
+    def list_vehicles(self) -> list[str]:
+        return ["local"]
