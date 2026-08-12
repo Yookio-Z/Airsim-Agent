@@ -28,6 +28,9 @@ class MissionStep:
     status: str = "pending"
     result: dict[str, Any] | None = None
     safety: dict[str, Any] | None = None
+    # True when this step's outcome must be observed before later steps can
+    # be chosen (e.g. a photo/VLM step whose result decides the next move).
+    needs_observation: bool = False
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -48,6 +51,10 @@ class MissionPlan:
     planner_model: str = ""
     reasoning: str = ""
     risk_notes: list[str] = field(default_factory=list)
+    # Execution strategy declared by the planner: "auto" (runtime decides) or
+    # "agent_loop" (task needs observe-respond cycles: visual search, tracking,
+    # conditional steps — execute step-by-step instead of as a fixed sequence).
+    execution_mode: str = "auto"
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -62,6 +69,7 @@ class MissionPlan:
             "planner_model": self.planner_model,
             "reasoning": self.reasoning,
             "risk_notes": list(self.risk_notes),
+            "execution_mode": self.execution_mode,
         }
 
 

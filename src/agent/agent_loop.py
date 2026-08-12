@@ -174,6 +174,13 @@ class AgentLoop:
             state.failure_reason = f"agent loop reached max_steps={max_steps}"
             if state.results:
                 state.summary = self._step_limit_summary(state, max_steps)
+                # smolagents provide_final_answer pattern: let the model review
+                # the attempt and produce an operator-facing report instead of
+                # a template line. Only when the LLM is already in use.
+                if require_llm:
+                    model_summary = self._llm_attempt_summary(state, model_id)
+                    if model_summary:
+                        state.summary = model_summary
 
         if state.status == "created" or state.status == "running":
             state.status = "completed"
@@ -182,6 +189,20 @@ class AgentLoop:
             state.summary = self._summary(state)
         self._notify_state(state)
         return state
+
+    def _llm_attempt_summary(self, state: LoopState, model_id: str | None) -> str:
+        """Model-generated final report for a step-budget-exhausted loop.
+
+        Returns "" on any failure so the caller keeps the local template
+        summary — the summary is an enhancement, never a failure path.
+        """
+        summarize = getattr(self.planner, "summarize_attempt", None)
+        if not callable(summarize):
+            return ""
+        try:
+            return summarize(state.command, state.to_dict(), model_id=model_id or None)
+        except Exception:
+            return ""
 
     def _sanitize_decision(self, decision: LoopDecision, allowed_tools: set[str]) -> LoopDecision:
         if decision.is_complete:

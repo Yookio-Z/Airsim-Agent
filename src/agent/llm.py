@@ -1146,6 +1146,77 @@ class LLMMissionPlanner:
             self.last_error = message
             raise LLMUnavailableError(message) from e
 
+    def summarize_attempt(
+        self,
+        command: str,
+        loop_state: dict[str, Any],
+        model_id: str | None = None,
+    ) -> str:
+        """Model-generated final report when an agent loop exhausts its step
+        budget (smolagents ``provide_final_answer`` pattern).
+
+        Reviews the tool-call history, failure reason and current telemetry,
+        then produces a concise operator-facing Chinese summary. Returns ""
+        when the LLM is unavailable so callers keep the local template
+        summary instead.
+        """
+        config = self._resolve_config(model_id)
+        if not self._enabled(config):
+            return ""
+        results = loop_state.get("results") or []
+        tool_lines = []
+        for item in results[-12:]:
+            tool = str(item.get("tool") or "?")
+            status = "成功" if item.get("ok") else "失败"
+            tool_lines.append(f"- {tool}: {status}")
+        world = loop_state.get("observations") or []
+        latest_world = {}
+        for observation in reversed(world):
+            payload = observation.get("world_state") or {}
+            if isinstance(payload, dict) and payload:
+                latest_world = payload
+                break
+        drone = latest_world.get("drone") or {}
+        position = drone.get("position_ned") or {}
+        messages = [
+            {
+                "role": "system",
+                "content": (
+                    "你是无人机地面站的执行总结助手。任务未在步数预算内完成，"
+                    "请基于已完成/失败的工具调用和当前遥测，用简洁中文总结："
+                    "已完成的部分、卡住的原因、当前飞行状态、建议的下一步。"
+                    "不要虚构工具结果或遥测数据。"
+                ),
+            },
+            {
+                "role": "user",
+                "content": json.dumps(
+                    {
+                        "operator_command": command,
+                        "tool_call_history": tool_lines,
+                        "failure_reason": loop_state.get("failure_reason", ""),
+                        "current_telemetry": {
+                            "position_ned": position,
+                            "flying": drone.get("flying"),
+                            "armed": drone.get("armed"),
+                        },
+                        "output_format": "2-4 句中文总结",
+                    },
+                    ensure_ascii=False,
+                    indent=2,
+                ),
+            },
+        ]
+        try:
+            client = _create_client(config)
+            text, _usage = client.chat_text(messages, max_tokens=600)
+            self.last_error = ""
+            summary = (text or "").strip()
+            return summary[:800] if summary else ""
+        except Exception as exc:
+            self.last_error = str(exc)
+            return ""
+
     def _answer_payload(
         self,
         command: str,
@@ -1230,12 +1301,23 @@ class LLMMissionPlanner:
             "reasoning": "brief non-sensitive planning rationale in Chinese",
             "assumptions": ["operator-visible assumptions"],
             "risk_notes": ["safety or ambiguity notes"],
+            "execution_mode": (
+                "auto | agent_loop. Use agent_loop when the task requires an "
+                "observe-respond cycle that a fixed sequence cannot express: "
+                "visual search/confirm targets, tracking, or any step whose "
+                "outcome decides the next action. Use auto for fixed sequences "
+                "such as takeoff -> waypoints -> land."
+            ),
             "steps": [
                 {
                     "label": "Chinese step label",
                     "tool": "one available tool name",
                     "layer": "tool|planning|perception|action|memory|safety",
                     "params": {"name": "value"},
+                    "needs_observation": (
+                        "true when this step's result must be observed before "
+                        "the next step can be chosen (photo/VLM/detect steps)"
+                    ),
                 }
             ],
         }
@@ -2037,6 +2119,7 @@ class LLMMissionPlanner:
                     tool=tool,
                     params=params,
                     layer=str(raw.get("layer") or "tool"),
+                    needs_observation=bool(raw.get("needs_observation")),
                 )
             )
 
@@ -2055,6 +2138,9 @@ class LLMMissionPlanner:
             planner_model="",
             reasoning=str(payload.get("reasoning") or ""),
             risk_notes=[str(x) for x in payload.get("risk_notes", []) if isinstance(x, (str, int, float))],
+            execution_mode=str(payload.get("execution_mode") or "auto").strip().lower()
+            if str(payload.get("execution_mode") or "").strip().lower() in {"auto", "agent_loop"}
+            else "auto",
         )
 
     def _normalize_steps(self, command: str, steps: list[MissionStep], known_tools: set[str]) -> list[MissionStep]:
