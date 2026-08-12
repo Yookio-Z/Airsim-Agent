@@ -316,6 +316,23 @@ class MavlinkController(FlightController):
             msg_dict["hdg"] = 0.0 if raw_hdg >= 65535 else raw_hdg / 100.0
             self._update_position_from_global(msg_dict)
 
+        elif msg_type == "VFR_HUD":
+            # 空速/地速/高度/爬升率（m/s, m）
+            self._telemetry["VFR_HUD"] = {
+                "airspeed": float(msg_dict.get("airspeed", 0.0) or 0.0),
+                "groundspeed": float(msg_dict.get("groundspeed", 0.0) or 0.0),
+                "alt": float(msg_dict.get("alt", 0.0) or 0.0),
+                "climb": float(msg_dict.get("climb", 0.0) or 0.0),
+                "heading": float(msg_dict.get("heading", 0.0) or 0.0),
+                "throttle": float(msg_dict.get("throttle", 0) or 0),
+            }
+            if not self._velocity:
+                self._velocity = {
+                    "vx": 0.0,
+                    "vy": 0.0,
+                    "vz": -float(msg_dict.get("climb", 0.0) or 0.0),
+                }
+
         elif msg_type == "SYS_STATUS":
             msg_dict["voltage_battery"] = float(msg_dict.get("voltage_battery", 0) or 0) / 1000.0
             msg_dict["current_battery"] = float(msg_dict.get("current_battery", 0) or 0) / 100.0
@@ -577,6 +594,7 @@ class MavlinkController(FlightController):
             mavutil.mavlink.MAVLINK_MSG_ID_EXTENDED_SYS_STATE: 2.0,
             mavutil.mavlink.MAVLINK_MSG_ID_GPS_RAW_INT: 1.0,
             mavutil.mavlink.MAVLINK_MSG_ID_MISSION_CURRENT: 2.0,
+            mavutil.mavlink.MAVLINK_MSG_ID_VFR_HUD: 5.0,
         }
         optional_rates = {
             "MAVLINK_MSG_ID_ATTITUDE_TARGET": 20.0,
@@ -2107,7 +2125,7 @@ class MavlinkController(FlightController):
             self._stop_offboard_hold()
         return succeeded
 
-    def rotate_to_heading(self, heading_deg: float, timeout: float = 30.0) -> bool:
+    def rotate_to_heading(self, heading_deg: float, timeout: float = 30.0, vehicle_name: str = "") -> bool:
         if not self.is_connected:
             return False
         target = heading_deg % 360.0

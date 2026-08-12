@@ -5657,3 +5657,36 @@ body.dragging-system-settings #systemSettingsModal .modal-head {
   color: var(--ink);
   border-color: var(--line-soft);
 }
+
+/* 多机：机名标签 + HUD 载具列表 */
+.wp-vehicle-marker .wp-vehicle-label {
+  position: absolute;
+  top: -26px;
+  left: 50%;
+  transform: translateX(-50%);
+  padding: 1px 6px;
+  border-radius: 3px;
+  background: rgba(10, 16, 24, 0.82);
+  border: 1px solid rgba(85, 223, 244, 0.5);
+  color: var(--cyan, #55dff4);
+  font-size: 11px;
+  line-height: 1.5;
+  white-space: nowrap;
+  pointer-events: none;
+}
+
+.hud-vehicle-list {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  margin-top: 6px;
+}
+
+.hud-vehicle-chip {
+  padding: 2px 8px;
+  border-radius: 4px;
+  background: rgba(10, 16, 24, 0.7);
+  border: 1px solid rgba(255, 255, 255, 0.14);
+  font-size: 11px;
+  color: var(--text-secondary, #aeb8c3);
+}

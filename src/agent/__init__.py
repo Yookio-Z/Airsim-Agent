@@ -9,7 +9,6 @@ from .agent_loop import AgentLoop
 from .loop_types import LoopActionResult, LoopDecision, LoopObservation, LoopState
 from .runtime import AgentRuntime
 from .skill_registry import AgentSkillResult, SkillRegistry, SkillSpec
-from .task_router import TaskLevel, TaskRoute, TaskRouter
 
 __all__ = [
     "AgentLoop",
@@ -21,7 +20,4 @@ __all__ = [
     "AgentSkillResult",
     "SkillRegistry",
     "SkillSpec",
-    "TaskLevel",
-    "TaskRoute",
-    "TaskRouter",
 ]

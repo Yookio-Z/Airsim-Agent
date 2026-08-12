@@ -259,7 +259,7 @@ def create_builtin_backend_registry() -> BackendRegistry:
                 flight_control=True,
                 telemetry=True,
                 mode_control=True,
-                gps=False,
+                gps=True,
                 image_capture=False,
                 depth_perception=True,
                 object_detection=False,

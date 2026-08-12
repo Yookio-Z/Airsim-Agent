@@ -34,6 +34,7 @@
               <span id="vehicleState">DISARMED</span>
               <span class="hud-coords" id="metricPosition">N 0.0 / E 0.0 / D 0.0</span>
             </div>
+            <div class="hud-vehicle-list" id="vehicleList" hidden></div>
           </div>
 
           <!-- 左侧浮动工具栏 -->
@@ -675,7 +676,12 @@
                   <label for="cameraSource">图像源</label>
                   <select id="cameraSource">
                     <option value="airsim">AirSim</option>
+                    <option value="rtsp">RTSP 摄像头</option>
                   </select>
+                </div>
+                <div class="form-row" id="cameraRtspUrlRow" hidden>
+                  <label for="cameraRtspUrl">RTSP URL</label>
+                  <input type="text" id="cameraRtspUrl" placeholder="rtsp://user:pass@host:554/stream">
                 </div>
                 <div class="form-row">
                   <label for="cameraName">相机 ID</label>
@@ -683,7 +689,8 @@
                 </div>
                 <div class="form-row">
                   <label for="cameraVehicle">车辆名</label>
-                  <input type="text" id="cameraVehicle" placeholder="留空使用第一架">
+                  <input type="text" id="cameraVehicle" list="vehicleOptions" placeholder="留空使用第一架">
+                  <datalist id="vehicleOptions"></datalist>
                 </div>
                 <div class="form-row">
                   <label for="cameraImageType">图像类型</label>

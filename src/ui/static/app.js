@@ -6,6 +6,7 @@ const els = {
   connectionDot: $("connectionDot"),
   connectionText: $("connectionText"),
   vehicleState: $("vehicleState"),
+  vehicleList: $("vehicleList"),
   plannerBadge: $("plannerBadge"),
   commandForm: $("commandForm"),
   commandInput: $("commandInput"),
@@ -125,6 +126,8 @@ const els = {
   vehicleParameterSummary: $("vehicleParameterSummary"),
   vehicleParametersPanel: $("vehicleParametersPanel"),
   cameraSource: $("cameraSource"),
+  cameraRtspUrlRow: $("cameraRtspUrlRow"),
+  cameraRtspUrl: $("cameraRtspUrl"),
   cameraName: $("cameraName"),
   cameraVehicle: $("cameraVehicle"),
   cameraImageType: $("cameraImageType"),
@@ -218,6 +221,10 @@ let droneAnimationDurationMs = 900;
 let droneRenderedLngLat = null;
 let droneRenderedHeading = null;
 let droneLastTelemetryLngLat = null;
+// 多机：每机一个 marker / 轨迹（多机模式启用，单机模式保持 droneMarker 单机路径）
+let vehicleMarkers = new Map();
+let vehicleTracks = new Map();
+let vehicleMultiMode = false;
 const SHOW_ACTIVE_LEG = true;
 const VEHICLE_TRACK_DISTANCE_TOLERANCE_M = 2.0;
 const VEHICLE_TRACK_AZIMUTH_TOLERANCE_DEG = 1.5;
@@ -997,6 +1004,7 @@ function normalizeCameraSettings(raw = {}) {
   const timeout = Number(raw.timeout_sec || DEFAULT_CAMERA_SETTINGS.timeout_sec);
   return {
     source: String(raw.source || DEFAULT_CAMERA_SETTINGS.source).trim().toLowerCase() || DEFAULT_CAMERA_SETTINGS.source,
+    url: String(raw.url || "").trim(),
     camera_name: String(raw.camera_name || DEFAULT_CAMERA_SETTINGS.camera_name).trim() || DEFAULT_CAMERA_SETTINGS.camera_name,
     vehicle_name: String(raw.vehicle_name || "").trim(),
     image_type: ["scene", "depth", "segmentation", "infrared"].includes(imageType) ? imageType : DEFAULT_CAMERA_SETTINGS.image_type,
@@ -1023,8 +1031,10 @@ async function loadCameraSettings(force = false) {
 }
 
 function readCameraSettingsForm() {
+  const source = els.cameraSource?.value || cameraSettings.source;
   return normalizeCameraSettings({
-    source: els.cameraSource?.value || cameraSettings.source,
+    source: source,
+    url: els.cameraRtspUrl?.value || cameraSettings.url || "",
     camera_name: els.cameraName?.value || cameraSettings.camera_name,
     vehicle_name: els.cameraVehicle?.value || "",
     image_type: els.cameraImageType?.value || cameraSettings.image_type,
@@ -1035,6 +1045,8 @@ function readCameraSettingsForm() {
 
 function renderCameraSettings() {
   if (els.cameraSource) els.cameraSource.value = cameraSettings.source;
+  if (els.cameraRtspUrlRow) els.cameraRtspUrlRow.hidden = cameraSettings.source !== "rtsp";
+  if (els.cameraRtspUrl) els.cameraRtspUrl.value = cameraSettings.url || "";
   if (els.cameraName) els.cameraName.value = cameraSettings.camera_name;
   if (els.cameraVehicle) els.cameraVehicle.value = cameraSettings.vehicle_name;
   if (els.cameraImageType) els.cameraImageType.value = cameraSettings.image_type;
@@ -1389,7 +1401,7 @@ function setupCameraEventListeners() {
       scheduleCameraFrame(0);
     }
   });
-  [els.cameraSource, els.cameraName, els.cameraVehicle, els.cameraImageType, els.cameraTimeout, els.cameraAutoSave]
+  [els.cameraSource, els.cameraRtspUrl, els.cameraName, els.cameraVehicle, els.cameraImageType, els.cameraTimeout, els.cameraAutoSave]
     .filter(Boolean)
     .forEach((control) => {
       control.addEventListener("change", () => {
@@ -3159,6 +3171,71 @@ function createDroneElement() {
   return el;
 }
 
+// 多机 marker：无人机图标 + 机名标签（多机模式使用）
+function createVehicleElement(name) {
+  const el = document.createElement("div");
+  el.className = "wp-drone-icon wp-vehicle-marker";
+  const label = String(name || "?");
+  el.title = `载具 ${label}`;
+  el.innerHTML = `
+    <svg class="wp-drone-svg" viewBox="0 0 48 48" aria-hidden="true">
+      <circle class="wp-drone-ring" cx="24" cy="24" r="17"></circle>
+      <path class="wp-drone-body" d="M24 5 L36 39 L24 31 L12 39 Z"></path>
+      <circle class="wp-drone-core" cx="24" cy="24" r="4"></circle>
+    </svg>
+    <span class="wp-vehicle-label">${label}</span>
+  `;
+  return el;
+}
+
+function vehicleMarkerPosition(vehicle, runtime) {
+  const gps = droneGpsPosition(vehicle, runtime);
+  if (!gps) return null;
+  return [gps[1], gps[0]]; // [lng, lat]
+}
+
+// 多机模式：每机一个 marker（即时更新，不做插值动画，保持简单可靠）
+function updateVehicleMarkers(vehicles, runtime) {
+  if (!maplibreMap || !Array.isArray(vehicles) || vehicles.length === 0) return;
+  const liveNames = new Set();
+  for (const vehicle of vehicles) {
+    const name = String(vehicle.vehicle_name || "");
+    liveNames.add(name);
+    const lngLat = vehicleMarkerPosition(vehicle, runtime);
+    const heading = normalizeHeadingDeg(droneHeadingDeg(vehicle));
+    let entry = vehicleMarkers.get(name);
+    if (!entry) {
+      const marker = new maplibregl.Marker({
+        element: createVehicleElement(name),
+        anchor: "center",
+        rotationAlignment: "map",
+      })
+        .setLngLat(lngLat || [0, 0])
+        .setRotation(heading)
+        .addTo(maplibreMap);
+      entry = { marker, lngLat, heading };
+      vehicleMarkers.set(name, entry);
+    }
+    if (lngLat) {
+      entry.marker.setLngLat(lngLat).setRotation(heading);
+      entry.lngLat = lngLat;
+      entry.heading = heading;
+    }
+    // 每机轨迹
+    if (applicationSettings.map.show_vehicle_track && lngLat) {
+      updateVehicleTrack(lngLat, vehicle, true, name);
+    }
+  }
+  // 清理已消失的载具
+  for (const [name, entry] of vehicleMarkers.entries()) {
+    if (!liveNames.has(name)) {
+      entry.marker.remove();
+      vehicleMarkers.delete(name);
+      vehicleTracks.delete(name);
+    }
+  }
+}
+
 function updateDroneMarker(lngLat, heading, options = {}) {
   if (!Array.isArray(lngLat) || !Number.isFinite(Number(lngLat[0])) || !Number.isFinite(Number(lngLat[1]))) return;
   const normalizedHeading = normalizeHeadingDeg(heading);
@@ -4340,6 +4417,8 @@ function renderTelemetry(drone, toolRuntime) {
   const realVehicle = isRealVehicleRuntime(toolRuntime);
   const reliableNavPosition = drone.navigation_position_valid === true || (!realVehicle && drone.navigation_position_valid !== false);
 
+  renderVehicleList(toolRuntime);
+
   if (els.vehicleState) {
     els.vehicleState.textContent = drone.armed ? "ARMED" : "DISARMED";
     els.vehicleState.classList.toggle("armed", Boolean(drone.armed));
@@ -4360,6 +4439,41 @@ function renderTelemetry(drone, toolRuntime) {
 
   renderMissionMetrics(drone);
   renderSystemConnection(drone, toolRuntime);
+}
+
+// 多机列表：HUD 显示每架载具的简要状态（多机模式）
+function renderVehicleList(toolRuntime = {}) {
+  const container = els.vehicleList;
+  if (!container) return;
+  const vehicles = Array.isArray(toolRuntime.vehicles) ? toolRuntime.vehicles : [];
+  // 相机设置页的车辆名建议（datalist）
+  const datalist = document.getElementById("vehicleOptions");
+  if (datalist) {
+    datalist.textContent = "";
+    for (const vehicle of vehicles) {
+      const option = document.createElement("option");
+      option.value = String(vehicle.vehicle_name || "");
+      datalist.appendChild(option);
+    }
+  }
+  if (vehicles.length <= 1) {
+    container.hidden = true;
+    container.textContent = "";
+    return;
+  }
+  container.hidden = false;
+  container.textContent = "";
+  for (const vehicle of vehicles) {
+    const name = String(vehicle.vehicle_name || "?");
+    const state = vehicle.armed ? (vehicle.flying ? "空中" : "待飞") : "未解锁";
+    const pos = vehicle.position_ned || {};
+    const battery = vehicle.battery_voltage != null ? ` ${fmt(vehicle.battery_voltage)}V` : "";
+    const row = document.createElement("span");
+    row.className = "hud-vehicle-chip";
+    row.title = `载具 ${name} · N ${fmt(pos.x)} / E ${fmt(pos.y)} / D ${fmt(pos.z)}`;
+    row.textContent = `${name}: ${state}${battery}`;
+    container.appendChild(row);
+  }
 }
 
 function renderSystemConnection(drone = {}, toolRuntime = {}) {
@@ -4779,6 +4893,24 @@ function updateMapView(state) {
   const backendName = backendDisplayName(runtime);
   const linked = Boolean(runtime.connected) && !runtime.stale_connection;
 
+  const vehicles = Array.isArray(runtime.vehicles) ? runtime.vehicles : [];
+  if (vehicles.length > 1) {
+    // 多机模式：每机 marker + 独立轨迹（单机逻辑保留给 vehicles.length <= 1）
+    stopDroneAnimation();
+    if (droneMarker) {
+      droneMarker.remove();
+      droneMarker = null;
+    }
+    droneRenderedLngLat = null;
+    droneLastTelemetryLngLat = null;
+    updateVehicleMarkers(vehicles, runtime);
+    if (!applicationSettings.map.show_vehicle_track) clearVehicleTrack();
+    const firstPos = vehicleMarkerPosition(vehicles[0], runtime);
+    if (firstPos && linked && applicationSettings.map.follow_vehicle && !mapCenteredOnFirstVehicle && !maplibreMap._userPanned) {
+      mapCenteredOnFirstVehicle = true;
+      maplibreMap.jumpTo({ center: firstPos });
+    }
+  } else {
   // 更新无人机位置 marker
   const gps = droneGpsPosition(drone, runtime);
   if (gps) {
@@ -4817,6 +4949,7 @@ function updateMapView(state) {
     droneLastTelemetryLngLat = null;
     clearVehicleTrack();
     clearActiveLeg();
+  }
   }
 
   // 更新 home marker（PX4 后端可能有真实 home，AirSim 用模拟原点）
@@ -5022,43 +5155,50 @@ function droneHeadingDeg(drone) {
   return Number.isFinite(yawDeg) ? yawDeg : 0;
 }
 
-function updateVehicleTrack(lngLat, drone, linked) {
+function updateVehicleTrack(lngLat, drone, linked, name = "") {
   const source = maplibreMap?.getSource("vehicle-track-source");
   if (!source || !linked || !Array.isArray(lngLat)) return;
   if (!drone?.armed) {
-    droneTrackActive = false;
-    droneTrackLastAzimuth = null;
+    vehicleTracks.delete(name);
+    if (!name) {
+      droneTrackActive = false;
+      droneTrackLastAzimuth = null;
+      droneTrackCoords = [];
+    }
+    updateVehicleTrackSource();
     return;
   }
-  if (!droneTrackActive) {
-    droneTrackActive = true;
-    droneTrackCoords = [];
-    droneTrackLastAzimuth = null;
-  }
-  const last = droneTrackCoords[droneTrackCoords.length - 1];
+  let track = vehicleTracks.get(name) || { coords: [], lastAzimuth: null };
+  const last = track.coords[track.coords.length - 1];
   if (last) {
     const distance = haversineMeters(last[1], last[0], lngLat[1], lngLat[0]);
     if (distance < VEHICLE_TRACK_DISTANCE_TOLERANCE_M) return;
     if (distance > 300) {
-      droneTrackCoords = [];
-      droneTrackLastAzimuth = null;
+      track = { coords: [lngLat], lastAzimuth: null };
     }
   }
-  if (!droneTrackCoords.length) {
-    droneTrackCoords.push(lngLat);
+  if (!track.coords.length) {
+    track.coords.push(lngLat);
   } else {
-    const prev = droneTrackCoords[droneTrackCoords.length - 1];
+    const prev = track.coords[track.coords.length - 1];
     const azimuth = calculateBearing(prev[1], prev[0], lngLat[1], lngLat[0]);
-    const azimuthDelta = droneTrackLastAzimuth == null ? Infinity : angleDeltaDeg(azimuth, droneTrackLastAzimuth);
-    if (droneTrackCoords.length < 2 || azimuthDelta > VEHICLE_TRACK_AZIMUTH_TOLERANCE_DEG) {
-      droneTrackCoords.push(lngLat);
-      droneTrackLastAzimuth = azimuth;
+    const azimuthDelta = track.lastAzimuth == null ? Infinity : angleDeltaDeg(azimuth, track.lastAzimuth);
+    if (track.coords.length < 2 || azimuthDelta > VEHICLE_TRACK_AZIMUTH_TOLERANCE_DEG) {
+      track.coords.push(lngLat);
+      track.lastAzimuth = azimuth;
     } else {
-      droneTrackCoords[droneTrackCoords.length - 1] = lngLat;
+      track.coords[track.coords.length - 1] = lngLat;
     }
   }
-  if (droneTrackCoords.length > VEHICLE_TRACK_MAX_POINTS) {
-    droneTrackCoords = droneTrackCoords.slice(-VEHICLE_TRACK_MAX_POINTS);
+  if (track.coords.length > VEHICLE_TRACK_MAX_POINTS) {
+    track.coords = track.coords.slice(-VEHICLE_TRACK_MAX_POINTS);
+  }
+  vehicleTracks.set(name, track);
+  if (!name) {
+    // 兼容单机旧状态变量（clearVehicleTrack / 其他消费者）
+    droneTrackCoords = track.coords;
+    droneTrackActive = true;
+    droneTrackLastAzimuth = track.lastAzimuth;
   }
   updateVehicleTrackSource();
 }
@@ -5066,17 +5206,21 @@ function updateVehicleTrack(lngLat, drone, linked) {
 function updateVehicleTrackSource() {
   const source = maplibreMap?.getSource("vehicle-track-source");
   if (!source) return;
-  source.setData({
-    type: "FeatureCollection",
-    features: droneTrackCoords.length >= 2 ? [{
-      type: "Feature",
-      properties: {},
-      geometry: { type: "LineString", coordinates: droneTrackCoords },
-    }] : [],
-  });
+  const features = [];
+  for (const [name, track] of vehicleTracks.entries()) {
+    if (track.coords.length >= 2) {
+      features.push({
+        type: "Feature",
+        properties: { vehicle: name },
+        geometry: { type: "LineString", coordinates: track.coords },
+      });
+    }
+  }
+  source.setData({ type: "FeatureCollection", features });
 }
 
 function clearVehicleTrack() {
+  vehicleTracks.clear();
   droneTrackCoords = [];
   droneTrackActive = false;
   droneTrackLastAzimuth = null;

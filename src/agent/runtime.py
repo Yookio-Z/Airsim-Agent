@@ -20,6 +20,7 @@ from src.modules.mavlink_autodiscovery import (
     discover_serial_mavlink_candidates,
     normalize_serial_baud,
 )
+from src.replay.session import ReplaySession, list_replay_sessions, read_replay_session
 
 from .agent_loop import AgentLoop
 from .llm import LLMMissionPlanner, LLMUnavailableError
@@ -27,7 +28,6 @@ from .loop_types import LoopState
 from .memory import AgentMemory
 from .planner import MissionPlan, MissionPlanner, MissionStep
 from .skill_registry import SkillRegistry
-from .task_router import TaskLevel, TaskRoute
 from .task_runs import TaskRunStore
 from .tool_cards import TOOL_CARDS
 from .tool_executor import ToolCallResult, ToolRuntime
@@ -41,6 +41,46 @@ SETTINGS_PATH = REPO_ROOT / "src" / "data" / "settings.json"
 SKILLS_OVERRIDES_PATH = REPO_ROOT / "src" / "data" / "skills.json"
 ATTACHMENTS_DIR = REPO_ROOT / "src" / "data" / "attachments"
 ATTACHMENTS_DIR.mkdir(parents=True, exist_ok=True)
+
+# Plan-Execute ⇄ ReAct collaboration:
+# - OBSERVATION_TOOLS: steps whose outcome must be seen before the next step
+#   can be chosen (photo/VLM/detect/depth).
+# - MOTION_TOOLS: steps that change vehicle state.
+# A fixed sequence with observation -> motion is structurally dependent on
+# mid-execution observations, so it routes to the ReAct loop before executing.
+CORRECTION_ATTEMPTS_MAX = 2
+OBSERVATION_TOOLS = {
+    "airsim_take_photo",
+    "airsim_detect_objects",
+    "airsim_vlm_analyze_image",
+    "airsim_vlm_confirm_target",
+    "airsim_get_depth_map",
+    "airsim_get_sensors",
+}
+MOTION_TOOLS = {
+    "drone_arm",
+    "drone_takeoff",
+    "drone_fly_to",
+    "drone_move_relative",
+    "drone_fly_path",
+    "drone_rotate_to",
+    "drone_land",
+    "drone_hover",
+}
+# Failures that re-running cannot fix: link/connection problems mean the
+# backend itself is unreachable, so a ReAct correction round is pointless.
+CONNECTION_FAILURE_TERMS = (
+    "connect",
+    "connection refused",
+    "connect timed out",
+    "connection timed out",
+    "connect timeout",
+    "unreachable",
+    "no backend",
+    "链接失败",
+    "连接失败",
+    "无法连接",
+)
 
 
 def _default_connection_settings() -> dict[str, Any]:
@@ -106,6 +146,7 @@ def _default_camera_settings() -> dict[str, Any]:
         "source": "airsim",
         "host": "127.0.0.1",
         "port": 41452,
+        "url": "",
         "camera_name": "0",
         "vehicle_name": "",
         "image_type": "scene",
@@ -251,6 +292,7 @@ def _camera_settings(settings: dict[str, Any] | None = None) -> dict[str, Any]:
         "source": str(section.get("source") or defaults["source"]).strip().lower() or defaults["source"],
         "host": host,
         "port": port,
+        "url": str(section.get("url") or "").strip(),
         "camera_name": str(section.get("camera_name") or defaults["camera_name"]).strip() or defaults["camera_name"],
         "vehicle_name": str(section.get("vehicle_name") or defaults["vehicle_name"]).strip(),
         "image_type": image_type,
@@ -453,6 +495,8 @@ class RunState:
     agent_state: dict[str, Any] = field(default_factory=dict)
     thought_trace: list[dict[str, Any]] = field(default_factory=list)
     process_trace: list[dict[str, Any]] = field(default_factory=list)
+    # ReAct correction rounds already spent after a failed Plan-Execute run.
+    correction_attempts: int = 0
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -476,6 +520,7 @@ class RunState:
             "agent_state": self.agent_state,
             "thought_trace": list(self.thought_trace),
             "process_trace": list(self.process_trace),
+            "correction_attempts": self.correction_attempts,
             "plan": self.plan.to_dict() if self.plan else None,
             "task_level": self.task_level,
             "route_strategy": self.route_strategy,
@@ -562,6 +607,10 @@ class AgentRuntime:
         self._last_visual_frame: dict[str, Any] = {}
         # P5: pending high-risk approvals keyed by run_id
         self._pending_approvals: dict[str, ToolApprovalRequest] = {}
+        # Replay: telemetry recording around runs and manual flights
+        self._active_replay: ReplaySession | None = None
+        self._manual_replay: ReplaySession | None = None
+        self._replay_lock = threading.Lock()
         self.gcs = GroundStationServices(
             self.tools,
             supervisor=self.supervisor,
@@ -1093,8 +1142,22 @@ class AgentRuntime:
             "backend_name": str(profile.get("name") or profile.get("id") or runtime.get("backend") or ""),
             "capabilities": dict(profile.get("capabilities") or {}),
             "vehicle": self._compact_vehicle_state(drone),
+            "vehicles": self._compact_vehicles_state(runtime.get("vehicles")),
             "active_run": active_run,
         }
+
+    def _compact_vehicles_state(self, raw_vehicles: Any) -> list[dict[str, Any]]:
+        """Compact per-vehicle states for the LLM context (multi-vehicle)."""
+        if not isinstance(raw_vehicles, list):
+            return []
+        compact: list[dict[str, Any]] = []
+        for item in raw_vehicles:
+            if not isinstance(item, dict):
+                continue
+            state = self._compact_vehicle_state(item) or {}
+            state.setdefault("vehicle_name", item.get("vehicle_name", ""))
+            compact.append(state)
+        return compact
 
     def _compact_vehicle_state(self, drone: dict[str, Any] | None) -> dict[str, Any] | None:
         if not isinstance(drone, dict):
@@ -1136,6 +1199,12 @@ class AgentRuntime:
     ) -> None:
         if execute:
             self._execution_thread_id = threading.get_ident()
+        replay_session = None
+        if execute and run_id:
+            replay_session = self._start_replay_session(
+                run_id,
+                {"run_id": run_id, "command": command, "mode": "execute"},
+            )
         try:
             tool_runtime = self.tools.status_snapshot()
             agent_state = agent_state or self._agent_state_context(tool_runtime)
@@ -1164,15 +1233,18 @@ class AgentRuntime:
             skill_guidance = self.skills.guidance_cards(command, capabilities, memory_snapshot)
             if skill_guidance:
                 agent_state = self._agent_state_with_skill_guidance(agent_state, skill_guidance)
-            route = TaskRoute(
-                TaskLevel.L3_AGENT_LOOP,
-                "agent_loop",
-                "LLM Agent Loop primary path; rule router bypassed",
-                notes=["router_bypassed", "llm_decides_tools_each_turn"],
-                risk_level="elevated" if capabilities.get("flight_control") else "safe",
-            )
-            self._append_event("info", "agent_loop", "Agent Loop 主路径启动", route.to_dict())
-            self._execute_agent_loop_route(
+            # Primary path: Plan-Execute. The LLM plans once and the runtime
+            # executes/verifies the sequence — simple commands finish after a
+            # few deterministic steps without an agent loop, and failures or
+            # observation-dependent tasks enter the correction loop.
+            route = {
+                "level": "plan_execute",
+                "strategy": "plan_execute",
+                "reason": "Plan-Execute primary path: LLM plans once, runtime executes and verifies; correction loop only on failure",
+                "risk_level": "elevated" if capabilities.get("flight_control") else "safe",
+            }
+            self._append_event("info", "planner", "Plan-Execute 主路径启动", route)
+            self._execute_plan_execute_route(
                 command,
                 execute,
                 telemetry,
@@ -1180,6 +1252,7 @@ class AgentRuntime:
                 route,
                 capabilities,
                 tool_runtime,
+                memory_snapshot,
                 run_id,
                 agent_state,
                 attachments=attachments or [],
@@ -1229,6 +1302,8 @@ class AgentRuntime:
                 self._append_message("assistant", f"任务处理失败: {str(e)}", status="error")
             self._append_event("danger", "planner", "任务处理失败", {"error": str(e)})
         finally:
+            if replay_session is not None:
+                self._stop_replay_session()
             if execute and self._execution_thread_id == threading.get_ident():
                 self._execution_thread_id = 0
             if release_execution_slot and self._execution_slot.locked():
@@ -1236,168 +1311,6 @@ class AgentRuntime:
             if run_id:
                 with self._lock:
                     self._cancelled_request_ids.discard(run_id)
-
-    def _execute_direct_route(
-        self,
-        command: str,
-        execute: bool,
-        telemetry: dict[str, Any] | None,
-        model_id: str,
-        route: TaskRoute,
-        capabilities: dict[str, Any] | None = None,
-        run_id: str = "",
-        agent_state: dict[str, Any] | None = None,
-    ) -> None:
-        run_id = run_id or f"run_{int(time.time() * 1000)}"
-        agent_state = agent_state or self._agent_state_context()
-        risk_level = getattr(route, "risk_level", "safe")
-        capabilities = capabilities or {}
-        risk_notes: list[str] = []
-        if risk_level == "high":
-            risk_notes.append(f"high-risk direct tool: {route.direct_tool}")
-            risk_notes.extend(route.notes)
-        elif risk_level == "elevated":
-            risk_notes.append(f"elevated-risk direct tool: {route.direct_tool}")
-        tool_label = self._tool_action_label(route.direct_tool)
-        step = MissionStep(
-            id="s01",
-            label=tool_label,
-            tool=route.direct_tool,
-            params=dict(route.direct_params),
-            layer="tool",
-        )
-        plan = MissionPlan(
-            run_id=run_id,
-            command=command,
-            intent="direct_command",
-            summary=tool_label,
-            steps=[step],
-            planner_source="task_router",
-            reasoning="这是明确的单步飞控意图，我选择对应工具直接执行，并用遥测结果校验动作是否真正完成。",
-            risk_notes=risk_notes,
-        )
-        run = RunState(
-            run_id=run_id,
-            command=command,
-            intent=plan.intent,
-            summary=plan.summary,
-            status="queued" if execute else "planned",
-            mode="execute" if execute else "plan",
-            phase="planning",
-            execute=execute,
-            model_id=model_id,
-            plan=plan,
-            task_level=route.level.value,
-            route_strategy=route.strategy,
-            route_reason=route.reason,
-            risk_level=risk_level,
-            answer_with_llm=False,
-            start_telemetry=dict(telemetry or {}),
-            agent_state=agent_state,
-        )
-        with self._lock:
-            self._current = run
-        self._start_task_run(run)
-        self._append_event("info", "router", "L0 直接工具路径", {"run_id": run.run_id, **route.to_dict()})
-        # High-risk mission actions get an explicit warning event for auditability.
-        if risk_level == "high":
-            self._append_event(
-                "warning",
-                "router",
-                f"高风险 mission 操作: {route.direct_tool}",
-                {
-                    "run_id": run.run_id,
-                    "tool": route.direct_tool,
-                    "risk_level": risk_level,
-                    "notes": route.notes,
-                    "message": "仿真环境快速执行；真机环境需 supervisor 审批",
-                },
-            )
-        if execute:
-            self._begin_execution_trace(run)
-        if execute:
-            self._run_plan(run)
-        else:
-            self._simulate_plan(run)
-            self._finalize_assistant_response(run)
-
-    @staticmethod
-    def _fast_direct_without_llm(route: TaskRoute) -> bool:
-        if route.risk_level != "safe":
-            return False
-        return route.direct_tool in {
-            "drone_get_status",
-            "drone_list_vehicles",
-            "drone_connect",
-            "drone_get_mission_progress",
-            "drone_download_mission",
-        }
-
-    def _try_llm_direct_plan(
-        self,
-        *,
-        command: str,
-        execute: bool,
-        telemetry: dict[str, Any] | None,
-        model_id: str,
-        run_id: str,
-        route: TaskRoute,
-        capabilities: dict[str, Any],
-        tool_runtime: dict[str, Any],
-        memory_snapshot: dict[str, Any],
-        agent_state: dict[str, Any],
-        attachments: list[dict[str, Any]],
-    ) -> MissionPlan | None:
-        """Let the model plan even simple commands, with direct route as fallback."""
-
-        plan = self._try_llm_plan(
-            command=command,
-            telemetry=telemetry,
-            model_id=model_id,
-            run_id=run_id,
-            capabilities=capabilities,
-            tool_runtime=tool_runtime,
-            memory_snapshot=memory_snapshot,
-            agent_state={
-                **agent_state,
-                "router_hint": route.to_dict(),
-                "planner_mode": "llm_first_direct",
-            },
-            attachments=attachments,
-        )
-        if plan is None:
-            return None
-        plan.assumptions.append("LLM 接管单步意图解析；TaskRouter direct 仅作为失败兜底。")
-        return plan
-
-    def _try_llm_template_plan(
-        self,
-        *,
-        command: str,
-        telemetry: dict[str, Any] | None,
-        model_id: str,
-        run_id: str,
-        capabilities: dict[str, Any],
-        tool_runtime: dict[str, Any],
-        memory_snapshot: dict[str, Any],
-        agent_state: dict[str, Any],
-        attachments: list[dict[str, Any]],
-    ) -> MissionPlan | None:
-        plan = self._try_llm_plan(
-            command=command,
-            telemetry=telemetry,
-            model_id=model_id,
-            run_id=run_id,
-            capabilities=capabilities,
-            tool_runtime=tool_runtime,
-            memory_snapshot=memory_snapshot,
-            agent_state={**agent_state, "planner_mode": "llm_first_template"},
-            attachments=attachments,
-        )
-        if plan is None:
-            return None
-        plan.assumptions.append("LLM 接管结构化任务拆解；规则模板仅作为失败兜底。")
-        return plan
 
     def _try_llm_plan(
         self,
@@ -1448,14 +1361,15 @@ class AgentRuntime:
             return None
         return plan
 
-    def _await_approval(self, run: RunState, route: TaskRoute, command: str) -> bool:
-        return self._await_tool_approval(
-            run,
-            route.direct_tool,
-            dict(route.direct_params),
-            route.risk_level,
-            "; ".join(route.notes) or f"high-risk tool: {route.direct_tool}",
-        )
+    @staticmethod
+    def _approval_reason(tool: str, params: dict[str, Any]) -> str:
+        """Approval reason including the target vehicle(s) so the operator
+        sees exactly what will be controlled (multi-vehicle aware)."""
+        vehicle = str((params or {}).get("vehicle_name") or "")
+        base = f"governed high-risk tool call: {tool}"
+        if not vehicle:
+            return base
+        return f"{base} (vehicle={vehicle})"
 
     def _await_tool_approval(
         self,
@@ -1566,51 +1480,147 @@ class AgentRuntime:
             req.event.set()
         return {"ok": True, "run_id": run_id, "status": "rejected"}
 
-    def _execute_blocked_route(
-        self,
-        command: str,
-        telemetry: dict[str, Any] | None,
-        model_id: str,
-        route: TaskRoute,
-        run_id: str = "",
-        agent_state: dict[str, Any] | None = None,
-    ) -> None:
-        run_id = run_id or f"run_{int(time.time() * 1000)}"
-        agent_state = agent_state or self._agent_state_context()
-        plan = MissionPlan(
-            run_id=run_id,
-            command=command,
-            intent="supervised_required",
-            summary="Task requires supervised execution",
-            steps=[],
-            planner_source="task_router",
-            reasoning=route.reason,
-            risk_notes=["Supervised route is reserved; automatic execution was blocked."],
+    # ── Replay 录制 ──
+
+    def _replay_snapshot(self) -> dict[str, Any]:
+        """Telemetry frame content for recording: lightweight drone states + backend id."""
+        snapshot = self.tools.status_snapshot()
+        drone = snapshot.get("drone")
+        vehicles = snapshot.get("vehicles") if isinstance(snapshot.get("vehicles"), list) else []
+        return {
+            "backend": str(snapshot.get("backend") or ""),
+            "drone": drone if isinstance(drone, dict) else {},
+            "vehicles": [item for item in vehicles if isinstance(item, dict)],
+        }
+
+    def _start_replay_session(self, name: str, meta: dict[str, Any]) -> ReplaySession | None:
+        with self._replay_lock:
+            if self._active_replay is not None:
+                return None
+            session = ReplaySession(
+                name,
+                snapshot_provider=self._replay_snapshot,
+                interval=0.2,
+                meta=meta,
+            )
+            session.start()
+            self._active_replay = session
+        self._append_event("info", "replay", f"遥测录制开始: {name}", dict(meta))
+        return session
+
+    def _stop_replay_session(self) -> dict[str, Any] | None:
+        with self._replay_lock:
+            session = self._active_replay
+            self._active_replay = None
+        if session is None:
+            return None
+        summary = session.stop()
+        self._append_event(
+            "info",
+            "replay",
+            f"遥测录制结束: {summary.name}（{summary.frame_count} 帧）",
+            summary.to_dict(),
         )
-        run = RunState(
-            run_id=run_id,
-            command=command,
-            intent=plan.intent,
-            summary=plan.summary,
-            status="blocked",
-            mode="execute",
-            phase="blocked",
-            execute=False,
-            model_id=model_id,
-            plan=plan,
-            task_level=route.level.value,
-            route_strategy=route.strategy,
-            route_reason=route.reason,
-            answer_with_llm=False,
-            start_telemetry=dict(telemetry or {}),
-            agent_state=agent_state,
-            failure_reason="supervised route requires operator approval",
+        return summary.to_dict()
+
+    def start_manual_replay(self, name: str = "") -> dict[str, Any]:
+        """Manually start recording (no run_id needed, e.g. UI manual flights)."""
+        session_name = (str(name).strip() or f"manual_{int(time.time())}")[:120]
+        with self._replay_lock:
+            if self._manual_replay is not None:
+                return {"ok": False, "error": "manual replay already recording"}
+            session = ReplaySession(
+                session_name,
+                snapshot_provider=self._replay_snapshot,
+                interval=0.2,
+                meta={"mode": "manual"},
+            )
+            session.start()
+            self._manual_replay = session
+        self._append_event("info", "replay", f"手动录制开始: {session_name}", {})
+        return {"ok": True, "name": session_name, "recording": True}
+
+    def stop_manual_replay(self) -> dict[str, Any]:
+        with self._replay_lock:
+            session = self._manual_replay
+            self._manual_replay = None
+        if session is None:
+            return {"ok": False, "error": "no manual replay recording"}
+        summary = session.stop()
+        self._append_event(
+            "info",
+            "replay",
+            f"手动录制结束: {summary.name}（{summary.frame_count} 帧）",
+            summary.to_dict(),
         )
-        with self._lock:
-            self._current = run
-        self._start_task_run(run)
-        self._append_event("warning", "router", "监督路径已阻断自动执行", {"run_id": run.run_id, **route.to_dict()})
-        self._finalize_assistant_response(run)
+        return {"ok": True, **summary.to_dict()}
+
+    def replay_sessions(self) -> list[dict[str, Any]]:
+        """List recorded sessions (for the UI replay panel)."""
+        return list_replay_sessions()
+
+    def get_replay_session(self, name: str) -> dict[str, Any] | None:
+        """Read one recorded session: metadata + capped telemetry frames."""
+        return read_replay_session(str(name or ""))
+
+
+    @staticmethod
+    def _plan_has_observation_dependency(plan: MissionPlan | None) -> bool:
+        """A fixed sequence fails when an observation step precedes a motion
+        step: the later move depends on what the observation shows (photo ->
+        decide -> move), so it must run in the ReAct loop instead."""
+        steps = list(plan.steps) if plan else []
+        for index, step in enumerate(steps):
+            if step.tool in OBSERVATION_TOOLS:
+                if any(s.tool in MOTION_TOOLS for s in steps[index + 1 :]):
+                    return True
+        return False
+
+    @staticmethod
+    def _plan_requires_agent_loop(plan: MissionPlan | None) -> bool:
+        """Choose Plan-Execute vs ReAct. The planner may declare agent_loop
+        explicitly (visual search, tracking, conditional tasks); otherwise a
+        fixed sequence with observation -> motion steps is detected
+        structurally — no natural-language classification involved."""
+        if plan is None:
+            return False
+        return plan.execution_mode == "agent_loop" or AgentRuntime._plan_has_observation_dependency(plan)
+
+    def _correction_command(self, run: RunState) -> str:
+        """Structured failure context for the ReAct correction loop: the LLM
+        needs the failed step, tool output, verification summary, and current
+        position to choose a meaningful corrective action."""
+        parts = [f"继续完成原始任务并修正失败步骤。原始任务：{run.command}"]
+        if run.failure_reason:
+            parts.append(f"失败原因：{run.failure_reason}")
+        verification = run.verification or {}
+        if verification.get("summary"):
+            parts.append(f"校验摘要：{verification.get('summary')}")
+        failed_step = next(
+            (s for s in (run.plan.steps if run.plan else []) if s.status == "failed"),
+            None,
+        )
+        if failed_step is not None:
+            detail = failed_step.result if isinstance(failed_step.result, dict) else {}
+            message = str(detail.get("message") or detail.get("error") or "")
+            parts.append(f"失败步骤：{failed_step.id} {failed_step.tool}{'：' + message if message else ''}")
+        final = run.final_telemetry or {}
+        position = final.get("position_ned") if isinstance(final, dict) else None
+        if isinstance(position, dict) and any(position.get(k) is not None for k in ("x", "y", "z")):
+            parts.append(
+                f"当前 NED 位置：N {position.get('x')} / E {position.get('y')} / D {position.get('z')}"
+            )
+        return "；".join(parts)
+
+    @staticmethod
+    def _agent_loop_primary_command(run: RunState) -> str:
+        """Command for a plan routed to ReAct before execution: the fixed
+        sequence cannot express the task, so the loop decides per step."""
+        return (
+            f"按已生成的计划逐步执行。原始任务：{run.command}\n"
+            "计划依赖中间观察结果（拍照/识别/确认后决策），请逐步执行："
+            "每次先观察最新状态和工具返回，再选择下一步工具，直到任务完成。"
+        )
 
     @staticmethod
     def _agent_state_with_skill_guidance(
@@ -1635,31 +1645,6 @@ class AgentRuntime:
         ]
         return enriched
 
-    @staticmethod
-    def _should_use_plan_execute(
-        command: str,
-        capabilities: dict[str, Any],
-        attachments: list[dict[str, Any]] | None = None,
-    ) -> bool:
-        text = (command or "").lower()
-        if attachments:
-            return False
-        if not capabilities.get("flight_control"):
-            return False
-        dynamic_terms = (
-            "search", "find", "detect", "track", "follow", "locate",
-            "搜索", "寻找", "查找", "识别", "检测", "跟踪", "追踪", "跟随",
-        )
-        if any(term in text for term in dynamic_terms):
-            return False
-        sequence_terms = (
-            "takeoff", "fly", "move", "forward", "backward", "left", "right", "up", "down",
-            "orbit", "circle", "scan", "photo", "image", "return", "rtl", "land", "hover",
-            "起飞", "飞行", "移动", "向前", "往前", "前进", "向后", "往后", "后退",
-            "向左", "往左", "向右", "往右", "上升", "下降", "绕圈", "转圈", "盘旋",
-            "扫描", "拍照", "图像", "照片", "看看", "返航", "返回", "降落", "落地", "悬停",
-        )
-        return any(term in text for term in sequence_terms)
 
     def _execute_plan_execute_route(
         self,
@@ -1667,7 +1652,7 @@ class AgentRuntime:
         execute: bool,
         telemetry: dict[str, Any] | None,
         model_id: str,
-        route: TaskRoute,
+        route: dict[str, Any],
         capabilities: dict[str, Any],
         tool_runtime: dict[str, Any],
         memory_snapshot: dict[str, Any],
@@ -1712,10 +1697,10 @@ class AgentRuntime:
             execute=execute,
             model_id=model_id,
             plan=plan,
-            task_level=route.level.value,
-            route_strategy=route.strategy,
-            route_reason=route.reason,
-            risk_level=route.risk_level,
+            task_level=route["level"],
+            route_strategy=route["strategy"],
+            route_reason=route["reason"],
+            risk_level=route["risk_level"],
             answer_with_llm=False,
             start_telemetry=dict(telemetry or {}),
             agent_state=agent_state,
@@ -1727,7 +1712,7 @@ class AgentRuntime:
             "info",
             "planner",
             "Plan-Execute route selected",
-            {"run_id": run.run_id, "execute": execute, "planner_source": plan.planner_source, **route.to_dict()},
+            {"run_id": run.run_id, "execute": execute, "planner_source": plan.planner_source, **route},
         )
         if execute:
             self._begin_execution_trace(run, "任务适合一次性规划执行：先生成完整工具序列，再由 runtime 逐步执行、回读和校验。")
@@ -1739,18 +1724,46 @@ class AgentRuntime:
                     status="completed",
                     kind="reasoning",
                 )
-            self._run_plan(run, finalize=False, remember=False)
-            if self._should_enter_correction_loop(run):
+            if self._plan_requires_agent_loop(run.plan):
+                # The plan depends on mid-execution observations (photo ->
+                # decide -> move) or the planner declared agent_loop: a fixed
+                # sequence would fail, so ReAct runs as the primary path.
+                run.route_strategy = "agent_loop"
+                self._append_event(
+                    "info",
+                    "planner",
+                    "计划依赖中间观察，转入 Agent Loop 逐步执行",
+                    {"run_id": run.run_id, "execution_mode": run.plan.execution_mode if run.plan else "auto"},
+                )
                 self._run_correction_loop(
                     run,
                     capabilities=capabilities,
                     tool_runtime=tool_runtime,
                     model_id=model_id,
                     attachments=attachments or [],
+                    label="Agent Loop",
+                    command_override=self._agent_loop_primary_command(run),
                 )
-            total = len(run.plan.steps if run.plan else [])
-            ok_count = sum(1 for step in (run.plan.steps if run.plan else []) if step.status == "completed")
-            self._remember_plan_run(run, total=max(1, total), ok_count=ok_count)
+            else:
+                self._run_plan(run, finalize=False, remember=False)
+                while self._should_enter_correction_loop(run):
+                    run.correction_attempts += 1
+                    self._append_event(
+                        "warning",
+                        "planner",
+                        f"计划执行失败，进入 Agent Loop 纠错（{run.correction_attempts}/{CORRECTION_ATTEMPTS_MAX}）",
+                        {"run_id": run.run_id, "failure_reason": run.failure_reason},
+                    )
+                    self._run_correction_loop(
+                        run,
+                        capabilities=capabilities,
+                        tool_runtime=tool_runtime,
+                        model_id=model_id,
+                        attachments=attachments or [],
+                    )
+                total = len(run.plan.steps if run.plan else [])
+                ok_count = sum(1 for step in (run.plan.steps if run.plan else []) if step.status == "completed")
+                self._remember_plan_run(run, total=max(1, total), ok_count=ok_count)
             self._finalize_assistant_response(run)
         else:
             self._simulate_plan(run)
@@ -1761,8 +1774,13 @@ class AgentRuntime:
             return False
         if run.route_strategy != "plan_execute":
             return False
+        if run.correction_attempts >= CORRECTION_ATTEMPTS_MAX:
+            return False
         reason = (run.failure_reason or "").lower()
         if any(term in reason for term in ["operator", "approval", "emergency stop", "急停", "操作员"]):
+            return False
+        # Link-level failures cannot be fixed by re-deciding the plan.
+        if any(term in reason for term in CONNECTION_FAILURE_TERMS):
             return False
         return run.status in {"failed", "blocked"} or run.verification.get("level") == "failed"
 
@@ -1774,19 +1792,20 @@ class AgentRuntime:
         tool_runtime: dict[str, Any],
         model_id: str,
         attachments: list[dict[str, Any]],
+        label: str = "纠错 Loop",
+        command_override: str | None = None,
     ) -> None:
         self._append_process(
             run,
-            "纠错 Loop",
-            "一次性计划未完全达成，进入 Agent Loop 回读当前状态并选择修正动作。",
+            label,
+            "一次性计划未完全达成，进入 Agent Loop 回读当前状态并选择修正动作。"
+            if label == "纠错 Loop"
+            else "任务需要观察-响应循环，进入 Agent Loop 逐步执行。",
             status="running",
             kind="reasoning",
         )
         self._update_assistant_message(run.run_id, self._progress_message(run), "running", self._message_details(run))
-        correction_command = (
-            f"继续完成原始任务并修正失败步骤。原始任务：{run.command}\n"
-            f"失败原因：{run.failure_reason or run.verification.get('summary') or '任务后校验未通过'}"
-        )
+        correction_command = command_override or self._correction_command(run)
         loop = self.agent_loop.run(
             run_id=run.run_id,
             command=correction_command,
@@ -1820,159 +1839,12 @@ class AgentRuntime:
         run.phase = run.status if run.status in {"completed", "failed", "blocked"} else "completed"
         self._append_process(
             run,
-            "纠错 Loop",
-            loop.summary or run.failure_reason or "纠错 Loop 已结束。",
+            label,
+            loop.summary or run.failure_reason or f"{label} 已结束。",
             status="completed" if run.status == "completed" else "failed",
             kind="reasoning",
         )
         self._publish_run_update(run)
-
-    def _execute_agent_loop_route(
-        self,
-        command: str,
-        execute: bool,
-        telemetry: dict[str, Any] | None,
-        model_id: str,
-        route: TaskRoute,
-        capabilities: dict[str, Any],
-        tool_runtime: dict[str, Any],
-        run_id: str = "",
-        agent_state: dict[str, Any] | None = None,
-        attachments: list[dict[str, Any]] | None = None,
-    ) -> None:
-        run_id = run_id or f"run_{int(time.time() * 1000)}"
-        agent_state = agent_state or self._agent_state_context(tool_runtime)
-        skill_guidance = self.skills.guidance_cards(command, capabilities, self.memory.snapshot())
-        if skill_guidance:
-            agent_state = dict(agent_state)
-            agent_state["skill_guidance"] = [
-                {
-                    "name": card.get("name", ""),
-                    "display_name": card.get("display_name", ""),
-                    "description": card.get("description", ""),
-                    "executable": False,
-                }
-                for card in skill_guidance[:3]
-            ]
-        plan = MissionPlan(
-            run_id=run_id,
-            command=command,
-            intent="agent_loop",
-            summary="L3 Agent Loop task",
-            steps=[],
-            planner_source="agent_loop",
-            reasoning=route.reason,
-            risk_notes=["Agent Loop uses observe-decide-act iterations with a hard max step limit."],
-        )
-        run = RunState(
-            run_id=run_id,
-            command=command,
-            intent=plan.intent,
-            summary=plan.summary,
-            status="running",
-            mode="execute" if execute else "plan",
-            phase="executing" if execute else "planning",
-            execute=execute,
-            model_id=model_id,
-            plan=plan,
-            task_level=route.level.value,
-            route_strategy=route.strategy,
-            route_reason=route.reason,
-            answer_with_llm=False,
-            start_telemetry=dict(telemetry or {}),
-            agent_state=agent_state,
-        )
-        with self._lock:
-            self._current = run
-        self._start_task_run(run)
-        self._append_event(
-            "info",
-            "agent_loop",
-            "L3 Agent Loop started" if execute else "L3 Agent Loop dry-run preview started",
-            {"run_id": run_id, "execute": execute, **route.to_dict()},
-        )
-        if execute:
-            self._begin_execution_trace(run, "Agent Loop 已启动，正在等待模型输出第一步工具决策。")
-            for card in skill_guidance[:3]:
-                self._append_process(
-                    run,
-                    "技能参考",
-                    f"{card.get('display_name') or card.get('name')}: {card.get('description') or 'Markdown guidance loaded'}",
-                    status="completed",
-                    kind="reasoning",
-                )
-
-        loop = self.agent_loop.run(
-            run_id=run_id,
-            command=command,
-            capabilities=capabilities,
-            tool_cards=tool_runtime.get("tool_cards") or self.tools.list_tool_cards(),
-            initial_plan=None,
-            model_id=model_id or None,
-            max_steps=16,
-            execute=execute,
-            attachments=attachments or [],
-            require_llm=True,
-        )
-        cancelled = self._is_run_cancelled(run.run_id)
-        run.loop_state = loop.to_dict()
-        run.plan = self._plan_from_loop_state(loop, planned=not execute)
-        run.summary = loop.summary or run.summary
-        run.phase = "verifying" if execute else "planning"
-        if cancelled:
-            run.status = "cancelled"
-            run.phase = "cancelled"
-            run.failure_reason = "operator cancelled task"
-            run.summary = "任务已由操作员中断"
-        elif execute:
-            run.status = loop.status if loop.status in {"completed", "failed", "blocked"} else "completed"
-        else:
-            run.status = "planned" if loop.status in {"completed", "running"} else loop.status
-        run.progress = 100.0
-        if not cancelled:
-            run.failure_reason = loop.failure_reason
-        run.finished_at = loop.finished_at or time.time()
-        run.final_telemetry = dict(self.tools.status_snapshot().get("drone") or {})
-        run.agent_state = self._agent_state_context()
-        if skill_guidance:
-            run.agent_state["skill_guidance"] = [
-                {
-                    "name": card.get("name", ""),
-                    "display_name": card.get("display_name", ""),
-                    "description": card.get("description", ""),
-                    "executable": False,
-                }
-                for card in skill_guidance[:3]
-            ]
-        run.verification = self._verify_run_outcome(run) if execute and not cancelled else {}
-        if execute and run.status == "completed" and run.verification.get("level") == "failed":
-            run.status = "failed"
-            run.phase = "failed"
-            run.failure_reason = run.verification.get("summary", "Agent Loop verification failed")
-            self._append_event("warning", "verifier", "Agent Loop verification failed", run.verification)
-        elif execute and run.status == "completed":
-            run.phase = "completed"
-        elif run.status in {"failed", "blocked"}:
-            run.phase = run.status
-        if execute:
-            self.memory.remember_mission(
-                {
-                    "run_id": run.run_id,
-                    "command": run.command,
-                    "intent": run.intent,
-                    "status": run.status,
-                    "summary": run.summary,
-                    "duration_sec": round(run.finished_at - run.started_at, 2),
-                    "steps_total": len(run.plan.steps if run.plan else []),
-                    "steps_ok": sum(1 for result in loop.results if result.ok),
-                    "failure_reason": run.failure_reason,
-                    "route_strategy": run.route_strategy,
-                    "tool_sequence": [result.tool for result in loop.results],
-                    "verification_status": run.verification.get("status", ""),
-                }
-            )
-        self._publish_run_update(run)
-        self._finalize_assistant_response(run)
 
     def _plan_from_loop_state(self, loop: LoopState, planned: bool = False) -> MissionPlan:
         results_by_step = {result.step_index: result for result in loop.results}
@@ -2893,7 +2765,7 @@ class AgentRuntime:
                 tool,
                 params,
                 risk_level,
-                reason=f"governed high-risk tool call: {tool}",
+                reason=self._approval_reason(tool, params),
             )
             if not approved:
                 return self._blocked_tool_result(tool, params, run.failure_reason or "operator approval rejected")
@@ -3995,7 +3867,7 @@ class AgentRuntime:
         if not run.plan:
             return run.route_reason or "正在整理任务上下文。"
         reasoning = (run.plan.reasoning or "").strip()
-        if reasoning and "TaskRouter selected" not in reasoning:
+        if reasoning:
             return reasoning
         if run.route_strategy == "direct" and run.plan.steps:
             tool = run.plan.steps[0].tool
@@ -4223,7 +4095,7 @@ class AgentRuntime:
                 step.tool,
                 dict(step.params),
                 risk_level,
-                reason=f"preflight approval for high-risk real-vehicle tool: {step.tool}",
+                reason=self._approval_reason(step.tool, dict(step.params)),
             )
             return {
                 "approved": approved,

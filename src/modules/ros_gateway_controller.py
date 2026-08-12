@@ -226,7 +226,7 @@ class RosGatewayController(FlightController):
     def set_mode(self, mode: str) -> bool:
         return self._ok(self.client.px4_set_mode({"mode": str(mode)}))
 
-    def rotate_to_heading(self, heading_deg: float, timeout: float = 30.0) -> bool:
+    def rotate_to_heading(self, heading_deg: float, timeout: float = 30.0, vehicle_name: str = "") -> bool:
         return self._ok(
             self.client.px4_rotate_to(
                 {

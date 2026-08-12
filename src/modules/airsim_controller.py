@@ -851,16 +851,16 @@ class AirSimController(FlightController):
         logger.warning("AirSim does not support flight modes")
         return False
 
-    def rotate_to_heading(self, heading_deg: float, timeout: float = 30.0) -> bool:
+    def rotate_to_heading(self, heading_deg: float, timeout: float = 30.0, vehicle_name: str = "") -> bool:
         self.last_error = ""
         if not self._ensure_connected():
             self.last_error = "AirSim not connected"
             return False
-        if self._uses_external_px4_controller():
+        if self._uses_external_px4_controller(vehicle_name):
             self.last_error = "AirSim settings use PX4Multirotor; use PX4 MAVLink or PX4 ROS2 mode for yaw control."
             return False
         try:
-            names = self._resolve_vehicles("")
+            names = self._resolve_vehicles(vehicle_name)
             for name in names:
                 self._rpc_call(
                     lambda n=name: self._client.rotateToYawAsync(

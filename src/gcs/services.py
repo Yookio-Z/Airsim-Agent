@@ -196,25 +196,25 @@ class ToolCommandManager:
         self._safety = safety
 
     def arm(self, vehicle_id: str = "") -> ManagerResult:
-        return self._execute("drone_arm", {})
+        return self._execute("drone_arm", {}, vehicle_id=vehicle_id)
 
     def disarm(self, vehicle_id: str = "") -> ManagerResult:
-        return self._execute("drone_disarm", {})
+        return self._execute("drone_disarm", {}, vehicle_id=vehicle_id)
 
     def takeoff(self, altitude_m: float, vehicle_id: str = "") -> ManagerResult:
-        return self._execute("drone_takeoff", {"altitude": altitude_m})
+        return self._execute("drone_takeoff", {"altitude": altitude_m}, vehicle_id=vehicle_id)
 
     def land(self, vehicle_id: str = "") -> ManagerResult:
-        return self._execute("drone_land", {})
+        return self._execute("drone_land", {}, vehicle_id=vehicle_id)
 
     def hold(self, vehicle_id: str = "") -> ManagerResult:
-        return self._execute("drone_hover", {})
+        return self._execute("drone_hover", {}, vehicle_id=vehicle_id)
 
     def rtl(self, vehicle_id: str = "") -> ManagerResult:
         return self.set_mode("RTL", vehicle_id=vehicle_id)
 
     def set_mode(self, mode: str, vehicle_id: str = "") -> ManagerResult:
-        return self._execute("drone_set_mode", {"mode": mode})
+        return self._execute("drone_set_mode", {"mode": mode}, vehicle_id=vehicle_id)
 
     def goto(self, item: dict[str, Any], vehicle_id: str = "") -> ManagerResult:
         payload = {
@@ -223,9 +223,11 @@ class ToolCommandManager:
             "z": float(item.get("z", -3.0)),
             "velocity": float(item.get("velocity", item.get("speed_mps", 2.0)) or 2.0),
         }
-        return self._execute("drone_fly_to", payload)
+        return self._execute("drone_fly_to", payload, vehicle_id=vehicle_id)
 
-    def _execute(self, tool: str, params: dict[str, Any]) -> ManagerResult:
+    def _execute(self, tool: str, params: dict[str, Any], vehicle_id: str = "") -> ManagerResult:
+        if vehicle_id:
+            params = {**dict(params), "vehicle_name": vehicle_id}
         state = self._telemetry.get_state()
         state.safety = self._safety.state()
         validation = self._safety.validate_command(tool, params, state)

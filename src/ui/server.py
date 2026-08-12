@@ -110,6 +110,17 @@ class AgentRequestHandler(BaseHTTPRequestHandler):
         if path.startswith("/api/sessions/"):
             self._handle_session_get(path, parsed)
             return
+        if path == "/api/replay/sessions":
+            self._send_json({"ok": True, "sessions": RUNTIME.replay_sessions()})
+            return
+        if path.startswith("/api/replay/sessions/"):
+            name = unquote(path[len("/api/replay/sessions/"):])
+            session = RUNTIME.get_replay_session(name)
+            if session is None:
+                self._send_json({"ok": False, "error": "replay session not found"}, HTTPStatus.NOT_FOUND)
+                return
+            self._send_json({"ok": True, "session": session})
+            return
         if path == "/api/tools":
             self._send_json({"tools": RUNTIME.tools.list_tools()})
             return
@@ -396,6 +407,17 @@ class AgentRequestHandler(BaseHTTPRequestHandler):
                 self._send_json({"ok": False, "error": "run_id required"}, HTTPStatus.BAD_REQUEST)
                 return
             self._send_json(RUNTIME.reject_run(run_id))
+            return
+
+        # Replay: manual recording start/stop (runs auto-record in the runtime).
+        if path == "/api/replay/record":
+            action = str(payload.get("action", "")).strip().lower()
+            if action == "start":
+                self._send_json(RUNTIME.start_manual_replay(name=str(payload.get("name", ""))))
+            elif action == "stop":
+                self._send_json(RUNTIME.stop_manual_replay())
+            else:
+                self._send_json({"ok": False, "error": "action must be start or stop"}, HTTPStatus.BAD_REQUEST)
             return
 
         if path.startswith("/api/sessions"):

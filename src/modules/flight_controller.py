@@ -127,7 +127,7 @@ class FlightController(ABC):
         """设置飞行模式"""
 
     @abstractmethod
-    def rotate_to_heading(self, heading_deg: float, timeout: float = 30.0) -> bool:
+    def rotate_to_heading(self, heading_deg: float, timeout: float = 30.0, vehicle_name: str = "") -> bool:
         """旋转到指定航向（度，0=North，顺时针+）"""
 
     def stop(self, vehicle_name: str = "") -> bool:

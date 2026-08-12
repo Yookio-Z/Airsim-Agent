@@ -166,6 +166,7 @@ class GroundStationState:
     capabilities: dict[str, Any] = field(default_factory=dict)
     link: LinkState = field(default_factory=LinkState)
     vehicle: VehicleTelemetry | None = None
+    vehicles: list[VehicleTelemetry] = field(default_factory=list)
     mission: MissionState = field(default_factory=MissionState)
     safety: SafetyState = field(default_factory=SafetyState)
     agent: AgentState = field(default_factory=AgentState)
@@ -177,6 +178,7 @@ class GroundStationState:
             "capabilities": self.capabilities,
             "link": self.link.to_dict(),
             "vehicle": self.vehicle.to_dict() if self.vehicle else None,
+            "vehicles": [item.to_dict() for item in self.vehicles],
             "mission": self.mission.to_dict(),
             "safety": self.safety.to_dict(),
             "agent": self.agent.to_dict(),
@@ -212,11 +214,21 @@ class GroundStationState:
             task_level=str((current_run or {}).get("task_level") or ""),
             route_strategy=str((current_run or {}).get("route_strategy") or ""),
         )
+        vehicles = [
+            VehicleTelemetry.from_drone_status(item)
+            for item in snapshot.get("vehicles") or []
+            if isinstance(item, dict)
+        ]
+        if not vehicles:
+            default = VehicleTelemetry.from_drone_status(snapshot.get("drone"))
+            if default is not None:
+                vehicles = [default]
         return cls(
             backend=dict(backend_profile),
             capabilities=capabilities,
             link=link,
             vehicle=VehicleTelemetry.from_drone_status(snapshot.get("drone")),
+            vehicles=vehicles,
             safety=safety,
             agent=agent,
         )

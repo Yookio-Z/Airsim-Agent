@@ -213,18 +213,25 @@ class ToolRuntime:
 
     def _camera_source_enabled(self) -> bool:
         settings = self._camera_settings()
-        return str(settings.get("source") or "").lower() == "airsim"
+        return str(settings.get("source") or "").lower() in {"airsim", "rtsp"}
 
     def _camera_capabilities(self, capabilities: dict[str, Any]) -> dict[str, Any]:
         merged = dict(capabilities or {})
         settings = self._camera_settings()
-        if str(settings.get("source") or "").lower() == "airsim":
+        source = str(settings.get("source") or "").lower()
+        if source == "airsim":
             merged["image_capture"] = True
             merged["depth_perception"] = True
             merged["camera_source"] = "airsim"
             merged["camera_host"] = settings.get("host", "127.0.0.1")
             merged["camera_port"] = settings.get("port", 41452)
             merged["image_capture_via"] = "airsim_camera_source"
+        elif source == "rtsp":
+            merged["image_capture"] = True
+            merged["depth_perception"] = False
+            merged["camera_source"] = "rtsp"
+            merged["camera_url"] = settings.get("url", "")
+            merged["image_capture_via"] = "rtsp_stream"
         return merged
 
     def _camera_tool_spec(self, name: str) -> ToolSpec | None:
@@ -258,7 +265,10 @@ class ToolRuntime:
 
     def _ensure_camera_tools(self) -> tuple[ToolCollector | None, str]:
         settings = self._camera_settings()
-        if str(settings.get("source") or "").lower() != "airsim":
+        source = str(settings.get("source") or "").lower()
+        if source == "rtsp":
+            return self._ensure_rtsp_camera_tools(settings)
+        if source != "airsim":
             return None, "camera source is not AirSim"
 
         host = str(settings.get("host") or "127.0.0.1")
@@ -316,6 +326,91 @@ class ToolRuntime:
         except Exception as exc:
             self.camera_error = str(exc)
             return None, self.camera_error
+
+    def _ensure_rtsp_camera_tools(self, settings: dict[str, Any]) -> tuple[ToolCollector | None, str]:
+        """Camera tool set for a real onboard camera pushed over RTSP."""
+        url = str(settings.get("url") or settings.get("rtsp_url") or "").strip()
+        if not url:
+            self.camera_error = "rtsp camera source requires a stream URL"
+            return None, self.camera_error
+        key = f"rtsp:{url}"
+
+        if self.camera_key != key:
+            if self.camera_controller is not None:
+                try:
+                    self.camera_controller.disconnect()
+                except Exception:
+                    pass
+            self.camera_controller = None
+            self.camera_collector = None
+            self.camera_key = key
+
+        if self.camera_controller is not None and self.camera_collector is not None:
+            if bool(getattr(self.camera_controller, "is_connected", False)):
+                return self.camera_collector, ""
+            self.camera_controller = None
+            self.camera_collector = None
+
+        try:
+            from src.modules.rtsp_camera_controller import RtspCameraController
+
+            controller = RtspCameraController(url)
+            info = controller.connect()
+            if not info.connected:
+                self.camera_error = controller.last_error or "rtsp camera source is not connected"
+                return None, self.camera_error
+
+            collector = ToolCollector()
+            self._register_rtsp_camera_tools(collector, controller)
+            self.camera_controller = controller
+            self.camera_collector = collector
+            self.camera_error = ""
+            return collector, ""
+        except Exception as exc:
+            self.camera_error = str(exc)
+            return None, self.camera_error
+
+    @staticmethod
+    def _register_rtsp_camera_tools(collector: ToolCollector, controller: Any) -> None:
+        """Single photo tool for RTSP sources (real cameras: scene only)."""
+
+        @collector.tool()
+        def airsim_take_photo(
+            camera_name: str = "0",
+            image_type: str = "scene",
+            vehicle_name: str = "",
+            auto_save: bool = False,
+            timeout_sec: float = 30.0,
+        ) -> str:
+            """Capture a JPEG frame from the RTSP camera source."""
+            import base64
+
+            raw = controller.capture_image(
+                camera_name=camera_name,
+                image_type=image_type,
+                vehicle_name=vehicle_name,
+                timeout=float(timeout_sec or 30.0),
+            )
+            if raw is None:
+                return json.dumps(
+                    {
+                        "status": "error",
+                        "backend": controller.backend_name,
+                        "message": controller.last_error or "frame capture failed",
+                    },
+                    ensure_ascii=False,
+                )
+            return json.dumps(
+                {
+                    "status": "ok",
+                    "backend": controller.backend_name,
+                    "image_base64": base64.b64encode(raw).decode("ascii"),
+                    "format": "jpeg",
+                    "source": "rtsp",
+                    "message": "frame captured from RTSP camera",
+                },
+                ensure_ascii=False,
+            )
 
     def _camera_params(self, name: str, params: dict[str, Any]) -> dict[str, Any]:
         settings = self._camera_settings()
@@ -409,10 +504,11 @@ class ToolRuntime:
         if collector is None or self.camera_controller is None:
             return False, b"", "text/plain; charset=utf-8", {
                 "status": "error",
-                "message": f"AirSim camera source unavailable: {error or 'unknown error'}",
+                "message": f"camera source unavailable: {error or 'unknown error'}",
             }
 
         settings = self._camera_settings()
+        source = str(settings.get("source") or "").lower()
         camera_name = str(raw_params.get("camera_name") or settings.get("camera_name") or "0")
         vehicle_name = str(raw_params.get("vehicle_name") or settings.get("vehicle_name") or "")
         image_type_name = str(raw_params.get("image_type") or settings.get("image_type") or "scene").lower()
@@ -433,20 +529,25 @@ class ToolRuntime:
         quality = max(35, min(90, quality))
 
         try:
-            import airsim
-
-            type_map = {
-                "scene": airsim.ImageType.Scene,
-                "depth": airsim.ImageType.DepthVis,
-                "segmentation": airsim.ImageType.Segmentation,
-                "infrared": airsim.ImageType.Infrared,
-                "depth_planar": airsim.ImageType.DepthPlanar,
-                "depth_perspective": airsim.ImageType.DepthPerspective,
-                "surface_normals": airsim.ImageType.SurfaceNormals,
-            }
-            image_type = type_map.get(image_type_name, airsim.ImageType.Scene)
             controller = self.camera_controller
+            if source == "rtsp":
+                image_type = 0  # real cameras: scene only
+            else:
+                import airsim
+
+                type_map = {
+                    "scene": airsim.ImageType.Scene,
+                    "depth": airsim.ImageType.DepthVis,
+                    "segmentation": airsim.ImageType.Segmentation,
+                    "infrared": airsim.ImageType.Infrared,
+                    "depth_planar": airsim.ImageType.DepthPlanar,
+                    "depth_perspective": airsim.ImageType.DepthPerspective,
+                    "surface_normals": airsim.ImageType.SurfaceNormals,
+                }
+                image_type = type_map.get(image_type_name, airsim.ImageType.Scene)
             names = [vehicle_name] if vehicle_name else list(getattr(controller, "_vehicles", []) or [])
+            if not names and source == "rtsp":
+                names = [""]
             if not names:
                 return False, b"", "text/plain; charset=utf-8", {
                     "status": "error",
@@ -1149,12 +1250,38 @@ class ToolRuntime:
                 "tool_cards": self.list_tool_cards() if ready else [],
                 "backends": self.backend_registry.list_public(),
                 "drone": drone_status,
+                "vehicles": self._vehicles_status(connected),
                 "operation_contract": self._operation_contract(drone_status),
             }
             self._last_status_snapshot = snapshot
             return dict(snapshot)
         finally:
             self._lock.release()
+
+    def _vehicles_status(self, connected: bool) -> list[dict[str, Any]]:
+        """Per-vehicle compact status for multi-vehicle backends (AirSim).
+
+        Single-vehicle backends report one entry matching ``drone``; backends
+        without per-vehicle status fall back to the default drone payload.
+        """
+        controller = self.controller
+        if not connected or controller is None:
+            return []
+        try:
+            names = list(controller.list_vehicles() or [])
+        except Exception:
+            names = []
+        if not names:
+            return []
+        vehicles: list[dict[str, Any]] = []
+        for name in names:
+            try:
+                status = controller.get_status(name).to_dict()
+            except Exception as exc:
+                status = {"vehicle_name": name, "error": str(exc)}
+            status.setdefault("vehicle_name", name)
+            vehicles.append(status)
+        return vehicles
 
     def vehicle_info(self, refresh: bool = False) -> dict[str, Any]:
         """Return active vehicle link and firmware metadata for settings UI."""
