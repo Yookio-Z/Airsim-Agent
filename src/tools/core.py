@@ -16,6 +16,36 @@ def register_core_tools(
 ) -> None:
     """Register backend-neutral core tools against a FlightController."""
 
+    def _resolve_target_vehicles(vehicle_name: str) -> list[str]:
+        """Map tool-level vehicle_name onto concrete vehicle names.
+
+        ""   -> the default vehicle only (never an implicit broadcast): the
+                sole vehicle when the backend has one, else the first listed.
+        "all" -> every vehicle reported by the backend.
+        name  -> that exact vehicle.
+        """
+        try:
+            vehicles = list(controller.list_vehicles() or [])
+        except Exception:
+            vehicles = []
+        if not vehicle_name:
+            if len(vehicles) <= 1:
+                return vehicles or [""]
+            return [vehicles[0]]
+        if str(vehicle_name).strip().lower() == "all":
+            return vehicles or [""]
+        return [str(vehicle_name)]
+
+    def _run_for_vehicles(vehicle_name: str, action) -> tuple[bool, list[str]]:
+        """Run action(name) for each resolved vehicle; all must succeed."""
+        targets = _resolve_target_vehicles(vehicle_name)
+        ok = True
+        for name in targets:
+            if not action(name):
+                ok = False
+                break
+        return ok, targets
+
     def finite_float(value) -> float | None:
         try:
             number = float(value)
@@ -155,42 +185,45 @@ def register_core_tools(
         })
 
     @mcp.tool()
-    def drone_arm() -> str:
-        """Arm the vehicle motors."""
-        ok = controller.arm()
+    def drone_arm(vehicle_name: str = "") -> str:
+        """Arm the vehicle motors (default vehicle; "all" arms every vehicle)."""
+        ok, targets = _run_for_vehicles(vehicle_name, controller.arm)
         message, detail = action_error("arm failed") if not ok else ("motors armed", "")
         payload = {
             "status": "ok" if ok else "error",
             "backend": controller.backend_name,
             "message": message,
+            "vehicles": targets,
         }
         if detail:
             payload["error_detail"] = detail
         return fmt_result(payload)
 
     @mcp.tool()
-    def drone_disarm() -> str:
-        """Disarm the vehicle motors."""
-        ok = controller.disarm()
+    def drone_disarm(vehicle_name: str = "") -> str:
+        """Disarm the vehicle motors (default vehicle; "all" disarms every vehicle)."""
+        ok, targets = _run_for_vehicles(vehicle_name, controller.disarm)
         message, detail = action_error("disarm failed") if not ok else ("motors disarmed", "")
         payload = {
             "status": "ok" if ok else "error",
             "backend": controller.backend_name,
             "message": message,
+            "vehicles": targets,
         }
         if detail:
             payload["error_detail"] = detail
         return fmt_result(payload)
 
     @mcp.tool()
-    def drone_takeoff(altitude: float = 3.0) -> str:
-        """Take off to the requested positive altitude in meters."""
-        ok = controller.takeoff(altitude)
+    def drone_takeoff(altitude: float = 3.0, vehicle_name: str = "") -> str:
+        """Take off to the requested positive altitude in meters (default vehicle; "all" for every vehicle)."""
+        ok, targets = _run_for_vehicles(vehicle_name, lambda name: controller.takeoff(altitude, name))
         message, detail = action_error("takeoff failed") if not ok else (f"takeoff complete ({altitude}m)", "")
         payload = {
             "status": "ok" if ok else "error",
             "backend": controller.backend_name,
             "message": message,
+            "vehicles": targets,
         }
         if detail:
             payload["error_detail"] = detail
@@ -198,13 +231,14 @@ def register_core_tools(
         return fmt_result(payload)
 
     @mcp.tool()
-    def drone_land() -> str:
-        """Land the active vehicle."""
-        ok = controller.land()
+    def drone_land(vehicle_name: str = "") -> str:
+        """Land the vehicle (default vehicle; "all" for every vehicle)."""
+        ok, targets = _run_for_vehicles(vehicle_name, controller.land)
         payload = {
             "status": "ok" if ok else "error",
             "backend": controller.backend_name,
             "message": "landing complete" if ok else "landing failed",
+            "vehicles": targets,
         }
         if not ok:
             _, detail = action_error("landing failed")
@@ -214,44 +248,47 @@ def register_core_tools(
         return fmt_result(payload)
 
     @mcp.tool()
-    def drone_hover() -> str:
-        """Hold the current position or stop motion."""
-        ok = controller.hover()
+    def drone_hover(vehicle_name: str = "") -> str:
+        """Hold the current position or stop motion (default vehicle; "all" for every vehicle)."""
+        ok, targets = _run_for_vehicles(vehicle_name, controller.hover)
         payload = {
             "status": "ok" if ok else "error",
             "backend": controller.backend_name,
             "message": "holding position" if ok else "hover failed",
+            "vehicles": targets,
         }
         payload.update(status_payload())
         return fmt_result(payload)
 
     @mcp.tool()
-    def drone_fly_to(x: float, y: float, z: float, velocity: float = 2.0) -> str:
-        """Fly to an absolute local NED coordinate.
+    def drone_fly_to(x: float, y: float, z: float, velocity: float = 2.0, vehicle_name: str = "") -> str:
+        """Fly to an absolute local NED coordinate (default vehicle; "all" for every vehicle).
 
         X is north meters, Y is east meters, Z is down meters. Negative Z means
         altitude above the local origin.
         """
-        ok = controller.move_to_position(x, y, z, velocity)
+        ok, targets = _run_for_vehicles(vehicle_name, lambda name: controller.move_to_position(x, y, z, velocity, name))
         payload = {
             "status": "ok" if ok else "error",
             "backend": controller.backend_name,
             "message": f"target reached ({x}, {y}, {z})" if ok else "position command failed",
+            "vehicles": targets,
         }
         payload.update(status_payload())
         return fmt_result(payload)
 
     @mcp.tool()
-    def drone_fly_velocity(vx: float, vy: float, vz: float, duration: float = 0.0) -> str:
-        """Command local NED velocity for a duration.
+    def drone_fly_velocity(vx: float, vy: float, vz: float, duration: float = 0.0, vehicle_name: str = "") -> str:
+        """Command local NED velocity for a duration (default vehicle; "all" for every vehicle).
 
         Duration 0 sends one backend update when supported.
         """
-        ok = controller.move_by_velocity(vx, vy, vz, duration)
+        ok, targets = _run_for_vehicles(vehicle_name, lambda name: controller.move_by_velocity(vx, vy, vz, duration, name))
         payload = {
             "status": "ok" if ok else "error",
             "backend": controller.backend_name,
             "message": f"velocity command sent ({vx}, {vy}, {vz})" if ok else "velocity command failed",
+            "vehicles": targets,
         }
         payload.update(status_payload())
         return fmt_result(payload)
@@ -262,20 +299,30 @@ def register_core_tools(
         right_m: float = 0.0,
         up_m: float = 0.0,
         velocity: float = 2.0,
+        vehicle_name: str = "",
     ) -> str:
-        """Move relative to the current vehicle heading."""
-        status = controller.get_status()
-        pos = status.position_ned or {"x": 0.0, "y": 0.0, "z": 0.0}
-        heading_deg = heading_deg_from_status(status)
-        heading_rad = math.radians(heading_deg)
+        """Move relative to the current vehicle heading (default vehicle; "all" for every vehicle)."""
+        targets = _resolve_target_vehicles(vehicle_name)
+        ok = True
+        pos: dict = {}
+        heading_deg = 0.0
+        target_position: dict = {}
+        for name in targets:
+            status = controller.get_status(name)
+            pos = status.position_ned or {"x": 0.0, "y": 0.0, "z": 0.0}
+            heading_deg = heading_deg_from_status(status)
+            heading_rad = math.radians(heading_deg)
 
-        dx = math.cos(heading_rad) * forward_m + math.cos(heading_rad + math.pi / 2) * right_m
-        dy = math.sin(heading_rad) * forward_m + math.sin(heading_rad + math.pi / 2) * right_m
-        target_x = float(pos.get("x", 0.0)) + dx
-        target_y = float(pos.get("y", 0.0)) + dy
-        target_z = float(pos.get("z", 0.0)) - up_m
+            dx = math.cos(heading_rad) * forward_m + math.cos(heading_rad + math.pi / 2) * right_m
+            dy = math.sin(heading_rad) * forward_m + math.sin(heading_rad + math.pi / 2) * right_m
+            target_x = float(pos.get("x", 0.0)) + dx
+            target_y = float(pos.get("y", 0.0)) + dy
+            target_z = float(pos.get("z", 0.0)) - up_m
+            target_position = {"x": round(target_x, 3), "y": round(target_y, 3), "z": round(target_z, 3)}
 
-        ok = controller.move_to_position(target_x, target_y, target_z, velocity)
+            if not controller.move_to_position(target_x, target_y, target_z, velocity, name):
+                ok = False
+                break
         return fmt_result(
             {
                 "status": "ok" if ok else "error",
@@ -286,19 +333,16 @@ def register_core_tools(
                 )
                 if ok
                 else "relative move failed",
+                "vehicles": targets,
                 "start_position_ned": pos,
                 "heading_deg": heading_deg,
-                "target_position_ned": {
-                    "x": round(target_x, 3),
-                    "y": round(target_y, 3),
-                    "z": round(target_z, 3),
-                },
+                "target_position_ned": target_position,
             }
         )
 
     @mcp.tool()
-    def drone_fly_path(waypoints_json: str, velocity: float = 2.0) -> str:
-        """Fly a local NED waypoint path.
+    def drone_fly_path(waypoints_json: str, velocity: float = 2.0, vehicle_name: str = "") -> str:
+        """Fly a local NED waypoint path (default vehicle; "all" for every vehicle).
 
         `waypoints_json` must be a JSON array of objects with x, y, and z.
         """
@@ -310,11 +354,12 @@ def register_core_tools(
         if not isinstance(waypoints, list) or not waypoints:
             return fmt_result({"status": "error", "message": "waypoints must be a non-empty list"})
 
-        ok = controller.move_on_path(waypoints, velocity)
+        ok, targets = _run_for_vehicles(vehicle_name, lambda name: controller.move_on_path(waypoints, velocity, name))
         payload = {
             "status": "ok" if ok else "error",
             "backend": controller.backend_name,
             "message": f"path complete ({len(waypoints)} waypoints)" if ok else "path command failed",
+            "vehicles": targets,
         }
         get_last_path_error = getattr(controller, "get_last_path_error", None)
         if not ok and callable(get_last_path_error):
@@ -431,15 +476,16 @@ def register_core_tools(
         )
 
     @mcp.tool()
-    def drone_rotate_to(heading_deg: float) -> str:
-        """Rotate to an absolute heading in degrees. 0 is north."""
+    def drone_rotate_to(heading_deg: float, vehicle_name: str = "") -> str:
+        """Rotate to an absolute heading in degrees. 0 is north (default vehicle; "all" for every vehicle)."""
         target_heading = float(heading_deg) % 360.0
-        ok = controller.rotate_to_heading(target_heading)
+        ok, targets = _run_for_vehicles(vehicle_name, lambda name: controller.rotate_to_heading(target_heading, vehicle_name=name))
         payload = {
             "status": "ok" if ok else "error",
             "backend": controller.backend_name,
             "message": f"rotated to {target_heading:g} deg" if ok else "rotation failed",
             "target_heading_deg": round(target_heading, 3),
+            "vehicles": targets,
         }
         payload.update(status_payload())
         return fmt_result(payload)
