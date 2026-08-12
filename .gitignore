@@ -24,9 +24,6 @@ logs/
 # Third-party source clones are vendored locally, not tracked.
 third_party/
 
-# Pytest suites are not part of the runtime artifact.
-tests/
-
 # One-off debug probes and dev-phase verification scripts.
 scripts/manual/
 scripts/verify_p*.py
@@ -34,3 +31,6 @@ scripts/verify_p*.py
 # Internal development tracking/handoff docs.
 docs/dev_task_list.md
 docs/px4_agent_handoff.md
+
+# ZCode tool session artifacts.
+.zcode/

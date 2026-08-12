@@ -22,7 +22,6 @@ classifiers = [
 dependencies = [
     "airsim>=1.8.0",
     "backports.ssl_match_hostname>=3.7.0.1",
-    "mcp>=1.6.0",
     "numpy>=1.20.0",
     "opencv-python-headless>=4.8.0",
     "pillow>=10.0.0",
@@ -42,9 +41,6 @@ dev = [
 ]
 
 [project.scripts]
-airsim-mcp-airsim = "src.server_airsim:main"
-airsim-mcp-px4 = "src.server_px4:main"
-airsim-mcp-px4-ros2 = "src.server_px4_ros2:main"
 airsim-agent-ui = "src.ui.server:main"
 
 [project.urls]

@@ -52,16 +52,12 @@ uv sync
 uv run python -m src.ui.server --host 127.0.0.1 --port 8765 --backend px4_mavlink
 ```
 
-Backend options: `px4_mavlink`, `airsim`, `px4_ros2`.
-
-### MCP servers
-
-| Entry point | Purpose |
-|---|---|
-| `python -m src.server_airsim` | AirSim simulation backend |
-| `python -m src.server_px4` | PX4 / MAVLink backend |
-| `python -m src.server_px4_ros2` | PX4 + ROS2 gateway backend |
-| `python -m src.server` | Legacy compatibility alias |
+Backend options: `px4_mavlink`, `airsim`, `px4_ros2`. Backends are switched
+at runtime from the UI's Links panel (or `POST /api/backend`); the switch
+replaces the controller, re-registers the backend's tool set, and reconnects
+without restarting the process. There are no external MCP servers — the
+in-process agent runtime (`src.agent.AgentRuntime`) is the single execution
+surface for both the UI and the LLM planner.
 
 ## Project Structure
 

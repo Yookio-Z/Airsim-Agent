@@ -5,7 +5,6 @@ Replay 记录器 - 记录 AirSim 状态和 MAVLink 遥测数据
 from __future__ import annotations
 
 import json
-import os
 import time
 from pathlib import Path
 from typing import Any
@@ -14,13 +13,18 @@ from src.logging_config import get_logger
 
 logger = get_logger(__name__)
 
+# Recordings are runtime-local state: keep them inside the repo's data dir
+# (gitignored) instead of the user home, so sessions travel with the project.
+REPO_ROOT = Path(__file__).resolve().parents[2]
+DEFAULT_REPLAY_DIR = REPO_ROOT / "src" / "data" / "replay"
+
 
 class ReplayRecorder:
     """记录仿真会话的遥测数据，用于后续回放"""
 
     def __init__(self, session_name: str | None = None, data_dir: str | None = None) -> None:
         self.session_name = session_name or f"session_{int(time.time())}"
-        self.data_dir = Path(data_dir or os.path.expanduser("~/src/replay_data"))
+        self.data_dir = Path(data_dir or DEFAULT_REPLAY_DIR)
         self.session_dir = self.data_dir / self.session_name
         self.session_dir.mkdir(parents=True, exist_ok=True)
 
@@ -28,6 +32,11 @@ class ReplayRecorder:
         self._airsim_file: Any | None = None
         self._recording = False
         self._start_time: float = 0.0
+
+    def write_meta(self, meta: dict[str, Any]) -> None:
+        """Persist run metadata (command, run_id, ...) next to the frames."""
+        path = self.session_dir / "run.json"
+        path.write_text(json.dumps(meta, ensure_ascii=False, indent=2), encoding="utf-8")
 
     def start(self) -> None:
         """开始记录"""

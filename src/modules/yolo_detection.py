@@ -9,6 +9,7 @@ building blocks.
 from __future__ import annotations
 
 import threading
+from pathlib import Path
 from typing import Any
 
 import numpy as np
@@ -57,6 +58,15 @@ SIM_FALSE_POSITIVES = {
 }
 
 
+def _resolve_yolo_model_path() -> str:
+    """Locate the YOLO-World weights: repo-local models/ dir, then CWD (legacy)."""
+
+    repo_models = Path(__file__).resolve().parents[2] / "models" / "yolov8s-worldv2.pt"
+    if repo_models.is_file():
+        return str(repo_models)
+    return "yolov8s-worldv2.pt"
+
+
 def get_yolo_model(classes: list[str] | None = None) -> Any:
     """Load and cache YOLO-World, updating its class vocabulary when needed."""
 
@@ -65,7 +75,7 @@ def get_yolo_model(classes: list[str] | None = None) -> Any:
         if _yolo_model is None:
             from ultralytics import YOLO
 
-            _yolo_model = YOLO("yolov8s-worldv2.pt")
+            _yolo_model = YOLO(_resolve_yolo_model_path())
             _yolo_model_classes = None
             logger.info("YOLO-World v2 model loaded")
         if classes and tuple(classes) != _yolo_model_classes:
