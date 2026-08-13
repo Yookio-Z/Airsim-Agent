@@ -5971,10 +5971,6 @@ function airsimTemplateForConnectionType(type) {
 }
 
 function renderAirSimSettingsTemplates(data = {}) {
-  const pathEl = document.getElementById("airsimSettingsPath");
-  if (pathEl) pathEl.textContent = data.target_path || "";
-  const pathInput = document.getElementById("airsimSettingsPathInput");
-  if (pathInput) pathInput.value = data.target_path || "";
   const select = document.getElementById("airsimTemplateSelect");
   if (!select) return;
   select.textContent = "";
@@ -6014,9 +6010,11 @@ function renderAirSimTemplatePreview() {
   const template = airsimTemplatesCache.find((t) => t.id === airsimTemplateSelected);
   const desc = document.getElementById("airsimTemplateDesc");
   const content = document.getElementById("airsimTemplateContent");
+  const badge = document.getElementById("airsimTemplateBadge");
   if (!template || !desc || !content) return;
   desc.textContent = template.description || "";
   content.textContent = template.content || "";
+  if (badge) badge.textContent = template.label || "自动";
 }
 
 function toggleAirSimTemplates() {
@@ -6025,7 +6023,6 @@ function toggleAirSimTemplates() {
   if (!toggle || !body) return;
   const expanded = toggle.getAttribute("aria-expanded") === "true";
   toggle.setAttribute("aria-expanded", String(!expanded));
-  toggle.querySelector(".airsim-templates-toggle-icon").textContent = expanded ? "▸" : "▾";
   body.hidden = expanded;
   if (!expanded && !airsimTemplatesLoaded) loadAirSimSettingsTemplates();
 }
@@ -6043,34 +6040,21 @@ async function applyAirSimSettingsTemplate() {
     const resultEl = document.getElementById("airsimTemplateResult");
     if (resultEl) {
       resultEl.hidden = false;
+      resultEl.classList.toggle("error", !result.ok);
       resultEl.textContent = result.ok
-        ? `✅ 已写入 ${result.target_path}${result.backup_path ? `（备份: ${result.backup_path}）` : ""}`
+        ? `✅ 已写入当前用户 Documents/AirSim/settings.json${result.backup_path ? "（原文件已自动备份）" : ""}`
         : `❌ ${result.error || "应用失败"}`;
     }
   } catch (error) {
     const resultEl = document.getElementById("airsimTemplateResult");
     if (resultEl) {
       resultEl.hidden = false;
+      resultEl.classList.add("error");
       resultEl.textContent = `❌ ${error.message || "应用失败"}`;
     }
   } finally {
     button.disabled = false;
     button.textContent = original;
-  }
-}
-
-async function saveAirSimSettingsPath() {
-  const input = document.getElementById("airsimSettingsPathInput");
-  if (!input) return;
-  const result = await post("/api/airsim-settings/path", { path: input.value.trim() });
-  const resultEl = document.getElementById("airsimTemplateResult");
-  if (resultEl) {
-    resultEl.hidden = false;
-    resultEl.textContent = result.ok ? `✅ 配置文件路径已更新: ${result.target_path}` : `❌ ${result.error || "保存失败"}`;
-  }
-  if (result.ok) {
-    const pathEl = document.getElementById("airsimSettingsPath");
-    if (pathEl) pathEl.textContent = result.target_path;
   }
 }
 
@@ -6081,7 +6065,6 @@ function initAirSimTemplatesEvents() {
     renderAirSimTemplatePreview();
   });
   document.getElementById("airsimTemplateApply")?.addEventListener("click", applyAirSimSettingsTemplate);
-  document.getElementById("airsimSettingsPathSave")?.addEventListener("click", saveAirSimSettingsPath);
 }
 
 function vehicleSettingsAvailable() {

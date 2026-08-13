@@ -339,9 +339,6 @@ class AgentRequestHandler(BaseHTTPRequestHandler):
                 return
             self._send_json(RUNTIME.apply_airsim_settings_template(template_id))
             return
-        if path == "/api/airsim-settings/path":
-            self._send_json(RUNTIME.save_airsim_settings_path(str(payload.get("path") or "")))
-            return
 
         if path == "/api/settings/vehicle-parameters/set":
             name = str(payload.get("name", "")).strip()

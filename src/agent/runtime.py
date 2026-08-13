@@ -2611,32 +2611,21 @@ class AgentRuntime:
             "templates": templates,
             "target_path": str(target),
             "target_exists": target.is_file(),
-            "custom_path_set": bool(self._custom_airsim_settings_path()),
         }
-
-    @staticmethod
-    def _custom_airsim_settings_path() -> str:
-        """User-configured path override (persisted in system settings)."""
-        try:
-            return str((_load_settings().get("airsim") or {}).get("settings_path") or "").strip()
-        except Exception:
-            return ""
 
     @classmethod
     def _airsim_settings_path(cls) -> Path:
-        """Resolve the AirSim settings.json location.
+        """Resolve the AirSim settings.json location automatically.
 
-        Priority: AIRSIM_SETTINGS_PATH env var > persisted override >
-        %USERPROFILE%\\Documents\\AirSim > %USERPROFILE%\\AirSim.
-        Nothing is hard-coded: Path.home() follows the current Windows user,
-        so moving to another machine just works.
+        Nothing is hard-coded: %USERPROFILE% resolves from the current
+        Windows user (Path.home()), so moving to another machine just works.
+        The AIRSIM_SETTINGS_PATH environment variable remains available for
+        deployment-level overrides (e.g. a custom AirSim install location);
+        it is not exposed in the UI.
         """
         env_path = os.environ.get("AIRSIM_SETTINGS_PATH", "").strip()
         if env_path:
             return Path(env_path)
-        override = cls._custom_airsim_settings_path()
-        if override:
-            return Path(override)
         candidates = [
             Path.home() / "Documents" / "AirSim" / "settings.json",
             Path.home() / "AirSim" / "settings.json",
@@ -2645,18 +2634,6 @@ class AgentRuntime:
             if candidate.is_file():
                 return candidate
         return candidates[0]
-
-    def save_airsim_settings_path(self, path: str) -> dict[str, Any]:
-        """Persist a custom AirSim settings.json path override."""
-        try:
-            settings = _load_settings()
-            airsim = dict(settings.get("airsim") or {})
-            airsim["settings_path"] = str(path or "").strip()
-            settings["airsim"] = airsim
-            _save_settings(settings)
-            return {"ok": True, "target_path": str(self._airsim_settings_path())}
-        except Exception as exc:
-            return {"ok": False, "error": str(exc)}
 
     def apply_airsim_settings_template(self, template_id: str) -> dict[str, Any]:
         """Backup the current settings.json and write the requested template.

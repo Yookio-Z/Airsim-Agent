@@ -516,33 +516,36 @@
                   </div>
 
                   <div class="airsim-settings-templates">
-                    <button type="button" class="airsim-templates-toggle" id="airsimTemplatesToggle" aria-expanded="false">
-                      <span class="airsim-templates-toggle-icon">▸</span>
-                      <strong>AirSim settings.json 模板</strong>
-                      <span class="airsim-settings-path" id="airsimSettingsPath" title="AirSim 通信模式配置文件"></span>
+                    <button type="button" class="airsim-templates-toggle" id="airsimTemplatesToggle" aria-expanded="false" aria-controls="airsimTemplatesBody">
+                      <span class="airsim-templates-toggle-icon" aria-hidden="true">▸</span>
+                      <span class="airsim-templates-toggle-text">AirSim settings.json 模板</span>
+                      <span class="airsim-template-badge" id="airsimTemplateBadge">自动</span>
                     </button>
                     <div id="airsimTemplatesBody" class="airsim-templates-body" hidden>
                       <p class="airsim-settings-hint">
-                        AirSim 的通信模式由 <code>settings.json</code> 决定。选择连接预设会自动匹配对应模板，
+                        AirSim 的通信模式由 <code>settings.json</code> 决定，系统会自动使用当前用户
+                        <code>Documents/AirSim</code> 下的配置文件。选择连接预设会自动匹配对应模板，
                         应用前自动备份原文件，之后重启 AirSim 生效。
                       </p>
-                      <div class="form-row">
-                        <label for="airsimTemplateSelect">模板</label>
-                        <select id="airsimTemplateSelect"></select>
+                      <div class="airsim-template-control">
+                        <div class="form-row">
+                          <label for="airsimTemplateSelect">模板</label>
+                          <select id="airsimTemplateSelect"></select>
+                        </div>
+                        <p class="airsim-template-desc" id="airsimTemplateDesc"></p>
                       </div>
                       <div class="airsim-template-preview">
                         <div class="airsim-template-preview-head">
-                          <span id="airsimTemplateDesc"></span>
-                          <button type="button" id="airsimTemplateApply" class="primary">应用模板</button>
+                          <span>配置预览</span>
+                          <span class="airsim-template-file">settings.json</span>
                         </div>
                         <pre id="airsimTemplateContent"></pre>
                       </div>
-                      <div id="airsimTemplateResult" class="airsim-template-result" hidden></div>
-                      <div class="form-row airsim-settings-path-row">
-                        <label for="airsimSettingsPathInput" title="换机器或自定义 AirSim 配置位置时使用（也可设置 AIRSIM_SETTINGS_PATH 环境变量）">配置文件路径</label>
-                        <input type="text" id="airsimSettingsPathInput" placeholder="C:\Users\...\Documents\AirSim\settings.json">
-                        <button type="button" id="airsimSettingsPathSave" class="secondary">保存</button>
+                      <div class="airsim-template-actions">
+                        <span class="airsim-template-note">应用后重启 AirSim 生效</span>
+                        <button type="button" id="airsimTemplateApply" class="primary">应用模板</button>
                       </div>
+                      <div id="airsimTemplateResult" class="airsim-template-result" hidden></div>
                     </div>
                   </div>
                 </form>

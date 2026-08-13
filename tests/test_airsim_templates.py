@@ -67,14 +67,6 @@ def test_airsim_settings_path_not_hardcoded(monkeypatch) -> None:
     monkeypatch.delenv("AIRSIM_SETTINGS_PATH", raising=False)
     resolved = AgentRuntime._airsim_settings_path()
     assert "26494" not in str(resolved).lower() or pathlib.Path.home().name == "26494"
-
-
-def test_save_airsim_settings_path_persists_override(tmp_path, monkeypatch) -> None:
-    from src.agent import runtime as runtime_module
-
-    target = tmp_path / "my_airsim" / "settings.json"
-    monkeypatch.setattr(runtime_module, "SETTINGS_PATH", tmp_path / "system_settings.json")
-    rt = object.__new__(AgentRuntime)
-    result = rt.save_airsim_settings_path(str(target))
-    assert result["ok"] is True
-    assert rt._airsim_settings_path() == target
+    # 默认落在当前用户 Documents/AirSim 或 AirSim 下，且不包含其他用户目录
+    assert resolved.parent.name == "AirSim"
+    assert resolved.parent.parent.parent == pathlib.Path.home()
