@@ -543,6 +543,12 @@ class ToolRuntime:
                 time.time(),
             )
 
+    # Real devices (local webcam / RTSP) must NOT stay opened when no preview
+    # request arrives for a while — otherwise e.g. a laptop webcam "in use" LED
+    # stays lit forever even though nobody is viewing it. Release idle preview
+    # controllers after this many seconds of no use.
+    PREVIEW_IDLE_RELEASE_SEC = 3.0
+
     def _ensure_preview_controller(self, params: dict[str, Any] | None = None) -> tuple[Any | None, str]:
         """Build (or reuse) a camera controller for a single UI preview frame.
 
@@ -588,6 +594,7 @@ class ToolRuntime:
         with self._camera_lock:
             controller = cache.get(key)
             if controller is not None and bool(getattr(controller, "is_connected", False)):
+                controller._last_preview_used = time.time()
                 return controller, ""
             if controller is not None:
                 try:
@@ -617,6 +624,7 @@ class ToolRuntime:
                 message = details.get("message") if isinstance(details, dict) else ""
                 return None, (message or f"{source} camera source is not connected")
             cache[key] = controller
+            controller._last_preview_used = time.time()
             return controller, ""
 
     def capture_camera_preview(self, params: dict[str, Any] | None = None) -> tuple[bool, bytes, str, dict[str, Any]]:
@@ -626,6 +634,7 @@ class ToolRuntime:
         path: no stationary check, no retry/cooldown loop, no base64 JSON.
         Agent visual reasoning still uses governed tools.
         """
+        self._start_preview_reaper()
         raw_params = dict(params or {})
         controller, error = self._ensure_preview_controller(raw_params)
         if controller is None:
@@ -707,6 +716,48 @@ class ToolRuntime:
                 "status": "error",
                 "message": str(exc),
             }
+
+    # -- preview controller idle reaper ------------------------------------
+
+    def _start_preview_reaper(self) -> None:
+        """Lazily start a daemon thread that releases idle real-device controllers.
+
+        Real cameras/streams (local webcam, RTSP) must be closed when no preview
+        request arrives for a while, otherwise e.g. a laptop webcam LED stays on
+        forever. The reaper disconnects cached local/rtsp controllers once they
+        have been idle longer than ``PREVIEW_IDLE_RELEASE_SEC``. AirSim RPC
+        clients are left connected (no physical device / cheap to reconnect).
+        """
+        if getattr(self, "_preview_reaper_started", False):
+            return
+        self._preview_reaper_started = True
+        thread = threading.Thread(target=self._preview_reaper_loop, name="preview-reaper", daemon=True)
+        thread.start()
+
+    def _preview_reaper_loop(self) -> None:
+        while True:
+            time.sleep(1.0)
+            try:
+                self._reap_idle_preview_controllers()
+            except Exception:
+                pass
+
+    def _reap_idle_preview_controllers(self) -> None:
+        cache = getattr(self, "_preview_controllers", None)
+        if not cache:
+            return
+        now = time.time()
+        with self._camera_lock:
+            for key, controller in list(cache.items()):
+                if not (key.startswith("local:") or key.startswith("rtsp:")):
+                    continue
+                last = float(getattr(controller, "_last_preview_used", 0.0) or 0.0)
+                if last and (now - last) > self.PREVIEW_IDLE_RELEASE_SEC:
+                    try:
+                        controller.disconnect()
+                    except Exception:
+                        pass
+                    controller._last_preview_used = 0.0
 
     @staticmethod
     def _encode_preview_frame(raw: bytes, max_width: int = 640, quality: int = 62) -> tuple[bytes, str]:
