@@ -1,0 +1,82 @@
+{
+  "SettingsVersion": 1.2,
+  "SimMode": "Multirotor",
+  "ApiServerPort": 41452,
+  "ClockSpeed": 1.0,
+  "ClockType": "SteppableClock",
+  "ViewMode": "FlyWithMe",
+  "AllowAPIAlways": true,
+
+  "OriginGeopoint": {
+    "Latitude": 39.9042,
+    "Longitude": 116.4074,
+    "Altitude": 50.0
+  },
+
+  "Vehicles": {
+    "Drone1": {
+      "VehicleType": "SimpleFlight",
+      "AutoCreate": true,
+      "X": 0,
+      "Y": 0,
+      "Z": -2,
+      "Yaw": 0,
+      "Cameras": {
+        "0": {
+          "X": 0,
+          "Y": 0,
+          "Z": 0,
+          "Pitch": -45,
+          "Roll": 0,
+          "Yaw": 0,
+          "CaptureSettings": [
+            { "ImageType": 0, "Width": 640, "Height": 480, "FOV_Degrees": 90 },
+            { "ImageType": 2, "Width": 640, "Height": 480, "FOV_Degrees": 90 }
+          ]
+        }
+      }
+    },
+    "Drone2": {
+      "VehicleType": "SimpleFlight",
+      "AutoCreate": true,
+      "X": 3,
+      "Y": 0,
+      "Z": -2,
+      "Yaw": 0,
+      "Cameras": {
+        "0": {
+          "X": 0,
+          "Y": 0,
+          "Z": 0,
+          "Pitch": -45,
+          "Roll": 0,
+          "Yaw": 0,
+          "CaptureSettings": [
+            { "ImageType": 0, "Width": 640, "Height": 480, "FOV_Degrees": 90 }
+          ]
+        }
+      }
+    },
+    "Drone3": {
+      "VehicleType": "SimpleFlight",
+      "AutoCreate": true,
+      "X": -3,
+      "Y": 0,
+      "Z": -2,
+      "Yaw": 0,
+      "Cameras": {
+        "0": {
+          "X": 0,
+          "Y": 0,
+          "Z": 0,
+          "Pitch": -45,
+          "Roll": 0,
+          "Yaw": 0,
+          "CaptureSettings": [
+            { "ImageType": 0, "Width": 640, "Height": 480, "FOV_Degrees": 90 }
+          ]
+        }
+      }
+    }
+  }
+}

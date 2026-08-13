@@ -5936,6 +5936,73 @@ async function openSystemSettings() {
   renderVehicleSettingsPanel();
   setSystemSettingsSection(activeSystemSettingsSection || "links");
   renderSystemConnection();
+  loadAirSimSettingsTemplates();
+}
+
+// ── AirSim settings.json 模板（通信模式一键切换） ──
+let airsimTemplatesLoaded = false;
+
+async function loadAirSimSettingsTemplates(force = false) {
+  if (airsimTemplatesLoaded && !force) return;
+  try {
+    const data = await api("/api/airsim-settings");
+    airsimTemplatesLoaded = true;
+    renderAirSimSettingsTemplates(data);
+  } catch (error) {
+    console.warn("AirSim settings templates load failed:", error);
+  }
+}
+
+function renderAirSimSettingsTemplates(data = {}) {
+  const pathEl = document.getElementById("airsimSettingsPath");
+  if (pathEl) pathEl.textContent = data.target_path || "";
+  const list = document.getElementById("airsimTemplatesList");
+  if (!list) return;
+  list.textContent = "";
+  for (const template of data.templates || []) {
+    const row = document.createElement("div");
+    row.className = "airsim-template-row";
+    const info = document.createElement("div");
+    info.className = "airsim-template-info";
+    const title = document.createElement("strong");
+    title.textContent = template.label;
+    const desc = document.createElement("span");
+    desc.textContent = template.description;
+    info.append(title, desc);
+    const btn = document.createElement("button");
+    btn.type = "button";
+    btn.className = "secondary";
+    btn.textContent = "应用模板";
+    btn.addEventListener("click", () => applyAirSimSettingsTemplate(template.id, btn));
+    row.append(info, btn);
+    list.appendChild(row);
+  }
+}
+
+async function applyAirSimSettingsTemplate(templateId, button) {
+  if (!confirm("将备份当前 settings.json 并写入该模板，之后需要重启 AirSim 生效。继续？")) return;
+  const original = button.textContent;
+  button.disabled = true;
+  button.textContent = "应用中...";
+  try {
+    const result = await post("/api/airsim-settings/apply", { template: templateId });
+    const resultEl = document.getElementById("airsimTemplateResult");
+    if (resultEl) {
+      resultEl.hidden = false;
+      resultEl.textContent = result.ok
+        ? `✅ 已写入 ${result.target_path}${result.backup_path ? `（备份: ${result.backup_path}）` : ""}`
+        : `❌ ${result.error || "应用失败"}`;
+    }
+  } catch (error) {
+    const resultEl = document.getElementById("airsimTemplateResult");
+    if (resultEl) {
+      resultEl.hidden = false;
+      resultEl.textContent = `❌ ${error.message || "应用失败"}`;
+    }
+  } finally {
+    button.disabled = false;
+    button.textContent = original;
+  }
 }
 
 function vehicleSettingsAvailable() {

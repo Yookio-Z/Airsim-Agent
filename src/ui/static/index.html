@@ -515,6 +515,19 @@
                     <button type="submit" class="primary">保存设置</button>
                   </div>
                 </form>
+
+                <div class="airsim-settings-templates">
+                  <div class="settings-section-head">
+                    <strong>AirSim settings.json 模板</strong>
+                    <span class="airsim-settings-path" id="airsimSettingsPath" title="AirSim 通信模式配置文件"></span>
+                  </div>
+                  <p class="airsim-settings-hint">
+                    AirSim 的通信模式由 <code>Documents\AirSim\settings.json</code> 决定。切换模式时一键应用模板
+                    （自动备份原文件），然后重启 AirSim 即可。
+                  </p>
+                  <div id="airsimTemplatesList" class="airsim-templates-list"></div>
+                  <div id="airsimTemplateResult" class="airsim-template-result" hidden></div>
+                </div>
               </div>
             </section>
 

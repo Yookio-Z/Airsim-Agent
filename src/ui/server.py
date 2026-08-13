@@ -205,6 +205,9 @@ class AgentRequestHandler(BaseHTTPRequestHandler):
         if path == "/api/settings/camera":
             self._send_json({"ok": True, "camera": RUNTIME.camera_settings()})
             return
+        if path == "/api/airsim-settings":
+            self._send_json({"ok": True, **RUNTIME.airsim_settings_info()})
+            return
         if path == "/api/camera/preview":
             params = self._query_params(parsed)
             ok, body, mime_type, meta = RUNTIME.camera_preview_frame(params)
@@ -323,6 +326,18 @@ class AgentRequestHandler(BaseHTTPRequestHandler):
 
         if path == "/api/settings/camera":
             self._send_json(RUNTIME.save_camera_settings(payload))
+            return
+
+        # AirSim settings.json 模板（通信模式一键切换，自动备份）
+        if path == "/api/airsim-settings":
+            self._send_json({"ok": True, **RUNTIME.airsim_settings_info()})
+            return
+        if path == "/api/airsim-settings/apply":
+            template_id = str(payload.get("template") or "")
+            if not template_id:
+                self._send_json({"ok": False, "error": "template required"}, HTTPStatus.BAD_REQUEST)
+                return
+            self._send_json(RUNTIME.apply_airsim_settings_template(template_id))
             return
 
         if path == "/api/settings/vehicle-parameters/set":

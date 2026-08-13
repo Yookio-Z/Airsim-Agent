@@ -42,6 +42,31 @@ SKILLS_OVERRIDES_PATH = REPO_ROOT / "src" / "data" / "skills.json"
 ATTACHMENTS_DIR = REPO_ROOT / "src" / "data" / "attachments"
 ATTACHMENTS_DIR.mkdir(parents=True, exist_ok=True)
 
+# AirSim settings.json 通信模式模板（config/airsim_settings/）：
+#   airsim_simpleflight_multirotor -> airsim 后端（本机直接 RPC 控制，3 机）
+#   px4_mavlink_udp_sitl          -> px4_mavlink 后端（UDP 连本机/WSL PX4 SITL）
+#   px4_ros2_tcp_edge             -> px4_ros2 后端（TCP 连 Jetson/边端 PX4 SITL）
+AIRSIM_SETTINGS_TEMPLATES: dict[str, dict[str, str]] = {
+    "airsim_simpleflight_multirotor": {
+        "label": "AirSim 纯仿真（SimpleFlight · 3 机）",
+        "description": "本机 AirSim 直接 API 控制，对应系统 airsim 后端。三架 SimpleFlight 用于多机验证。",
+        "backend": "airsim",
+        "file": "airsim_simpleflight_multirotor.json",
+    },
+    "px4_mavlink_udp_sitl": {
+        "label": "PX4 MAVLink（UDP · 本机/虚拟机 SITL）",
+        "description": "AirSim 作为 PX4 仿真器，UDP 14540/14580 连接本机或 WSL 的 PX4 SITL，对应 px4_mavlink 后端。",
+        "backend": "px4_mavlink",
+        "file": "px4_mavlink_udp_sitl.json",
+    },
+    "px4_ros2_tcp_edge": {
+        "label": "PX4 ROS2（TCP · Jetson/边端 SITL）",
+        "description": "TCP 4560 连接 Jetson 边端 PX4 SITL（ControlIp 按实际 IP 修改），对应 px4_ros2 后端。",
+        "backend": "px4_ros2",
+        "file": "px4_ros2_tcp_edge.json",
+    },
+}
+
 # Plan-Execute ⇄ ReAct collaboration:
 # - OBSERVATION_TOOLS: steps whose outcome must be seen before the next step
 #   can be chosen (photo/VLM/detect/depth).
@@ -2552,6 +2577,78 @@ class AgentRuntime:
             settings["camera"] = persisted
             _save_settings(settings)
             return {"ok": True, "camera": merged}
+        except Exception as exc:
+            return {"ok": False, "error": str(exc)}
+
+    # ── AirSim settings.json 模板（通信模式一键切换） ──
+
+    def airsim_settings_info(self) -> dict[str, Any]:
+        """List AirSim settings.json templates + the target file location.
+
+        AirSim's communication mode is decided by ~/Documents/AirSim/settings.json:
+          * SimpleFlight           -> airsim backend (direct RPC control)
+          * PX4Multirotor + UDP    -> px4_mavlink backend (local/WSL PX4 SITL)
+          * PX4Multirotor + TCP    -> px4_ros2 backend (Jetson/edge PX4 SITL)
+        """
+        templates_dir = REPO_ROOT / "config" / "airsim_settings"
+        templates: list[dict[str, Any]] = []
+        for template_id, meta in AIRSIM_SETTINGS_TEMPLATES.items():
+            path = templates_dir / meta["file"]
+            templates.append(
+                {
+                    "id": template_id,
+                    "label": meta["label"],
+                    "description": meta["description"],
+                    "backend": meta["backend"],
+                    "exists": path.is_file(),
+                    "size": path.stat().st_size if path.is_file() else 0,
+                }
+            )
+        target = self._airsim_settings_path()
+        return {
+            "templates": templates,
+            "target_path": str(target),
+            "target_exists": target.is_file(),
+        }
+
+    @staticmethod
+    def _airsim_settings_path() -> Path:
+        """AirSim settings.json location (Windows Documents/AirSim)."""
+        candidates = [
+            Path.home() / "Documents" / "AirSim" / "settings.json",
+            Path.home() / "AirSim" / "settings.json",
+        ]
+        for candidate in candidates:
+            if candidate.is_file():
+                return candidate
+        return candidates[0]
+
+    def apply_airsim_settings_template(self, template_id: str) -> dict[str, Any]:
+        """Backup the current settings.json and write the requested template.
+
+        Never destructive: the existing file (if any) is copied to
+        settings.json.bak-<timestamp> before writing.
+        """
+        meta = AIRSIM_SETTINGS_TEMPLATES.get(str(template_id or ""))
+        if meta is None:
+            return {"ok": False, "error": f"unknown template: {template_id}"}
+        template_path = REPO_ROOT / "config" / "airsim_settings" / meta["file"]
+        if not template_path.is_file():
+            return {"ok": False, "error": f"template file missing: {template_path.name}"}
+        target = self._airsim_settings_path()
+        try:
+            target.parent.mkdir(parents=True, exist_ok=True)
+            backup_path = None
+            if target.is_file():
+                backup_path = target.with_name(f"settings.json.bak-{time.strftime('%Y%m%d-%H%M%S')}")
+                backup_path.write_bytes(target.read_bytes())
+            target.write_bytes(template_path.read_bytes())
+            return {
+                "ok": True,
+                "template": template_id,
+                "target_path": str(target),
+                "backup_path": str(backup_path) if backup_path else None,
+            }
         except Exception as exc:
             return {"ok": False, "error": str(exc)}
 

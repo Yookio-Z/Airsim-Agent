@@ -1,0 +1,62 @@
+{
+  "SettingsVersion": 1.2,
+  "SimMode": "Multirotor",
+  "ApiServerPort": 41452,
+  "ClockSpeed": 1.0,
+  "ClockType": "SteppableClock",
+  "ViewMode": "FlyWithMe",
+  "AllowAPIAlways": true,
+
+  "OriginGeopoint": {
+    "Latitude": 39.9042,
+    "Longitude": 116.4074,
+    "Altitude": 50.0
+  },
+
+  "Vehicles": {
+    "Drone1": {
+      "VehicleType": "PX4Multirotor",
+      "AutoCreate": true,
+      "X": 0,
+      "Y": 0,
+      "Z": -2,
+      "Yaw": 0,
+
+      "UseSerial": false,
+      "LockStep": false,
+      "UseTcp": true,
+      "TcpPort": 4560,
+      "ControlIp": "192.168.137.217",
+      "ControlPortLocal": 14540,
+      "ControlPortRemote": 14580,
+
+      "LocalHostIp": "0.0.0.0",
+      "Sensors": {
+        "imu": { "SensorType": 2, "Enabled": true },
+        "magnetometer": { "SensorType": 4, "Enabled": true },
+        "gps": { "SensorType": 3, "Enabled": true },
+        "barometer": { "SensorType": 1, "Enabled": true }
+      },
+      "Cameras": {
+        "0": {
+          "X": 0,
+          "Y": 0,
+          "Z": 0,
+          "Pitch": -45,
+          "Roll": 0,
+          "Yaw": 0,
+          "CaptureSettings": [
+            { "ImageType": 0, "Width": 640, "Height": 480, "FOV_Degrees": 90 },
+            { "ImageType": 2, "Width": 640, "Height": 480, "FOV_Degrees": 90 }
+          ]
+        }
+      },
+
+      "Parameters": {
+        "LPE_LAT": 39.9042,
+        "LPE_LON": 116.4074,
+        "COM_OBL_ACT": 1
+      }
+    }
+  }
+}
