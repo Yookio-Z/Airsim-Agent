@@ -341,19 +341,24 @@
     <!-- 系统设置模态框：应用设置 + 飞控设置 -->
     <div id="systemSettingsModal" class="modal-overlay" hidden>
       <div class="modal-card system-settings-card">
+        <div class="resize-handle resize-nw" data-resize="nw" title="拖拽调整大小"></div>
+        <div class="resize-handle resize-n" data-resize="n"></div>
+        <div class="resize-handle resize-ne" data-resize="ne"></div>
+        <div class="resize-handle resize-e" data-resize="e"></div>
+        <div class="resize-handle resize-se" data-resize="se" title="拖拽调整大小"></div>
+        <div class="resize-handle resize-s" data-resize="s"></div>
+        <div class="resize-handle resize-sw" data-resize="sw"></div>
+        <div class="resize-handle resize-w" data-resize="w"></div>
         <header class="modal-head">
-          <div>
-            <strong>设置</strong>
-            <span>应用设置与飞控设置</span>
+          <div class="modal-head-title">设置</div>
+          <div class="modal-head-actions">
+            <button id="systemSettingsMaximize" class="icon-button" type="button" title="全屏" aria-label="全屏"><svg viewBox="0 0 16 16" width="15" height="15" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><path d="M2.5 6V2.5h3.5M13.5 6V2.5h-3.5M2.5 10v3.5h3.5M13.5 10v3.5h-3.5"/></svg></button>
+            <button id="systemSettingsClose" class="icon-button" title="关闭">×</button>
           </div>
-          <button id="systemSettingsClose" class="icon-button" title="关闭">×</button>
         </header>
 
         <div class="system-settings-body">
           <aside class="system-settings-sidebar">
-            <div class="sidebar-head">
-              <strong>Settings</strong>
-            </div>
             <nav id="systemSettingsNav" class="system-settings-nav" aria-label="系统设置导航">
               <span class="nav-group-label">Application Settings</span>
               <button type="button" data-system-section="general">通用</button>
@@ -431,22 +436,10 @@
             </section>
 
             <section class="system-settings-panel active" data-system-panel="links">
-              <header class="system-panel-head">
-                <div>
-                  <strong>通信链路</strong>
-                  <span>USB 自动识别优先，UDP/SITL 只作为备用链路</span>
-                </div>
-                <label class="toggle-switch small" title="启动时自动连接">
-                  <input id="autoConnectToggle" type="checkbox" checked>
-                  <span class="toggle-track"></span>
-                </label>
-              </header>
-
               <div class="link-settings-layout">
                 <aside class="links-list-column">
                   <div class="settings-section-head">
                     <strong>连接预设</strong>
-                    <span id="detectedLinkCount">0 detected</span>
                   </div>
                   <div id="connectionsList" class="connections-list"></div>
                   <button id="addConnectionBtn" class="sidebar-add" type="button">+ 添加连接</button>
@@ -510,43 +503,27 @@
                     </label>
                   </div>
 
-                  <div class="detail-footer">
-                    <button type="button" id="connectionDetailCancel" class="secondary">取消</button>
-                    <button type="submit" class="primary">保存设置</button>
+                  <div id="airsimSettingsTemplates" class="airsim-settings-templates" hidden>
+                    <div class="airsim-template-row">
+                      <span class="airsim-template-label">AirSim settings.json</span>
+                      <span class="airsim-template-name" id="airsimTemplateName">—</span>
+                    </div>
+                    <details class="airsim-template-preview" open>
+                      <summary>
+                        <span class="airsim-template-preview-label">
+                          <span class="airsim-template-preview-dot"></span>
+                          配置预览
+                        </span>
+                      </summary>
+                      <div class="airsim-template-code" id="airsimTemplateCode" aria-label="AirSim settings.json 预览"></div>
+                    </details>
+                    <div id="airsimTemplateResult" class="airsim-template-result" hidden></div>
                   </div>
 
-                  <div class="airsim-settings-templates">
-                    <button type="button" class="airsim-templates-toggle" id="airsimTemplatesToggle" aria-expanded="false" aria-controls="airsimTemplatesBody">
-                      <span class="airsim-templates-toggle-icon" aria-hidden="true">▸</span>
-                      <span class="airsim-templates-toggle-text">AirSim settings.json 模板</span>
-                      <span class="airsim-template-badge" id="airsimTemplateBadge">自动</span>
-                    </button>
-                    <div id="airsimTemplatesBody" class="airsim-templates-body" hidden>
-                      <p class="airsim-settings-hint">
-                        AirSim 的通信模式由 <code>settings.json</code> 决定，系统会自动使用当前用户
-                        <code>Documents/AirSim</code> 下的配置文件。选择连接预设会自动匹配对应模板，
-                        应用前自动备份原文件，之后重启 AirSim 生效。
-                      </p>
-                      <div class="airsim-template-control">
-                        <div class="form-row">
-                          <label for="airsimTemplateSelect">模板</label>
-                          <select id="airsimTemplateSelect"></select>
-                        </div>
-                        <p class="airsim-template-desc" id="airsimTemplateDesc"></p>
-                      </div>
-                      <div class="airsim-template-preview">
-                        <div class="airsim-template-preview-head">
-                          <span>配置预览</span>
-                          <span class="airsim-template-file">settings.json</span>
-                        </div>
-                        <pre id="airsimTemplateContent"></pre>
-                      </div>
-                      <div class="airsim-template-actions">
-                        <span class="airsim-template-note">应用后重启 AirSim 生效</span>
-                        <button type="button" id="airsimTemplateApply" class="primary">应用模板</button>
-                      </div>
-                      <div id="airsimTemplateResult" class="airsim-template-result" hidden></div>
-                    </div>
+                  <div class="detail-footer">
+                    <button type="button" id="connectionDetailCancel" class="secondary">取消</button>
+                    <button type="button" id="airsimTemplateApply" class="secondary airsim-apply-btn" hidden>应用到 settings.json</button>
+                    <button type="submit" class="primary">保存设置</button>
                   </div>
                 </form>
               </div>

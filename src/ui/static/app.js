@@ -1,4 +1,4 @@
-const $ = (id) => document.getElementById(id);
+﻿const $ = (id) => document.getElementById(id);
 
 const els = {
   appShell: $("appShell"),
@@ -84,13 +84,12 @@ const els = {
   settingsOpen: $("settingsOpen"),
   agentSettingsClose: $("agentSettingsClose"),
   systemSettingsClose: $("systemSettingsClose"),
+  systemSettingsMaximize: $("systemSettingsMaximize"),
   systemSettingsNav: $("systemSettingsNav"),
   vehicleSettingsSource: $("vehicleSettingsSource"),
   mapSettingsBtn: $("mapSettingsBtn"),
-  autoConnectToggle: $("autoConnectToggle"),
   addConnectionBtn: $("addConnectionBtn"),
   connectionsList: $("connectionsList"),
-  detectedLinkCount: $("detectedLinkCount"),
   connectionDetailForm: $("connectionDetailForm"),
   connectionDetailId: $("connectionDetailId"),
   connectionDetailName: $("connectionDetailName"),
@@ -793,199 +792,17 @@ function isConnectionActive(connId) {
   return connId === activeConnectionId;
 }
 
-function renderConnectionsList() {
-  const list = els.connectionsList;
-  if (!list) return;
-  const connections = connectionsCache;
-  if (!connections.length) {
-    list.innerHTML = `<div class="empty" style="padding:12px 4px;color:var(--faint);font-size:12px;text-align:center;">暂无连接，点击下方添加</div>`;
-    return;
-  }
-  list.innerHTML = connections.map((conn) => {
-    const typeLabel = { auto: "自动", serial: "Serial", udp: "UDP", tcp: "TCP", airsim: "AirSim" }[conn.type] || conn.type;
-    const paramText = Object.entries(conn.params || {})
-      .filter(([, v]) => v)
-      .map(([k, v]) => `${k}: ${v}`)
-      .join(" · ") || "默认参数";
-    const activeClass = conn.id === selectedConnectionId ? "active" : "";
-    const connectedClass = isConnectionActive(conn.id) ? "connected" : "";
-    return `
-      <div class="connection-item ${activeClass} ${connectedClass}" data-connection-id="${escapeHtml(conn.id)}" role="button" tabindex="0" aria-pressed="${conn.id === selectedConnectionId ? 'true' : 'false'}">
-        <span class="link-dot"></span>
-        <div class="connection-item-info">
-          <strong>${escapeHtml(conn.name)}</strong>
-          <span>${escapeHtml(typeLabel)} · ${escapeHtml(paramText)}</span>
-        </div>
-        <span class="link-chevron">›</span>
-      </div>
-    `;
-  }).join("");
-}
 
-function renderConnectionDetail(connectionId) {
-  selectedConnectionId = connectionId || "";
-  renderConnectionsList();
-  syncAirSimTemplateForConnection();
 
-  const conn = selectedConnectionId ? connectionsCache.find((c) => c.id === selectedConnectionId) : null;
-  const form = els.connectionDetailForm;
-  if (!form) return;
 
-  if (!conn) {
-    form.reset();
-    els.connectionDetailId.value = "";
-    updateConnectionDetailStatus(false);
-    if (els.connectionDetailConnect) els.connectionDetailConnect.textContent = "连接";
-    if (els.connectionDetailDelete) els.connectionDetailDelete.hidden = true;
-    return;
-  }
 
-  els.connectionDetailId.value = conn.id;
-  els.connectionDetailName.value = conn.name;
-  els.connectionDetailType.value = conn.type;
-  const params = conn.params || {};
-  els.connectionDetailPort.value = params.port || "";
-  els.connectionDetailHost.value = params.host || "";
-  els.connectionDetailAddress.value = params.address || "";
-  els.connectionDetailPortNumber.value = params.portNumber || params.baud || "";
-  els.connectionDetailRemotePort.value = params.remotePort || "";
-  els.connectionDetailRealVehicle.checked = Boolean(params.realVehicle);
-  updateConnectionTypeFields();
 
-  const actuallyActive = isConnectionActive(conn.id);
-  updateConnectionDetailStatus(actuallyActive);
-  if (els.connectionDetailConnect) {
-    els.connectionDetailConnect.textContent = actuallyActive ? "断开" : "连接";
-  }
-  if (els.connectionDetailDelete) els.connectionDetailDelete.hidden = false;
-}
 
-function updateConnectionDetailStatus(connected) {
-  if (!els.connectionDetailStatus) return;
-  els.connectionDetailStatus.classList.toggle("connected", connected);
-  const text = els.connectionDetailStatus.querySelector(".status-text");
-  if (text) text.textContent = connected ? "已连接" : "未连接";
-}
 
-function updateConnectionTypeFields() {
-  const type = els.connectionDetailType ? els.connectionDetailType.value : "auto";
-  const serialFields = document.getElementById("serialFieldsDetail");
-  const udpFields = document.getElementById("udpFieldsDetail");
-  const tcpFields = document.getElementById("tcpFieldsDetail");
-  const portFields = document.getElementById("portFieldsDetail");
-  const remotePortFields = document.getElementById("remotePortFieldsDetail");
-  const realVehicleFields = document.getElementById("realVehicleFieldsDetail");
-  if (serialFields) serialFields.hidden = type !== "serial";
-  if (udpFields) udpFields.hidden = type !== "udp" && type !== "airsim" && type !== "auto";
-  if (tcpFields) tcpFields.hidden = type !== "tcp";
-  if (remotePortFields) remotePortFields.hidden = type !== "udp" && type !== "auto";
-  if (realVehicleFields) realVehicleFields.hidden = type === "airsim";
-  if (portFields) {
-    const label = portFields.querySelector("label");
-    if (label) {
-      label.textContent = type === "serial"
-        ? "波特率"
-        : type === "udp" || type === "auto"
-          ? "本地监听端口"
-          : "端口";
-    }
-    els.connectionDetailPortNumber.placeholder = type === "serial"
-      ? "57600、115200 或 921600"
-      : "14540、14550 或 5760";
-    portFields.hidden = type !== "serial" && type !== "udp" && type !== "tcp" && type !== "airsim" && type !== "auto";
-  }
-}
 
-async function submitConnectionDetail(event) {
-  event.preventDefault();
-  const id = els.connectionDetailId.value.trim();
-  const name = els.connectionDetailName.value.trim();
-  const type = els.connectionDetailType.value;
-  if (!name) {
-    showNotice("请输入连接名称", "error");
-    return;
-  }
-  const params = {};
-  if (type === "serial") params.port = els.connectionDetailPort.value.trim();
-  if (type === "udp" || type === "airsim" || type === "auto") params.host = els.connectionDetailHost.value.trim();
-  if (type === "tcp") params.address = els.connectionDetailAddress.value.trim();
-  if (type === "serial") params.baud = els.connectionDetailPortNumber.value.trim();
-  if (type === "udp" || type === "tcp" || type === "airsim" || type === "auto") params.portNumber = els.connectionDetailPortNumber.value.trim();
-  if (type === "udp" || type === "auto") params.remotePort = els.connectionDetailRemotePort.value.trim();
-  if (type !== "airsim") params.realVehicle = Boolean(els.connectionDetailRealVehicle.checked);
 
-  if (id) {
-    const idx = connectionsCache.findIndex((c) => c.id === id);
-    if (idx >= 0) {
-      connectionsCache[idx] = { ...connectionsCache[idx], name, type, params };
-    }
-  } else {
-    const newConn = {
-      id: `conn_${Date.now()}`,
-      name,
-      type,
-      params,
-    };
-    connectionsCache.push(newConn);
-    selectedConnectionId = newConn.id;
-  }
-  const saved = await saveConnectionSettings();
-  if (!saved) return;
-  renderConnectionsList();
-  renderConnectionDetail(selectedConnectionId);
-  showNotice(id ? "连接已更新" : "连接已添加", "success");
-}
 
-async function activateSelectedConnection() {
-  if (!selectedConnectionId) return;
-  const conn = connectionsCache.find((c) => c.id === selectedConnectionId);
-  if (!conn) return;
 
-  const actuallyActive = isConnectionActive(conn.id);
-  if (actuallyActive) {
-    showNotice("正在断开连接...", "info");
-  } else {
-    showNotice(`正在连接 ${conn.name}...`, "info");
-  }
-
-  try {
-    // Use raw fetch — api() throws on ok=false, discarding detailed error info.
-    const resp = await fetch("/api/settings/connections/activate", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ connection_id: conn.id }),
-    });
-    const result = await resp.json();
-    const toolData = result?.result?.data || {};
-    const backendLabel = result?.backend === "px4_mavlink" ? "PX4 MAVLink" : result?.backend === "airsim" ? "AirSim" : result?.backend || "";
-
-    if (result && result.ok && result.result && result.result.ok) {
-      activeConnectionId = conn.id;
-      showNotice(`已连接到 ${conn.name}`, "success");
-    } else if (result && result.ok && result.action === "disconnect") {
-      activeConnectionId = "";
-      showNotice("已断开连接", "info");
-    } else {
-      activeConnectionId = "";
-      const rawMsg = toolData.message || result?.error || "";
-      const hint = backendLabel === "PX4 MAVLink"
-        ? "请确认本地监听端口可用，且 PX4 主机与远端端口可达"
-        : backendLabel === "AirSim"
-        ? "请确认 AirSim 仿真环境已启动 (如 127.0.0.1:41452)"
-        : "请检查连接参数";
-      showNotice(rawMsg ? `${rawMsg} — ${hint}` : `连接失败 — ${hint}`, "error");
-    }
-  } catch (error) {
-    activeConnectionId = "";
-    showNotice(error.message || "切换连接失败", "error");
-  }
-  await loadConnectionSettings(true);
-  await loadVehicleInfo(false);
-  renderConnectionsList();
-  renderConnectionDetail(selectedConnectionId);
-  renderVehicleSettingsPanel();
-  await refresh();
-}
 
 async function deleteSelectedConnection() {
   if (!selectedConnectionId) return;
@@ -1044,34 +861,9 @@ function readCameraSettingsForm() {
   });
 }
 
-function renderCameraSettings() {
-  if (els.cameraSource) els.cameraSource.value = cameraSettings.source;
-  if (els.cameraRtspUrlRow) els.cameraRtspUrlRow.hidden = cameraSettings.source !== "rtsp";
-  if (els.cameraRtspUrl) els.cameraRtspUrl.value = cameraSettings.url || "";
-  if (els.cameraName) els.cameraName.value = cameraSettings.camera_name;
-  if (els.cameraVehicle) els.cameraVehicle.value = cameraSettings.vehicle_name;
-  if (els.cameraImageType) els.cameraImageType.value = cameraSettings.image_type;
-  if (els.cameraTimeout) els.cameraTimeout.value = String(Math.round(cameraSettings.timeout_sec));
-  if (els.cameraAutoSave) els.cameraAutoSave.checked = Boolean(cameraSettings.auto_save);
-  if (els.cameraViewerCamera) {
-    const cameraName = String(cameraSettings.camera_name || "0");
-    if (![...els.cameraViewerCamera.options].some((option) => option.value === cameraName)) {
-      els.cameraViewerCamera.add(new Option(`${cameraName} · 自定义`, cameraName));
-    }
-    els.cameraViewerCamera.value = cameraName;
-  }
-  if (els.cameraViewerImageType) els.cameraViewerImageType.value = cameraSettings.image_type;
-}
 
-function renderCameraMeta(data = null) {
-  if (!els.cameraMeta) return;
-  const sourceLabel = cameraSettings.source === "airsim" ? "AirSim" : cameraSettings.source;
-  const camera = data?.camera || cameraSettings.camera_name || "0";
-  const vehicle = data?.vehicle || cameraSettings.vehicle_name || "default";
-  const type = data?.image_type || cameraSettings.image_type || "scene";
-  const size = data?.size_kb ? ` · ${data.size_kb} KB` : "";
-  els.cameraMeta.textContent = `${sourceLabel} · ${vehicle} · camera ${camera} · ${type}${size}`;
-}
+
+
 
 async function saveCameraSettings({ silent = false } = {}) {
   cameraSettings = readCameraSettingsForm();
@@ -1090,54 +882,13 @@ async function saveCameraSettings({ silent = false } = {}) {
   }
 }
 
-function setCameraViewerVisible(visible) {
-  if (!els.cameraViewer) return;
-  els.cameraViewer.hidden = !visible;
-  if (els.cameraViewBtn) {
-    els.cameraViewBtn.setAttribute("aria-pressed", String(Boolean(visible)));
-    els.cameraViewBtn.classList.toggle("active", Boolean(visible));
-    els.cameraViewBtn.title = visible ? "隐藏摄像头视频流" : "显示摄像头视频流";
-    els.cameraViewBtn.setAttribute("aria-label", visible ? "隐藏摄像头视频流" : "显示摄像头视频流");
-  }
-  if (visible && !cameraViewerPositioned) {
-    requestAnimationFrame(placeCameraViewerAtDefault);
-  }
-}
 
-function cameraViewerIsVisible() {
-  return Boolean(els.cameraViewer && !els.cameraViewer.hidden);
-}
 
-function placeCameraViewerAtDefault() {
-  if (!els.cameraViewer || els.cameraViewer.hidden) return;
-  const stage = els.cameraViewer.offsetParent;
-  const profile = els.missionProfile;
-  if (!stage || !profile) return;
-  const stageRect = stage.getBoundingClientRect();
-  const profileRect = profile.getBoundingClientRect();
-  const viewerRect = els.cameraViewer.getBoundingClientRect();
-  const left = Math.max(10, profileRect.left - stageRect.left);
-  const preferredTop = profileRect.top - stageRect.top - viewerRect.height - 8;
-  const maxTop = Math.max(64, stageRect.height - viewerRect.height - 10);
-  const top = Math.max(64, Math.min(preferredTop, maxTop));
-  els.cameraViewer.style.left = `${Math.round(left)}px`;
-  els.cameraViewer.style.top = `${Math.round(top)}px`;
-  els.cameraViewer.style.right = "auto";
-  els.cameraViewer.style.bottom = "auto";
-  cameraViewerPositioned = true;
-}
 
-function clampCameraViewerPosition() {
-  if (!cameraViewerPositioned || !cameraViewerIsVisible() || !els.cameraViewer) return;
-  const stage = els.cameraViewer.offsetParent;
-  if (!stage) return;
-  const stageRect = stage.getBoundingClientRect();
-  const viewerRect = els.cameraViewer.getBoundingClientRect();
-  const left = Math.max(6, Math.min(viewerRect.left - stageRect.left, stageRect.width - viewerRect.width - 6));
-  const top = Math.max(6, Math.min(viewerRect.top - stageRect.top, stageRect.height - viewerRect.height - 6));
-  els.cameraViewer.style.left = `${Math.round(left)}px`;
-  els.cameraViewer.style.top = `${Math.round(top)}px`;
-}
+
+
+
+
 
 function setupCameraViewerDrag() {
   const handle = els.cameraViewerDragHandle;
@@ -1186,18 +937,7 @@ function setupCameraViewerDrag() {
   handle.addEventListener("pointercancel", finishDrag);
 }
 
-function setCameraViewerState(state, message) {
-  if (els.cameraViewer) els.cameraViewer.dataset.state = state;
-  if (els.cameraSnapshotStatus) els.cameraSnapshotStatus.textContent = message || "";
-  const hasFrame = Boolean(els.cameraImage?.src);
-  if (els.cameraPlaceholder) {
-    els.cameraPlaceholder.hidden = state === "ready" || hasFrame;
-    els.cameraPlaceholder.textContent = message || "暂无画面";
-  }
-  if (els.cameraImage) {
-    els.cameraImage.hidden = state !== "ready" && !hasFrame;
-  }
-}
+
 
 function cameraSupportsImageCapture() {
   const capabilities = latestState?.tool_runtime?.backend_profile?.capabilities || {};
@@ -1210,208 +950,23 @@ function cameraUnavailableMessage() {
   return `当前 ${backend} 未注册可用图像源，请在系统设置中配置 AirSim 或相机连接`;
 }
 
-function setCameraStreamActive(active) {
-  cameraStreamActive = Boolean(active);
-  if (!cameraStreamActive) cameraFrameSeq += 1;
-  if (cameraStreamTimer) {
-    clearTimeout(cameraStreamTimer);
-    cameraStreamTimer = null;
-  }
-  if (els.cameraViewer) els.cameraViewer.dataset.streaming = String(cameraStreamActive);
-  if (els.cameraStreamToggle) {
-    els.cameraStreamToggle.setAttribute("aria-pressed", String(cameraStreamActive));
-    els.cameraStreamToggle.title = cameraStreamActive ? "暂停视频流" : "继续视频流";
-    els.cameraStreamToggle.setAttribute("aria-label", cameraStreamActive ? "暂停视频流" : "继续视频流");
-  }
-}
 
-function scheduleCameraFrame(delay = CAMERA_STREAM_INTERVAL_MS) {
-  if (!cameraStreamActive || !cameraViewerIsVisible()) return;
-  if (cameraStreamTimer) clearTimeout(cameraStreamTimer);
-  cameraStreamTimer = setTimeout(() => {
-    cameraStreamTimer = null;
-    captureCameraFrame({ notify: false, openViewer: false });
-  }, delay);
-}
 
-function readCameraViewerSettings() {
-  return normalizeCameraSettings({
-    ...cameraSettings,
-    camera_name: els.cameraViewerCamera?.value || cameraSettings.camera_name,
-    image_type: els.cameraViewerImageType?.value || cameraSettings.image_type,
-  });
-}
 
-function cameraPreviewUrl() {
-  const params = new URLSearchParams({
-    camera_name: cameraSettings.camera_name || "0",
-    vehicle_name: cameraSettings.vehicle_name || "",
-    image_type: cameraSettings.image_type || "scene",
-    timeout_sec: String(Math.min(Number(cameraSettings.timeout_sec || 2), 2.5)),
-    max_width: "560",
-    quality: "54",
-    _: String(Date.now()),
-  });
-  return `/api/camera/preview?${params.toString()}`;
-}
 
-async function captureCameraFrame({ notify = true, openViewer = true } = {}) {
-  if (cameraCaptureInFlight) return;
-  if (openViewer) setCameraViewerVisible(true);
-  if (!cameraSettingsLoaded) await loadCameraSettings();
-  cameraSettings = readCameraViewerSettings();
-  renderCameraSettings();
-  renderCameraMeta();
 
-  if (cameraSettings.source !== "airsim") {
-    const message = `暂未接入 ${cameraSettings.source} 图像源`;
-    setCameraViewerState("error", message);
-    setCameraStreamActive(false);
-    if (notify) showNotice(message, "error");
-    return;
-  }
 
-  cameraCaptureInFlight = true;
-  const seq = ++cameraFrameSeq;
-  const buttons = [els.cameraViewerRefresh, els.cameraCaptureFromSettingsBtn].filter(Boolean);
-  buttons.forEach((button) => { button.disabled = true; });
-  if (!els.cameraImage?.src) setCameraViewerState("loading", "正在连接视频流");
-  const controller = new AbortController();
-  const timeout = setTimeout(() => controller.abort(), 3600);
-  try {
-    const response = await fetch(cameraPreviewUrl(), { cache: "no-store", signal: controller.signal });
-    if (!response.ok) {
-      let message = response.statusText || "获取摄像头画面失败";
-      try {
-        const data = await response.json();
-        message = extractApiError(data, message);
-      } catch (_) {
-        try {
-          message = (await response.text()) || message;
-        } catch (_) {}
-      }
-      throw new Error(message);
-    }
-    const metaText = response.headers.get("X-Camera-Meta") || "";
-    let data = {};
-    if (metaText) {
-      try { data = JSON.parse(metaText); } catch (_) { data = {}; }
-    }
-    const blob = await response.blob();
-    if (!blob.size) throw new Error("未返回图像数据");
-    const nextUrl = URL.createObjectURL(blob);
-    if (els.cameraImage) {
-      const previousUrl = cameraFrameObjectUrl;
-      cameraFrameObjectUrl = nextUrl;
-      els.cameraImage.src = nextUrl;
-      els.cameraImage.hidden = false;
-      if (previousUrl) {
-        setTimeout(() => URL.revokeObjectURL(previousUrl), 250);
-      }
-    }
-    if (seq !== cameraFrameSeq) return;
-    cameraStreamErrorCount = 0;
-    const timestamp = new Date().toLocaleTimeString("zh-CN", { hour12: false });
-    setCameraViewerState("ready", cameraStreamActive ? `视频流 · ${timestamp}` : (data.message || "画面已更新"));
-    renderCameraMeta(data);
-    if (notify) showNotice(data.message || "摄像头画面已更新", "success");
-  } catch (error) {
-    cameraStreamErrorCount += 1;
-    const message = error.name === "AbortError" ? "摄像头预览超时，正在降频重试" : (error.message || "获取摄像头画面失败");
-    setCameraViewerState("error", message);
-    if (notify || cameraStreamErrorCount === 1) showNotice(message, "error");
-  } finally {
-    clearTimeout(timeout);
-    cameraCaptureInFlight = false;
-    buttons.forEach((button) => { button.disabled = false; });
-    if (cameraStreamActive) {
-      scheduleCameraFrame(
-        els.cameraViewer?.dataset.state === "error" ? CAMERA_STREAM_ERROR_INTERVAL_MS : CAMERA_STREAM_INTERVAL_MS,
-      );
-    }
-  }
-}
 
-async function startCameraStream({ notify = true } = {}) {
-  setCameraViewerVisible(true);
-  await loadCameraSettings();
-  setCameraStreamActive(true);
-  await captureCameraFrame({ notify, openViewer: false });
-}
 
-function stopCameraStream({ hide = false } = {}) {
-  setCameraStreamActive(false);
-  if (hide && cameraFrameObjectUrl) {
-    URL.revokeObjectURL(cameraFrameObjectUrl);
-    cameraFrameObjectUrl = "";
-    if (els.cameraImage) els.cameraImage.removeAttribute("src");
-  }
-  if (hide) setCameraViewerVisible(false);
-  else if (cameraViewerIsVisible()) setCameraViewerState(els.cameraImage?.src ? "ready" : "idle", "视频流已暂停");
-}
 
-async function updateCameraViewerSelection() {
-  cameraSettings = readCameraViewerSettings();
-  renderCameraSettings();
-  renderCameraMeta();
-  await saveCameraSettings({ silent: true });
-  if (cameraViewerIsVisible()) {
-    setCameraViewerState("loading", "正在切换图像源");
-    if (!cameraStreamActive) setCameraStreamActive(true);
-    await captureCameraFrame({ notify: false, openViewer: false });
-  }
-}
 
-function setupCameraEventListeners() {
-  if (els.cameraViewBtn) {
-    els.cameraViewBtn.addEventListener("click", () => {
-      if (cameraViewerIsVisible()) stopCameraStream({ hide: true });
-      else startCameraStream();
-    });
-  }
-  if (els.cameraStreamToggle) {
-    els.cameraStreamToggle.addEventListener("click", () => {
-      if (cameraStreamActive) stopCameraStream();
-      else startCameraStream({ notify: false });
-    });
-  }
-  if (els.cameraViewerRefresh) {
-    els.cameraViewerRefresh.addEventListener("click", () => captureCameraFrame({ notify: false, openViewer: false }));
-  }
-  if (els.cameraViewerClose) {
-    els.cameraViewerClose.addEventListener("click", () => stopCameraStream({ hide: true }));
-  }
-  if (els.cameraSaveSettingsBtn) {
-    els.cameraSaveSettingsBtn.addEventListener("click", () => saveCameraSettings());
-  }
-  if (els.cameraCaptureFromSettingsBtn) {
-    els.cameraCaptureFromSettingsBtn.addEventListener("click", () => startCameraStream());
-  }
-  [els.cameraViewerCamera, els.cameraViewerImageType]
-    .filter(Boolean)
-    .forEach((control) => control.addEventListener("change", updateCameraViewerSelection));
-  setupCameraViewerDrag();
-  setCameraStreamActive(false);
-  window.addEventListener("resize", clampCameraViewerPosition);
-  document.addEventListener("visibilitychange", () => {
-    if (!cameraViewerIsVisible()) return;
-    if (document.hidden) {
-      if (cameraStreamTimer) clearTimeout(cameraStreamTimer);
-      cameraStreamTimer = null;
-    } else if (cameraStreamActive) {
-      scheduleCameraFrame(0);
-    }
-  });
-  [els.cameraSource, els.cameraRtspUrl, els.cameraName, els.cameraVehicle, els.cameraImageType, els.cameraTimeout, els.cameraAutoSave]
-    .filter(Boolean)
-    .forEach((control) => {
-      control.addEventListener("change", () => {
-        cameraSettings = readCameraSettingsForm();
-        renderCameraSettings();
-        renderCameraMeta();
-      });
-    });
-}
+
+
+
+
+
+
+
 
 function prepareCameraTemplateRoles(el = els.cameraViewer) {
   if (!el) return;
@@ -1979,12 +1534,6 @@ async function saveAutoConnectEnabled(enabled) {
 }
 
 function setupConnectionEventListeners() {
-  if (els.autoConnectToggle) {
-    els.autoConnectToggle.checked = loadAutoConnectEnabled();
-    els.autoConnectToggle.addEventListener("change", () => {
-      saveAutoConnectEnabled(els.autoConnectToggle.checked);
-    });
-  }
   if (els.addConnectionBtn) {
     els.addConnectionBtn.addEventListener("click", () => {
       renderConnectionDetail("");
@@ -2010,14 +1559,19 @@ function setupConnectionEventListeners() {
     els.connectionsList.addEventListener("click", (event) => {
       const item = event.target.closest(".connection-item");
       if (!item) return;
-      renderConnectionDetail(item.dataset.connectionId);
+      const connId = item.dataset.connectionId;
+      renderConnectionDetail(connId);
+      // 保险: 切换预设后强制再渲染一次模板, 避免被中间步骤覆盖
+      renderAirSimSettingsForConnection();
     });
     els.connectionsList.addEventListener("keydown", (event) => {
       if (event.key !== "Enter" && event.key !== " ") return;
       const item = event.target.closest(".connection-item");
       if (!item) return;
       event.preventDefault();
-      renderConnectionDetail(item.dataset.connectionId);
+      const connId = item.dataset.connectionId;
+      renderConnectionDetail(connId);
+      renderAirSimSettingsForConnection();
     });
   }
 }
@@ -2662,9 +2216,133 @@ if (els.profileToggle) {
 if (els.agentSettingsClose) {
   els.agentSettingsClose.addEventListener("click", () => closeAgentSettings());
 }
+const SETTINGS_EXPAND_SVG = '<svg viewBox="0 0 16 16" width="15" height="15" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><path d="M2.5 6V2.5h3.5M13.5 6V2.5h-3.5M2.5 10v3.5h3.5M13.5 10v3.5h-3.5"/></svg>';
+const SETTINGS_COLLAPSE_SVG = '<svg viewBox="0 0 16 16" width="15" height="15" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><path d="M5.5 2.5v3H2.5M10.5 2.5v3h3M5.5 13.5v-3H2.5M10.5 13.5v-3h3"/></svg>';
+let settingsSavedSize = null;
+
+function setupSystemSettingsResize() {
+  const card = els.systemSettingsModal && els.systemSettingsModal.querySelector(".modal-card");
+  if (!card) return;
+  card.querySelectorAll(".resize-handle").forEach((handle) => {
+    handle.addEventListener("mousedown", (e) => startSystemSettingsResize(handle, e, card));
+  });
+}
+
+function startSystemSettingsResize(handle, e, card) {
+  if (card.classList.contains("is-maximized")) return;
+  e.preventDefault();
+  e.stopPropagation();
+  // 脱钩居中变换: 卡片之前用 transform: translate(-50%,-50%) 居中, 拖拽前要先切到显式 px 定位,
+  // 否则 transform 仍会作用于盒子, 后续 left/top 改动会被先偏移再定位, 拖拽会跳.
+  const rect = card.getBoundingClientRect();
+  card.style.transition = "none";
+  card.style.transform = "none";
+  card.style.left = rect.left + "px";
+  card.style.top = rect.top + "px";
+  card.style.width = rect.width + "px";
+  card.style.height = rect.height + "px";
+
+  const startX = e.clientX;
+  const startY = e.clientY;
+  const startLeft = rect.left;
+  const startTop = rect.top;
+  const startWidth = rect.width;
+  const startHeight = rect.height;
+  const dir = handle.dataset.resize || "";
+  const minW = 380;
+  const minH = 300;
+
+  function onMove(ev) {
+    const dx = ev.clientX - startX;
+    const dy = ev.clientY - startY;
+    let newLeft = startLeft;
+    let newTop = startTop;
+    let newWidth = startWidth;
+    let newHeight = startHeight;
+    if (dir.includes("e")) newWidth = Math.max(minW, startWidth + dx);
+    if (dir.includes("w")) {
+      newWidth = Math.max(minW, startWidth - dx);
+      newLeft = startLeft + (startWidth - newWidth);
+    }
+    if (dir.includes("s")) newHeight = Math.max(minH, startHeight + dy);
+    if (dir.includes("n")) {
+      newHeight = Math.max(minH, startHeight - dy);
+      newTop = startTop + (startHeight - newHeight);
+    }
+    card.style.left = newLeft + "px";
+    card.style.top = newTop + "px";
+    card.style.width = newWidth + "px";
+    card.style.height = newHeight + "px";
+  }
+  function onUp() {
+    document.removeEventListener("mousemove", onMove);
+    document.removeEventListener("mouseup", onUp);
+    // 恢复 transition (留空让 CSS 规则重新生效, 不要写回具体值)
+    card.style.transition = "";
+  }
+  document.addEventListener("mousemove", onMove);
+  document.addEventListener("mouseup", onUp);
+}
+
+function toggleSystemSettingsMaximize() {
+  const card = els.systemSettingsModal && els.systemSettingsModal.querySelector(".modal-card");
+  if (!card) return;
+  const btn = els.systemSettingsMaximize;
+  if (card.classList.contains("is-maximized")) {
+    card.classList.remove("is-maximized");
+    if (settingsSavedSize) {
+      card.style.width = settingsSavedSize.width || "";
+      card.style.height = settingsSavedSize.height || "";
+      card.style.left = settingsSavedSize.left || "";
+      card.style.top = settingsSavedSize.top || "";
+      card.style.transform = settingsSavedSize.transform || "";
+    }
+    btn.innerHTML = SETTINGS_EXPAND_SVG;
+    btn.title = "全屏";
+  } else {
+    settingsSavedSize = {
+      width: card.style.width,
+      height: card.style.height,
+      left: card.style.left,
+      top: card.style.top,
+      transform: card.style.transform,
+    };
+    card.classList.add("is-maximized");
+    card.style.width = "100vw";
+    card.style.height = "100vh";
+    card.style.left = "50%";
+    card.style.top = "50%";
+    card.style.transform = "translate(-50%, -50%)";
+    btn.innerHTML = SETTINGS_COLLAPSE_SVG;
+    btn.title = "退出全屏";
+  }
+}
+
+function resetSystemSettingsMaximize() {
+  const card = els.systemSettingsModal && els.systemSettingsModal.querySelector(".modal-card");
+  if (card) {
+    card.classList.remove("is-maximized");
+    card.style.width = "";
+    card.style.height = "";
+    card.style.left = "";
+    card.style.top = "";
+    card.style.transform = "";
+  }
+  settingsSavedSize = null;
+  if (els.systemSettingsMaximize) {
+    els.systemSettingsMaximize.innerHTML = SETTINGS_EXPAND_SVG;
+    els.systemSettingsMaximize.title = "全屏";
+  }
+}
+
 if (els.systemSettingsClose) {
   els.systemSettingsClose.addEventListener("click", () => closeSystemSettings());
 }
+if (els.systemSettingsMaximize) {
+  els.systemSettingsMaximize.innerHTML = SETTINGS_EXPAND_SVG;
+  els.systemSettingsMaximize.addEventListener("click", toggleSystemSettingsMaximize);
+}
+setupSystemSettingsResize();
 if (els.refreshFirmwareInfoBtn) {
   els.refreshFirmwareInfoBtn.addEventListener("click", async () => {
     els.refreshFirmwareInfoBtn.disabled = true;
@@ -2801,6 +2479,23 @@ if (waypointPanelToggle && waypointPanel) {
 }
 
 els.canvas = document.querySelector("#missionMap");
+// DEBUG: 排查地图黑屏 — 捕获 canvas 真实状态
+// 遮罩层显隐会改变页面的合成层; 在切换完成后强制一次地图重算 + 重绘作为双保险.
+function refreshMapAfterLayoutChange() {
+  if (!maplibreMap) return;
+  const repaint = () => {
+    try { maplibreMap.resize(); } catch (e) {}
+    try { maplibreMap.triggerRepaint(); } catch (e) {}
+  };
+  requestAnimationFrame(() => {
+    repaint();
+    requestAnimationFrame(() => {
+      repaint();
+      setTimeout(repaint, 160);
+    });
+  });
+}
+
 initMissionMap();
 
 function initMissionMap() {
@@ -2834,6 +2529,9 @@ function initMissionMap() {
     zoom: 15,
     attributionControl: false,
     dragRotate: false,
+    // 关键: 保留绘制缓冲, 避免全屏遮罩层出现触发页面重新合成时 WebGL
+    // 缓冲被清空导致卫星图黑屏 (display 切换 / 合成层变化都会触发清缓冲)
+    preserveDrawingBuffer: true,
   });
 
   maplibreMap.on("load", () => {
@@ -3487,18 +3185,7 @@ function isPx4MavlinkBackend() {
   return currentBackendId() === "px4_mavlink";
 }
 
-function extractApiSuccess(data, fallback = "ok") {
-  const candidates = [
-    data?.message,
-    data?.result?.message,
-    data?.result?.data?.message,
-    data?.progress?.message,
-  ];
-  for (const item of candidates) {
-    if (typeof item === "string" && item.trim()) return item;
-  }
-  return fallback;
-}
+
 
 function markMissionEdited() {
   missionExecutionActive = false;
@@ -3565,38 +3252,9 @@ function buildLocalMissionItems() {
   return items;
 }
 
-async function uploadMissionToVehicle() {
-  if (!missionWaypoints.length) {
-    throw new Error("当前没有航点，无法上传");
-  }
-  const items = buildLocalMissionItems();
-  if (isPx4MavlinkBackend()) {
-    // P6: PX4 后端走统一 GCS MissionManager facade
-    const draft = buildMissionDraftFromItems(items);
-    return await post("/api/gcs/mission/upload", { draft });
-  }
-  // AirSim 后端保留 fly_path 直接执行
-  return await post("/api/tool", {
-    tool: "drone_upload_mission",
-    params: { waypoints_json: JSON.stringify(items) },
-    dry_run: false,
-  });
-}
 
-async function startVehicleMission() {
-  if (isPx4MavlinkBackend()) {
-    const payload = {};
-    if (missionWaypoints.length) {
-      payload.draft = buildMissionDraftFromItems(buildLocalMissionItems());
-    }
-    return await post("/api/gcs/mission/start", payload);
-  }
-  return await post("/api/tool", {
-    tool: "drone_start_mission",
-    params: {},
-    dry_run: false,
-  });
-}
+
+
 
 async function deployAndStartMission() {
   const uploadResult = await uploadMissionToVehicle();
@@ -3612,52 +3270,9 @@ async function deployAndStartMission() {
   }
 }
 
-async function downloadVehicleMission() {
-  if (!isPx4MavlinkBackend()) {
-    // AirSim 后端无飞控 mission 概念，直接返回
-    return null;
-  }
-  const result = await post("/api/gcs/mission/download", {});
-  const draft = result?.draft;
-  const items = draft?.items || [];
-    if (Array.isArray(items) && items.length) {
-      missionWaypoints = items.map((item, idx) => ({
-      id: item.id || `wp_${String(idx + 1).padStart(3, "0")}`,
-      type: item.type || "waypoint",
-      frame: item.frame || "global_relative_alt",
-      lat: round6(Number(item.lat)),
-      lon: round6(Number(item.lon)),
-      alt_m: Number(item.alt_m || 0),
-      x: item.x != null ? Number(item.x) : null,
-      y: item.y != null ? Number(item.y) : null,
-      z: item.z != null ? Number(item.z) : null,
-      speed_mps: Number(item.speed_mps || 2),
-      hold_s: Number(item.hold_s || 0),
-      acceptance_radius_m: Number(item.acceptance_radius_m || 2),
-      actions: Array.isArray(item.actions) ? item.actions : [],
-        metadata: item.metadata || { source: "vehicle_download" },
-      }));
-      markMissionEdited();
-      renderWaypoints();
-      drawMissionPath();
-    }
-  return result;
-}
 
-async function clearVehicleMission() {
-  if (isPx4MavlinkBackend()) {
-    const result = await post("/api/gcs/mission/clear", {});
-    markMissionEdited();
-    return result;
-  }
-  const result = await post("/api/tool", {
-    tool: "drone_clear_mission",
-    params: {},
-    dry_run: false,
-  });
-  markMissionEdited();
-  return result;
-}
+
+
 
 function clearLocalMissionDraft() {
   missionWaypoints = [];
@@ -3676,20 +3291,7 @@ async function clearMissionEverywhere() {
   return result;
 }
 
-async function refreshMissionProgress() {
-  if (isPx4MavlinkBackend()) {
-    const result = await post("/api/gcs/mission/progress", {});
-    lastMissionProgress = result?.progress || result || {};
-    return lastMissionProgress;
-  }
-  const result = await post("/api/tool", {
-    tool: "drone_get_mission_progress",
-    params: {},
-    dry_run: false,
-  });
-  lastMissionProgress = result?.data || result || {};
-  return lastMissionProgress;
-}
+
 
 function buildMissionDraftFromItems(items) {
   // 构造 backend-neutral MissionPlanDraft，供 GCS /api/gcs/mission/upload 使用
@@ -3740,153 +3342,11 @@ async function executeLocalPath() {
   });
 }
 
-function waypointExecutionMessage() {
-  return isPx4MavlinkBackend() ? "PX4 航线已上传，启动任务请显式执行 mission start" : "航线执行指令已发送";
-}
 
-function syncWaypointActionLabels() {
-  // PX4 后端下显示上传/启动/下载/清空；AirSim 后端下仅保留上传按钮，实际走 fly_path
-  const deployBtn = document.querySelector("[data-waypoint-action='deploy_start'], [data-waypoint-action='upload']");
-  if (deployBtn) {
-    deployBtn.title = isPx4MavlinkBackend()
-      ? "上传为 PX4 MAVLink Mission 并开始执行"
-      : "上传并开始执行本地航线";
-  }
-  const startBtn = document.querySelector("[data-waypoint-action='start']");
-  if (startBtn) {
-    startBtn.style.display = "none";
-  }
-  const downloadBtn = document.querySelector("[data-waypoint-action='download']");
-  if (downloadBtn) {
-    downloadBtn.style.display = "none";
-  }
-  const progressBtn = document.querySelector("[data-waypoint-action='progress']");
-  if (progressBtn) {
-    progressBtn.style.display = isPx4MavlinkBackend() ? "" : "none";
-  }
-  const clearVehicleBtn = document.querySelector("[data-waypoint-action='clear_vehicle']");
-  if (clearVehicleBtn) {
-    clearVehicleBtn.style.display = "";
-    clearVehicleBtn.title = "删除本地航点并清空飞控任务";
-  }
-}
 
-async function handleWaypointAction(action, button) {
-  if (action === "clear") {
-    missionWaypoints = [];
-    missionFence = [];
-    selectedWaypointIndex = -1;
-    renderWaypoints();
-    drawMissionPath();
-    drawFence();
-    showNotice("本地航点与围栏已清空", "success");
-    return;
-  }
 
-  if (action === "fence") {
-    fenceDrawingMode = !fenceDrawingMode;
-    if (button) {
-      button.classList.toggle("active", fenceDrawingMode);
-      button.textContent = fenceDrawingMode ? "完成围栏" : "围栏";
-    }
-    if (fenceDrawingMode) {
-      missionFence = [];
-      drawFence();
-      showNotice("围栏绘制模式：点击地图添加顶点，再次点击完成", "success");
-    } else {
-      if (missionFence.length < 3) {
-        missionFence = [];
-        drawFence();
-        showNotice("围栏顶点不足 3 个，已取消", "error");
-      } else {
-        showNotice(`围栏已保存，共 ${missionFence.length} 个顶点`, "success");
-      }
-    }
-    return;
-  }
 
-  if (action === "upload") {
-    if (!missionWaypoints.length) {
-      showNotice("请先添加航点", "error");
-      return;
-    }
-    if (isPx4MavlinkBackend()) {
-      const ok = await confirmDialog({
-        title: "上传任务到飞控",
-        message: "此操作会替换飞控上的当前 mission，不会自动启动。是否继续？",
-        confirmLabel: "上传",
-        danger: true,
-      });
-      if (!ok) return;
-      await runButton(button, uploadMissionToVehicle, "PX4 任务已上传，请显式启动");
-    } else {
-      await runButton(button, executeLocalPath, "本地航线已执行");
-    }
-    return;
-  }
 
-  if (action === "deploy_start") {
-    if (!missionWaypoints.length) {
-      showNotice("请先添加航点", "error");
-      return;
-    }
-    const ok = await confirmDialog({
-      title: "上传并开始航线",
-      message: "此操作会替换飞控上的当前 mission，并立即开始执行。是否继续？",
-      confirmLabel: "上传并开始",
-      danger: true,
-    });
-    if (!ok) return;
-    await runButton(button, deployAndStartMission, "航线已上传并开始执行");
-    return;
-  }
-
-  if (action === "start") {
-    const ok = await confirmDialog({
-      title: "启动飞控任务",
-      message: "将向飞控发送 MAV_CMD_MISSION_START，无人机可能开始飞行。是否继续？",
-      confirmLabel: "启动",
-      danger: true,
-    });
-    if (!ok) return;
-    await runButton(button, async () => {
-      markMissionExecutionStarted();
-      try {
-        return await startVehicleMission();
-      } catch (error) {
-        markMissionEdited();
-        throw error;
-      }
-    }, "启动任务指令已发送");
-    return;
-  }
-
-  if (action === "download") {
-    await runButton(button, downloadVehicleMission, "飞控任务已下载并显示在地图");
-    return;
-  }
-
-  if (action === "progress") {
-    await runButton(button, refreshMissionProgress, "任务进度已刷新");
-    return;
-  }
-
-  if (action === "clear_vehicle") {
-    const ok = await confirmDialog({
-      title: "清空飞控任务",
-      message: "此操作会清空飞控上的所有 mission items，不可恢复。建议先下载备份。是否继续？",
-      confirmLabel: "清空",
-      danger: true,
-    });
-    if (!ok) return;
-    await runButton(button, async () => {
-      const result = await clearVehicleMission();
-      markMissionEdited();
-      return result;
-    }, "飞控任务已清空");
-    return;
-  }
-}
 
 function confirmDialog({ title, message, confirmLabel = "确认", danger = false }) {
   return new Promise((resolve) => {
@@ -4505,34 +3965,7 @@ function renderVehicleList(toolRuntime = {}) {
   }
 }
 
-function renderSystemConnection(drone = {}, toolRuntime = {}) {
-  const connected = Boolean(toolRuntime.connected) && !toolRuntime.stale_connection;
-  let activeChanged = false;
 
-  // 严格跟随后端真实连接状态：连接时反推 active 连接，断开时清空。
-  if (connected && connectionsCache.length) {
-    const backend = toolRuntime.backend || "airsim";
-    const expected = connectionsCache.find((c) => {
-      if (backend === "airsim") return c.type === "airsim";
-      return c.type !== "airsim";
-    });
-    if (expected && expected.id !== activeConnectionId) {
-      activeConnectionId = expected.id;
-      activeChanged = true;
-    }
-  } else if (activeConnectionId) {
-    activeConnectionId = "";
-    activeChanged = true;
-  }
-
-  if (activeChanged && selectedConnectionId) {
-    renderConnectionDetail(selectedConnectionId);
-  }
-  if (els.connectionDetailStatus) {
-    const actuallyActive = selectedConnectionId ? isConnectionActive(selectedConnectionId) : connected;
-    updateConnectionDetailStatus(actuallyActive);
-  }
-}
 
 function renderToolCall(step) {
   const state = step.status || "pending";
@@ -4721,111 +4154,11 @@ function renderEvents(events) {
   }).join("");
 }
 
-function renderTools(tools, toolCards = [], toolRuntime = {}) {
-  const cards = Array.isArray(toolCards) ? toolCards : [];
-  const rawTools = Array.isArray(tools) ? tools : [];
-  const items = cards.length
-    ? cards
-    : rawTools.map((tool) => ({
-      name: tool.name,
-      category: tool.category,
-      purpose: tool.description || "",
-      when_to_use: "",
-      cost: "",
-      risk: "",
-      required_capabilities: [],
-    }));
 
-  els.toolCount.textContent = `${items.length} 个工具`;
-  if (!items.length) {
-    els.toolList.innerHTML = `<div class="empty">工具未加载</div>`;
-    return;
-  }
-  els.toolList.innerHTML = items.slice(0, 36).map((tool) => renderToolCardItem(tool)).join("");
-}
 
-function renderToolCardItem(tool) {
-  const key = tool.name || "";
-  const locale = TOOL_LOCALE[key] || {};
-  const name = locale.name || key;
-  const desc = locale.desc || tool.purpose || tool.description || "";
-  const category = locale.category || TOOL_CATEGORY_LOCALE[tool.category] || tool.category || "";
-  const contract = tool.execution_mode === "async" ? "异步操作" : (tool.kind === "atomic" ? "原子工具" : tool.kind || "工具");
-  return `
-    <article class="compact-item tool-card-item" title="${escapeHtml(key)}">
-      <strong>${escapeHtml(name)}</strong>
-      <div class="tool-meta">
-        ${category ? `<span>${escapeHtml(category)}</span>` : ""}
-        <span>${escapeHtml(contract)}</span>
-        ${tool.risk ? `<span>风险 ${escapeHtml(tool.risk)}</span>` : ""}
-      </div>
-      <span>${escapeHtml(desc)}</span>
-    </article>
-  `;
-}
 
-function renderMemory(memory) {
-  const lessons = memory.lessons || [];
-  const risks = memory.risk_events || [];
-  const missions = memory.missions || [];
-  const candidates = memory.skill_candidates || [];
-  const taskRuns = Array.isArray(memory.task_runs?.recent) ? memory.task_runs.recent : [];
-  const conversation = memory.conversation || {};
-  const working = memory.working_state || memory.session || {};
-  els.memoryCount.textContent = String(lessons.length + risks.length + missions.length + candidates.length + taskRuns.length);
 
-  const items = [
-    {
-      title: "会话上下文",
-      text: `${conversation.messages_saved || 0} 条消息已保存 · 最近 ${conversation.messages_sent_to_model || 0} 条送入模型 · Session ${conversation.session_id || "-"}`,
-      tag: "SESSION",
-    },
-    {
-      title: "Agent 工作状态",
-      text: Object.keys(working).length
-        ? `最近位置/任务起点等 ${Object.keys(working).length} 个字段，跨会话供任务连续性参考`
-        : "暂无位置或任务起点工作状态",
-      tag: "WORKING",
-    },
-    ...candidates.slice(0, 4).map((item) => ({
-      title: item.intent || "Skill 候选",
-      text: `${item.tool_sequence?.join(" → ") || "无序列"} · ${item.successes || 0}/${item.runs || 0} 成功${item.eligible_for_review ? " · 可评审" : " · 继续积累"}`,
-      tag: "SKILL CANDIDATE",
-    })),
-    ...taskRuns.slice(0, 4).map((item) => ({
-      title: item.summary || item.command || "任务回放",
-      text: `${humanRunStatus(item.status)} · ${item.counters?.steps_ok || 0}/${item.counters?.steps_total || 0} 步 · ${item.counters?.events || 0} 事件`,
-      tag: "TASK RUN",
-    })),
-    ...missions.slice(0, 6).map((item) => ({
-      title: item.summary || item.intent || "任务记录",
-      text: `${item.status || "unknown"} · ${item.tool_sequence?.join(" → ") || item.command || "无工具序列"}`,
-      tag: "MISSION",
-    })),
-    ...lessons.slice(0, 5).map((item) => ({
-      title: item.intent || "经验摘要",
-      text: item.summary || `success=${item.success_rate}`,
-      tag: "LESSON",
-    })),
-    ...risks.slice(0, 5).map((item) => ({
-      title: item.run_id || "风险事件",
-      text: item.reason || item.command || "",
-      tag: "RISK",
-    })),
-  ];
 
-  if (!items.length) {
-    els.memoryList.innerHTML = `<div class="empty">暂无记忆</div>`;
-    return;
-  }
-
-  els.memoryList.innerHTML = items.slice(0, 24).map((item) => `
-    <article class="compact-item">
-      <div class="memory-item-head"><strong>${escapeHtml(item.title)}</strong><small>${escapeHtml(item.tag || "MEMORY")}</small></div>
-      <p>${escapeHtml(item.text)}</p>
-    </article>
-  `).join("");
-}
 
 function renderWaypoints() {
   syncWaypointActionLabels();
@@ -5085,28 +4418,9 @@ function drawFence() {
   });
 }
 
-function droneGpsPosition(drone, runtime) {
-  // PX4 后端：优先用真实 GPS
-  const gps = drone.gps || {};
-  if (gps.lat && gps.lon && Math.abs(gps.lat) > 0.001) {
-    return [gps.lat, gps.lon];
-  }
-  // AirSim 后端：NED → GPS（基于模拟原点）
-  const pos = drone.position_ned || {};
-  if (typeof pos.x === "number" || typeof pos.y === "number") {
-    const gps = nedToGps(Number(pos.x || 0), Number(pos.y || 0), Number(pos.z || 0));
-    return [gps.lat, gps.lon];
-  }
-  return null;
-}
 
-function homeGpsPosition(drone, runtime) {
-  const gps = drone.gps || {};
-  if (gps.lat && gps.lon && Math.abs(gps.lat) > 0.001) {
-    return [gps.lat, gps.lon];
-  }
-  return [AIRSIM_HOME_LAT, AIRSIM_HOME_LON];
-}
+
+
 
 // NED (north/east/down meters) → GPS (lat/lon degrees) 转换
 // 使用平面近似，小范围（<10km）内有效
@@ -5916,6 +5230,8 @@ async function openSystemSettings() {
   if (els.agentSettingsDrawer) els.agentSettingsDrawer.hidden = true;
   if (els.systemSettingsModal) els.systemSettingsModal.hidden = false;
   if (els.settingsBackdrop) els.settingsBackdrop.hidden = false;
+  // 遮罩层显示后, 页面合成层变化可能清空 WebGL 缓冲; 强制地图重绘
+  refreshMapAfterLayoutChange();
   const card = els.systemSettingsModal?.querySelector(".modal-card");
   if (card) {
     card.style.transform = "";
@@ -5930,7 +5246,6 @@ async function openSystemSettings() {
   ]);
   updateVehicleSettingsAvailability();
   if (vehicleSettingsAvailable()) await loadVehicleSetup(false);
-  if (els.autoConnectToggle) els.autoConnectToggle.checked = autoConnectEnabled;
   selectedConnectionId = activeConnectionId || connectionsCache[0]?.id || "";
   renderConnectionsList();
   renderConnectionDetail(selectedConnectionId);
@@ -5940,7 +5255,7 @@ async function openSystemSettings() {
   loadAirSimSettingsTemplates();
 }
 
-// ── AirSim settings.json 模板（通信模式一键切换，可折叠 + 连接联动） ──
+// ── AirSim settings.json（按连接类型联动，详情内嵌 + 共享 detail-footer 应用按钮） ──
 let airsimTemplatesLoaded = false;
 let airsimTemplatesCache = [];
 let airsimTemplateSelected = "";
@@ -5951,14 +5266,14 @@ async function loadAirSimSettingsTemplates(force = false) {
     const data = await api("/api/airsim-settings");
     airsimTemplatesLoaded = true;
     airsimTemplatesCache = data.templates || [];
-    renderAirSimSettingsTemplates(data);
+    renderAirSimSettingsForConnection();
   } catch (error) {
     console.warn("AirSim settings templates load failed:", error);
   }
 }
 
 function airsimTemplateForConnectionType(type) {
-  // 连接预设 → 匹配模板：AirSim 连接对 SimpleFlight，MAVLink 类对 UDP，ROS2 对 TCP
+  // 连接预设 → 模板：AirSim → SimpleFlight; PX4 MAVLink(UDP/TCP/auto/serial) → UDP SITL; ROS2 → TCP 边端
   const mapping = {
     airsim: "airsim_simpleflight_multirotor",
     udp: "px4_mavlink_udp_sitl",
@@ -5970,87 +5285,160 @@ function airsimTemplateForConnectionType(type) {
   return mapping[String(type || "").toLowerCase()] || "";
 }
 
-function renderAirSimSettingsTemplates(data = {}) {
-  const select = document.getElementById("airsimTemplateSelect");
-  if (!select) return;
-  select.textContent = "";
-  for (const template of airsimTemplatesCache) {
-    const option = document.createElement("option");
-    option.value = template.id;
-    option.textContent = template.label;
-    select.appendChild(option);
-  }
-  // 当前连接类型匹配的模板
-  const matched = airsimTemplateForConnectionType(selectedConnectionTypeForTemplate());
-  const preferred = matched && airsimTemplatesCache.some((t) => t.id === matched) ? matched : airsimTemplatesCache[0]?.id;
-  select.value = airsimTemplateSelected || preferred || "";
-  airsimTemplateSelected = select.value;
-  renderAirSimTemplatePreview();
-}
-
 function selectedConnectionTypeForTemplate() {
+  // 1) cache 的 connection.type 最可靠 (持久化), 优先
   const detail = connectionsCache.find((c) => c.id === selectedConnectionId);
-  return detail?.type || latestState?.tool_runtime?.backend || "";
+  if (detail?.type) return detail.type;
+  // 2) 新建 (id 为空), 用表单 select 当前值
+  if (els.connectionDetailType && els.connectionDetailType.value) {
+    return els.connectionDetailType.value;
+  }
+  return latestState?.tool_runtime?.backend || "";
 }
 
-function syncAirSimTemplateForConnection() {
-  // 连接预设联动：选中 AirSim / MAVLink / ROS2 连接时自动匹配对应模板
-  if (!airsimTemplatesLoaded) return;
-  const matched = airsimTemplateForConnectionType(selectedConnectionTypeForTemplate());
-  const select = document.getElementById("airsimTemplateSelect");
-  if (!select || !matched) return;
-  if ([...select.options].some((o) => o.value === matched)) {
-    select.value = matched;
-    airsimTemplateSelected = matched;
-    renderAirSimTemplatePreview();
+function renderAirSimSettingsForConnection() {
+  const wrap = document.getElementById("airsimSettingsTemplates");
+  const applyBtn = document.getElementById("airsimTemplateApply");
+  const name = document.getElementById("airsimTemplateName");
+  const code = document.getElementById("airsimTemplateCode");
+  if (!wrap || !applyBtn) return;
+
+  const rawType = selectedConnectionTypeForTemplate();
+  const type = String(rawType || "").toLowerCase().trim();
+  const matched = airsimTemplateForConnectionType(type);
+  const template = airsimTemplatesCache.find((t) => t.id === matched) || null;
+  airsimTemplateSelected = template?.id || "";
+
+  // 给应用按钮 dataset 留一份最近一次的 (conn, type, template) 用于兜底/调试;
+  // 不再把诊断信息写到可见 DOM 上.
+  const connId = selectedConnectionId || "(无)";
+  applyBtn.dataset.connId = connId;
+  applyBtn.dataset.connectionType = type;
+  applyBtn.dataset.templateId = airsimTemplateSelected;
+  console.debug("[AirSim template] type=", type, "matched=", matched, "template=", template?.label, "connId=", connId);
+
+  if (!template) {
+    wrap.hidden = true;
+    applyBtn.hidden = true;
+    if (code) code.innerHTML = "";
+    return;
+  }
+  wrap.hidden = false;
+    applyBtn.hidden = false;
+  if (name) name.textContent = template.label || "—";
+
+  const raw = String(template.content || "");
+  const formatted = formatAirSimSettingsJson(raw);
+  if (code) {
+    code.innerHTML = "";
+    code.appendChild(buildHighlightedJsonLines(formatted));
   }
 }
 
-function renderAirSimTemplatePreview() {
-  const template = airsimTemplatesCache.find((t) => t.id === airsimTemplateSelected);
-  const desc = document.getElementById("airsimTemplateDesc");
-  const content = document.getElementById("airsimTemplateContent");
-  const badge = document.getElementById("airsimTemplateBadge");
-  if (!template || !desc || !content) return;
-  desc.textContent = template.description || "";
-  content.textContent = template.content || "";
-  if (badge) badge.textContent = template.label || "自动";
+// ---- 配置预览美化: 行号 + 语法高亮 ----
+
+function formatAirSimSettingsJson(raw) {
+  if (!raw) return "";
+  // 模板可能本来就是合法 JSON 字符串, 也可能是带注释或多余空格的近似 JSON.
+  // 先尝试解析再 2 空格格式化; 失败则按原文逐行轻处理 (保留行结构, 但去掉空行).
+  try {
+    return JSON.stringify(JSON.parse(raw), null, 2);
+  } catch (_) {
+    return raw.replace(/\r\n/g, "\n").replace(/^\s*\n/gm, "").trimEnd();
+  }
 }
 
-function toggleAirSimTemplates() {
-  const toggle = document.getElementById("airsimTemplatesToggle");
-  const body = document.getElementById("airsimTemplatesBody");
-  if (!toggle || !body) return;
-  const expanded = toggle.getAttribute("aria-expanded") === "true";
-  toggle.setAttribute("aria-expanded", String(!expanded));
-  body.hidden = expanded;
-  if (!expanded && !airsimTemplatesLoaded) loadAirSimSettingsTemplates();
+// 经典 JSON 语法高亮 (highlight.js 同款正则), 改为每行调用一次以保留行号结构.
+const JSON_TOKEN_RE = /("(?:\\u[a-zA-Z0-9]{4}|\\[^u]|[^\\"])*"(?:\s*:)?|\b(?:true|false|null)\b|-?\d+(?:\.\d+)?(?:[eE][+\-]?\d+)?|[{}\[\],])/g;
+
+function highlightJsonLine(line) {
+  if (!line) return "";
+  // 先 HTML 转义, 再用正则匹配插入 span.
+  const escaped = line
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;");
+  return escaped.replace(JSON_TOKEN_RE, (match) => {
+    let cls = "";
+    if (match.startsWith('"')) {
+      cls = /:\s*$/.test(match) ? "json-key" : "json-string";
+    } else if (/^(?:true|false)$/.test(match)) {
+      cls = "json-boolean";
+    } else if (match === "null") {
+      cls = "json-null";
+    } else if (/^-?\d/.test(match)) {
+      cls = "json-number";
+    } else {
+      cls = "json-punct";
+    }
+    return `<span class="${cls}">${match}</span>`;
+  });
+}
+
+function buildHighlightedJsonLines(text) {
+  const ol = document.createElement("ol");
+  ol.className = "airsim-template-lines";
+  const lines = (text || "").split("\n");
+  for (let i = 0; i < lines.length; i++) {
+    const li = document.createElement("li");
+    const ln = document.createElement("span");
+    ln.className = "ln";
+    ln.textContent = String(i + 1);
+    const codeSpan = document.createElement("span");
+    codeSpan.className = "code";
+    const line = lines[i];
+    codeSpan.innerHTML = line ? highlightJsonLine(line) : "<span class=\"empty\">·</span>";
+    li.append(ln, codeSpan);
+    ol.append(li);
+  }
+  return ol;
 }
 
 async function applyAirSimSettingsTemplate() {
-  const templateId = document.getElementById("airsimTemplateSelect")?.value;
-  if (!templateId) return;
-  if (!confirm("将备份当前 settings.json 并写入该模板，之后需要重启 AirSim 生效。继续？")) return;
+  // 应用前再算一次, 同时从按钮 dataset 拉出最近一次 render 算出的 (type, templateId)
+  // 任意两者任一非空都作为兜底, 拒绝使用完全 stale 的 airsimTemplateSelected.
+  renderAirSimSettingsForConnection();
+
   const button = document.getElementById("airsimTemplateApply");
+  const fallbackType = String(button?.dataset.connectionType || "").toLowerCase();
+  const fallbackTemplate = String(button?.dataset.templateId || "");
+  if (!airsimTemplateSelected) {
+    if (fallbackTemplate && airsimTemplatesCache.some((t) => t.id === fallbackTemplate)) {
+      airsimTemplateSelected = fallbackTemplate;
+    } else {
+      showNotice("当前连接类型没有可用的 AirSim settings 模板", "error");
+      return;
+    }
+  }
+
+  const type = String(selectedConnectionTypeForTemplate() || fallbackType || "").toLowerCase();
+  const template = airsimTemplatesCache.find((t) => t.id === airsimTemplateSelected);
+  const templateLabel = template?.label || airsimTemplateSelected;
+  console.info(
+    "[AirSim apply] connId=", button?.dataset.connId,
+    "type=", type,
+    "template=", airsimTemplateSelected
+  );
+  if (!confirm(`将备份当前 settings.json 并写入模板：${templateLabel}\n之后需重启 AirSim 生效。继续？`)) return;
   const original = button.textContent;
   button.disabled = true;
-  button.textContent = "应用中...";
+  button.textContent = "写入中...";
   try {
-    const result = await post("/api/airsim-settings/apply", { template: templateId });
+    const result = await post("/api/airsim-settings/apply", { template: airsimTemplateSelected });
     const resultEl = document.getElementById("airsimTemplateResult");
     if (resultEl) {
       resultEl.hidden = false;
       resultEl.classList.toggle("error", !result.ok);
       resultEl.textContent = result.ok
-        ? `✅ 已写入当前用户 Documents/AirSim/settings.json${result.backup_path ? "（原文件已自动备份）" : ""}`
-        : `❌ ${result.error || "应用失败"}`;
+        ? `已写入模板「${templateLabel}」到 Documents/AirSim/settings.json${result.backup_path ? "（原文件已备份）" : ""}`
+        : `${result.error || "应用失败"}`;
     }
   } catch (error) {
     const resultEl = document.getElementById("airsimTemplateResult");
     if (resultEl) {
       resultEl.hidden = false;
       resultEl.classList.add("error");
-      resultEl.textContent = `❌ ${error.message || "应用失败"}`;
+      resultEl.textContent = `${error.message || "应用失败"}`;
     }
   } finally {
     button.disabled = false;
@@ -6059,11 +5447,6 @@ async function applyAirSimSettingsTemplate() {
 }
 
 function initAirSimTemplatesEvents() {
-  document.getElementById("airsimTemplatesToggle")?.addEventListener("click", toggleAirSimTemplates);
-  document.getElementById("airsimTemplateSelect")?.addEventListener("change", (event) => {
-    airsimTemplateSelected = event.target.value;
-    renderAirSimTemplatePreview();
-  });
   document.getElementById("airsimTemplateApply")?.addEventListener("click", applyAirSimSettingsTemplate);
 }
 
@@ -6099,7 +5482,9 @@ function closeSystemSettings() {
   if (els.settingsBackdrop && (!els.agentSettingsDrawer || els.agentSettingsDrawer.hidden)) {
     els.settingsBackdrop.hidden = true;
   }
+  resetSystemSettingsMaximize();
   stopVehicleSetupPolling();
+  refreshMapAfterLayoutChange();
 }
 
 function setSettingsTab(tab, drawer = document) {
@@ -6651,36 +6036,7 @@ function renderSkillSubTools(result) {
   `;
 }
 
-function renderPendingCommand(command, mode = "chat", attachments = []) {
-  const base = latestState?.messages || [];
-  forceNextChatScroll = true;
-  const isExecute = mode === "execute";
-  renderChat([
-    ...base,
-    {
-      id: `pending_user_${Date.now()}`,
-      role: "user",
-      content: command,
-      attachments,
-      status: "complete",
-    },
-    {
-      id: `pending_agent_${Date.now()}`,
-      role: "assistant",
-      content: "",
-      status: "running",
-      details: {
-        mode,
-        phase: isExecute ? "understanding" : "responding",
-        thought_trace: [{
-          title: isExecute ? "理解指令" : "读取上下文",
-          body: isExecute ? "正在准备进入规划与执行流程。" : "Chat 模式不会执行工具。",
-          status: "running",
-        }],
-      },
-    },
-  ], latestState?.current_run || null, latestState?.llm || {});
-}
+
 
 function renderPendingCommand(command, mode = "chat", attachments = []) {
   const serial = ++pendingMessageCounter;
@@ -7554,10 +6910,6 @@ async function submitSkillForm() {
 function normalizeSystemSettingsCopy() {
   const drawer = document.getElementById("systemSettingsModal");
   if (!drawer) return;
-  const title = drawer.querySelector(".settings-head strong");
-  const subtitle = drawer.querySelector(".settings-head span");
-  if (title) title.textContent = "设置";
-  if (subtitle) subtitle.textContent = "应用设置与飞控设置";
   const close = document.getElementById("systemSettingsClose");
   if (close) {
     close.textContent = "×";
@@ -7565,8 +6917,6 @@ function normalizeSystemSettingsCopy() {
   }
   const add = document.getElementById("addConnectionBtn");
   if (add) add.textContent = "+ 添加连接";
-  const sidebarTitle = drawer.querySelector(".sidebar-head strong");
-  if (sidebarTitle) sidebarTitle.textContent = "Settings";
   const setLabel = (id, text) => {
     const label = drawer.querySelector(`label[for="${id}"]`);
     if (label) label.textContent = text;
@@ -9234,10 +8584,6 @@ function renderConnectionsList() {
   const list = els.connectionsList;
   if (!list) return;
   const connections = Array.isArray(connectionsCache) ? connectionsCache : [];
-  if (els.detectedLinkCount) {
-    const count = new Set((Array.isArray(detectedMavlinkLinksCache) ? detectedMavlinkLinksCache : []).map((item) => item.device || item.url)).size;
-    els.detectedLinkCount.textContent = `${count} detected`;
-  }
   if (!connections.length) {
     list.innerHTML = `<div class="empty" style="padding:12px 4px;color:var(--faint);font-size:12px;text-align:center;">No links yet. Add one below.</div>`;
     return;
@@ -9276,6 +8622,7 @@ function renderConnectionDetail(connectionId) {
     if (els.connectionDetailDelete) els.connectionDetailDelete.hidden = true;
     updateConnectionTypeFields();
     renderActualLinkCard();
+    renderAirSimSettingsForConnection();
     return;
   }
 
@@ -9296,6 +8643,8 @@ function renderConnectionDetail(connectionId) {
   if (els.connectionDetailConnect) els.connectionDetailConnect.textContent = actuallyActive ? "断开" : "连接";
   if (els.connectionDetailDelete) els.connectionDetailDelete.hidden = false;
   renderActualLinkCard();
+  // 切换预设后, AirSim settings.json 模板按当前 type 重新计算
+  renderAirSimSettingsForConnection();
 }
 
 function updateConnectionDetailStatus(connected) {
@@ -9352,6 +8701,10 @@ function updateConnectionTypeFields() {
           : "14550, 14540, or 5760";
     }
     portFields.hidden = !["serial", "udp", "tcp", "airsim", "auto"].includes(type);
+  }
+  // 连接类型切换后, AirSim settings.json 模板区按当前 type 联动
+  if (typeof renderAirSimSettingsForConnection === "function") {
+    renderAirSimSettingsForConnection();
   }
 }
 

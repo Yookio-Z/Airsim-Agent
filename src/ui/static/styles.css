@@ -2416,7 +2416,22 @@ body[data-profile-collapsed="true"] .mission-profile {
   position: fixed;
   inset: 0;
   z-index: 29;
-  background: rgba(0, 0, 0, 0.36);
+  /* 独立负责面板暗化 (systemSettingsModal 自身透明, 不再叠层);
+     0.30 单独使用足以提示模态焦点, 又不会把卫星图吃成黑屏. */
+  background: rgba(0, 0, 0, 0.30);
+  opacity: 0;
+  pointer-events: none;
+  /* 透明度淡入/淡出, 避免 display:none 切换瞬间导致 WebGL canvas 黑屏闪烁 */
+  transition: opacity 180ms ease;
+}
+
+.settings-backdrop:not([hidden]) {
+  opacity: 1;
+  pointer-events: auto;
+}
+
+.settings-drawer[hidden] {
+  display: none;
 }
 
 .settings-head {
@@ -2464,8 +2479,7 @@ body[data-profile-collapsed="true"] .mission-profile {
   border-right: 1px solid var(--line);
 }
 
-.settings-drawer[hidden],
-.settings-backdrop[hidden] {
+.settings-drawer[hidden] {
   display: none;
 }
 
@@ -3285,8 +3299,8 @@ body[data-profile-collapsed="true"] .mission-profile {
 }
 
 .modal-head {
-  min-height: 46px;
-  padding: 12px 14px;
+  min-height: 38px;
+  padding: 8px 12px;
   display: flex;
   align-items: center;
   justify-content: space-between;
@@ -3294,21 +3308,17 @@ body[data-profile-collapsed="true"] .mission-profile {
   border-bottom: 1px solid var(--line-soft);
 }
 
-.modal-head > div {
-  display: grid;
-  gap: 2px;
-}
-
-.modal-head strong {
+.modal-head-title {
   color: #c7d1e4;
   font-size: 13px;
   font-weight: 800;
   letter-spacing: 1px;
-}
-
-.modal-head span {
-  color: var(--muted);
-  font-size: 12px;
+  flex: 1 1 auto;
+  min-width: 0;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  /* 标题区也可作为拖动区: cursor:grab 在 #systemSettingsModal .modal-head 上 */
 }
 
 .modal-body {
@@ -3396,21 +3406,82 @@ body[data-profile-collapsed="true"] .mission-profile {
 }
 
 #systemSettingsModal {
-  background: rgba(0, 0, 0, 0.55);
+  /* 不再加暗化背景: 暗化已由 .settings-backdrop (rgba(0,0,0,0.20)) 提供.
+     再叠一层会让中央的卫星图变成黑屏. 这里只负责定位 modal-card, 背景保持透明. */
+  background: transparent;
 }
 
 #systemSettingsModal .modal-card {
-  background: rgba(20, 22, 28, 0.78);
+  /* 完全不透明: 之前的 0.92 在高对比度卫星图底上仍会显出 8% 透出,
+  看起来像面板很透、内容难辨. 现在 1.0 实色, 内容清晰. */
+  background: rgb(20, 22, 28);
   border: 1px solid rgba(255, 255, 255, 0.14);
-  -webkit-backdrop-filter: blur(18px);
-  backdrop-filter: blur(18px);
+  /* 不再用 backdrop-filter: 在 MapLibre (WebGL canvas) 上即使 10px blur
+     在 Chrome/Edge 仍会把背后地图渲染成黑色. 用更不透明的背景
+     (1.0) 替代毛玻璃效果, 保证卡片清晰 + 地图不被吃掉. */
+  -webkit-backdrop-filter: none;
+  backdrop-filter: none;
+  /* 用 scale 微动效替代透明度淡入, 既消除"中心瞬间盖上"的突兀感,
+     又保持 1.0 完全不透, 内容从一开始就能看清 */
+  transform: translate(-50%, -50%) scale(0.97);
+  transition: transform 180ms cubic-bezier(0.2, 0.8, 0.4, 1);
+}
+
+#systemSettingsModal:not([hidden]) .modal-card {
+  transform: translate(-50%, -50%) scale(1);
 }
 
 /* 系统设置模态框：QGC Links 风格，左列表 + 右详情 */
 .system-settings-card {
-  width: min(1680px, 96vw);
-  height: min(900px, calc(100vh - 28px));
+  width: min(1080px, 92vw);
+  height: min(620px, calc(100vh - 60px));
   max-height: none;
+  /* 缩放下限防止内容被压没, 真正的"任意边/角自由伸缩"由 JS 接管 (8 个 .resize-handle) */
+  min-width: 380px;
+  min-height: 300px;
+}
+
+/* 全屏态: 由 JS 设 inline width/height = 100vw/100vh, 这里只负责去圆角边框 */
+.system-settings-card.is-maximized {
+  border-radius: 0;
+  border: none;
+}
+
+/* 8 方向缩放手柄 (4 角 + 4 边) — 任意边/角都能拖拽伸缩 */
+.resize-handle {
+  position: absolute;
+  z-index: 10;
+  transition: none;
+}
+.resize-handle.resize-nw { top: 0; left: 0; width: 14px; height: 14px; cursor: nw-resize; }
+.resize-handle.resize-n  { top: 0; left: 14px; right: 14px; height: 6px; cursor: n-resize; }
+.resize-handle.resize-ne { top: 0; right: 0; width: 14px; height: 14px; cursor: ne-resize; }
+.resize-handle.resize-e  { top: 14px; right: 0; bottom: 14px; width: 6px; cursor: e-resize; }
+.resize-handle.resize-s  { bottom: 0; left: 14px; right: 14px; height: 6px; cursor: s-resize; }
+.resize-handle.resize-sw { bottom: 0; left: 0; width: 14px; height: 14px; cursor: sw-resize; }
+.resize-handle.resize-w  { top: 14px; left: 0; bottom: 14px; width: 6px; cursor: w-resize; }
+/* 右下手柄加 SVG 三条斜线作为可视提示 (原来只有 L 形太不明显) */
+.resize-handle.resize-se {
+  bottom: 0;
+  right: 0;
+  width: 20px;
+  height: 20px;
+  cursor: se-resize;
+  background-image: url("data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 20 20'><path d='M18 2L2 18M18 7L7 18M18 12L12 18' stroke='rgba(255,255,255,0.6)' stroke-width='1.6' stroke-linecap='round' fill='none'/></svg>");
+  background-repeat: no-repeat;
+  background-position: bottom right;
+}
+.system-settings-card.is-maximized .resize-handle {
+  display: none;
+}
+
+/* 头部右侧按钮组 (全屏 + 关闭) — 必须在 .modal-head > div 之后定义,
+   且 specificity 要够高才能不被前者的 display:grid 覆盖 */
+.modal-head-actions {
+  display: flex;
+  flex-direction: row;
+  align-items: center;
+  gap: 4px;
 }
 
 .system-settings-body {
@@ -3423,28 +3494,14 @@ body[data-profile-collapsed="true"] .mission-profile {
 }
 
 .system-settings-sidebar {
-  display: grid;
-  grid-template-rows: auto 1fr;
-  gap: 12px;
-  padding: 12px;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  padding: 12px 10px;
   border-right: 1px solid rgba(255, 255, 255, 0.09);
   background: rgba(0, 0, 0, 0.16);
   overflow: hidden;
-}
-
-.sidebar-head {
-  min-height: 34px;
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  gap: 10px;
-}
-
-.sidebar-head strong {
-  font-size: 13px;
-  font-weight: 800;
-  letter-spacing: 1px;
-  color: #c7d1e4;
+  min-height: 0;
 }
 
 .system-settings-nav {
@@ -3453,11 +3510,26 @@ body[data-profile-collapsed="true"] .mission-profile {
   gap: 6px;
   min-height: 0;
   overflow-y: auto;
-  scrollbar-width: none;
+  padding-right: 2px;
+  scrollbar-width: thin;
+  scrollbar-color: rgba(255, 255, 255, 0.18) transparent;
 }
 
 .system-settings-nav::-webkit-scrollbar {
-  display: none;
+  width: 5px;
+}
+
+.system-settings-nav::-webkit-scrollbar-thumb {
+  background: rgba(255, 255, 255, 0.18);
+  border-radius: 5px;
+}
+
+.system-settings-nav::-webkit-scrollbar-thumb:hover {
+  background: rgba(255, 255, 255, 0.32);
+}
+
+.system-settings-nav::-webkit-scrollbar-track {
+  background: transparent;
 }
 
 .system-settings-nav button {
@@ -3536,12 +3608,25 @@ body[data-profile-collapsed="true"] .mission-profile {
   height: 100%;
   min-height: 0;
   background: rgba(0, 0, 0, 0.08);
-  scrollbar-width: none;
-  -ms-overflow-style: none;
+  scrollbar-width: thin;
+  scrollbar-color: rgba(255, 255, 255, 0.18) transparent;
 }
 
 .system-settings-main::-webkit-scrollbar {
-  display: none;
+  width: 8px;
+}
+
+.system-settings-main::-webkit-scrollbar-thumb {
+  background: rgba(255, 255, 255, 0.18);
+  border-radius: 8px;
+}
+
+.system-settings-main::-webkit-scrollbar-thumb:hover {
+  background: rgba(255, 255, 255, 0.32);
+}
+
+.system-settings-main::-webkit-scrollbar-track {
+  background: transparent;
 }
 
 .system-settings-panel {
@@ -3632,8 +3717,10 @@ body[data-profile-collapsed="true"] .mission-profile {
   flex: 0 0 auto;
 }
 
-/* 通信链路面板占满可用高度，左右两列互不拉伸 */
-.system-settings-panel[data-system-panel="links"] {
+/* 通信链路面板占满可用高度，左右两列互不拉伸.
+   关键: 必须加 .active, 否则下面的 [data-system-panel="links"] 规则会
+   把 display:none 覆盖掉, 让 links 面板永远可见 (与其它面板同堆叠). */
+.system-settings-panel[data-system-panel="links"].active {
   height: 100%;
   min-height: 0;
   overflow: hidden;
@@ -3663,12 +3750,26 @@ body[data-profile-collapsed="true"] .mission-profile {
   align-content: start;
   min-height: 0;
   overflow-y: auto;
-  scrollbar-width: none;
-  -ms-overflow-style: none;
+  padding-right: 4px;
+  scrollbar-width: thin;
+  scrollbar-color: rgba(255, 255, 255, 0.18) transparent;
 }
 
 .connection-detail-form::-webkit-scrollbar {
-  display: none;
+  width: 6px;
+}
+
+.connection-detail-form::-webkit-scrollbar-thumb {
+  background: rgba(255, 255, 255, 0.18);
+  border-radius: 6px;
+}
+
+.connection-detail-form::-webkit-scrollbar-thumb:hover {
+  background: rgba(255, 255, 255, 0.32);
+}
+
+.connection-detail-form::-webkit-scrollbar-track {
+  background: transparent;
 }
 
 .detail-header {
@@ -3872,12 +3973,26 @@ body.dragging-system-settings #systemSettingsModal .modal-head {
   gap: 4px;
   overflow-y: auto;
   min-height: 0;
-  scrollbar-width: none;
-  -ms-overflow-style: none;
+  padding-right: 2px;
+  scrollbar-width: thin;
+  scrollbar-color: rgba(255, 255, 255, 0.18) transparent;
 }
 
 .connections-list::-webkit-scrollbar {
-  display: none;
+  width: 5px;
+}
+
+.connections-list::-webkit-scrollbar-thumb {
+  background: rgba(255, 255, 255, 0.18);
+  border-radius: 5px;
+}
+
+.connections-list::-webkit-scrollbar-thumb:hover {
+  background: rgba(255, 255, 255, 0.32);
+}
+
+.connections-list::-webkit-scrollbar-track {
+  background: transparent;
 }
 
 .connection-item {
@@ -5725,161 +5840,207 @@ body.dragging-system-settings #systemSettingsModal .modal-head {
   max-width: 140px;
 }
 
-/* AirSim settings.json 模板（通信链路面板 · 可折叠） */
+/* AirSim settings.json（连接详情 → 平铺、受连接类型约束，只读模板名 + 可选预览） */
 .airsim-settings-templates {
-  margin-top: 4px;
-  border: 1px solid rgba(255, 255, 255, 0.1);
+  margin-top: 6px;
+  border: 1px solid rgba(255, 255, 255, 0.10);
   border-radius: 8px;
   background: rgba(10, 16, 24, 0.45);
-  overflow: hidden;
+  padding: 10px 12px;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
 }
 
-.airsim-templates-toggle {
+.airsim-template-row {
   display: flex;
   align-items: center;
-  gap: 8px;
-  width: 100%;
-  padding: 10px 12px;
-  background: none;
-  border: none;
-  color: inherit;
-  cursor: pointer;
-  text-align: left;
-  font-size: 13px;
+  justify-content: space-between;
+  gap: 12px;
+  min-height: 28px;
 }
 
-.airsim-templates-toggle:hover {
-  background: rgba(255, 255, 255, 0.04);
-}
-
-.airsim-templates-toggle-icon {
-  color: var(--cyan, #55dff4);
-  font-size: 12px;
-  flex: 0 0 auto;
-  transition: transform 120ms ease;
-}
-
-.airsim-templates-toggle[aria-expanded="true"] .airsim-templates-toggle-icon {
-  transform: rotate(90deg);
-}
-
-.airsim-templates-toggle-text {
-  color: #d9e2f3;
-  font-weight: 700;
-  font-size: 13px;
-}
-
-.airsim-template-badge {
-  margin-left: auto;
-  padding: 2px 8px;
-  border-radius: 999px;
-  background: rgba(85, 223, 244, 0.12);
-  border: 1px solid rgba(85, 223, 244, 0.3);
-  color: var(--cyan, #55dff4);
+.airsim-template-label {
   font-size: 11px;
   font-weight: 600;
-  white-space: nowrap;
-  max-width: 45%;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+  color: var(--text-tertiary, #7c8794);
+}
+
+.airsim-template-name {
+  font-size: 12.5px;
+  font-weight: 600;
+  color: #d9e2f3;
+  text-align: right;
   overflow: hidden;
   text-overflow: ellipsis;
-}
-
-.airsim-templates-body {
-  padding: 12px;
-  border-top: 1px solid rgba(255, 255, 255, 0.08);
-}
-
-.airsim-settings-hint {
-  font-size: 12px;
-  color: var(--text-secondary, #aeb8c3);
-  line-height: 1.6;
-  margin: 0 0 12px;
-}
-
-.airsim-settings-hint code {
-  background: rgba(255, 255, 255, 0.07);
-  padding: 1px 5px;
-  border-radius: 3px;
-  color: #c8d3de;
-}
-
-.airsim-template-control {
-  display: grid;
-  grid-template-columns: minmax(0, 1fr);
-  gap: 6px;
-}
-
-.airsim-template-desc {
-  margin: 0;
-  font-size: 12px;
-  color: var(--text-secondary, #aeb8c3);
-  line-height: 1.5;
+  white-space: nowrap;
+  flex: 1;
 }
 
 .airsim-template-preview {
-  margin-top: 12px;
+  border-top: 1px solid rgba(255, 255, 255, 0.08);
+  padding-top: 4px;
 }
 
-.airsim-template-preview-head {
+.airsim-template-preview > summary {
+  list-style: none;
+  cursor: pointer;
   display: flex;
   align-items: center;
   justify-content: space-between;
   gap: 8px;
-  margin-bottom: 6px;
+  padding: 6px 0;
   font-size: 11px;
   color: var(--text-tertiary, #7c8794);
   text-transform: uppercase;
   letter-spacing: 0.05em;
+  user-select: none;
 }
 
-.airsim-template-file {
-  padding: 1px 7px;
-  border-radius: 4px;
-  background: rgba(255, 255, 255, 0.07);
-  color: var(--muted, #8b96a3);
-  font-family: Consolas, "Courier New", monospace;
+.airsim-template-preview > summary::-webkit-details-marker {
+  display: none;
+}
+
+.airsim-template-preview > summary::before {
+  content: "▸";
   font-size: 10px;
-  text-transform: none;
-  letter-spacing: 0;
+  color: var(--cyan, #55dff4);
+  transition: transform 120ms ease;
+  margin-right: 2px;
 }
 
-.airsim-template-preview pre {
-  max-height: 220px;
-  overflow: auto;
-  margin: 0;
-  padding: 12px;
-  border-radius: 6px;
-  background: rgba(0, 0, 0, 0.5);
+.airsim-template-preview[open] > summary::before {
+  transform: rotate(90deg);
+}
+
+.airsim-template-preview-label {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  margin-left: 4px;
+  color: var(--text-secondary, #a3aebd);
+}
+
+.airsim-template-preview-dot {
+  width: 5px;
+  height: 5px;
+  border-radius: 50%;
+  background: var(--cyan, #55dff4);
+  box-shadow: 0 0 6px rgba(85, 223, 244, 0.55);
+}
+
+.airsim-template-code {
+  margin: 8px 0 0;
+  padding: 12px 0;
+  border-radius: 8px;
+  background: linear-gradient(180deg, rgba(0, 0, 0, 0.55), rgba(0, 0, 0, 0.42));
   border: 1px solid rgba(255, 255, 255, 0.08);
-  font-family: Consolas, "Courier New", monospace;
-  font-size: 11px;
-  line-height: 1.55;
+  box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.04);
+  max-height: 240px;
+  overflow: auto;
+  scrollbar-width: thin;
+  scrollbar-color: rgba(255, 255, 255, 0.25) transparent;
+}
+
+.airsim-template-code::-webkit-scrollbar {
+  width: 6px;
+  height: 6px;
+}
+
+.airsim-template-code::-webkit-scrollbar-thumb {
+  background: rgba(255, 255, 255, 0.25);
+  border-radius: 6px;
+}
+
+.airsim-template-lines {
+  margin: 0;
+  padding: 0;
+  list-style: none;
+  font-family: Consolas, "Courier New", ui-monospace, SFMono-Regular, monospace;
+  font-size: 11.5px;
+  line-height: 1.65;
   color: #c8d3de;
+}
+
+.airsim-template-lines > li {
+  display: flex;
+  align-items: flex-start;
+  padding: 0 14px 0 0;
   white-space: pre;
 }
 
-.airsim-template-actions {
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  gap: 10px;
-  margin-top: 12px;
+.airsim-template-lines > li:hover {
+  background: rgba(255, 255, 255, 0.025);
 }
 
-.airsim-template-note {
-  font-size: 11px;
-  color: var(--text-tertiary, #7c8794);
+.airsim-template-lines .ln {
+  flex: 0 0 auto;
+  width: 38px;
+  padding: 0 10px 0 12px;
+  margin-right: 10px;
+  text-align: right;
+  color: rgba(255, 255, 255, 0.22);
+  border-right: 1px solid rgba(255, 255, 255, 0.06);
+  font-variant-numeric: tabular-nums;
+  user-select: none;
 }
 
-.airsim-template-actions .primary {
-  min-height: 32px;
-  padding: 0 16px;
-  font-size: 12px;
+.airsim-template-lines .code {
+  flex: 1 1 auto;
+  min-width: 0;
+  padding-left: 6px;
+}
+
+.airsim-template-code .json-key {
+  color: #82d8ff;
+}
+.airsim-template-code .json-string {
+  color: #c8e6a3;
+}
+.airsim-template-code .json-number {
+  color: #ffb774;
+}
+.airsim-template-code .json-boolean {
+  color: #f29ad4;
+  font-weight: 600;
+}
+.airsim-template-code .json-null {
+  color: #f29ad4;
+  font-style: italic;
+}
+.airsim-template-code .json-punct {
+  color: rgba(255, 255, 255, 0.45);
+}
+
+.airsim-template-code .empty {
+  color: rgba(255, 255, 255, 0.15);
+}
+
+.airsim-apply-btn {
+  position: relative;
+}
+
+.airsim-apply-btn::before {
+  content: "▾";
+  margin-right: 6px;
+  font-size: 10px;
+  color: var(--cyan, #55dff4);
+}
+
+.detail-footer .airsim-apply-btn {
+  border-color: rgba(85, 223, 244, 0.35);
+  color: #d2f1fa;
+  background: rgba(85, 223, 244, 0.10);
+}
+
+.detail-footer .airsim-apply-btn:hover {
+  background: rgba(85, 223, 244, 0.18);
 }
 
 .airsim-template-result {
-  margin-top: 10px;
-  padding: 8px 10px;
+  padding: 6px 9px;
   border-radius: 6px;
   font-size: 12px;
   line-height: 1.5;
