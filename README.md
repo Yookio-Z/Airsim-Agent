@@ -50,6 +50,9 @@ uv sync
 
 # Or start it directly
 uv run python -m src.ui.server --host 127.0.0.1 --port 8765 --backend px4_mavlink
+
+# Or the short form (same defaults)
+uv run python -m src
 ```
 
 Backend options: `px4_mavlink`, `airsim`, `px4_ros2`. Backends are switched
