@@ -543,6 +543,82 @@ class ToolRuntime:
                 time.time(),
             )
 
+    def _ensure_preview_controller(self, params: dict[str, Any] | None = None) -> tuple[Any | None, str]:
+        """Build (or reuse) a camera controller for a single UI preview frame.
+
+        Unlike ``_ensure_camera_tools`` (which keeps ONE global controller for the
+        agent's configured source), this honours an optional per-request
+        ``source``/``url`` override so multiple viewer windows can display
+        *different* sources at the same time — e.g. one window on the AirSim
+        drone, another on a real drone's RTSP stream for digital-twin work.
+
+        Controllers are cached by a source-specific key and reused across
+        requests to avoid reconnecting on every frame.
+        """
+        raw = dict(params or {})
+        settings = self._camera_settings()
+        source = str(raw.get("source") or settings.get("source") or "airsim").strip().lower()
+        if source not in {"airsim", "rtsp", "local"}:
+            return None, f"unsupported camera source: {source}"
+
+        if source == "rtsp":
+            url = str(raw.get("url") or settings.get("url") or settings.get("rtsp_url") or "").strip()
+            if not url:
+                return None, "rtsp camera source requires a stream URL"
+            key = f"rtsp:{url}"
+        elif source == "local":
+            try:
+                index = int(raw.get("camera_name") or settings.get("camera_name") or 0)
+            except (TypeError, ValueError):
+                index = 0
+            key = f"local:{index}"
+        else:
+            host = str(raw.get("host") or settings.get("host") or "127.0.0.1")
+            try:
+                port = int(raw.get("port") or settings.get("port") or 41452)
+            except (TypeError, ValueError):
+                port = 41452
+            key = f"airsim:{host}:{port}"
+
+        cache = getattr(self, "_preview_controllers", None)
+        if cache is None:
+            cache = {}
+            self._preview_controllers = cache
+
+        with self._camera_lock:
+            controller = cache.get(key)
+            if controller is not None and bool(getattr(controller, "is_connected", False)):
+                return controller, ""
+            if controller is not None:
+                try:
+                    controller.disconnect()
+                except Exception:
+                    pass
+            try:
+                if source == "airsim":
+                    from src.modules.airsim_controller import AirSimController
+
+                    controller = AirSimController(ip=host, port=port)
+                    info = controller.connect(ip=host, port=port)
+                elif source == "rtsp":
+                    from src.modules.rtsp_camera_controller import RtspCameraController
+
+                    controller = RtspCameraController(url)
+                    info = controller.connect()
+                else:
+                    from src.modules.rtsp_camera_controller import LocalCameraController
+
+                    controller = LocalCameraController(index)
+                    info = controller.connect()
+            except Exception as exc:
+                return None, str(exc)
+            if not getattr(info, "connected", False):
+                details = getattr(info, "details", {}) or {}
+                message = details.get("message") if isinstance(details, dict) else ""
+                return None, (message or f"{source} camera source is not connected")
+            cache[key] = controller
+            return controller, ""
+
     def capture_camera_preview(self, params: dict[str, Any] | None = None) -> tuple[bool, bytes, str, dict[str, Any]]:
         """Return one lightweight preview frame for the UI.
 
@@ -551,15 +627,15 @@ class ToolRuntime:
         Agent visual reasoning still uses governed tools.
         """
         raw_params = dict(params or {})
-        collector, error = self._ensure_camera_tools()
-        if collector is None or self.camera_controller is None:
+        controller, error = self._ensure_preview_controller(raw_params)
+        if controller is None:
             return False, b"", "text/plain; charset=utf-8", {
                 "status": "error",
                 "message": f"camera source unavailable: {error or 'unknown error'}",
             }
 
         settings = self._camera_settings()
-        source = str(settings.get("source") or "").lower()
+        source = str(raw_params.get("source") or settings.get("source") or "airsim").strip().lower()
         camera_name = str(raw_params.get("camera_name") or settings.get("camera_name") or "0")
         vehicle_name = str(raw_params.get("vehicle_name") or settings.get("vehicle_name") or "")
         image_type_name = str(raw_params.get("image_type") or settings.get("image_type") or "scene").lower()
@@ -580,7 +656,6 @@ class ToolRuntime:
         quality = max(35, min(90, quality))
 
         try:
-            controller = self.camera_controller
             if source in {"rtsp", "local"}:
                 image_type = 0  # real cameras: scene only
             else:
@@ -624,7 +699,7 @@ class ToolRuntime:
                 "camera": camera_name,
                 "image_type": image_type_name,
                 "size_kb": round(len(body) / 1024, 1),
-                "source": "airsim_preview",
+                "source": source,
             }
         except Exception as exc:
             self.camera_error = str(exc)

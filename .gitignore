@@ -34,3 +34,6 @@ docs/px4_agent_handoff.md
 
 # ZCode tool session artifacts.
 .zcode/
+
+# 本地工具工作目录
+.workbuddy/

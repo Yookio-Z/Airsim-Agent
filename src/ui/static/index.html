@@ -50,25 +50,26 @@
           </div>
 
           <section id="cameraViewer" class="camera-viewer" aria-label="无人机摄像头视频流" data-state="idle" hidden>
-            <header id="cameraViewerDragHandle" class="camera-viewer-drag-handle">
-              <div>
+            <header>
+              <div id="cameraViewerDragHandle" class="camera-viewer-drag-handle">
                 <strong>Camera Stream</strong>
                 <span id="cameraSnapshotStatus">等待画面</span>
               </div>
+              <label class="camera-viewer-source-inline">
+                <span>图像源</span>
+                <select id="cameraViewerSource" aria-label="选择图像源">
+                  <option value="airsim">AirSim 无人机</option>
+                  <option value="rtsp">RTSP 视频流</option>
+                  <option value="local">本机摄像头</option>
+                </select>
+              </label>
               <div class="camera-viewer-actions">
                 <button id="cameraViewerNewWindow" type="button" title="新建摄像头窗口" aria-label="新建摄像头窗口">+</button>
-                <button id="cameraStreamToggle" type="button" title="暂停视频流" aria-label="暂停视频流" aria-pressed="true">
-                  <svg class="camera-stream-pause-icon" width="15" height="15" viewBox="0 0 24 24" fill="currentColor" aria-hidden="true"><rect x="6" y="4" width="4" height="16" rx="1"/><rect x="14" y="4" width="4" height="16" rx="1"/></svg>
-                  <svg class="camera-stream-play-icon" width="15" height="15" viewBox="0 0 24 24" fill="currentColor" aria-hidden="true"><polygon points="6 4 20 12 6 20 6 4"/></svg>
-                </button>
-                <button id="cameraViewerRefresh" type="button" title="刷新画面" aria-label="刷新画面">
-                  <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 12a9 9 0 1 1-2.64-6.36"/><polyline points="21 3 21 9 15 9"/></svg>
-                </button>
                 <button id="cameraViewerClose" type="button" title="关闭画面" aria-label="关闭画面">×</button>
               </div>
             </header>
             <div class="camera-viewer-controls">
-              <label>
+              <label data-camera-role="cameraField">
                 <span>摄像头</span>
                 <select id="cameraViewerCamera" aria-label="选择摄像头">
                   <option value="0">0 · 前视</option>
@@ -78,7 +79,7 @@
                   <option value="4">4 · 后视</option>
                 </select>
               </label>
-              <label>
+              <label data-camera-role="imageTypeField">
                 <span>图像</span>
                 <select id="cameraViewerImageType" aria-label="选择图像类型">
                   <option value="scene">Scene</option>
@@ -86,6 +87,10 @@
                   <option value="segmentation">Segmentation</option>
                   <option value="infrared">Infrared</option>
                 </select>
+              </label>
+              <label data-camera-role="vehicleField">
+                <span>无人机</span>
+                <select id="cameraViewerVehicle" aria-label="选择无人机"></select>
               </label>
               <span id="cameraLiveIndicator" class="camera-live-indicator"><i></i>LIVE</span>
             </div>

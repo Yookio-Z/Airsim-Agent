@@ -68,8 +68,6 @@ const els = {
   cameraViewer: $("cameraViewer"),
   cameraViewerDragHandle: $("cameraViewerDragHandle"),
   cameraViewerNewWindow: $("cameraViewerNewWindow"),
-  cameraStreamToggle: $("cameraStreamToggle"),
-  cameraViewerRefresh: $("cameraViewerRefresh"),
   cameraViewerClose: $("cameraViewerClose"),
   cameraViewerCamera: $("cameraViewerCamera"),
   cameraViewerImageType: $("cameraViewerImageType"),
@@ -362,6 +360,7 @@ let cameraWindowCounter = 1;
 const CAMERA_STREAM_INTERVAL_MS = 90;
 const CAMERA_STREAM_ERROR_INTERVAL_MS = 1400;
 const MAX_CAMERA_WINDOWS = 4;
+const MAX_CAMERA_STREAM_ERRORS = 3;
 
 function mergeApplicationSettings(raw) {
   const source = raw && typeof raw === "object" ? raw : {};
@@ -973,11 +972,14 @@ function prepareCameraTemplateRoles(el = els.cameraViewer) {
   el.dataset.cameraWindow = el.dataset.cameraWindow || "camera_1";
   el.querySelector("#cameraViewerDragHandle")?.setAttribute("data-camera-role", "handle");
   el.querySelector("#cameraViewerNewWindow")?.setAttribute("data-camera-action", "new");
-  el.querySelector("#cameraStreamToggle")?.setAttribute("data-camera-action", "toggle");
-  el.querySelector("#cameraViewerRefresh")?.setAttribute("data-camera-action", "refresh");
   el.querySelector("#cameraViewerClose")?.setAttribute("data-camera-action", "close");
+  el.querySelector("#cameraViewerSource")?.setAttribute("data-camera-role", "source");
   el.querySelector("#cameraViewerCamera")?.setAttribute("data-camera-role", "camera");
+  el.querySelector("#cameraViewerVehicle")?.setAttribute("data-camera-role", "vehicle");
   el.querySelector("#cameraViewerImageType")?.setAttribute("data-camera-role", "imageType");
+  el.querySelector("[data-camera-role='camera']")?.closest("label")?.setAttribute("data-camera-role", "cameraField");
+  el.querySelector("[data-camera-role='vehicle']")?.closest("label")?.setAttribute("data-camera-role", "vehicleField");
+  el.querySelector("[data-camera-role='imageType']")?.closest("label")?.setAttribute("data-camera-role", "imageTypeField");
   el.querySelector("#cameraLiveIndicator")?.setAttribute("data-camera-role", "live");
   el.querySelector("#cameraSnapshotStatus")?.setAttribute("data-camera-role", "status");
   el.querySelector("#cameraImage")?.setAttribute("data-camera-role", "image");
@@ -994,11 +996,15 @@ function cameraWindowParts(el) {
   return {
     handle: el.querySelector("[data-camera-role='handle']") || el.querySelector(".camera-viewer-drag-handle"),
     newBtn: el.querySelector("[data-camera-action='new']"),
-    toggleBtn: el.querySelector("[data-camera-action='toggle']"),
-    refreshBtn: el.querySelector("[data-camera-action='refresh']"),
     closeBtn: el.querySelector("[data-camera-action='close']"),
     cameraSelect: el.querySelector("[data-camera-role='camera']"),
+    vehicleSelect: el.querySelector("[data-camera-role='vehicle']"),
     imageTypeSelect: el.querySelector("[data-camera-role='imageType']"),
+    sourceSelect: el.querySelector("[data-camera-role='source']"),
+    liveIndicator: el.querySelector("[data-camera-role='live']"),
+    cameraFieldEl: el.querySelector("[data-camera-role='cameraField']"),
+    vehicleFieldEl: el.querySelector("[data-camera-role='vehicleField']"),
+    imageTypeFieldEl: el.querySelector("[data-camera-role='imageTypeField']"),
     statusEl: el.querySelector("[data-camera-role='status']"),
     imageEl: el.querySelector("[data-camera-role='image']"),
     placeholderEl: el.querySelector("[data-camera-role='placeholder']"),
@@ -1039,6 +1045,7 @@ function createCameraWindow({ id = "", el = null, settings = null, primary = fal
     objectUrl: "",
     errorCount: 0,
     eventsBound: false,
+    lastSuccessSource: "",
   };
   if (!primary && win.imageEl) {
     win.imageEl.removeAttribute("src");
@@ -1064,8 +1071,34 @@ function activeCameraStreams() {
   return [...cameraWindows.values()].filter((win) => win.streamActive && cameraViewerIsVisible(win));
 }
 
+function toggleCameraSourceSpecificFields(win) {
+  if (!win) return;
+  const source = String(win.sourceSelect?.value || win.settings?.source || "airsim").toLowerCase();
+  const isAirSim = source === "airsim";
+  if (win.cameraFieldEl) win.cameraFieldEl.hidden = !isAirSim;
+  if (win.vehicleFieldEl) win.vehicleFieldEl.hidden = !isAirSim;
+  if (win.imageTypeFieldEl) win.imageTypeFieldEl.hidden = !isAirSim;
+}
+
+function clearCameraWindowImage(win) {
+  if (!win) return;
+  if (win.objectUrl) {
+    try { URL.revokeObjectURL(win.objectUrl); } catch (_) {}
+    win.objectUrl = "";
+  }
+  if (win.imageEl) {
+    win.imageEl.removeAttribute("src");
+    win.imageEl.hidden = true;
+  }
+  if (win.placeholderEl) {
+    win.placeholderEl.hidden = false;
+    win.placeholderEl.textContent = "等待新画面";
+  }
+}
+
 function syncCameraWindowControls(win) {
   if (!win) return;
+  if (win.sourceSelect) win.sourceSelect.value = String(win.settings.source || "airsim").toLowerCase();
   if (win.cameraSelect) {
     const cameraName = String(win.settings.camera_name || "0");
     if (![...win.cameraSelect.options].some((option) => option.value === cameraName)) {
@@ -1074,6 +1107,15 @@ function syncCameraWindowControls(win) {
     win.cameraSelect.value = cameraName;
   }
   if (win.imageTypeSelect) win.imageTypeSelect.value = win.settings.image_type || "scene";
+  if (win.vehicleSelect) {
+    const vehicleName = String(win.settings.vehicle_name || "");
+    const hasOption = [...win.vehicleSelect.options].some((option) => option.value === vehicleName);
+    if (vehicleName && !hasOption) {
+      win.vehicleSelect.add(new Option(`${vehicleName} · custom`, vehicleName));
+    }
+    win.vehicleSelect.value = hasOption ? vehicleName : (win.vehicleSelect.value || "");
+  }
+  toggleCameraSourceSpecificFields(win);
 }
 
 function renderCameraSettings() {
@@ -1095,10 +1137,21 @@ function syncCameraToolbarState() {
   els.cameraViewBtn.setAttribute("aria-label", visible ? "隐藏摄像头窗口" : "显示摄像头窗口");
 }
 
+function cameraSourceLabel(settings) {
+  const source = String(settings.source || "airsim").toLowerCase();
+  if (source === "airsim") return "AirSim";
+  if (source === "local") return "本机摄像头";
+  if (source === "rtsp") {
+    const url = String(settings.url || "").trim();
+    return url ? `RTSP ${url.length > 28 ? url.slice(0, 27) + "…" : url}` : "RTSP";
+  }
+  return source;
+}
+
 function renderCameraMeta(data = null, win = primaryCameraWindow()) {
   if (!win?.metaEl) return;
   const settings = win.settings || cameraSettings;
-  const sourceLabel = settings.source === "airsim" ? "AirSim" : settings.source;
+  const sourceLabel = cameraSourceLabel(settings);
   const camera = data?.camera || settings.camera_name || "0";
   const vehicle = data?.vehicle || settings.vehicle_name || "default";
   const type = data?.image_type || settings.image_type || "scene";
@@ -1237,22 +1290,32 @@ function setCameraViewerState(win, state, message) {
 
 function setCameraStreamActive(win, active) {
   if (!win) return;
-  win.streamActive = Boolean(active);
+  const next = Boolean(active);
+  win.streamActive = next;
   if (!win.streamActive) win.frameSeq += 1;
   if (win.timer) {
     clearTimeout(win.timer);
     win.timer = null;
   }
-  if (win.el) win.el.dataset.streaming = String(win.streamActive);
-  if (win.toggleBtn) {
-    win.toggleBtn.setAttribute("aria-pressed", String(win.streamActive));
-    win.toggleBtn.title = win.streamActive ? "暂停视频流" : "继续视频流";
-    win.toggleBtn.setAttribute("aria-label", win.streamActive ? "暂停视频流" : "继续视频流");
+  if (win.el) win.el.dataset.streaming = String(next);
+  if (win.liveIndicator) {
+    win.liveIndicator.innerHTML = next ? "<i></i>LIVE" : "<i></i>PAUSED";
+  }
+  if (!next) {
+    const hasFrame = Boolean(win.imageEl?.src);
+    setCameraViewerState(win, hasFrame ? "paused" : "idle", hasFrame ? "视频流已暂停" : "未连接视频流");
   }
 }
 
-function cameraStreamQuality() {
+function cameraStreamQuality(source = "airsim") {
   const count = Math.max(1, activeCameraStreams().length);
+  // 本机摄像头: 不需要降频, 保持原生画质 + 短轮询间隔, 画面才流畅
+  if (String(source || "").toLowerCase() === "local") {
+    if (count <= 1) return { interval: 50, maxWidth: 1280, quality: 90 };
+    if (count <= 2) return { interval: 70, maxWidth: 960, quality: 86 };
+    return { interval: 90, maxWidth: 800, quality: 82 };
+  }
+  // AirSim / RTSP: 适度降频避免对仿真器/网络造成压力
   if (count <= 1) return { interval: CAMERA_STREAM_INTERVAL_MS, maxWidth: 560, quality: 54 };
   if (count === 2) return { interval: 220, maxWidth: 480, quality: 50 };
   return { interval: 420, maxWidth: 400, quality: 46 };
@@ -1261,7 +1324,8 @@ function cameraStreamQuality() {
 function scheduleCameraFrame(win, delay = null) {
   if (!win?.streamActive || !cameraViewerIsVisible(win)) return;
   if (win.timer) clearTimeout(win.timer);
-  const quality = cameraStreamQuality();
+  const source = win.sourceSelect?.value || win.settings?.source || "airsim";
+  const quality = cameraStreamQuality(source);
   const wait = delay ?? (win.el?.dataset.state === "error" ? CAMERA_STREAM_ERROR_INTERVAL_MS : quality.interval);
   win.timer = setTimeout(() => {
     win.timer = null;
@@ -1272,22 +1336,28 @@ function scheduleCameraFrame(win, delay = null) {
 function readCameraViewerSettings(win = primaryCameraWindow()) {
   return normalizeCameraSettings({
     ...(win?.settings || cameraSettings),
+    source: win?.sourceSelect?.value || win?.settings?.source || cameraSettings.source,
     camera_name: win?.cameraSelect?.value || win?.settings?.camera_name || cameraSettings.camera_name,
+    vehicle_name: win?.vehicleSelect?.value || win?.settings?.vehicle_name || cameraSettings.vehicle_name,
     image_type: win?.imageTypeSelect?.value || win?.settings?.image_type || cameraSettings.image_type,
   });
 }
 
 function cameraPreviewUrl(settings) {
-  const quality = cameraStreamQuality();
+  const source = String(settings.source || "airsim").toLowerCase();
+  const quality = cameraStreamQuality(source);
   const params = new URLSearchParams({
-    camera_name: settings.camera_name || "0",
-    vehicle_name: settings.vehicle_name || "",
-    image_type: settings.image_type || "scene",
+    source,
     timeout_sec: String(Math.min(Number(settings.timeout_sec || 2), 2.5)),
     max_width: String(quality.maxWidth),
     quality: String(quality.quality),
     _: String(Date.now()),
   });
+  if (source === "airsim") {
+    params.set("camera_name", settings.camera_name || "0");
+    params.set("vehicle_name", settings.vehicle_name || "");
+    params.set("image_type", settings.image_type || "scene");
+  }
   return `/api/camera/preview?${params.toString()}`;
 }
 
@@ -1304,7 +1374,7 @@ async function captureCameraFrame({ notify = true, openViewer = true, windowId =
   syncCameraWindowControls(win);
   renderCameraMeta(null, win);
 
-  if (win.settings.source !== "airsim") {
+  if (!["airsim", "rtsp", "local"].includes(win.settings.source)) {
     const message = `暂未接入 ${win.settings.source} 图像源`;
     setCameraViewerState(win, "error", message);
     setCameraStreamActive(win, false);
@@ -1314,7 +1384,7 @@ async function captureCameraFrame({ notify = true, openViewer = true, windowId =
 
   win.captureInFlight = true;
   const seq = ++win.frameSeq;
-  const buttons = [win.refreshBtn, els.cameraCaptureFromSettingsBtn].filter(Boolean);
+  const buttons = [els.cameraCaptureFromSettingsBtn].filter(Boolean);
   buttons.forEach((button) => { button.disabled = true; });
   if (!win.imageEl?.src) setCameraViewerState(win, "loading", "正在连接视频流");
   const controller = new AbortController();
@@ -1356,12 +1426,19 @@ async function captureCameraFrame({ notify = true, openViewer = true, windowId =
     const timestamp = new Date().toLocaleTimeString("zh-CN", { hour12: false });
     setCameraViewerState(win, "ready", win.streamActive ? `视频流 · ${timestamp}` : (data.message || "画面已更新"));
     renderCameraMeta(data, win);
+    win.lastSuccessSource = win.settings.source;
     if (notify) showNotice(data.message || "摄像头画面已更新", "success");
   } catch (error) {
     win.errorCount += 1;
     const message = error.name === "AbortError" ? "摄像头预览超时，正在降频重试" : (error.message || "获取摄像头画面失败");
     setCameraViewerState(win, "error", message);
     if (notify || win.errorCount === 1) showNotice(message, "error");
+    // 持续失败达到阈值后停止轮询, 避免对已断开/不可达的源做无效重试 (例如 AirSim 端口未开)
+    if (win.errorCount >= MAX_CAMERA_STREAM_ERRORS && win.streamActive) {
+      setCameraStreamActive(win, false);
+      setCameraViewerState(win, "error", `${message}（已停止重试，切换图像源或关闭后重开）`);
+      showNotice("已自动停止摄像头重试", "warning");
+    }
   } finally {
     clearTimeout(timeout);
     win.captureInFlight = false;
@@ -1454,6 +1531,9 @@ async function updateCameraViewerSelection(eventOrWindow = null) {
   }
   renderCameraMeta(null, win);
   if (cameraViewerIsVisible(win)) {
+    if (win.settings.source !== (win.lastSuccessSource || "")) {
+      clearCameraWindowImage(win);
+    }
     setCameraViewerState(win, "loading", "正在切换图像源");
     if (!win.streamActive) setCameraStreamActive(win, true);
     await captureCameraFrame({ notify: false, openViewer: false, windowId: win.id });
@@ -1465,13 +1545,12 @@ function setupCameraWindowEvents(win) {
   win.eventsBound = true;
   win.el.addEventListener("pointerdown", () => focusCameraWindow(win));
   win.newBtn?.addEventListener("click", () => createAdditionalCameraWindow(win));
-  win.toggleBtn?.addEventListener("click", () => {
-    if (win.streamActive) stopCameraStream({ windowId: win.id });
-    else startCameraStream({ notify: false, windowId: win.id });
-  });
-  win.refreshBtn?.addEventListener("click", () => captureCameraFrame({ notify: false, openViewer: false, windowId: win.id }));
   win.closeBtn?.addEventListener("click", () => stopCameraStream({ hide: true, windowId: win.id }));
-  [win.cameraSelect, win.imageTypeSelect]
+  win.sourceSelect?.addEventListener("change", (event) => {
+    toggleCameraSourceSpecificFields(win);
+    updateCameraViewerSelection(event);
+  });
+  [win.cameraSelect, win.vehicleSelect, win.imageTypeSelect]
     .filter(Boolean)
     .forEach((control) => control.addEventListener("change", updateCameraViewerSelection));
   setupCameraWindowDrag(win);
@@ -3948,10 +4027,12 @@ function renderVehicleList(toolRuntime = {}) {
   if (vehicles.length <= 1) {
     container.hidden = true;
     container.textContent = "";
+    syncCameraVehicleOptions(vehicles);
     return;
   }
   container.hidden = false;
   container.textContent = "";
+  syncCameraVehicleOptions(vehicles);
   for (const vehicle of vehicles) {
     const name = String(vehicle.vehicle_name || "?");
     const state = vehicle.armed ? (vehicle.flying ? "空中" : "待飞") : "未解锁";
@@ -3963,6 +4044,34 @@ function renderVehicleList(toolRuntime = {}) {
     row.textContent = `${name}: ${state}${battery}`;
     container.appendChild(row);
   }
+}
+
+function syncCameraVehicleOptions(vehicles) {
+  const list = Array.isArray(vehicles) ? vehicles : [];
+  const names = list.map((vehicle) => String(vehicle?.vehicle_name || "").trim()).filter(Boolean);
+  cameraWindows.forEach((win) => {
+    if (!win.vehicleSelect) return;
+    const previous = win.vehicleSelect.value || win.settings?.vehicle_name || "";
+    win.vehicleSelect.textContent = "";
+    if (!names.length) {
+      const placeholder = document.createElement("option");
+      placeholder.value = "";
+      placeholder.textContent = "等待 AirSim";
+      win.vehicleSelect.appendChild(placeholder);
+    } else {
+      names.forEach((name) => {
+        const option = document.createElement("option");
+        option.value = name;
+        option.textContent = name;
+        win.vehicleSelect.appendChild(option);
+      });
+    }
+    if (previous && names.includes(previous)) {
+      win.vehicleSelect.value = previous;
+    } else if (names.length) {
+      win.vehicleSelect.value = names[0];
+    }
+  });
 }
 
 
