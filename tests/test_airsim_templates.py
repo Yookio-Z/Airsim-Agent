@@ -51,3 +51,30 @@ def test_apply_creates_dir_when_missing(tmp_path, monkeypatch) -> None:
 def test_apply_unknown_template_fails(tmp_path, monkeypatch) -> None:
     result = _runtime(tmp_path, monkeypatch).apply_airsim_settings_template("nope")
     assert result["ok"] is False
+
+
+def test_airsim_settings_path_uses_env_var_first(tmp_path, monkeypatch) -> None:
+    env_path = tmp_path / "custom" / "settings.json"
+    monkeypatch.setenv("AIRSIM_SETTINGS_PATH", str(env_path))
+    resolved = AgentRuntime._airsim_settings_path()
+    assert resolved == env_path
+
+
+def test_airsim_settings_path_not_hardcoded(monkeypatch) -> None:
+    # 换机器/用户名时 Path.home() 动态解析，不应出现固定用户名
+    import pathlib
+
+    monkeypatch.delenv("AIRSIM_SETTINGS_PATH", raising=False)
+    resolved = AgentRuntime._airsim_settings_path()
+    assert "26494" not in str(resolved).lower() or pathlib.Path.home().name == "26494"
+
+
+def test_save_airsim_settings_path_persists_override(tmp_path, monkeypatch) -> None:
+    from src.agent import runtime as runtime_module
+
+    target = tmp_path / "my_airsim" / "settings.json"
+    monkeypatch.setattr(runtime_module, "SETTINGS_PATH", tmp_path / "system_settings.json")
+    rt = object.__new__(AgentRuntime)
+    result = rt.save_airsim_settings_path(str(target))
+    assert result["ok"] is True
+    assert rt._airsim_settings_path() == target

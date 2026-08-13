@@ -825,6 +825,7 @@ function renderConnectionsList() {
 function renderConnectionDetail(connectionId) {
   selectedConnectionId = connectionId || "";
   renderConnectionsList();
+  syncAirSimTemplateForConnection();
 
   const conn = selectedConnectionId ? connectionsCache.find((c) => c.id === selectedConnectionId) : null;
   const form = els.connectionDetailForm;
@@ -5939,48 +5940,101 @@ async function openSystemSettings() {
   loadAirSimSettingsTemplates();
 }
 
-// ── AirSim settings.json 模板（通信模式一键切换） ──
+// ── AirSim settings.json 模板（通信模式一键切换，可折叠 + 连接联动） ──
 let airsimTemplatesLoaded = false;
+let airsimTemplatesCache = [];
+let airsimTemplateSelected = "";
 
 async function loadAirSimSettingsTemplates(force = false) {
   if (airsimTemplatesLoaded && !force) return;
   try {
     const data = await api("/api/airsim-settings");
     airsimTemplatesLoaded = true;
+    airsimTemplatesCache = data.templates || [];
     renderAirSimSettingsTemplates(data);
   } catch (error) {
     console.warn("AirSim settings templates load failed:", error);
   }
 }
 
+function airsimTemplateForConnectionType(type) {
+  // 连接预设 → 匹配模板：AirSim 连接对 SimpleFlight，MAVLink 类对 UDP，ROS2 对 TCP
+  const mapping = {
+    airsim: "airsim_simpleflight_multirotor",
+    udp: "px4_mavlink_udp_sitl",
+    tcp: "px4_mavlink_udp_sitl",
+    auto: "px4_mavlink_udp_sitl",
+    serial: "px4_mavlink_udp_sitl",
+    px4_ros2: "px4_ros2_tcp_edge",
+  };
+  return mapping[String(type || "").toLowerCase()] || "";
+}
+
 function renderAirSimSettingsTemplates(data = {}) {
   const pathEl = document.getElementById("airsimSettingsPath");
   if (pathEl) pathEl.textContent = data.target_path || "";
-  const list = document.getElementById("airsimTemplatesList");
-  if (!list) return;
-  list.textContent = "";
-  for (const template of data.templates || []) {
-    const row = document.createElement("div");
-    row.className = "airsim-template-row";
-    const info = document.createElement("div");
-    info.className = "airsim-template-info";
-    const title = document.createElement("strong");
-    title.textContent = template.label;
-    const desc = document.createElement("span");
-    desc.textContent = template.description;
-    info.append(title, desc);
-    const btn = document.createElement("button");
-    btn.type = "button";
-    btn.className = "secondary";
-    btn.textContent = "应用模板";
-    btn.addEventListener("click", () => applyAirSimSettingsTemplate(template.id, btn));
-    row.append(info, btn);
-    list.appendChild(row);
+  const pathInput = document.getElementById("airsimSettingsPathInput");
+  if (pathInput) pathInput.value = data.target_path || "";
+  const select = document.getElementById("airsimTemplateSelect");
+  if (!select) return;
+  select.textContent = "";
+  for (const template of airsimTemplatesCache) {
+    const option = document.createElement("option");
+    option.value = template.id;
+    option.textContent = template.label;
+    select.appendChild(option);
+  }
+  // 当前连接类型匹配的模板
+  const matched = airsimTemplateForConnectionType(selectedConnectionTypeForTemplate());
+  const preferred = matched && airsimTemplatesCache.some((t) => t.id === matched) ? matched : airsimTemplatesCache[0]?.id;
+  select.value = airsimTemplateSelected || preferred || "";
+  airsimTemplateSelected = select.value;
+  renderAirSimTemplatePreview();
+}
+
+function selectedConnectionTypeForTemplate() {
+  const detail = connectionsCache.find((c) => c.id === selectedConnectionId);
+  return detail?.type || latestState?.tool_runtime?.backend || "";
+}
+
+function syncAirSimTemplateForConnection() {
+  // 连接预设联动：选中 AirSim / MAVLink / ROS2 连接时自动匹配对应模板
+  if (!airsimTemplatesLoaded) return;
+  const matched = airsimTemplateForConnectionType(selectedConnectionTypeForTemplate());
+  const select = document.getElementById("airsimTemplateSelect");
+  if (!select || !matched) return;
+  if ([...select.options].some((o) => o.value === matched)) {
+    select.value = matched;
+    airsimTemplateSelected = matched;
+    renderAirSimTemplatePreview();
   }
 }
 
-async function applyAirSimSettingsTemplate(templateId, button) {
+function renderAirSimTemplatePreview() {
+  const template = airsimTemplatesCache.find((t) => t.id === airsimTemplateSelected);
+  const desc = document.getElementById("airsimTemplateDesc");
+  const content = document.getElementById("airsimTemplateContent");
+  if (!template || !desc || !content) return;
+  desc.textContent = template.description || "";
+  content.textContent = template.content || "";
+}
+
+function toggleAirSimTemplates() {
+  const toggle = document.getElementById("airsimTemplatesToggle");
+  const body = document.getElementById("airsimTemplatesBody");
+  if (!toggle || !body) return;
+  const expanded = toggle.getAttribute("aria-expanded") === "true";
+  toggle.setAttribute("aria-expanded", String(!expanded));
+  toggle.querySelector(".airsim-templates-toggle-icon").textContent = expanded ? "▸" : "▾";
+  body.hidden = expanded;
+  if (!expanded && !airsimTemplatesLoaded) loadAirSimSettingsTemplates();
+}
+
+async function applyAirSimSettingsTemplate() {
+  const templateId = document.getElementById("airsimTemplateSelect")?.value;
+  if (!templateId) return;
   if (!confirm("将备份当前 settings.json 并写入该模板，之后需要重启 AirSim 生效。继续？")) return;
+  const button = document.getElementById("airsimTemplateApply");
   const original = button.textContent;
   button.disabled = true;
   button.textContent = "应用中...";
@@ -6003,6 +6057,31 @@ async function applyAirSimSettingsTemplate(templateId, button) {
     button.disabled = false;
     button.textContent = original;
   }
+}
+
+async function saveAirSimSettingsPath() {
+  const input = document.getElementById("airsimSettingsPathInput");
+  if (!input) return;
+  const result = await post("/api/airsim-settings/path", { path: input.value.trim() });
+  const resultEl = document.getElementById("airsimTemplateResult");
+  if (resultEl) {
+    resultEl.hidden = false;
+    resultEl.textContent = result.ok ? `✅ 配置文件路径已更新: ${result.target_path}` : `❌ ${result.error || "保存失败"}`;
+  }
+  if (result.ok) {
+    const pathEl = document.getElementById("airsimSettingsPath");
+    if (pathEl) pathEl.textContent = result.target_path;
+  }
+}
+
+function initAirSimTemplatesEvents() {
+  document.getElementById("airsimTemplatesToggle")?.addEventListener("click", toggleAirSimTemplates);
+  document.getElementById("airsimTemplateSelect")?.addEventListener("change", (event) => {
+    airsimTemplateSelected = event.target.value;
+    renderAirSimTemplatePreview();
+  });
+  document.getElementById("airsimTemplateApply")?.addEventListener("click", applyAirSimSettingsTemplate);
+  document.getElementById("airsimSettingsPathSave")?.addEventListener("click", saveAirSimSettingsPath);
 }
 
 function vehicleSettingsAvailable() {
@@ -9700,6 +9779,7 @@ normalizeAgentSettingsCopy();
 normalizeSystemSettingsCopy();
 
 connectEventStream();
+initAirSimTemplatesEvents();
 
 // Initial render with defaults so the page is never blank
 function renderInitialDefaults() {

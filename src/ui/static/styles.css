@@ -5704,24 +5704,55 @@ body.dragging-system-settings #systemSettingsModal .modal-head {
   max-width: 140px;
 }
 
-/* AirSim settings.json 模板（通信链路面板） */
+/* AirSim settings.json 模板（通信链路面板 · 可折叠） */
 .airsim-settings-templates {
   margin-top: 16px;
-  padding-top: 12px;
-  border-top: 1px solid rgba(255, 255, 255, 0.08);
+  border: 1px solid rgba(255, 255, 255, 0.1);
+  border-radius: 8px;
+  background: rgba(10, 16, 24, 0.45);
+  overflow: hidden;
+}
+
+.airsim-templates-toggle {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  width: 100%;
+  padding: 10px 12px;
+  background: none;
+  border: none;
+  color: inherit;
+  cursor: pointer;
+  text-align: left;
+  font-size: 13px;
+}
+
+.airsim-templates-toggle:hover {
+  background: rgba(255, 255, 255, 0.04);
+}
+
+.airsim-templates-toggle-icon {
+  color: var(--cyan, #55dff4);
+  font-size: 12px;
 }
 
 .airsim-settings-path {
+  margin-left: auto;
   font-size: 11px;
   color: var(--text-tertiary, #7c8794);
   word-break: break-all;
+}
+
+.airsim-templates-body {
+  padding: 0 12px 12px;
+  border-top: 1px solid rgba(255, 255, 255, 0.08);
 }
 
 .airsim-settings-hint {
   font-size: 12px;
   color: var(--text-secondary, #aeb8c3);
   line-height: 1.5;
-  margin: 6px 0 10px;
+  margin: 10px 0;
 }
 
 .airsim-settings-hint code {
@@ -5730,38 +5761,49 @@ body.dragging-system-settings #systemSettingsModal .modal-head {
   border-radius: 3px;
 }
 
-.airsim-templates-list {
-  display: flex;
-  flex-direction: column;
-  gap: 8px;
+.airsim-template-preview {
+  margin-top: 8px;
 }
 
-.airsim-template-row {
+.airsim-template-preview-head {
   display: flex;
   align-items: center;
   justify-content: space-between;
-  gap: 10px;
-  padding: 8px 10px;
-  border: 1px solid rgba(255, 255, 255, 0.1);
-  border-radius: 6px;
-  background: rgba(10, 16, 24, 0.5);
+  gap: 8px;
+  margin-bottom: 6px;
 }
 
-.airsim-template-info {
-  display: flex;
-  flex-direction: column;
-  gap: 2px;
-  min-width: 0;
-}
-
-.airsim-template-info strong {
-  font-size: 13px;
-}
-
-.airsim-template-info span {
+.airsim-template-preview-head span {
   font-size: 12px;
   color: var(--text-secondary, #aeb8c3);
-  line-height: 1.4;
+}
+
+.airsim-template-preview pre {
+  max-height: 260px;
+  overflow: auto;
+  margin: 0;
+  padding: 10px;
+  border-radius: 6px;
+  background: rgba(0, 0, 0, 0.45);
+  border: 1px solid rgba(255, 255, 255, 0.08);
+  font-family: Consolas, "Courier New", monospace;
+  font-size: 11px;
+  line-height: 1.5;
+  color: #c8d3de;
+  white-space: pre-wrap;
+  word-break: break-all;
+}
+
+.airsim-settings-path-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-top: 10px;
+}
+
+.airsim-settings-path-row input {
+  flex: 1;
+  min-width: 0;
 }
 
 .airsim-template-result {

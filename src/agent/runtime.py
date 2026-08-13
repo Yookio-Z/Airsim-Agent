@@ -6,6 +6,7 @@ import base64
 import hashlib
 import json
 import math
+import os
 import re
 import threading
 import time
@@ -2583,9 +2584,9 @@ class AgentRuntime:
     # ── AirSim settings.json 模板（通信模式一键切换） ──
 
     def airsim_settings_info(self) -> dict[str, Any]:
-        """List AirSim settings.json templates + the target file location.
+        """List AirSim settings.json templates (with full content) + target path.
 
-        AirSim's communication mode is decided by ~/Documents/AirSim/settings.json:
+        AirSim's communication mode is decided by the settings.json:
           * SimpleFlight           -> airsim backend (direct RPC control)
           * PX4Multirotor + UDP    -> px4_mavlink backend (local/WSL PX4 SITL)
           * PX4Multirotor + TCP    -> px4_ros2 backend (Jetson/edge PX4 SITL)
@@ -2602,6 +2603,7 @@ class AgentRuntime:
                     "backend": meta["backend"],
                     "exists": path.is_file(),
                     "size": path.stat().st_size if path.is_file() else 0,
+                    "content": path.read_text(encoding="utf-8") if path.is_file() else "",
                 }
             )
         target = self._airsim_settings_path()
@@ -2609,11 +2611,32 @@ class AgentRuntime:
             "templates": templates,
             "target_path": str(target),
             "target_exists": target.is_file(),
+            "custom_path_set": bool(self._custom_airsim_settings_path()),
         }
 
     @staticmethod
-    def _airsim_settings_path() -> Path:
-        """AirSim settings.json location (Windows Documents/AirSim)."""
+    def _custom_airsim_settings_path() -> str:
+        """User-configured path override (persisted in system settings)."""
+        try:
+            return str((_load_settings().get("airsim") or {}).get("settings_path") or "").strip()
+        except Exception:
+            return ""
+
+    @classmethod
+    def _airsim_settings_path(cls) -> Path:
+        """Resolve the AirSim settings.json location.
+
+        Priority: AIRSIM_SETTINGS_PATH env var > persisted override >
+        %USERPROFILE%\\Documents\\AirSim > %USERPROFILE%\\AirSim.
+        Nothing is hard-coded: Path.home() follows the current Windows user,
+        so moving to another machine just works.
+        """
+        env_path = os.environ.get("AIRSIM_SETTINGS_PATH", "").strip()
+        if env_path:
+            return Path(env_path)
+        override = cls._custom_airsim_settings_path()
+        if override:
+            return Path(override)
         candidates = [
             Path.home() / "Documents" / "AirSim" / "settings.json",
             Path.home() / "AirSim" / "settings.json",
@@ -2622,6 +2645,18 @@ class AgentRuntime:
             if candidate.is_file():
                 return candidate
         return candidates[0]
+
+    def save_airsim_settings_path(self, path: str) -> dict[str, Any]:
+        """Persist a custom AirSim settings.json path override."""
+        try:
+            settings = _load_settings()
+            airsim = dict(settings.get("airsim") or {})
+            airsim["settings_path"] = str(path or "").strip()
+            settings["airsim"] = airsim
+            _save_settings(settings)
+            return {"ok": True, "target_path": str(self._airsim_settings_path())}
+        except Exception as exc:
+            return {"ok": False, "error": str(exc)}
 
     def apply_airsim_settings_template(self, template_id: str) -> dict[str, Any]:
         """Backup the current settings.json and write the requested template.
