@@ -3701,7 +3701,7 @@ function buildMissionDraftFromItems(items) {
   })();
   return {
     name: "UI mission",
-    vehicle: document.getElementById("missionVehicle")?.value || "",
+    vehicle: document.getElementById("missionVehicleSelect")?.value || "",
     home,
     items: items.map((it) => ({
       id: it.id,
@@ -4455,6 +4455,33 @@ function renderVehicleList(toolRuntime = {}) {
       const option = document.createElement("option");
       option.value = String(vehicle.vehicle_name || "");
       datalist.appendChild(option);
+    }
+  }
+  // 航点面板的目标载具下拉：仅多机模式显示（单机不挤占 header）
+  const vehicleSelect = document.getElementById("missionVehicleSelect");
+  if (vehicleSelect) {
+    if (vehicles.length > 1) {
+      const previous = vehicleSelect.value;
+      vehicleSelect.textContent = "";
+      const defaultOption = document.createElement("option");
+      defaultOption.value = "";
+      defaultOption.textContent = "默认机";
+      vehicleSelect.appendChild(defaultOption);
+      for (const vehicle of vehicles) {
+        const name = String(vehicle.vehicle_name || "");
+        if (!name) continue;
+        const option = document.createElement("option");
+        option.value = name;
+        option.textContent = name;
+        vehicleSelect.appendChild(option);
+      }
+      if (previous && [...vehicleSelect.options].some((o) => o.value === previous)) {
+        vehicleSelect.value = previous;
+      }
+      vehicleSelect.hidden = false;
+    } else {
+      vehicleSelect.hidden = true;
+      vehicleSelect.textContent = "";
     }
   }
   if (vehicles.length <= 1) {

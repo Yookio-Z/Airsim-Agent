@@ -5691,22 +5691,15 @@ body.dragging-system-settings #systemSettingsModal .modal-head {
   color: var(--text-secondary, #aeb8c3);
 }
 
-/* 多机：航点面板载具选择 */
-.waypoint-panel-vehicle {
-  display: flex;
-  align-items: center;
-  gap: 6px;
-  padding: 0 8px;
-  font-size: 12px;
-  color: var(--text-secondary, #aeb8c3);
-}
 
-.waypoint-panel-vehicle input {
-  width: 110px;
-  padding: 3px 6px;
+/* 多机：航点面板目标载具下拉（仅多机模式显示） */
+.waypoint-vehicle-select {
+  margin-left: 8px;
+  padding: 2px 6px;
   border: 1px solid rgba(255, 255, 255, 0.14);
   border-radius: 4px;
   background: rgba(10, 16, 24, 0.7);
-  color: inherit;
+  color: var(--text-secondary, #aeb8c3);
   font-size: 12px;
+  max-width: 140px;
 }
