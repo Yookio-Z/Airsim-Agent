@@ -1,0 +1,23 @@
+[run]
+# Coverage gate scope: the critical reliability surface (agent core, control
+# loops, backends, safety). UI/telemetry/ML-perception code is intentionally
+# excluded — it needs hardware or a live simulator and would drag the gate
+# below any meaningful threshold.
+include =
+    src/agent/agent_loop.py
+    src/agent/llm.py
+    src/agent/llm_protocol.py
+    src/agent/runtime.py
+    src/agent/tool_executor.py
+    src/agent/run_log.py
+    src/agent/sub_agent.py
+    src/agent/memory.py
+    src/modules/formation.py
+    src/modules/mavlink_controller.py
+    src/modules/airsim_controller.py
+    src/modules/safety_validator.py
+
+[report]
+fail_under = 45
+show_missing = false
+skip_covered = true

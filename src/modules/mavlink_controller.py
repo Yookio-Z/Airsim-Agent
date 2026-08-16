@@ -9,7 +9,7 @@ import subprocess
 import threading
 import time
 from collections import deque
-from typing import Any
+from typing import Any, Callable
 
 os.environ.setdefault("MAVLINK20", "1")
 from pymavlink import mavutil
@@ -170,10 +170,14 @@ class MavlinkController(FlightController):
         return 0
 
     def _target_sysid(self) -> int:
-        """命令上下文的目标机：target_system 已设置时用它，否则 active 机。"""
+        """命令上下文的目标机：target_system 已设置时用它，否则 active 机。
+
+        sysid 0 is never a real vehicle (the default-initialized bookkeeping
+        table), so it always falls back to the active vehicle.
+        """
         if self._mavlink is not None:
-            sysid = getattr(self._mavlink, "target_system", 0) or 0
-            if sysid in self._systems:
+            sysid = int(getattr(self._mavlink, "target_system", 0) or 0)
+            if sysid and sysid in self._systems:
                 return sysid
         return self._active_sysid
 
@@ -190,27 +194,29 @@ class MavlinkController(FlightController):
 
     @property
     def _position(self) -> dict[str, float]:
-        return self._system_table(self._active_sysid)["position"]
+        # target-first: per-vehicle command paths _set_target() before reading,
+        # so this returns the CURRENT vehicle's position, not the first one's
+        return self._system_table(self._target_sysid())["position"]
 
     @_position.setter
     def _position(self, value: dict[str, float]) -> None:
-        self._system_table(self._active_sysid)["position"] = value
+        self._system_table(self._target_sysid())["position"] = value
 
     @property
     def _velocity(self) -> dict[str, float]:
-        return self._system_table(self._active_sysid)["velocity"]
+        return self._system_table(self._target_sysid())["velocity"]
 
     @_velocity.setter
     def _velocity(self, value: dict[str, float]) -> None:
-        self._system_table(self._active_sysid)["velocity"] = value
+        self._system_table(self._target_sysid())["velocity"] = value
 
     @property
     def _gps_origin(self) -> dict[str, float] | None:
-        return self._system_table(self._active_sysid)["gps_origin"]
+        return self._system_table(self._target_sysid())["gps_origin"]
 
     @_gps_origin.setter
     def _gps_origin(self, value: dict[str, float] | None) -> None:
-        self._system_table(self._active_sysid)["gps_origin"] = value
+        self._system_table(self._target_sysid())["gps_origin"] = value
 
     @property
     def _last_heartbeat(self) -> float:
@@ -1008,8 +1014,13 @@ class MavlinkController(FlightController):
         return False
 
     def _takeoff_via_offboard(self, target: dict[str, float], altitude: float, vehicle_name: str = "") -> bool:
-        self._prime_offboard_position(target)
-        if not self.set_mode("OFFBOARD") and self._current_mode() != "OFFBOARD":
+        if not self._prime_offboard_position(target):
+            self._stop_offboard_hold()
+            self._last_action_error = self._with_status_text(
+                "takeoff interrupted by emergency stop / cancel"
+            )
+            return False
+        if not self._set_mode_one("OFFBOARD") and self._current_mode() != "OFFBOARD":
             self._stop_offboard_hold()
             self._last_action_error = self._with_status_text(
                 f"OFFBOARD takeoff rejected before arming; current mode={self._current_mode()}"
@@ -1025,6 +1036,12 @@ class MavlinkController(FlightController):
         arrival_threshold = max(0.15, min(0.45, self._arrival_threshold_m))
         period = 1.0 / self._setpoint_hz
         while time.time() < deadline:
+            if self._stop_requested():
+                self._finish_offboard_position_hold(dict(self._position))
+                self._last_action_error = self._with_status_text(
+                    "takeoff interrupted by emergency stop / cancel"
+                )
+                return False
             self._send_position_setpoint(target)
             self.update_telemetry(timeout=0.02)
             if self._distance_to(target) <= arrival_threshold:
@@ -1054,7 +1071,7 @@ class MavlinkController(FlightController):
     def _land_one(self) -> bool:
         if not self.is_connected:
             return False
-        mode_ok = self.set_mode("LAND")
+        mode_ok = self._set_mode_one("LAND")
         self._mavlink.mav.command_long_send(
             self._mavlink.target_system,
             self._mavlink.target_component,
@@ -1091,14 +1108,17 @@ class MavlinkController(FlightController):
         if not self.is_connected:
             return False
         if self._current_altitude_m() < 0.5:
-            return self.stop(vehicle_name)
+            # on the ground: stop the current target (never re-resolve to the
+            # first vehicle), mirroring stop()'s ground branch
+            self._stop_offboard_hold()
+            return self._stream_velocity_setpoint({"vx": 0.0, "vy": 0.0, "vz": 0.0}, duration=0.5)
         current = dict(self._position)
         mode = self._current_mode()
         if mode in {"LOITER", "POSCTL"}:
             return True
         if mode == "OFFBOARD":
             return self._finish_offboard_position_hold(current)
-        return self.set_mode("LOITER") or self.set_mode("POSCTL")
+        return self._set_mode_one("LOITER") or self._set_mode_one("POSCTL")
 
     def stop(self, vehicle_name: str = "") -> bool:
         if not self.is_connected:
@@ -1144,8 +1164,15 @@ class MavlinkController(FlightController):
         target = {"x": float(x), "y": float(y), "z": float(z)}
         velocity = max(0.2, min(abs(float(velocity)), self._max_velocity))
 
-        self._prime_offboard_position(target)
-        if not self.set_mode("OFFBOARD"):
+        if not self._prime_offboard_position(target):
+            self._stop_offboard_hold()
+            self._last_path_error = {
+                "stage": "move_to_position",
+                "message": "interrupted by emergency stop / cancel",
+                "target": target,
+            }
+            return False
+        if not self._set_mode_one("OFFBOARD"):
             if self._current_mode() != "OFFBOARD":
                 self._stop_offboard_hold()
             self._last_path_error = {
@@ -1168,6 +1195,17 @@ class MavlinkController(FlightController):
         )
         period = 1.0 / self._setpoint_hz
         while time.time() - start < timeout:
+            if self._stop_requested():
+                # leave OFFBOARD cleanly at the current position so the
+                # vehicle holds instead of continuing toward the target
+                self._finish_offboard_position_hold(dict(self._position))
+                self._last_path_error = {
+                    "stage": "move_to_position",
+                    "message": "interrupted by emergency stop / cancel",
+                    "target": target,
+                    "position": dict(self._position),
+                }
+                return False
             self._send_position_setpoint(target)
             self.update_telemetry(timeout=0.02)
             if self._distance_to(target) <= arrival_threshold:
@@ -1201,19 +1239,141 @@ class MavlinkController(FlightController):
                 break
         return ok
 
+    # ------------------------------------------------------------------
+    # Formation velocity-control protocol (duck-typed for FormationController)
+    #
+    # The formation loop re-issues a setpoint every tick (~10Hz), forming a
+    # continuous OFFBOARD stream. These methods deliberately avoid the
+    # single-shot streaming semantics of move_by_velocity (which blocks for
+    # `duration` and then leaves OFFBOARD).
+    # ------------------------------------------------------------------
+
+    def send_velocity_setpoint(self, vx: float, vy: float, vz: float, vehicle_name: str = "") -> bool:
+        """Send ONE velocity setpoint per vehicle and return immediately."""
+        targets = self._resolve_sysids(vehicle_name)
+        if not targets:
+            self._last_action_error = "no MAVLink system available"
+            return False
+        if not self.is_connected:
+            self._last_action_error = "MAVLink link is not connected"
+            return False
+        ok = True
+        for sysid in targets:
+            self._set_target(sysid)
+            try:
+                self._send_velocity_setpoint(
+                    self._limit_velocity({"vx": float(vx), "vy": float(vy), "vz": float(vz)})
+                )
+            except Exception:
+                ok = False
+                break
+        return ok
+
+    def prepare_velocity_control(self, vehicle_name: str = "") -> bool:
+        """Enter OFFBOARD for the formation velocity loop.
+
+        Stops the shared hold/velocity thread first so it never competes with
+        the formation loop's setpoint stream.
+        """
+        targets = self._resolve_sysids(vehicle_name)
+        if not targets:
+            self._last_action_error = "no MAVLink system available"
+            return False
+        ok = True
+        for sysid in targets:
+            self._set_target(sysid)
+            self._stop_offboard_hold()
+            if not self._set_mode_one("OFFBOARD") and self._current_mode() != "OFFBOARD":
+                self._last_action_error = self._with_status_text(
+                    f"OFFBOARD activation rejected for {sysid}; current mode={self._current_mode()}"
+                )
+                ok = False
+                break
+        return ok
+
+    def is_velocity_control_active(self, vehicle_name: str = "") -> bool:
+        """True while every resolved vehicle is still in OFFBOARD with a fresh
+        heartbeat.
+
+        RC takeover or an operator mode switch exits OFFBOARD; a stale heartbeat
+        (link loss) also counts as inactive so the formation loop stops instead
+        of commanding a dead link. The formation loop polls this each tick.
+        """
+        targets = self._resolve_sysids(vehicle_name)
+        if not targets:
+            return False
+        for sysid in targets:
+            self._set_target(sysid)
+            if self._current_mode() != "OFFBOARD":
+                return False
+            heartbeat_age = time.time() - self._system_table(sysid)["last_heartbeat"]
+            if heartbeat_age > 2.0:
+                return False
+        return True
+
+    def release_velocity_control(self, vehicle_name: str = "") -> bool:
+        """Leave OFFBOARD safely: LOITER/POSCTL, or a position-hold stream."""
+        targets = self._resolve_sysids(vehicle_name)
+        if not targets:
+            return False
+        ok = True
+        for sysid in targets:
+            self._set_target(sysid)
+            if self._current_mode() == "OFFBOARD":
+                if not self._finish_offboard_position_hold(dict(self._position)):
+                    ok = False
+            else:
+                self._stop_offboard_hold()
+        return ok
+
+    # ------------------------------------------------------------------
+    # External stop/cancel signal (emergency stop preemption)
+    # ------------------------------------------------------------------
+
+    def set_stop_provider(self, stop_provider: Callable[[], bool] | None = None) -> None:
+        """Wire an external stop/cancel signal into blocking flight commands.
+
+        The provider is polled while a single-vehicle position move, takeoff,
+        or hold stream is in flight. When it returns True the command exits
+        cleanly (OFFBOARD left through a position hold / LOITER) instead of
+        letting the vehicle keep flying after an emergency stop.
+        """
+        self._stop_provider = stop_provider
+
+    def _stop_requested(self) -> bool:
+        provider = getattr(self, "_stop_provider", None)
+        try:
+            return bool(provider and provider())
+        except Exception:
+            return False
+
+    def _sleep_interruptible(self, seconds: float) -> bool:
+        """Sleep in small slices, returning False early when a stop is requested."""
+        deadline = time.time() + max(0.0, float(seconds))
+        while time.time() < deadline:
+            if self._stop_requested():
+                return False
+            time.sleep(min(0.05, deadline - time.time()))
+        return True
+
     def _move_by_velocity_one(self, vx: float, vy: float, vz: float, duration: float = 0.0) -> bool:
         if not self.is_connected:
             return False
         velocity = self._limit_velocity({"vx": float(vx), "vy": float(vy), "vz": float(vz)})
         duration = max(0.8, float(duration or 0.8))
-        self._prime_offboard_velocity(velocity)
-        if not self.set_mode("OFFBOARD"):
+        if not self._prime_offboard_velocity(velocity):
+            self._stop_offboard_hold()
+            return False
+        if not self._set_mode_one("OFFBOARD"):
             if self._current_mode() != "OFFBOARD":
                 self._stop_offboard_hold()
             return False
         streamed = self._stream_velocity_setpoint(velocity, duration=duration)
         self.update_telemetry(timeout=0.1)
-        return streamed and self._finish_offboard_position_hold(dict(self._position))
+        # Always leave OFFBOARD through the safe hold path, even when the
+        # stream was interrupted by an emergency stop.
+        held = self._finish_offboard_position_hold(dict(self._position))
+        return streamed and held
 
     def move_on_path(self, waypoints: list[dict], velocity: float = 2.0, vehicle_name: str = "") -> bool:
         """多机：vehicle_name（""=默认机 / all=全部 / px4_sysN）解析后逐机执行。"""
@@ -2448,14 +2608,19 @@ class MavlinkController(FlightController):
             return False
         target = heading_deg % 360.0
         start = time.time()
-        self._prime_offboard_velocity({"vx": 0.0, "vy": 0.0, "vz": 0.0})
-        if not self.set_mode("OFFBOARD"):
+        if not self._prime_offboard_velocity({"vx": 0.0, "vy": 0.0, "vz": 0.0}):
+            self._stop_offboard_hold()
+            return False
+        if not self._set_mode_one("OFFBOARD"):
             if self._current_mode() != "OFFBOARD":
                 self._stop_offboard_hold()
             return False
         self._send_yaw_rate_setpoint(0.0)
         self._stop_offboard_hold()
         while time.time() - start < timeout:
+            if self._stop_requested():
+                self._finish_offboard_position_hold(dict(self._position))
+                return False
             self.update_telemetry(timeout=0.05)
             gps = self._telemetry.get("GLOBAL_POSITION_INT", {})
             current = float(gps.get("hdg", 0.0) or 0.0)
@@ -3046,9 +3211,13 @@ class MavlinkController(FlightController):
             thread.join(timeout=0.6)
 
     def _finish_offboard_position_hold(self, target: dict[str, float]) -> bool:
-        """Leave OFFBOARD without a setpoint gap, or keep a safe hold worker alive."""
+        """Leave OFFBOARD without a setpoint gap, or keep a safe hold worker alive.
+
+        Mode switches go through _set_mode_one so they act on the CURRENT
+        target system (multi-vehicle), never re-resolving to the first one.
+        """
         self._start_offboard_position_hold(target)
-        if self.set_mode("LOITER") or self.set_mode("POSCTL"):
+        if self._set_mode_one("LOITER") or self._set_mode_one("POSCTL"):
             self._stop_offboard_hold()
             return True
         logger.warning(
@@ -3056,17 +3225,23 @@ class MavlinkController(FlightController):
         )
         return self._offboard_hold_active()
 
-    def _prime_offboard_position(self, target: dict[str, float]) -> None:
+    def _prime_offboard_position(self, target: dict[str, float]) -> bool:
+        """Start streaming position setpoints and wait briefly so PX4 sees the
+        stream before the OFFBOARD mode switch. Returns False on stop."""
         self._start_offboard_position_hold(target)
-        time.sleep(1.0)
+        return self._sleep_interruptible(1.0)
 
-    def _prime_offboard_velocity(self, velocity: dict[str, float]) -> None:
+    def _prime_offboard_velocity(self, velocity: dict[str, float]) -> bool:
+        """Start streaming velocity setpoints and wait briefly so PX4 sees the
+        stream before the OFFBOARD mode switch. Returns False on stop."""
         self._start_offboard_velocity_stream(velocity)
-        time.sleep(1.0)
+        return self._sleep_interruptible(1.0)
 
     def _stream_position_setpoint(self, target: dict[str, float], duration: float) -> bool:
         end = time.time() + max(0.0, duration)
         while time.time() < end:
+            if self._stop_requested():
+                return False
             self._send_position_setpoint(target)
             time.sleep(1.0 / self._setpoint_hz)
         return True
@@ -3074,6 +3249,8 @@ class MavlinkController(FlightController):
     def _stream_velocity_setpoint(self, velocity: dict[str, float], duration: float) -> bool:
         end = time.time() + max(0.0, duration)
         while time.time() < end:
+            if self._stop_requested():
+                return False
             self._send_velocity_setpoint(velocity)
             time.sleep(1.0 / self._setpoint_hz)
         return True

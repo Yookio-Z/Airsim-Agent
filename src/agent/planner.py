@@ -13,7 +13,7 @@ import time
 from dataclasses import asdict, dataclass, field
 from typing import Any
 
-from .command_slots import extract_command_slots
+from .command_slots import extract_command_slots, extract_intents, extract_target_class
 
 
 @dataclass
@@ -55,6 +55,10 @@ class MissionPlan:
     # "agent_loop" (task needs observe-respond cycles: visual search, tracking,
     # conditional steps — execute step-by-step instead of as a fixed sequence).
     execution_mode: str = "auto"
+    # Task contract: machine-verifiable completion criteria. The agent loop
+    # checks these before accepting an is_complete decision (LLM 提议 +
+    # 确定性验证), so "model said done" is never the only gate.
+    goal: dict[str, Any] = field(default_factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -70,18 +74,12 @@ class MissionPlan:
             "reasoning": self.reasoning,
             "risk_notes": list(self.risk_notes),
             "execution_mode": self.execution_mode,
+            "goal": dict(self.goal),
         }
 
 
 class MissionPlanner:
     """Rule planner that establishes the VLA tool contract."""
-
-    TARGET_ALIASES = {
-        "car": ["car", "vehicle", "truck", "bus", "汽车", "车辆", "车", "卡车"],
-        "person": ["person", "pedestrian", "human", "人", "行人", "人员"],
-        "truck": ["truck", "lorry", "卡车", "货车"],
-        "bus": ["bus", "公交", "巴士"],
-    }
 
     def plan(self, command: str, capabilities: dict[str, Any] | None = None) -> MissionPlan:
         normalized = command.strip()
@@ -90,6 +88,7 @@ class MissionPlanner:
 
         lower = normalized.lower()
         slots = extract_command_slots(normalized)
+        intents = extract_intents(normalized)
         run_id = f"run_{int(time.time() * 1000)}"
         steps: list[MissionStep] = []
         assumptions: list[str] = []
@@ -110,7 +109,7 @@ class MissionPlanner:
             altitude = 3.0
             assumptions.append("未指定起飞/搜索高度，默认使用 3m。")
 
-        target_class = slots.target_class or self._extract_target(lower)
+        target_class = slots.target_class or extract_target_class(normalized)
         coordinate = _target_tuple(slots.ned_target) or self._extract_coordinate(normalized)
         relative_move = slots.relative_move
         relative_moves = list(slots.relative_moves or [])
@@ -120,16 +119,16 @@ class MissionPlanner:
         radius = slots.radius or self._extract_radius(normalized) or 25.0
 
         wants_return = bool(slots.return_to_start)
-        wants_land = slots.land is True or wants_return or any(k in lower for k in ["land", "降落", "落地"])
-        wants_hover = any(k in lower for k in ["hover", "悬停", "暂停"])
-        wants_photo = any(k in lower for k in ["photo", "capture", "拍照", "图像", "截图"])
-        wants_search = any(k in lower for k in ["search", "find", "detect", "识别", "搜索", "寻找", "找", "目标"])
-        wants_patrol = any(k in lower for k in ["patrol", "inspect", "巡检", "巡航", "区域"])
-        wants_track = any(k in lower for k in ["track", "follow", "跟踪", "追踪"])
-        wants_connect = any(k in lower for k in ["connect", "连接"])
-        wants_takeoff = any(k in lower for k in ["takeoff", "起飞", "升空"])
+        wants_land = slots.land is True or wants_return or intents["land"]
+        wants_hover = intents["hover"]
+        wants_photo = intents["photo"]
+        wants_search = intents["search"]
+        wants_patrol = intents["patrol"]
+        wants_track = intents["track"]
+        wants_connect = intents["connect"]
+        wants_takeoff = intents["takeoff"]
         wants_upload_only = any(k in lower for k in ["upload", "plan only", "上传", "下发", "规划", "保存"])
-        wants_status = any(k in lower for k in ["status", "state", "telemetry", "查看状态", "状态", "遥测"])
+        wants_status = intents["status"]
         wants_conditional = any(k in lower for k in ["if", "when", "如果", "未起飞", "没有起飞"])
         hover_index = _first_keyword_index(lower, ["hover", "悬停", "暂停"])
         motion_index = _first_keyword_index(
@@ -197,7 +196,8 @@ class MissionPlanner:
             else:
                 add("悬停稳定", "drone_hover", layer="safety")
                 add("执行降落", "drone_land", layer="action")
-            return MissionPlan(run_id, normalized, "land", "安全降落", steps, assumptions)
+            goal = {"objective": "安全降落", "target": "", "success_criteria": [{"metric": "landed"}]}
+            return MissionPlan(run_id, normalized, "land", "安全降落", steps, assumptions, goal=goal)
 
         if wants_hover and not requires_flight:
             add("进入悬停", "drone_hover", layer="action")
@@ -321,7 +321,47 @@ class MissionPlanner:
         if intent in {"general_mission", "takeoff"} and relative_moves:
             intent = "move_relative"
         summary = self._summary(intent, target_class, radius, altitude)
-        return MissionPlan(run_id, normalized, intent, summary, steps, assumptions)
+        goal = self._goal_for(intent, target_class, coordinate, altitude, effective_search)
+        if wants_land and not any(c.get("metric") == "landed" for c in goal["success_criteria"]):
+            goal["success_criteria"].append({"metric": "landed"})
+        return MissionPlan(run_id, normalized, intent, summary, steps, assumptions, goal=goal)
+
+    def _goal_for(
+        self,
+        intent: str,
+        target_class: str,
+        coordinate: tuple[float, float, float] | None,
+        altitude: float,
+        effective_search: bool,
+    ) -> dict[str, Any]:
+        """Synthesize machine-verifiable completion criteria from the intent.
+
+        The loop checks these before accepting a model-declared completion, so
+        a search task cannot end with 'complete' unless the target was found or
+        an explicit not-found search ran, and a fly-to task cannot end before
+        the reported position is within tolerance.
+        """
+        criteria: list[dict[str, Any]] = []
+        if intent in {"search_target", "search_and_track"} and effective_search:
+            criteria.append({"metric": "target_confirmed", "target": target_class})
+        elif intent == "fly_to_point" and coordinate:
+            criteria.append(
+                {
+                    "metric": "position_reached",
+                    "x": coordinate[0],
+                    "y": coordinate[1],
+                    "z": coordinate[2],
+                    "tolerance": 1.5,
+                }
+            )
+        elif intent == "visual_capture":
+            criteria.append({"metric": "photo_taken"})
+        elif intent == "takeoff":
+            criteria.append({"metric": "flying_at", "altitude": altitude, "tolerance": 1.0})
+        elif intent in {"area_patrol", "move_relative", "general_mission"}:
+            criteria.append({"metric": "status_ok"})
+        objective = self._summary(intent, target_class, 25.0, altitude) if intent else "任务"
+        return {"objective": objective, "target": target_class, "success_criteria": criteria}
 
     def _supports(self, capabilities: dict[str, Any], capability: str, default: bool) -> bool:
         if capability not in capabilities:
@@ -405,12 +445,6 @@ class MissionPlanner:
         if grouped:
             return tuple(float(grouped.group(i)) for i in range(1, 4))  # type: ignore[return-value]
         return None
-
-    def _extract_target(self, lower: str) -> str:
-        for canonical, aliases in self.TARGET_ALIASES.items():
-            if any(alias.lower() in lower for alias in aliases):
-                return canonical
-        return ""
 
     def _patrol_waypoints(self, radius: float, altitude: float) -> list[dict[str, float]]:
         r = max(5.0, min(radius, 80.0))

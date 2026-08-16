@@ -5,6 +5,7 @@ from __future__ import annotations
 import time
 from typing import Any, Callable
 
+from .command_slots import MOTION_TERMS, extract_intents, extract_target_class
 from .llm import LLMMissionPlanner
 from .loop_types import LoopActionResult, LoopDecision, LoopObservation, LoopState
 from .memory import AgentMemory
@@ -61,6 +62,9 @@ class AgentLoop:
         execute: bool = True,
         attachments: list[dict[str, Any]] | None = None,
         require_llm: bool = False,
+        conversation_context: list[dict[str, Any]] | None = None,
+        system_prompt: str | None = None,
+        fallback_enabled: bool = True,
     ) -> LoopState:
         state = LoopState(
             run_id=run_id,
@@ -78,6 +82,7 @@ class AgentLoop:
         failure_count = 0
         unresolved_failure = False
         replan_count = 0
+        verify_corrected = False
 
         for step_index in range(1, max_steps + 1):
             if self._should_stop():
@@ -91,9 +96,11 @@ class AgentLoop:
                 world_state=self.tools.status_snapshot(),
                 last_action_result=last_result,
                 elapsed_since_start=time.time() - state.started_at,
+                frame_age_s=self._latest_image_age(state),
             )
             state.observations.append(observation)
             self._notify_state(state)
+            self._event("info", "agent_loop", f"Observation {step_index}", observation.to_dict(), kind="observation")
 
             decision = None if require_llm else self._preemptive_guard_decision(command, state, observation, allowed_tools, capabilities)
             if decision is None:
@@ -108,13 +115,45 @@ class AgentLoop:
                     attachments=attachments or [],
                     require_llm=require_llm,
                     skill_guidance=skill_guidance,
+                    tools=self._tool_specs(),
+                    system_prompt=system_prompt,
+                    fallback_enabled=fallback_enabled,
+                    conversation_context=conversation_context,
                 )
                 decision = self._guard_decision(command, state, observation, decision, allowed_tools, capabilities)
             decision = self._sanitize_decision(decision, allowed_tools)
             state.decisions.append(decision)
             self._notify_state(state)
-            self._event("info", "agent_loop", f"Loop decision {step_index}: {decision.action or 'complete'}", decision.to_dict())
+            self._event("info", "agent_loop", f"Loop decision {step_index}: {decision.action or 'complete'}", decision.to_dict(), kind="loop.decision")
 
+            if decision.is_complete:
+                goal = self._run_goal(initial_plan)
+                verification = self._verify_completion(goal, state, observation)
+                if verification["criteria"]:
+                    if not verification["satisfied"] and not verify_corrected:
+                        corrective = self._corrective_decision(verification, state, allowed_tools)
+                        if corrective is not None:
+                            verify_corrected = True
+                            corrective = self._sanitize_decision(corrective, allowed_tools)
+                            self._event(
+                                "warning",
+                                "verification",
+                                f"完成判据未满足，先执行纠正动作: {corrective.action or '状态回读'}",
+                                verification,
+                                kind="verification",
+                            )
+                            decision = corrective
+                            # record the corrective decision in the audit trail
+                            state.decisions.append(corrective)
+                            self._notify_state(state)
+                        else:
+                            state.verification_status = "failed"
+                            self._event("warning", "verification", "完成判据无法满足且无纠正路径", verification, kind="verification")
+                    elif not verification["satisfied"]:
+                        state.verification_status = "failed"
+                        self._event("warning", "verification", "完成判据仍未满足（已执行一次纠正）", verification, kind="verification")
+                    else:
+                        state.verification_status = "ok"
             if decision.is_complete:
                 if unresolved_failure:
                     state.status = "failed"
@@ -130,7 +169,7 @@ class AgentLoop:
                         "ok": False,
                         "data": {"status": "replan_requested", "message": decision.reflection or decision.reason},
                     }
-                    self._event("warning", "agent_loop", f"Replan requested ({replan_count}/2)", decision.to_dict())
+                    self._event("warning", "agent_loop", f"Replan requested ({replan_count}/2)", decision.to_dict(), kind="replan")
                     continue
                 state.status = "failed"
                 state.failure_reason = decision.reflection or decision.reason or "agent loop produced no executable action"
@@ -151,7 +190,7 @@ class AgentLoop:
             self._notify_state(state)
             self.memory.remember_tool_call(result_row.tool, result_row.ok)
             last_result = result_row.to_dict()
-            self._event("info" if result_row.ok else "warning", "tool", f"Loop action {result_row.tool}", result["raw"])
+            self._event("info" if result_row.ok else "warning", "tool", f"Loop action {result_row.tool}", result["raw"], kind="tool.result")
 
             if not result_row.ok:
                 failure_count += 1
@@ -165,10 +204,29 @@ class AgentLoop:
                     "agent_loop",
                     f"Action failed; observation/recovery turn allowed ({failure_count}/3)",
                     result_row.to_dict(),
+                    kind="tool.result",
                 )
                 continue
             if result_row.tool not in {"drone_get_status", "airsim_task_status"}:
                 unresolved_failure = False
+
+            if decision.parallel_actions and state.status != "failed":
+                batch_state = self._execute_batch_actions(
+                    decision.parallel_actions,
+                    command,
+                    state,
+                    observation,
+                    allowed_tools,
+                    capabilities,
+                    step_index,
+                    execute,
+                    failure_count,
+                    unresolved_failure,
+                )
+                failure_count = batch_state["failure_count"]
+                unresolved_failure = batch_state["unresolved_failure"]
+                if state.status == "failed":
+                    break
         else:
             state.status = "blocked"
             state.failure_reason = f"agent loop reached max_steps={max_steps}"
@@ -322,14 +380,7 @@ class AgentLoop:
         if not self._is_visual_request(command):
             return None
         lower = command.lower()
-        has_motion_goal = any(
-            term in lower
-            for term in [
-                "takeoff", "fly", "move", "forward", "backward", "left", "right", "return", "land",
-                "\u8d77\u98de", "\u98de\u884c", "\u524d\u98de", "\u5411\u524d", "\u540e\u98de", "\u5de6",
-                "\u53f3", "\u8fd4\u822a", "\u8fd4\u56de", "\u964d\u843d",
-            ]
-        )
+        has_motion_goal = any(term in lower for term in MOTION_TERMS)
         visual_target_approach = self._wants_visual_approach(command) and self._wants_target_confirmation(command)
         flight_progress = any(
             self._has_successful_tool(state, tool)
@@ -363,7 +414,12 @@ class AgentLoop:
                 continue
             seen.add(name)
             deduped.append(card)
-        return deduped[:32]
+        # Agent-level cards (memory/subtask) always keep a slot even when the
+        # regular tool set overflows the decision-card budget.
+        agent_names = {"memory_recall", "memory_remember", "agent_subtask"}
+        agent_cards = [card for card in deduped if card.get("name") in agent_names]
+        regular = [card for card in deduped if card.get("name") not in agent_names]
+        return (regular[: max(0, 32 - len(agent_cards))] + agent_cards)[:32]
 
     def _allowed_tools(self, tool_cards: list[dict[str, Any]]) -> set[str]:
         card_names = {card.get("name") for card in tool_cards if isinstance(card, dict)}
@@ -374,48 +430,19 @@ class AgentLoop:
         return {"memory_store"}
 
     def _is_visual_request(self, command: str) -> bool:
-        text = command.lower()
-        terms = [
-            "camera", "image", "photo", "picture", "frame", "view", "visible", "see", "look",
-            "detect", "search", "find", "locate", "target", "red car", "vehicle",
-            "\u6444\u50cf\u5934", "\u753b\u9762", "\u56fe\u50cf", "\u56fe\u7247", "\u62cd\u7167",
-            "\u770b\u5230", "\u770b\u4e00\u4e0b", "\u89c6\u89c9", "\u8bc6\u522b", "\u68c0\u6d4b",
-            "\u641c\u7d22", "\u5bfb\u627e", "\u76ee\u6807", "\u7ea2\u8272\u8f66", "\u8f66\u8f86",
-        ]
-        return any(term in text for term in terms)
+        return extract_intents(command)["visual"]
 
     def _wants_open_image_analysis(self, command: str) -> bool:
-        text = command.lower()
-        terms = [
-            "what do you see", "what can you see", "describe", "what is in the image",
-            "\u770b\u5230\u4e86\u4ec0\u4e48", "\u753b\u9762\u4fe1\u606f", "\u6709\u5565",
-            "\u6709\u4ec0\u4e48", "\u770b\u4e00\u4e0b", "\u544a\u8bc9\u6211\u56fe\u7247",
-        ]
-        return any(term in text for term in terms) and not self._wants_target_confirmation(command)
+        return extract_intents(command)["open_image_analysis"]
 
     def _wants_target_confirmation(self, command: str) -> bool:
-        text = command.lower()
-        terms = [
-            "target", "car", "vehicle", "truck", "bus", "person", "red", "blue", "white",
-            "detect", "search", "find", "locate",
-            "\u76ee\u6807", "\u8f66", "\u8f66\u8f86", "\u6c7d\u8f66", "\u5361\u8f66",
-            "\u884c\u4eba", "\u4eba\u5458", "\u7ea2\u8272", "\u84dd\u8272", "\u767d\u8272", "\u641c\u7d22",
-            "\u5bfb\u627e", "\u8bc6\u522b", "\u68c0\u6d4b",
-        ]
-        return any(term in text for term in terms)
+        return extract_intents(command)["target_confirmation"]
 
     def _wants_visual_approach(self, command: str) -> bool:
-        text = command.lower()
-        terms = [
-            "fly to", "go to", "move to", "approach", "toward", "towards",
-            "\u98de\u5411", "\u98de\u5230", "\u9760\u8fd1", "\u524d\u5f80", "\u79fb\u52a8\u5230",
-        ]
-        return any(term in text for term in terms)
+        return extract_intents(command)["visual_approach"]
 
     def _wants_search(self, command: str) -> bool:
-        text = command.lower()
-        terms = ["search", "find", "locate", "\u641c\u7d22", "\u5bfb\u627e", "\u627e\u5230", "\u67e5\u627e"]
-        return any(term in text for term in terms)
+        return extract_intents(command)["search"]
 
     def _target_description(self, command: str) -> str:
         text = command.strip()
@@ -424,25 +451,31 @@ class AgentLoop:
         return "target"
 
     def _target_class(self, command: str) -> str:
-        text = command.lower()
-        if any(term in text for term in ["truck", "\u5361\u8f66", "\u8d27\u8f66"]):
-            return "truck"
-        if any(term in text for term in ["bus", "\u516c\u4ea4", "\u5df4\u58eb"]):
-            return "bus"
-        if any(term in text for term in ["person", "pedestrian", "human", "\u884c\u4eba", "\u4eba\u5458"]):
-            return "person"
-        if any(term in text for term in ["car", "vehicle", "\u6c7d\u8f66", "\u8f66\u8f86", "\u8f66"]):
-            return "car"
-        return "target"
+        return extract_target_class(command) or "target"
 
     def _has_successful_tool(self, state: LoopState, tool: str) -> bool:
         return any(item.get("tool") == tool and bool(item.get("ok")) for item in self._iter_tool_results(state))
 
     def _has_recent_image(self, state: LoopState) -> bool:
+        now = time.time()
         for result in reversed(state.results):
-            if result.ok and self._result_contains_image(result.data):
+            if (
+                result.ok
+                and (now - result.timestamp) <= self._FRAME_MAX_AGE_S
+                and self._result_contains_image(result.data)
+            ):
                 return True
         return False
+
+    def _latest_image_age(self, state: LoopState) -> float | None:
+        """Seconds since the newest image-bearing result (None if no image)."""
+        now = time.time()
+        ages = [
+            now - result.timestamp
+            for result in reversed(state.results)
+            if result.ok and self._result_contains_image(result.data)
+        ]
+        return min(ages) if ages else None
 
     def _result_contains_image(self, value: Any) -> bool:
         if isinstance(value, dict):
@@ -535,6 +568,346 @@ class AgentLoop:
             )
         return None
 
+    def _tool_specs(self) -> list[dict[str, Any]] | None:
+        """Runtime tool specs (annotations/defaults) for schema synthesis."""
+        try:
+            return self.tools.list_tools() if hasattr(self.tools, "list_tools") else None
+        except Exception:
+            return None
+
+    def _is_parallel_safe(self, name: str) -> bool:
+        """Batch actions are restricted to read-only tools so a batch can never
+        smuggle a flight-control call past the one-flight-tool-per-turn rule.
+        airsim_task_cancel is deliberately excluded: cancelling an in-flight
+        task is a control-side effect and stays single-turn."""
+        read_only = getattr(self.tools, "READ_ONLY_TOOLS", set())
+        if name in read_only:
+            return True
+        if name in {"airsim_task_status", "memory_store", "memory_recall", "memory_remember"}:
+            return True
+        if name == "skill:visual_observe":
+            return True
+        return False
+
+    # Task-contract verification: machine-checkable completion criteria that
+    # gate model-declared completion ("LLM 提议 + 确定性验证").
+    _CORRECTIVE_TOOLS = {
+        "status_ok": "drone_get_status",
+        "landed": "drone_get_status",
+        "flying_at": "drone_get_status",
+        "position_reached": "drone_get_status",
+        "photo_taken": "airsim_take_photo",
+        "mission_progress_complete": "drone_get_mission_progress",
+        "target_confirmed": "airsim_vlm_confirm_target",
+        "formation_stable": "formation_command",
+    }
+    # Frames older than this are treated as "no recent image" by the guards.
+    _FRAME_MAX_AGE_S = 60.0
+
+    @staticmethod
+    def _run_goal(initial_plan: MissionPlan | None) -> dict[str, Any]:
+        if initial_plan is None:
+            return {}
+        plan_dict = initial_plan.to_dict() if hasattr(initial_plan, "to_dict") else {}
+        return plan_dict.get("goal") or {}
+
+    def _verify_completion(self, goal: dict[str, Any], state: LoopState, observation: LoopObservation) -> dict[str, Any]:
+        criteria = (goal or {}).get("success_criteria") or []
+        if not isinstance(criteria, list) or not criteria:
+            return {"satisfied": True, "criteria": [], "results": []}
+        results = [self._verify_criterion(criterion, state, observation) for criterion in criteria]
+        # Unevaluated criteria (missing telemetry) do not fail the run; they are
+        # recorded as warnings per the design ("无法评估 → 接受完成 + warning").
+        failed = [item for item in results if not item["satisfied"] and item.get("evaluated", True)]
+        unevaluated = [item for item in results if not item.get("evaluated", True)]
+        satisfied = not failed
+        reason = "; ".join(f"{item['metric']}: {item['detail']}" for item in failed)
+        if unevaluated:
+            note = "; ".join(f"{item['metric']}: {item['detail']}" for item in unevaluated)
+            reason = f"{reason}; unevaluated: {note}".strip("; ")
+        return {"satisfied": satisfied, "criteria": criteria, "results": results, "reason": reason, "unevaluated": unevaluated}
+
+    def _verify_criterion(self, criterion: dict[str, Any], state: LoopState, observation: LoopObservation) -> dict[str, Any]:
+        metric = str(criterion.get("metric") or "")
+        base: dict[str, Any] = {"metric": metric, "satisfied": False, "detail": "", "evaluated": True}
+        if metric == "status_ok":
+            failed = [result for result in state.results if not result.ok]
+            # "无失败工具" plus at least one executed action: an empty loop that
+            # declares completion without doing anything must not pass the gate.
+            base["satisfied"] = bool(state.results) and not failed
+            base["detail"] = f"results={len(state.results)} failed={len(failed)}"
+        elif metric == "photo_taken":
+            ok = self._has_successful_tool(state, "airsim_take_photo") or any(
+                result.ok and self._result_contains_image(result.data) for result in state.results
+            )
+            base.update(satisfied=ok, detail="photo captured" if ok else "no successful photo in results")
+        elif metric == "target_confirmed":
+            found = self._target_found_any(state)
+            explicitly_not_found = self._target_not_found_explicit(state)
+            looked = self._has_successful_tool(state, "skill:search") or self._has_successful_tool(state, "airsim_take_photo") or self._has_successful_tool(state, "airsim_vlm_confirm_target")
+            satisfied = bool(found) or (explicitly_not_found and looked)
+            base.update(satisfied=satisfied, detail=f"found={found} not_found={explicitly_not_found}")
+        elif metric == "landed":
+            flying = self._observation_flying(observation)
+            if flying is None:
+                # no telemetry: criterion cannot be evaluated, do not fail the run
+                base.update(satisfied=True, evaluated=False, detail="no flight-state telemetry")
+            else:
+                base.update(satisfied=flying is False, detail=f"flying={flying}")
+        elif metric == "flying_at":
+            current = self._observation_altitude(observation)
+            altitude = criterion.get("altitude")
+            tolerance = float(criterion.get("tolerance") or 1.0)
+            if current is None:
+                base.update(satisfied=True, evaluated=False, detail="no altitude telemetry")
+            else:
+                satisfied = altitude is not None and abs(current - float(altitude)) <= tolerance
+                base.update(satisfied=satisfied, detail=f"current={current} target={altitude}±{tolerance}")
+        elif metric == "position_reached":
+            pos = self._observation_position(observation)
+            tolerance = float(criterion.get("tolerance") or 1.5)
+            if pos is None:
+                base.update(satisfied=True, evaluated=False, detail="no position telemetry")
+            else:
+                dx = abs(pos[0] - float(criterion.get("x") or 0.0))
+                dy = abs(pos[1] - float(criterion.get("y") or 0.0))
+                dz = abs(pos[2] - float(criterion.get("z") or 0.0))
+                satisfied = dx <= tolerance and dy <= tolerance and dz <= tolerance
+                base.update(satisfied=satisfied, detail=f"current={pos} target=({criterion.get('x')},{criterion.get('y')},{criterion.get('z')})±{tolerance}")
+        elif metric == "mission_progress_complete":
+            complete = any(self._progress_complete(result.data) for result in state.results if result.ok)
+            base.update(satisfied=complete, detail="mission progress complete" if complete else "mission progress not complete")
+        elif metric == "formation_stable":
+            # only the LATEST formation_command result counts — a stale stable
+            # flag from an earlier status must not satisfy the criterion
+            last_formation = None
+            for result in reversed(state.results):
+                if result.tool == "formation_command":
+                    last_formation = result
+                    break
+            stable = bool(
+                last_formation
+                and last_formation.ok
+                and self._nested_bool(last_formation.data, "stable") is True
+            )
+            base.update(satisfied=stable, detail="formation stable" if stable else "formation not stable / no status result")
+        return base
+
+    def _corrective_decision(self, verification: dict[str, Any], state: LoopState, allowed_tools: set[str]) -> LoopDecision | None:
+        """One corrective action for the first unsatisfied criterion that has a
+        re-verification path. Returns None when nothing can be re-checked."""
+        for criterion, item in zip(verification.get("criteria") or [], verification.get("results") or []):
+            if item.get("satisfied"):
+                continue
+            tool = self._CORRECTIVE_TOOLS.get(str(item.get("metric") or ""))
+            if tool is None or tool not in allowed_tools:
+                continue
+            if tool == "airsim_vlm_confirm_target":
+                if not self._has_recent_image(state):
+                    if "airsim_take_photo" in allowed_tools:
+                        return LoopDecision(
+                            "airsim_take_photo",
+                            {"image_type": "scene", "auto_save": False},
+                            "Capture a fresh frame before re-verifying the target.",
+                            is_complete=False,
+                        )
+                    continue
+                return LoopDecision(
+                    "airsim_vlm_confirm_target",
+                    {"target_description": str(criterion.get("target") or state.command[:160]), "source": "last_image"},
+                    "Re-confirm the target before accepting completion.",
+                    is_complete=False,
+                )
+            if tool == "formation_command":
+                return LoopDecision(
+                    "formation_command",
+                    {"action": "status"},
+                    "Re-poll formation status before accepting completion.",
+                    is_complete=False,
+                )
+            return LoopDecision(
+                tool,
+                {},
+                f"Re-read state to verify completion criterion '{item.get('metric')}'.",
+                is_complete=False,
+            )
+        return None
+
+    def _target_found_any(self, state: LoopState) -> bool:
+        for item in self._iter_tool_results(state):
+            if self._nested_bool(item.get("data"), "target_found") is True:
+                return True
+        return False
+
+    def _target_not_found_explicit(self, state: LoopState) -> bool:
+        for item in self._iter_tool_results(state):
+            data = item.get("data") or {}
+            if self._nested_bool(data, "target_found") is False:
+                return True
+            if self._nested_value(data, "status") == "target_not_confirmed":
+                return True
+        return False
+
+    @staticmethod
+    def _nested_bool(value: Any, key: str) -> bool | None:
+        found = AgentLoop._nested_value(value, key)
+        return bool(found) if isinstance(found, bool) else None
+
+    @staticmethod
+    def _nested_value(value: Any, key: str) -> Any:
+        if isinstance(value, dict):
+            if key in value:
+                return value[key]
+            for item in value.values():
+                found = AgentLoop._nested_value(item, key)
+                if found is not None:
+                    return found
+        elif isinstance(value, list):
+            for item in value:
+                found = AgentLoop._nested_value(item, key)
+                if found is not None:
+                    return found
+        return None
+
+    @staticmethod
+    def _progress_complete(data: Any) -> bool:
+        if not isinstance(data, dict):
+            return False
+        progress = data.get("progress")
+        if isinstance(progress, (int, float)) and not isinstance(progress, bool) and progress >= 99.0:
+            return True
+        percent = data.get("percent")
+        if isinstance(percent, (int, float)) and not isinstance(percent, bool) and percent >= 99.0:
+            return True
+        status = str(data.get("status") or "").lower()
+        return any(marker in status for marker in ("complete", "finished", "done"))
+
+    @staticmethod
+    def _observation_drone(observation: LoopObservation) -> dict[str, Any]:
+        world = observation.world_state if hasattr(observation, "world_state") else {}
+        drone = world.get("drone") if isinstance(world, dict) else {}
+        return drone if isinstance(drone, dict) else {}
+
+    @staticmethod
+    def _observation_flying(observation: LoopObservation) -> bool | None:
+        flying = AgentLoop._observation_drone(observation).get("flying")
+        return bool(flying) if flying is not None else None
+
+    @staticmethod
+    def _observation_altitude(observation: LoopObservation) -> float | None:
+        drone = AgentLoop._observation_drone(observation)
+        pos = drone.get("position_ned")
+        if isinstance(pos, dict):
+            try:
+                z = float(pos.get("z") or 0.0)
+                return abs(z)
+            except (TypeError, ValueError):
+                pass
+        try:
+            altitude = float(drone.get("altitude_m") or 0.0)
+            return abs(altitude) if altitude else None
+        except (TypeError, ValueError):
+            return None
+
+    @staticmethod
+    def _observation_position(observation: LoopObservation) -> tuple[float, float, float] | None:
+        pos = AgentLoop._observation_drone(observation).get("position_ned")
+        if not isinstance(pos, dict):
+            return None
+        try:
+            return (float(pos.get("x") or 0.0), float(pos.get("y") or 0.0), float(pos.get("z") or 0.0))
+        except (TypeError, ValueError):
+            return None
+
+    def _execute_batch_actions(
+        self,
+        raw_actions: list[dict[str, Any]],
+        command: str,
+        state: LoopState,
+        observation: LoopObservation,
+        allowed_tools: set[str],
+        capabilities: dict[str, Any],
+        step_index: int,
+        execute: bool,
+        failure_count: int,
+        unresolved_failure: bool,
+    ) -> dict[str, Any]:
+        """Execute read-only batch actions one by one, each through the same
+        sanitize + guard pipeline as the main action. Returns the updated
+        failure counters so the caller keeps the 3-strike window semantics."""
+        for raw_action in raw_actions:
+            if state.status == "failed":
+                break
+            if not isinstance(raw_action, dict):
+                continue
+            sub = LoopDecision(
+                action=str(raw_action.get("action") or ""),
+                params=dict(raw_action.get("params") or {}),
+                reason=str(raw_action.get("reason") or ""),
+                is_complete=bool(raw_action.get("is_complete")),
+                needs_replan=bool(raw_action.get("needs_replan")),
+                reflection=str(raw_action.get("reflection") or ""),
+            )
+            if not sub.action or sub.is_complete:
+                continue
+            sub = self._sanitize_decision(sub, allowed_tools)
+            if not sub.action:
+                self._event("warning", "agent_loop", f"Batch action skipped: {raw_action.get('action')}", sub.to_dict(), kind="loop.decision")
+                continue
+            if not self._is_parallel_safe(sub.action):
+                self._event(
+                    "warning",
+                    "agent_loop",
+                    f"Batch action rejected (flight-control tools are one per turn): {sub.action}",
+                    sub.to_dict(),
+                    kind="loop.decision",
+                )
+                continue
+            guarded = self._guard_decision(command, state, observation, sub, allowed_tools, capabilities)
+            if guarded is not None:
+                sub = guarded
+            sub = self._sanitize_decision(sub, allowed_tools)
+            if sub.is_complete or not sub.action:
+                continue
+            batch_result = self._execute_action(sub, dry_run=not execute)
+            batch_result = self._settle_async_result(batch_result, dry_run=not execute)
+            batch_row = LoopActionResult(
+                step_index=step_index,
+                tool=batch_result["tool"],
+                params=batch_result["params"],
+                ok=bool(batch_result["ok"]),
+                data=batch_result["data"],
+                safety=batch_result.get("safety"),
+                duration_ms=batch_result["duration_ms"],
+            )
+            state.results.append(batch_row)
+            self._notify_state(state)
+            self.memory.remember_tool_call(batch_row.tool, batch_row.ok)
+            self._event(
+                "info" if batch_row.ok else "warning",
+                "tool",
+                f"Batch action {batch_row.tool}",
+                batch_result["raw"],
+                kind="tool.result",
+            )
+            if not batch_row.ok:
+                failure_count += 1
+                unresolved_failure = True
+                state.failure_reason = str(batch_row.data.get("message") or f"{batch_row.tool} failed")
+                self._event(
+                    "warning",
+                    "agent_loop",
+                    f"Batch action failed ({failure_count}/3)",
+                    batch_row.to_dict(),
+                    kind="tool.result",
+                )
+                if failure_count >= 3:
+                    state.status = "failed"
+                    break
+            elif batch_row.tool not in {"drone_get_status", "airsim_task_status"}:
+                unresolved_failure = False
+        return {"failure_count": failure_count, "unresolved_failure": unresolved_failure}
+
     def _execute_action(self, decision: LoopDecision, dry_run: bool) -> dict[str, Any]:
         started = time.time()
         if decision.action.startswith("skill:"):
@@ -597,6 +970,22 @@ class AgentLoop:
                 return result
             self._wait_if_paused()
             status_result = self._call_tool("airsim_task_status", {"task_id": task_id}, False)
+            polled = True
+            # Backend coupling guard: airsim_task_status is an AirSim-backend
+            # tool. If the active backend does not register it (PX4 backends
+            # never return async descriptors today, but a future tool could),
+            # polling would spin the whole timeout for nothing — accept the
+            # original result and note the gap instead.
+            if status_result.error_code == "UNKNOWN_TOOL":
+                result["data"] = {
+                    "status": "accepted",
+                    "task_id": task_id,
+                    "task": status_result.data,
+                    "accepted_result": accepted,
+                    "message": "background task accepted; task_status tool is not available on this backend",
+                }
+                self._event("warning", "async_task", f"Task {task_id} accepted, but airsim_task_status is unavailable on this backend", {"task_id": task_id})
+                return result
             status = str((status_result.data or {}).get("status") or "").strip().lower()
             self._event(
                 "info" if status_result.ok else "warning",
@@ -659,7 +1048,9 @@ class AgentLoop:
     def _should_stop(self) -> bool:
         return bool(self.should_stop and self.should_stop())
 
-    def _event(self, level: str, source: str, message: str, data: dict[str, Any]) -> None:
+    def _event(self, level: str, source: str, message: str, data: dict[str, Any], kind: str = "") -> None:
+        if kind:
+            data = {**data, "kind": kind}
         if self.on_event:
             self.on_event(level, source, message, data)
 

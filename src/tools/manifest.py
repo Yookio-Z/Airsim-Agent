@@ -94,6 +94,13 @@ TOOL_MANIFEST: dict[str, ToolManifestEntry] = {
         future="ROS backends should implement this through a bridge/link profile, not a topic publish.",
     ),
     "drone_disconnect": _atomic("drone_disconnect", "core", "link", ("telemetry",)),
+    "formation_command": _atomic(
+        "formation_command",
+        "core",
+        "formation",
+        ("flight_control",),
+        notes="Multi-vehicle formation and coverage control on the airsim / px4_mavlink backends. A deterministic 10Hz velocity loop maintains the formation; the agent issues high-level intents and polls action=status until stable. Single-vehicle flight tools are blocked while a formation is active.",
+    ),
     "drone_list_vehicles": _atomic("drone_list_vehicles", "core", "telemetry", ("telemetry",)),
     "drone_get_status": _atomic(
         "drone_get_status",
@@ -245,7 +252,7 @@ TOOL_MANIFEST: dict[str, ToolManifestEntry] = {
         "formation",
         "workflow",
         ("flight_control", "multi_vehicle"),
-        "skill:formation_mission",
+        "skill:formation",
         future="Real multi-vehicle control needs a coordinator/provider with collision and approval gates.",
     ),
     "airsim_precise_formation": _skill_candidate(
@@ -253,7 +260,7 @@ TOOL_MANIFEST: dict[str, ToolManifestEntry] = {
         "formation",
         "workflow",
         ("flight_control", "multi_vehicle"),
-        "skill:formation_mission",
+        "skill:formation",
     ),
     "airsim_patrol_area": _skill_candidate(
         "airsim_patrol_area",

@@ -3,19 +3,27 @@
 from __future__ import annotations
 
 import json
+import re
+import threading
 import time
 from pathlib import Path
 from typing import Any
 
 
 class AgentMemory:
-    """Short-term event memory plus persisted long-term mission lessons."""
+    """Short-term event memory plus persisted long-term mission lessons.
+
+    Writes are serialized through a lock: today all writes happen on the
+    single execution thread, but the tmp-file swap in ``_save`` would corrupt
+    if a second writer ever appeared (chat, telemetry polling, UI panel).
+    """
 
     def __init__(self, data_dir: Path | None = None) -> None:
         root = Path(__file__).resolve().parents[2]
         self.data_dir = data_dir or root / ".airsim_agent"
         self.path = self.data_dir / "memory.json"
         self.data_dir.mkdir(parents=True, exist_ok=True)
+        self._lock = threading.RLock()
         self._data = self._load()
 
     def _load(self) -> dict[str, Any]:
@@ -28,6 +36,8 @@ class AgentMemory:
                 "risk_events": [],
                 "tool_stats": {},
                 "skill_candidates": [],
+                "facts": {},
+                "runs": [],
             }
         try:
             with self.path.open("r", encoding="utf-8") as f:
@@ -40,6 +50,8 @@ class AgentMemory:
             data.setdefault("tool_stats", {})
             data.setdefault("session", {})
             data.setdefault("skill_candidates", [])
+            data.setdefault("facts", {})
+            data.setdefault("runs", [])
             return data
         except Exception:
             backup = self.path.with_suffix(f".corrupt_{int(time.time())}.json")
@@ -55,23 +67,27 @@ class AgentMemory:
                 "risk_events": [],
                 "tool_stats": {},
                 "skill_candidates": [],
+                "facts": {},
+                "runs": [],
             }
 
     def _save(self) -> None:
         tmp = self.path.with_suffix(".tmp")
-        with tmp.open("w", encoding="utf-8") as f:
-            json.dump(self._data, f, ensure_ascii=False, indent=2)
-        tmp.replace(self.path)
+        with self._lock:
+            with tmp.open("w", encoding="utf-8") as f:
+                json.dump(self._data, f, ensure_ascii=False, indent=2)
+            tmp.replace(self.path)
 
     def remember_tool_call(self, tool: str, ok: bool) -> None:
-        stats = self._data.setdefault("tool_stats", {})
-        item = stats.setdefault(tool, {"calls": 0, "success": 0, "fail": 0})
-        item["calls"] += 1
-        if ok:
-            item["success"] += 1
-        else:
-            item["fail"] += 1
-        self._save()
+        with self._lock:
+            stats = self._data.setdefault("tool_stats", {})
+            item = stats.setdefault(tool, {"calls": 0, "success": 0, "fail": 0})
+            item["calls"] += 1
+            if ok:
+                item["success"] += 1
+            else:
+                item["fail"] += 1
+            self._save()
 
     def remember_position(
         self,
@@ -79,13 +95,14 @@ class AgentMemory:
         heading_deg: float | None = None,
         source: str = "status",
     ) -> None:
-        session = self._data.setdefault("session", {})
-        session["last_known_position_ned"] = position_ned
-        if heading_deg is not None:
-            session["last_heading_deg"] = heading_deg
-        session["last_position_source"] = source
-        session["last_position_at"] = time.time()
-        self._save()
+        with self._lock:
+            session = self._data.setdefault("session", {})
+            session["last_known_position_ned"] = position_ned
+            if heading_deg is not None:
+                session["last_heading_deg"] = heading_deg
+            session["last_position_source"] = source
+            session["last_position_at"] = time.time()
+            self._save()
 
     def remember_task_start(
         self,
@@ -94,58 +111,60 @@ class AgentMemory:
         position_ned: dict[str, Any],
         heading_deg: float | None = None,
     ) -> None:
-        session = self._data.setdefault("session", {})
-        session["last_task_start_run_id"] = run_id
-        session["last_task_start_command"] = command
-        session["last_task_start_position_ned"] = position_ned
-        if heading_deg is not None:
-            session["last_task_start_heading_deg"] = heading_deg
-        session["last_task_start_at"] = time.time()
-        self._save()
+        with self._lock:
+            session = self._data.setdefault("session", {})
+            session["last_task_start_run_id"] = run_id
+            session["last_task_start_command"] = command
+            session["last_task_start_position_ned"] = position_ned
+            if heading_deg is not None:
+                session["last_task_start_heading_deg"] = heading_deg
+            session["last_task_start_at"] = time.time()
+            self._save()
 
     def remember_mission(self, mission: dict[str, Any]) -> None:
-        item = {
-            "timestamp": time.time(),
-            "run_id": mission.get("run_id"),
-            "command": mission.get("command", ""),
-            "intent": mission.get("intent", ""),
-            "status": mission.get("status", ""),
-            "summary": mission.get("summary", ""),
-            "duration_sec": mission.get("duration_sec", 0),
-            "steps_total": mission.get("steps_total", 0),
-            "steps_ok": mission.get("steps_ok", 0),
-            "route_strategy": mission.get("route_strategy", ""),
-            "tool_sequence": [str(x) for x in mission.get("tool_sequence", []) if x],
-            "verification_status": mission.get("verification_status", ""),
-        }
-        self._data.setdefault("missions", []).append(item)
-        self._data["missions"] = self._data["missions"][-50:]
-
-        status = str(item["status"])
-        if status in {"failed", "blocked", "error"}:
-            self._data.setdefault("risk_events", []).append(
-                {
-                    "timestamp": item["timestamp"],
-                    "run_id": item["run_id"],
-                    "command": item["command"],
-                    "reason": mission.get("failure_reason", status),
-                    "filtered_from_lessons": True,
-                }
-            )
-            self._data["risk_events"] = self._data["risk_events"][-50:]
-        elif status == "completed" and item["steps_total"]:
-            lesson = {
-                "timestamp": item["timestamp"],
-                "intent": item["intent"],
-                "summary": item["summary"],
-                "success_rate": round(item["steps_ok"] / max(1, item["steps_total"]), 2),
+        with self._lock:
+            item = {
+                "timestamp": time.time(),
+                "run_id": mission.get("run_id"),
+                "command": mission.get("command", ""),
+                "intent": mission.get("intent", ""),
+                "status": mission.get("status", ""),
+                "summary": mission.get("summary", ""),
+                "duration_sec": mission.get("duration_sec", 0),
+                "steps_total": mission.get("steps_total", 0),
+                "steps_ok": mission.get("steps_ok", 0),
+                "route_strategy": mission.get("route_strategy", ""),
+                "tool_sequence": [str(x) for x in mission.get("tool_sequence", []) if x],
+                "verification_status": mission.get("verification_status", ""),
             }
-            self._merge_lesson(lesson)
+            self._data.setdefault("missions", []).append(item)
+            self._data["missions"] = self._data["missions"][-50:]
 
-        if item["tool_sequence"]:
-            self._update_skill_candidate(item)
+            status = str(item["status"])
+            if status in {"failed", "blocked", "error"}:
+                self._data.setdefault("risk_events", []).append(
+                    {
+                        "timestamp": item["timestamp"],
+                        "run_id": item["run_id"],
+                        "command": item["command"],
+                        "reason": mission.get("failure_reason", status),
+                        "filtered_from_lessons": True,
+                    }
+                )
+                self._data["risk_events"] = self._data["risk_events"][-50:]
+            elif status == "completed" and item["steps_total"]:
+                lesson = {
+                    "timestamp": item["timestamp"],
+                    "intent": item["intent"],
+                    "summary": item["summary"],
+                    "success_rate": round(item["steps_ok"] / max(1, item["steps_total"]), 2),
+                }
+                self._merge_lesson(lesson)
 
-        self._save()
+            if item["tool_sequence"]:
+                self._update_skill_candidate(item)
+
+            self._save()
 
     def _merge_lesson(self, lesson: dict[str, Any]) -> None:
         lessons = self._data.setdefault("lessons", [])
@@ -196,6 +215,111 @@ class AgentMemory:
         candidate["last_summary"] = mission.get("summary", "")
         candidate["updated_at"] = time.time()
         self._data["skill_candidates"] = candidates[-50:]
+
+    def remember_fact(self, key: str, value: str, tags: list[str] | None = None) -> None:
+        """Store a durable operator-stated fact for future runs (LLM-active)."""
+        key = str(key or "").strip()
+        if not key:
+            return
+        with self._lock:
+            facts = self._data.setdefault("facts", {})
+            facts[key] = {
+                "value": str(value or "")[:1000],
+                "tags": [str(item) for item in (tags or [])][:8],
+                "updated_at": time.time(),
+            }
+            if len(facts) > 50:
+                for stale in sorted(facts, key=lambda k: facts[k].get("updated_at", 0.0))[: len(facts) - 50]:
+                    facts.pop(stale, None)
+            self._save()
+
+    def remember_transcript(
+        self,
+        run_id: str,
+        command: str,
+        status: str,
+        summary: str,
+        tools: list[str],
+        failure_reason: str = "",
+    ) -> None:
+        """One bounded cross-run transcript row written at run end (throttled
+        to a single file write per run; the RunLog is the step-level truth)."""
+        with self._lock:
+            runs = self._data.setdefault("runs", [])
+            runs.append(
+                {
+                    "run_id": str(run_id or "")[:80],
+                    "command": str(command or "")[:200],
+                    "status": str(status or ""),
+                    "summary": str(summary or "")[:300],
+                    "tools": [str(item)[:40] for item in (tools or [])][:20],
+                    "failure_reason": str(failure_reason or "")[:200],
+                    "timestamp": time.time(),
+                }
+            )
+            self._data["runs"] = runs[-50:]
+            self._save()
+
+    def recall(self, query: str, limit: int = 5) -> list[dict[str, Any]]:
+        """Keyword-overlap recall across facts, missions, lessons, and run
+        transcripts, with a recency bonus for records younger than 14 days.
+
+        Deliberately simple: no embeddings, no LLM involvement. CJK queries
+        match by bigrams, so recall works without a tokenizer.
+        """
+        query = str(query or "").strip()
+        if not query:
+            return []
+        tokens = self._recall_tokens(query)
+        scored: list[tuple[float, dict[str, Any]]] = []
+        now = time.time()
+
+        for key, fact in (self._data.get("facts") or {}).items():
+            if not isinstance(fact, dict):
+                continue
+            text = f"{key} {fact.get('value', '')}"
+            raw = self._score_text(tokens, text)
+            if raw > 0:
+                score = raw + 0.2  # facts are slightly favored over history rows
+                scored.append(
+                    (score, {"kind": "fact", "key": key, "value": fact.get("value", ""), "tags": fact.get("tags", []), "score": round(score, 3)})
+                )
+
+        for kind, field in (("mission", "command"), ("lesson", "summary"), ("run", "command")):
+            rows = self._data.get(kind + "s" if kind != "mission" else "missions") or []
+            for row in reversed(rows):
+                if not isinstance(row, dict):
+                    continue
+                text = f"{row.get(field) or ''} {row.get('summary') or ''}"
+                score = self._score_text(tokens, text)
+                if score > 0:
+                    age_days = (now - float(row.get("timestamp") or 0.0)) / 86400.0
+                    recency = max(0.0, 1.0 - age_days / 14.0)
+                    score += recency * 0.3
+                    scored.append((score, {**row, "kind": kind, "score": round(score, 3)}))
+
+        scored.sort(key=lambda item: (-item[0], float(item[1].get("timestamp") or 0.0)))
+        return [row for _, row in scored[: max(1, min(20, int(limit)))]]
+
+    @staticmethod
+    def _recall_tokens(query: str) -> list[str]:
+        lower = query.lower()
+        parts = [part for part in re.split(r"[^a-z0-9\u4e00-\u9fff]+", lower) if part]
+        tokens: list[str] = []
+        for part in parts:
+            if len(part) >= 2:
+                tokens.append(part)
+            if any("\u4e00" <= ch <= "\u9fff" for ch in part) and len(part) >= 2:
+                tokens.extend(part[i : i + 2] for i in range(len(part) - 1))
+        return list(dict.fromkeys(tokens))
+
+    @staticmethod
+    def _score_text(tokens: list[str], text: str) -> float:
+        if not tokens or not text:
+            return 0.0
+        lowered = text.lower()
+        hits = sum(1 for token in tokens if token in lowered)
+        return hits / len(tokens)
 
     def guidance(self) -> dict[str, Any]:
         """Turn raw memories into small actionable hints for routing and planning."""
@@ -294,6 +418,12 @@ class AgentMemory:
 
     def snapshot(self) -> dict[str, Any]:
         working_state = dict(self._data.get("session", {}))
+        facts = self._data.get("facts") or {}
+        fact_rows = [
+            {"key": key, "value": str(item.get("value") or "")[:300], "tags": item.get("tags", []), "updated_at": item.get("updated_at", 0.0)}
+            for key, item in sorted(facts.items(), key=lambda kv: float(kv[1].get("updated_at") or 0.0), reverse=True)[:8]
+            if isinstance(item, dict)
+        ]
         return {
             "session": working_state,
             "working_state": working_state,
@@ -302,5 +432,7 @@ class AgentMemory:
             "risk_events": list(reversed(self._data.get("risk_events", [])[-8:])),
             "tool_stats": self._data.get("tool_stats", {}),
             "skill_candidates": list(reversed(self._data.get("skill_candidates", [])[-8:])),
+            "facts": fact_rows,
+            "runs": list(reversed(self._data.get("runs", [])[-3:])),
             "guidance": self.guidance(),
         }

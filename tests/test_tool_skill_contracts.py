@@ -50,7 +50,8 @@ def test_tool_manifest_marks_workflows_as_skill_candidates() -> None:
 
     assert formation is not None
     assert formation.kind == "workflow"
-    assert formation.replacement_skill == "skill:formation_mission"
+    # the replacement must point at the actually registered skill
+    assert formation.replacement_skill == "skill:formation"
 
 
 def test_skill_registry_starts_without_legacy_runtime_skills() -> None:
@@ -63,7 +64,11 @@ def test_skill_registry_starts_without_legacy_runtime_skills() -> None:
     assert docs["skill:flight_sequence"]["executable"] is False
     assert "drone_takeoff" in docs["skill:flight_sequence"]["subtools"]
     assert registry.available_cards({"flight_control": True, "telemetry": True}) == []
-    assert [card["name"] for card in registry.guidance_cards("起飞拍照返航降落", {"flight_control": True, "telemetry": True})] == ["skill:flight_sequence"]
+    # both guidance docs match generic flight wording (crude keyword scorer keeps
+    # flight_sequence first); the formation doc is loaded as guidance only
+    names = [card["name"] for card in registry.guidance_cards("起飞拍照返航降落", {"flight_control": True, "telemetry": True})]
+    assert names[0] == "skill:flight_sequence"
+    assert "skill:formation" in names
 
 
 def test_skill_registry_can_opt_in_to_legacy_builtins_for_migration_tests() -> None:

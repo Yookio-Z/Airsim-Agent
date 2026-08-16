@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import os
+import random
 import re
 import time
 import urllib.error
@@ -12,7 +13,22 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-from .command_slots import extract_command_slots
+from .command_slots import (
+    FLIGHT_TERMS,
+    NAVIGATION_TERMS,
+    extract_command_slots,
+    extract_intents,
+    extract_target_class,
+)
+from .llm_protocol import (
+    IMAGE_TOKEN_QUOTA,
+    ContextBudget,
+    TokenMeter,
+    estimate_messages,
+    function_tool_schema,
+    openai_tools_to_anthropic,
+    tool_schema_from_spec,
+)
 from .loop_types import LoopDecision
 from .planner import MissionPlan, MissionPlanner, MissionStep
 
@@ -40,6 +56,16 @@ _CONTEXT_WINDOW_HINTS = (
     (("deepseek", "gpt-4o", "o1", "o3", "qwen", "mimo"), 128_000),
 )
 
+# Providers whose OpenAI/Anthropic-compatible endpoints support native
+# function/tool calling. Unknown or local endpoints default to JSON mode
+# (zero risk); users can force "tools" via capability_mode.
+_NATIVE_TOOL_PROVIDERS = (
+    "openai", "deepseek", "anthropic", "openrouter", "qwen", "aliyun", "dashscope",
+    "moonshot", "zhipu", "glm", "mistral", "groq", "together", "siliconflow",
+    "azure", "ollama", "vllm", "lmstudio", "localai", "xai", "cohere", "minimax",
+    "stepfun", "volcengine", "ark", "hunyuan", "kimi", "baichuan", "ernie",
+)
+
 
 def infer_model_capabilities(model: str, provider: str = "", capability_mode: str = "auto") -> dict[str, Any]:
     """Infer stable UI capabilities without making provider-specific network calls."""
@@ -55,6 +81,16 @@ def infer_model_capabilities(model: str, provider: str = "", capability_mode: st
         multimodal = any(hint in haystack for hint in _VISION_MODEL_HINTS)
         source = "model_id"
 
+    if mode == "tools":
+        native_tools = True
+        tools_source = "manual"
+    elif mode == "text":
+        native_tools = False
+        tools_source = "manual"
+    else:
+        native_tools = any(name in provider.lower() for name in _NATIVE_TOOL_PROVIDERS)
+        tools_source = "provider"
+
     context_window = 64_000
     for hints, size in _CONTEXT_WINDOW_HINTS:
         if any(hint in haystack for hint in hints):
@@ -65,6 +101,8 @@ def infer_model_capabilities(model: str, provider: str = "", capability_mode: st
         "capability_source": source,
         "context_window": context_window,
         "input_modes": ["text", "image"] if multimodal else ["text"],
+        "native_tools": native_tools,
+        "native_tools_source": tools_source,
     }
 
 
@@ -223,6 +261,8 @@ class ModelRegistry:
             "multimodal": bool(inferred["multimodal"]),
             "capability_source": inferred["capability_source"],
             "input_modes": inferred["input_modes"],
+            "native_tools": bool(inferred["native_tools"]),
+            "native_tools_source": inferred["native_tools_source"],
             "context_window": int(model.get("context_window") or inferred["context_window"]),
         }
 
@@ -290,11 +330,139 @@ def _extract_json(text: str) -> str:
     return text.strip()
 
 
+# ---------------------------------------------------------------------------
+# LLM transport retry (transient failures only)
+# ---------------------------------------------------------------------------
+#
+# 429 (rate limit) and 5xx (server) are transient; other 4xx responses (auth,
+# bad request, context overflow) are not — retrying them cannot help, and a
+# context-overflow retry would just fail again. Timeouts and connection
+# errors (URLError) are transient at the transport level.
+_RETRYABLE_HTTP_CODES = {429, 500, 502, 503, 504}
+_RETRY_MAX_ATTEMPTS = 3
+_RETRY_BASE_DELAY_S = 0.5
+_RETRY_MAX_DELAY_S = 8.0
+_RETRY_AFTER_CAP_S = 30.0
+
+
+def _retry_delay(attempt: int, retry_after: str | None = None) -> float:
+    """Exponential backoff with jitter; prefers the provider's Retry-After."""
+    if retry_after:
+        try:
+            seconds = float(str(retry_after).strip())
+            if seconds > 0:
+                return min(seconds, _RETRY_AFTER_CAP_S)
+        except ValueError:
+            pass
+    delay = _RETRY_BASE_DELAY_S * (2 ** (attempt - 1))
+    jitter = random.uniform(0.0, delay * 0.3)
+    return min(delay + jitter, _RETRY_MAX_DELAY_S)
+
+
+def _request_with_retry(
+    req: urllib.request.Request,
+    timeout: float,
+    label: str = "LLM",
+    retry_box: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """POST once, retrying transient HTTP/transport errors with backoff.
+
+    Returns the parsed JSON body. Raises RuntimeError for non-retryable
+    errors and when all attempts are exhausted. ``retry_box`` (optional)
+    receives ``{"attempts": n}`` for observability.
+    """
+    last_error: Exception | None = None
+    for attempt in range(1, _RETRY_MAX_ATTEMPTS + 1):
+        try:
+            with urllib.request.urlopen(req, timeout=timeout) as resp:
+                if retry_box is not None:
+                    retry_box["attempts"] = attempt - 1
+                return json.loads(resp.read().decode("utf-8"))
+        except urllib.error.HTTPError as e:
+            detail = e.read().decode("utf-8", errors="replace")
+            message = f"{label} HTTP {e.code}: {detail}"
+            if e.code not in _RETRYABLE_HTTP_CODES or attempt == _RETRY_MAX_ATTEMPTS:
+                raise RuntimeError(message) from e
+            last_error = RuntimeError(message)
+            delay = _retry_delay(attempt, e.headers.get("Retry-After"))
+        except urllib.error.URLError as e:
+            message = f"{label} request failed: {e.reason}"
+            if attempt == _RETRY_MAX_ATTEMPTS:
+                raise RuntimeError(message) from e
+            last_error = RuntimeError(message)
+            delay = _retry_delay(attempt)
+        time.sleep(delay)
+    raise last_error  # pragma: no cover — loop always returns or raises above
+
+
+# ---------------------------------------------------------------------------
+# Context-overflow detection (recovery path)
+# ---------------------------------------------------------------------------
+#
+# When a provider rejects the request because the prompt exceeds its context
+# window, the planner rebuilds the request with a tighter budget and retries
+# once (see LLMMissionPlanner._chat_with_overflow_recovery). Markers cover
+# OpenAI/DeepSeek/OpenRouter ("maximum context length", "context_length_
+# exceeded"), Anthropic ("prompt is too long"), and local endpoints.
+_CONTEXT_OVERFLOW_MARKERS = (
+    "context_length_exceeded",
+    "maximum context length",
+    "context window",
+    "context length",
+    "prompt is too long",
+    "input is too long",
+    "too many tokens",
+    "reduce the length",
+    "reduce your message",
+    "token limit",
+)
+
+
+def is_context_overflow_error(exc: Exception) -> bool:
+    message = str(exc).lower()
+    return any(marker in message for marker in _CONTEXT_OVERFLOW_MARKERS)
+
+
+def _retryable_stream_error(exc: Exception) -> bool:
+    """Stream retry policy: retry transport errors, 429 and 5xx; never retry
+    other 4xx responses (auth, bad request, context overflow)."""
+    message = str(exc).lower()
+    if "http 4" in message and "http 429" not in message:
+        return False
+    return True
+
+
+def _stream_events_with_first_chunk_retry(
+    client: Any,
+    messages: list[dict[str, Any]],
+    max_tokens: int = 0,
+    attempts: int = 2,
+):
+    """Yield stream events, retrying once only when the FIRST event fails to
+    arrive — nothing has been delivered yet, so a retry cannot duplicate
+    output. After the first token, errors propagate as-is (a retry would
+    produce a duplicated partial answer)."""
+    for attempt in range(max(1, attempts)):
+        stream = client.stream_events(messages, max_tokens=max_tokens)
+        try:
+            first = next(stream)
+        except StopIteration:
+            return
+        except Exception as exc:
+            if attempt >= attempts - 1 or not _retryable_stream_error(exc):
+                raise
+            continue
+        yield first
+        yield from stream
+        return
+
+
 class OpenAIClient:
     """OpenAI-compatible chat completions client (covers DeepSeek, OpenAI, OpenRouter, vLLM, Ollama, etc.)."""
 
     def __init__(self, config: dict[str, Any]) -> None:
         self.config = config
+        self.last_retries = 0
 
     def _request(self, messages: list[dict[str, Any]], payload_extra: dict[str, Any]) -> urllib.request.Request:
         url = str(self.config.get("base_url", "https://api.openai.com")).rstrip("/") + "/chat/completions"
@@ -347,6 +515,46 @@ class OpenAIClient:
         if not content:
             raise RuntimeError("LLM returned empty content")
         return content, response.get("usage") or {}
+
+    def chat_tools(
+        self,
+        messages: list[dict[str, Any]],
+        tools: list[dict[str, Any]],
+        tool_choice: str = "auto",
+    ) -> tuple[list[dict[str, Any]], str, dict[str, Any]]:
+        """Native function-calling round trip.
+
+        Returns (tool_calls, text, usage); tool_calls items are
+        {id, name, arguments(dict)}. Raises ToolCallUnsupportedError when the
+        endpoint rejects the tools parameter so the caller can degrade to JSON
+        mode.
+        """
+        req = self._request(messages, {"tools": tools, "tool_choice": tool_choice})
+        try:
+            response = self._do_request(req)
+        except Exception as exc:
+            if is_tool_unsupported_error(exc):
+                raise ToolCallUnsupportedError(str(exc)) from exc
+            raise
+        message = ((response.get("choices") or [{}])[0].get("message")) or {}
+        text = str(message.get("content") or "")
+        tool_calls: list[dict[str, Any]] = []
+        for call in message.get("tool_calls") or []:
+            if not isinstance(call, dict):
+                continue
+            function = call.get("function") or {}
+            name = str(function.get("name") or "").strip()
+            if not name:
+                continue
+            arguments = str(function.get("arguments") or "").strip()
+            try:
+                parsed = json.loads(arguments) if arguments else {}
+            except json.JSONDecodeError as e:
+                raise RuntimeError(f"LLM tool arguments JSON parse failed: {e}: {arguments[:200]}") from e
+            if not isinstance(parsed, dict):
+                parsed = {}
+            tool_calls.append({"id": str(call.get("id") or ""), "name": name, "arguments": parsed})
+        return tool_calls, text, response.get("usage") or {}
 
     @staticmethod
     def _stream_token(value: Any) -> str:
@@ -409,14 +617,14 @@ class OpenAIClient:
                 yield event.get("token", "")
 
     def _do_request(self, req: urllib.request.Request) -> dict[str, Any]:
+        box: dict[str, Any] = {}
         try:
-            with urllib.request.urlopen(req, timeout=float(self.config.get("timeout_sec", 25.0))) as resp:
-                return json.loads(resp.read().decode("utf-8"))
-        except urllib.error.HTTPError as e:
-            detail = e.read().decode("utf-8", errors="replace")
-            raise RuntimeError(f"LLM HTTP {e.code}: {detail}") from e
-        except urllib.error.URLError as e:
-            raise RuntimeError(f"LLM request failed: {e.reason}") from e
+            data = _request_with_retry(req, float(self.config.get("timeout_sec", 25.0)), label="LLM", retry_box=box)
+            self.last_retries = int(box.get("attempts") or 0)
+            return data
+        except Exception:
+            self.last_retries = int(box.get("attempts") or 0)
+            raise
 
     @staticmethod
     def _first_content(response: dict[str, Any]) -> str:
@@ -434,6 +642,7 @@ class AnthropicClient:
 
     def __init__(self, config: dict[str, Any]) -> None:
         self.config = config
+        self.last_retries = 0
 
     def _build_body(self, messages: list[dict[str, Any]], max_tokens: int, stream: bool) -> tuple[str, dict[str, Any]]:
         system_parts: list[str] = []
@@ -488,9 +697,11 @@ class AnthropicClient:
             })
         return blocks
 
-    def _request(self, messages: list[dict[str, Any]], max_tokens: int, stream: bool):
+    def _request(self, messages: list[dict[str, Any]], max_tokens: int, stream: bool, extra: dict[str, Any] | None = None):
         url = str(self.config.get("base_url", "https://api.anthropic.com")).rstrip("/") + "/v1/messages"
         system, body = self._build_body(messages, max_tokens, stream)
+        if extra:
+            body.update(extra)
         if system:
             body["system"] = system
         req = urllib.request.Request(
@@ -504,6 +715,47 @@ class AnthropicClient:
             method="POST",
         )
         return req
+
+    def chat_tools(
+        self,
+        messages: list[dict[str, Any]],
+        tools: list[dict[str, Any]],
+        tool_choice: str | None = None,
+    ) -> tuple[list[dict[str, Any]], str, dict[str, Any]]:
+        """Native tool_use round trip for the Anthropic Messages API.
+
+        ``tools`` must already be in Anthropic shape ({name, description,
+        input_schema}). Returns (tool_calls, text, usage); tool_calls items are
+        {id, name, arguments(dict)}.
+        """
+        configured_max = int(self.config.get("max_tokens", 0) or 0)
+        extra: dict[str, Any] = {"tools": tools, "tool_choice": tool_choice or {"type": "auto"}}
+        req = self._request(messages, configured_max, stream=False, extra=extra)
+        try:
+            response = self._do_request(req)
+        except Exception as exc:
+            if is_tool_unsupported_error(exc):
+                raise ToolCallUnsupportedError(str(exc)) from exc
+            raise
+        text_parts: list[str] = []
+        tool_calls: list[dict[str, Any]] = []
+        for block in response.get("content") or []:
+            if not isinstance(block, dict):
+                continue
+            block_type = str(block.get("type") or "")
+            if block_type == "text":
+                text_parts.append(str(block.get("text") or ""))
+            elif block_type == "tool_use":
+                tool_calls.append({
+                    "id": str(block.get("id") or ""),
+                    "name": str(block.get("name") or ""),
+                    "arguments": block.get("input") or {},
+                })
+        usage = response.get("usage") or {}
+        return tool_calls, "".join(text_parts), {
+            "prompt_tokens": usage.get("input_tokens", 0),
+            "completion_tokens": usage.get("output_tokens", 0),
+        }
 
     def chat_json(self, messages: list[dict[str, Any]]) -> tuple[dict[str, Any], dict[str, Any]]:
         # chat_json 不限制 max_tokens，_build_body 内部用默认值 8192 保证推理空间
@@ -568,14 +820,14 @@ class AnthropicClient:
                 yield event.get("token", "")
 
     def _do_request(self, req: urllib.request.Request) -> dict[str, Any]:
+        box: dict[str, Any] = {}
         try:
-            with urllib.request.urlopen(req, timeout=float(self.config.get("timeout_sec", 25.0))) as resp:
-                return json.loads(resp.read().decode("utf-8"))
-        except urllib.error.HTTPError as e:
-            detail = e.read().decode("utf-8", errors="replace")
-            raise RuntimeError(f"Anthropic HTTP {e.code}: {detail}") from e
-        except urllib.error.URLError as e:
-            raise RuntimeError(f"Anthropic request failed: {e.reason}") from e
+            data = _request_with_retry(req, float(self.config.get("timeout_sec", 25.0)), label="Anthropic", retry_box=box)
+            self.last_retries = int(box.get("attempts") or 0)
+            return data
+        except Exception:
+            self.last_retries = int(box.get("attempts") or 0)
+            raise
 
     @staticmethod
     def _first_text(response: dict[str, Any]) -> str:
@@ -592,6 +844,52 @@ def _create_client(config: dict[str, Any]):
     return OpenAIClient(config)
 
 
+class ToolCallUnsupportedError(RuntimeError):
+    """The provider rejected the tools parameter. The caller should fall back
+    to JSON-schema prompting instead of retrying the native path."""
+
+
+def is_tool_unsupported_error(exc: Exception) -> bool:
+    """Distinguish 'provider does not support tools' from our own bugs.
+
+    The authoritative signal is the OpenAI-style error.param field; message
+    keywords are a conservative fallback. A schema bug in our own tools payload
+    usually surfaces as 'invalid schema for function X' and is NOT treated as
+    unsupported, so it stays visible instead of being silently degraded.
+    """
+    text = str(exc)
+    match = re.match(r"LLM HTTP (\d+):\s*(.*)", text, flags=re.S)
+    if not match:
+        return False
+    code = int(match.group(1))
+    if code not in {400, 404, 422}:
+        return False
+    detail = match.group(2)
+    try:
+        parsed = json.loads(detail)
+        error = parsed.get("error") if isinstance(parsed, dict) else None
+        if isinstance(error, dict):
+            param = str(error.get("param") or "")
+            if param and any(marker in param.lower() for marker in ("tool", "function")):
+                return True
+    except Exception:
+        pass
+    lowered = detail.lower()
+    return any(
+        marker in lowered
+        for marker in (
+            "does not support",
+            "not supported",
+            "unsupported parameter",
+            "unknown parameter",
+            "unexpected parameter",
+            "extra field",
+            "unknown field",
+            "unexpected field",
+        )
+    )
+
+
 class LLMUnavailableError(RuntimeError):
     """Raised when an interactive chat request cannot reach the selected model."""
 
@@ -605,6 +903,7 @@ class LLMMissionPlanner:
         self.fallback = MissionPlanner()
         self.last_error = ""
         self.last_usage: dict[str, Any] = {}
+        self.token_meter = TokenMeter()
 
     def reload_config(self) -> None:
         self.registry = ModelRegistry()
@@ -672,6 +971,44 @@ class LLMMissionPlanner:
             )
         )
 
+    def _fit_sections(
+        self,
+        config: dict[str, Any],
+        sections: list[dict[str, Any]],
+        images: int = 0,
+        window_scale: float = 1.0,
+    ) -> dict[str, str]:
+        """Fit prompt sections to the context budget, optionally scaled down.
+
+        ``window_scale < 1`` is used by the context-overflow recovery path: the
+        provider's real window is smaller than our estimate, so the whole
+        budget is tightened instead of only the low-priority sections.
+        """
+        budget = self._context_budget(config)
+        if window_scale < 1.0:
+            budget = ContextBudget(
+                context_window=max(1024, int(budget.context_window * window_scale)),
+                output_reserve=2048,
+                meter=self._token_meter(),
+            )
+        return budget.with_reserve(images * IMAGE_TOKEN_QUOTA).fit(sections)
+
+    def _chat_with_overflow_recovery(
+        self,
+        client: Any,
+        build_messages: Callable[[float], list[dict[str, Any]]],
+        call: Callable[[list[dict[str, Any]]], tuple[dict[str, Any], dict[str, Any]]],
+    ) -> tuple[dict[str, Any], dict[str, Any]]:
+        """Call the LLM, retrying once with a halved context budget when the
+        provider reports a context-length overflow."""
+        try:
+            return call(build_messages(1.0))
+        except Exception as exc:
+            if not is_context_overflow_error(exc):
+                raise
+            self.last_error = f"context overflow; retrying with a tighter budget: {exc}"
+            return call(build_messages(0.5))
+
     def supports_multimodal(self, model_id: str | None = None) -> bool:
         config = self._resolve_config(model_id)
         return self._enabled(config) and self._config_supports_multimodal(config)
@@ -728,38 +1065,52 @@ class LLMMissionPlanner:
         available_tools = self._compact_tools(tools)
         capability_payload = capabilities or {}
         card_payload = self._compact_tool_cards(tool_cards or [])
-        messages = [
-            {"role": "system", "content": self._system_prompt()},
+        images = self._image_attachments(attachments)
+        sections = [
+            {"key": "operator_command", "value": command, "priority": "command"},
+            {"key": "output_schema", "value": json.dumps(self._schema_hint(), ensure_ascii=False, default=str), "priority": "command"},
+            {"key": "backend", "value": str(backend or ""), "priority": "observation"},
+            {"key": "backend_capabilities", "value": json.dumps(capability_payload, ensure_ascii=False, default=str), "priority": "observation"},
+            {"key": "safety_constraints", "value": json.dumps(safety, ensure_ascii=False, default=str), "priority": "observation"},
+            {"key": "current_telemetry", "value": json.dumps(telemetry or {}, ensure_ascii=False, default=str), "priority": "observation"},
+            {"key": "agent_state", "value": json.dumps(agent_state or {}, ensure_ascii=False, default=str), "priority": "observation"},
+            {"key": "available_tools", "value": json.dumps(available_tools, ensure_ascii=False, default=str), "priority": "tool_cards"},
+            {"key": "available_tool_cards", "value": json.dumps(card_payload, ensure_ascii=False, default=str), "priority": "tool_cards"},
             {
-                "role": "user",
-                "content": self._content_with_images(json.dumps(
-                    {
-                        "operator_command": command,
-                        "backend": backend,
-                        "backend_capabilities": capability_payload,
-                        "available_tools": available_tools,
-                        "available_tool_cards": card_payload,
-                        "safety_constraints": safety,
-                        "current_telemetry": telemetry or {},
-                        "agent_state": agent_state or {},
-                        "skill_guidance": self._compact_skill_guidance(
-                            (agent_state or {}).get("skill_guidance") or []
-                        ),
-                        "memory_snapshot": self._compact_memory(memory),
-                        "conversation_context": self._compact_conversation(conversation_context or []),
-                        "output_schema": self._schema_hint(),
-                    },
-                    ensure_ascii=False,
-                    indent=2,
-                ), attachments or []),
+                "key": "skill_guidance",
+                "value": json.dumps(self._compact_skill_guidance((agent_state or {}).get("skill_guidance") or []), ensure_ascii=False, default=str),
+                "priority": "guidance",
+            },
+            {"key": "memory_snapshot", "value": json.dumps(self._compact_memory(memory), ensure_ascii=False, default=str), "priority": "memory"},
+            {
+                "key": "conversation_context",
+                "value": json.dumps(self._compact_conversation(conversation_context or []), ensure_ascii=False, default=str),
+                "priority": "memory",
             },
         ]
+        sent_messages: list[list[dict[str, Any]]] = []
+
+        def build_messages(window_scale: float = 1.0) -> list[dict[str, Any]]:
+            payload_parts = self._sections_to_payload(self._fit_sections(config, sections, len(images), window_scale))
+            messages = [
+                {"role": "system", "content": self._system_prompt()},
+                {
+                    "role": "user",
+                    "content": self._content_with_images(
+                        json.dumps(payload_parts, ensure_ascii=False, indent=2, default=str),
+                        attachments or [],
+                    ),
+                },
+            ]
+            sent_messages.append(messages)
+            return messages
 
         try:
             client = _create_client(config)
-            payload, usage = self._chat_json_with_retries(client, messages)
+            payload, usage = self._chat_with_overflow_recovery(client, build_messages, self._chat_json_with_retries)
             self.last_error = ""
             self.last_usage = usage
+            self._record_usage(sent_messages[-1] if sent_messages else [], usage)
             plan = self._plan_from_payload(command, payload, {t["name"] for t in available_tools})
             if config:
                 plan.planner_source = str(config.get("provider", "llm"))
@@ -781,8 +1132,22 @@ class LLMMissionPlanner:
         attachments: list[dict[str, Any]] | None = None,
         require_llm: bool = False,
         skill_guidance: list[dict[str, Any]] | None = None,
+        tools: list[dict[str, Any]] | None = None,
+        system_prompt: str | None = None,
+        fallback_enabled: bool = True,
+        conversation_context: list[dict[str, Any]] | None = None,
     ) -> LoopDecision:
-        """Choose the next action for a lightweight observe-decide-act loop."""
+        """Choose the next action for a lightweight observe-decide-act loop.
+
+        Uses the native function-calling protocol when the selected model
+        supports it. The protocol is deliberately single-round and stateless:
+        tool results are folded into the next observation JSON instead of being
+        appended as tool messages, so native and JSON modes can interleave
+        without history-format conflicts. On ToolCallUnsupportedError the
+        planner degrades to JSON-schema prompting; other model errors fall back
+        to the rule decision unless require_llm is set (or fallback_enabled is
+        False, used by sub-agents, in which case errors always raise).
+        """
 
         allowed_tools = self._loop_action_names(tool_cards)
         config = self._resolve_config(model_id)
@@ -793,43 +1158,244 @@ class LLMMissionPlanner:
                 raise LLMUnavailableError(message)
             return self._fallback_loop_decision(command, loop_state, observation, allowed_tools, capabilities or {})
 
-        messages = [
-            {"role": "system", "content": self._loop_decision_system_prompt()},
-            {
-                "role": "user",
-                "content": self._content_with_images(json.dumps(
-                    {
-                        "operator_command": command,
-                        "loop_state": self._compact_loop_state(loop_state),
-                        "observation": self._compact_observation(observation),
-                        "backend_capabilities": capabilities or {},
-                        "available_tool_cards": self._compact_tool_cards(tool_cards),
-                        "skill_guidance": self._compact_skill_guidance(skill_guidance or []),
-                        "memory_snapshot": self._compact_memory(memory),
-                        "output_schema": self._loop_decision_schema_hint(),
-                    },
-                    ensure_ascii=False,
-                    indent=2,
-                    default=str,
-                ), attachments or []),
-            },
+        prompt = system_prompt or self._loop_decision_system_prompt()
+        images = self._image_attachments(attachments)
+        sections = [
+            {"key": "operator_command", "value": command, "priority": "command"},
+            {"key": "output_schema", "value": json.dumps(self._loop_decision_schema_hint(), ensure_ascii=False, default=str), "priority": "command"},
+            {"key": "observation", "value": json.dumps(self._compact_observation(observation), ensure_ascii=False, default=str), "priority": "observation"},
+            {"key": "backend_capabilities", "value": json.dumps(capabilities or {}, ensure_ascii=False, default=str), "priority": "observation"},
+            {"key": "loop_state", "value": json.dumps(self._compact_loop_state(loop_state), ensure_ascii=False, default=str), "priority": "recent"},
+            {"key": "available_tool_cards", "value": json.dumps(self._compact_tool_cards(tool_cards), ensure_ascii=False, default=str), "priority": "tool_cards"},
+            {"key": "skill_guidance", "value": json.dumps(self._compact_skill_guidance(skill_guidance or []), ensure_ascii=False, default=str), "priority": "guidance"},
+            {"key": "memory_snapshot", "value": json.dumps(self._compact_memory(memory), ensure_ascii=False, default=str), "priority": "memory"},
         ]
+        if conversation_context:
+            sections.append(
+                {
+                    "key": "conversation_context",
+                    "value": json.dumps(self._compact_conversation(conversation_context), ensure_ascii=False, default=str),
+                    "priority": "memory",
+                }
+            )
+        sent_messages: list[list[dict[str, Any]]] = []
+
+        def build_messages(window_scale: float = 1.0) -> list[dict[str, Any]]:
+            payload = self._sections_to_payload(self._fit_sections(config, sections, len(images), window_scale))
+            messages = [
+                {"role": "system", "content": prompt},
+                {
+                    "role": "user",
+                    "content": self._content_with_images(
+                        json.dumps(payload, ensure_ascii=False, indent=2, default=str),
+                        attachments or [],
+                    ),
+                },
+            ]
+            sent_messages.append(messages)
+            return messages
+
+        def fallback(error: Exception) -> LoopDecision:
+            if not fallback_enabled:
+                raise LLMUnavailableError(f"Agent Loop LLM decision failed: {error}") from error
+            decision = self._fallback_loop_decision(command, loop_state, observation, allowed_tools, capabilities or {})
+            message = str(error)
+            if decision.reflection:
+                decision.reflection = f"{decision.reflection} LLM fallback: {message}"
+            else:
+                decision.reflection = f"LLM fallback: {message}"
+            return decision
+
+        native = self._config_native_tools(config)
+        openai_tools = self._loop_tool_schemas(tool_cards, tools) if native else []
+        if native and openai_tools:
+            try:
+                decision = self._native_decision(config, build_messages(1.0), openai_tools, allowed_tools)
+                self._record_usage(sent_messages[-1] if sent_messages else [], self.last_usage)
+                return decision
+            except ToolCallUnsupportedError as exc:
+                self.last_error = f"native tool calling unavailable; using JSON mode: {exc}"
+            except Exception as e:
+                if is_context_overflow_error(e):
+                    # tighter budget, then the JSON path below as the final fallback
+                    try:
+                        decision = self._native_decision(config, build_messages(0.5), openai_tools, allowed_tools)
+                        self._record_usage(sent_messages[-1] if sent_messages else [], self.last_usage)
+                        return decision
+                    except ToolCallUnsupportedError as exc:
+                        self.last_error = f"native tool calling unavailable; using JSON mode: {exc}"
+                    except Exception as e2:
+                        self.last_error = str(e2)
+                        if require_llm and fallback_enabled:
+                            raise LLMUnavailableError(f"Agent Loop LLM decision failed: {e2}") from e2
+                        return fallback(e2)
+                self.last_error = str(e)
+                if require_llm and fallback_enabled:
+                    raise LLMUnavailableError(f"Agent Loop LLM decision failed: {e}") from e
+                return fallback(e)
         try:
             client = _create_client(config)
-            payload, usage = self._chat_json_with_retries(client, messages)
+            parsed, usage = self._chat_with_overflow_recovery(client, build_messages, self._chat_json_with_retries)
             self.last_error = ""
             self.last_usage = usage
-            return self._decision_from_payload(payload, allowed_tools)
+            self._record_usage(sent_messages[-1] if sent_messages else [], usage)
+            return self._decision_from_payload(parsed, allowed_tools)
         except Exception as e:
             self.last_error = str(e)
-            if require_llm:
+            if require_llm and fallback_enabled:
                 raise LLMUnavailableError(f"Agent Loop LLM decision failed: {e}") from e
-            decision = self._fallback_loop_decision(command, loop_state, observation, allowed_tools, capabilities or {})
-            if decision.reflection:
-                decision.reflection = f"{decision.reflection} LLM fallback: {e}"
-            else:
-                decision.reflection = f"LLM fallback: {e}"
-            return decision
+            return fallback(e)
+
+    def _image_attachments(self, attachments: list[dict[str, Any]] | None) -> list[dict[str, Any]]:
+        return [
+            item
+            for item in (attachments or [])[:4]
+            if isinstance(item, dict) and str(item.get("data_url") or "").startswith("data:image/")
+        ]
+
+    def _context_budget(self, config: dict[str, Any]) -> ContextBudget:
+        inferred = infer_model_capabilities(
+            str(config.get("model") or ""),
+            str(config.get("provider") or ""),
+            str(config.get("capability_mode") or "auto"),
+        )
+        context_window = int(config.get("context_window") or inferred.get("context_window") or 64000)
+        return ContextBudget(context_window=context_window, output_reserve=2048, meter=self._token_meter())
+
+    def _token_meter(self) -> TokenMeter:
+        meter = getattr(self, "token_meter", None)
+        if meter is None:
+            meter = TokenMeter()
+            self.token_meter = meter
+        return meter
+
+    def _record_usage(self, messages: list[dict[str, Any]], usage: dict[str, Any], images: int = 0) -> None:
+        """Recalibrate the token meter from the provider's real prompt count."""
+        try:
+            estimated = estimate_messages(messages, images=images)
+            actual = int((usage or {}).get("prompt_tokens") or 0)
+            self._token_meter().recalibrate(estimated, actual)
+        except Exception:
+            pass
+
+    @staticmethod
+    def _sections_to_payload(fitted: dict[str, str]) -> dict[str, Any]:
+        """Rebuild a prompt payload dict from budgeted section strings.
+
+        Truncated sections may no longer be valid JSON; they are passed through
+        as raw text so the model still sees the available information.
+        """
+        payload: dict[str, Any] = {}
+        for key, text in fitted.items():
+            if not text or text == "[omitted]":
+                payload[key] = text
+                continue
+            try:
+                payload[key] = json.loads(text)
+            except (json.JSONDecodeError, ValueError):
+                payload[key] = text
+        return payload
+
+    def _config_native_tools(self, config: dict[str, Any] | None) -> bool:
+        """Per-model gate for the native function-calling path."""
+        if not config:
+            return False
+        explicit = config.get("native_tools")
+        if explicit is not None:
+            return bool(explicit)
+        inferred = infer_model_capabilities(
+            str(config.get("model") or ""),
+            str(config.get("provider") or ""),
+            str(config.get("capability_mode") or "auto"),
+        )
+        return bool(inferred["native_tools"])
+
+    def _loop_tool_schemas(
+        self,
+        tool_cards: list[dict[str, Any]],
+        tools: list[dict[str, Any]] | None,
+    ) -> list[dict[str, Any]]:
+        """Synthesize function-calling schemas from tool cards + runtime specs."""
+        specs = {str(t.get("name") or ""): t for t in (tools or []) if isinstance(t, dict)}
+        schemas: list[dict[str, Any]] = []
+        for card in tool_cards[:40]:
+            if not isinstance(card, dict):
+                continue
+            name = str(card.get("name") or "")
+            if not name or name == "memory_store":
+                continue
+            spec = specs.get(name)
+            parameters = spec.get("parameters") if spec else None
+            inputs = card.get("inputs") if isinstance(card.get("inputs"), dict) else {}
+            schema = tool_schema_from_spec(name, parameters or {}, inputs)
+            description = str(card.get("purpose") or (spec or {}).get("description") or name)
+            schemas.append(function_tool_schema(name, description, schema))
+        return schemas
+
+    def _native_decision(
+        self,
+        config: dict[str, Any],
+        messages: list[dict[str, Any]],
+        openai_tools: list[dict[str, Any]],
+        allowed_tools: set[str],
+    ) -> LoopDecision:
+        client = _create_client(config)
+        if str(config.get("api_type") or "openai") == "anthropic":
+            tools_payload = openai_tools_to_anthropic(openai_tools)
+        else:
+            tools_payload = openai_tools
+        tool_calls, text, usage = client.chat_tools(messages, tools_payload)
+        self.last_error = ""
+        self.last_usage = usage
+        return self._decision_from_tool_calls(tool_calls, text, allowed_tools)
+
+    def _decision_from_tool_calls(
+        self,
+        tool_calls: list[dict[str, Any]],
+        text: str,
+        allowed_tools: set[str],
+    ) -> LoopDecision:
+        """Native protocol: tool calls => actions; no tool calls => complete.
+
+        Unavailable tool calls are skipped (noted in reflection) instead of
+        failing the whole turn — one hallucinated name must not kill the run.
+        """
+        if not tool_calls:
+            return LoopDecision(action="", reason=text.strip() or "complete", is_complete=True)
+        decisions: list[LoopDecision] = []
+        rejected: list[str] = []
+        for call in tool_calls:
+            name = str(call.get("name") or "").strip()
+            if not name:
+                continue
+            arguments = call.get("arguments") or {}
+            if not isinstance(arguments, dict):
+                arguments = {}
+            if name not in allowed_tools:
+                rejected.append(name)
+                continue
+            decisions.append(
+                LoopDecision(
+                    action=name,
+                    params=dict(arguments),
+                    reason=text.strip() or f"Call {name}",
+                    is_complete=False,
+                )
+            )
+        if not decisions:
+            if rejected:
+                return LoopDecision(
+                    action="",
+                    reason=f"Model selected unavailable tools: {', '.join(rejected)}",
+                    is_complete=False,
+                    reflection="Stopped before executing unavailable tools.",
+                )
+            return LoopDecision(action="", reason=text.strip() or "complete", is_complete=True)
+        main = decisions[0]
+        if rejected:
+            main.reflection = f"skipped unavailable tool calls: {', '.join(rejected)}"
+        main.parallel_actions = [item.to_dict() for item in decisions[1:]]
+        return main
 
     def confirm_target_in_image(
         self,
@@ -1119,7 +1685,7 @@ class LLMMissionPlanner:
             client = _create_client(config)
             stream_events = getattr(client, "stream_events", None)
             if callable(stream_events):
-                for event in stream_events(messages):
+                for event in _stream_events_with_first_chunk_retry(client, messages):
                     if callable(should_stop) and should_stop():
                         break
                     token = str(event.get("token") or "")
@@ -1326,6 +1892,9 @@ class LLMMissionPlanner:
         return (
             "You are the decision layer of a UAV Agent Loop using ReAct / plan-execute-observe. "
             "At each step, choose exactly one next tool action, or mark the task complete after the latest observation proves the goal is handled. "
+            "You may additionally batch up to 2 independent read-only tool calls (drone_get_status, drone_list_vehicles, drone_get_mission_progress, airsim_take_photo, airsim_get_sensors, airsim_get_depth_map, airsim_vlm_analyze_image, airsim_vlm_confirm_target) "
+            "in the 'actions' array (JSON mode) or as extra tool calls (native mode). "
+            "Never place flight-control tools (arm, disarm, takeoff, land, hover, fly, move, rotate, set_mode, mission upload/start) in that batch — one flight tool per turn. "
             "Use only available_tool_cards. Do not call unavailable tools. "
             "Parse the operator's full instruction yourself, including multi-step Chinese or English commands. Do not rely on keyword routing. "
             "Never bypass safety, never invent telemetry, and do not perform low-level continuous control. "
@@ -1354,6 +1923,13 @@ class LLMMissionPlanner:
             "is_complete": False,
             "needs_replan": False,
             "reflection": "optional brief public reflection on the latest observation/result",
+            "actions": [
+                {
+                    "action": "additional read-only tool name (drone_get_status, airsim_take_photo, sensors, depth, VLM analysis/confirm) — never flight-control tools",
+                    "params": {"name": "value"},
+                    "reason": "optional short text",
+                }
+            ],
         }
 
     def _decision_from_payload(self, payload: dict[str, Any], allowed_tools: set[str]) -> LoopDecision:
@@ -1361,7 +1937,7 @@ class LLMMissionPlanner:
         is_complete = bool(payload.get("is_complete", False))
         if is_complete:
             action = ""
-        elif action not in allowed_tools:
+        elif action and action not in allowed_tools:
             return LoopDecision(
                 action="",
                 reason=f"Model selected unavailable tool: {action}",
@@ -1371,7 +1947,7 @@ class LLMMissionPlanner:
         params = payload.get("params") or {}
         if not isinstance(params, dict):
             params = {}
-        return LoopDecision(
+        decision = LoopDecision(
             action=action,
             params=params,
             reason=str(payload.get("reason") or action or "complete"),
@@ -1379,6 +1955,39 @@ class LLMMissionPlanner:
             needs_replan=bool(payload.get("needs_replan", False)),
             reflection=str(payload.get("reflection") or ""),
         )
+        raw_actions = payload.get("actions")
+        if isinstance(raw_actions, list) and not is_complete:
+            extras: list[LoopDecision] = []
+            for raw in raw_actions:
+                if not isinstance(raw, dict):
+                    continue
+                name = str(raw.get("action") or "").strip()
+                if not name or name not in allowed_tools or name == action:
+                    continue
+                raw_params = raw.get("params") or {}
+                if not isinstance(raw_params, dict):
+                    raw_params = {}
+                extras.append(
+                    LoopDecision(
+                        action=name,
+                        params=dict(raw_params),
+                        reason=str(raw.get("reason") or ""),
+                        is_complete=False,
+                        needs_replan=False,
+                        reflection=str(raw.get("reflection") or ""),
+                    )
+                )
+            if not action and extras:
+                first = extras.pop(0)
+                decision = LoopDecision(
+                    action=first.action,
+                    params=first.params,
+                    reason=first.reason or "complete",
+                    is_complete=False,
+                    reflection=first.reflection,
+                )
+            decision.parallel_actions = [item.to_dict() for item in extras]
+        return decision
 
     def _compact_loop_state(self, loop_state: dict[str, Any]) -> dict[str, Any]:
         return {
@@ -1395,6 +2004,7 @@ class LLMMissionPlanner:
         return {
             "step_index": observation.get("step_index", 0),
             "elapsed_since_start": observation.get("elapsed_since_start", 0),
+            "frame_age_s": observation.get("frame_age_s"),
             "backend": world.get("backend", ""),
             "connected": world.get("connected", False),
             "stale_connection": world.get("stale_connection", False),
@@ -1412,6 +2022,7 @@ class LLMMissionPlanner:
     ) -> LoopDecision:
         lower = command.lower()
         slots = extract_command_slots(command)
+        intents = extract_intents(command)
         world = observation.get("world_state") or {}
         drone = world.get("drone") or {}
         connected = bool(world.get("connected", False)) and not bool(world.get("stale_connection", False))
@@ -1424,21 +2035,15 @@ class LLMMissionPlanner:
                 reflection=str((last.get("data") or {}).get("message") or "previous action failed"),
             )
 
-        wants_search = any(k in lower for k in ["search", "find", "detect", "locate", "搜索", "寻找", "识别", "检测"])
-        wants_track = any(k in lower for k in ["track", "follow", "追踪", "跟踪", "跟随"])
-        wants_photo = any(k in lower for k in ["photo", "capture", "image", "screenshot", "拍照", "截图", "图像"])
+        wants_search = intents["search"]
+        wants_track = intents["track"]
+        wants_photo = intents["photo"]
         wants_visual = wants_search or wants_track or wants_photo
-        wants_return = any(k in lower for k in ["return", "rtl", "go home", "return home", "返航", "返回", "回家"])
-
-        wants_search = wants_search or any(k in lower for k in ["搜索", "寻找", "查找", "识别", "检测", "找"])
-        wants_track = wants_track or any(k in lower for k in ["跟踪", "追踪", "跟随"])
-        wants_photo = wants_photo or any(k in lower for k in ["拍照", "截图", "图像"])
-        wants_return = wants_return or slots.land is True
-        wants_visual = wants_search or wants_track or wants_photo
+        wants_return = intents["return_home"] or slots.land is True
         wants_navigation = (
             slots.ned_target is not None
             or slots.relative_move is not None
-            or any(k in lower for k in ["takeoff", "fly", "move", "go to", "起飞", "飞", "移动", "前进", "后退", "左移", "右移"])
+            or any(k in lower for k in NAVIGATION_TERMS)
         )
 
         completed_navigation_skill = self._loop_has_action(loop_state, "skill:navigation") or self._loop_has_action(loop_state, "skill:return_home")
@@ -1525,7 +2130,7 @@ class LLMMissionPlanner:
                 params.update(slots.relative_move)
             return LoopDecision("skill:navigation", params, "Use the navigation skill for the requested movement.")
 
-        needs_flight = wants_visual or any(k in lower for k in ["takeoff", "fly", "patrol", "起飞", "飞", "巡检"])
+        needs_flight = wants_visual or any(k in lower for k in FLIGHT_TERMS)
         if needs_flight and not drone.get("armed") and "drone_arm" in allowed_tools and not self._loop_has_action(loop_state, "drone_arm"):
             return LoopDecision("drone_arm", {}, "Arm before airborne task execution.")
         if needs_flight and not drone.get("flying") and "drone_takeoff" in allowed_tools and not self._loop_has_action(loop_state, "drone_takeoff"):
@@ -1583,16 +2188,7 @@ class LLMMissionPlanner:
             return 3.0
 
     def _loop_target_class(self, command: str) -> str:
-        lower = command.lower()
-        if any(k in lower for k in ["person", "human", "pedestrian", "人", "行人", "人员"]):
-            return "person"
-        if any(k in lower for k in ["truck", "lorry", "卡车", "货车"]):
-            return "truck"
-        if any(k in lower for k in ["bus", "公交", "巴士"]):
-            return "bus"
-        if any(k in lower for k in ["car", "vehicle", "汽车", "车辆", "车"]):
-            return "car"
-        return "target"
+        return extract_target_class(command) or "target"
 
     def _compact_tools(self, tools: list[dict[str, Any]]) -> list[dict[str, Any]]:
         keep = []
@@ -1670,6 +2266,8 @@ class LLMMissionPlanner:
             "lessons": memory.get("lessons", [])[:5],
             "risk_events": memory.get("risk_events", [])[:5],
             "skill_candidates": memory.get("skill_candidates", [])[:5],
+            "facts": memory.get("facts", [])[:5],
+            "recent_runs": memory.get("runs", [])[:3],
             "guidance": memory.get("guidance", {}),
         }
 
@@ -2141,7 +2739,65 @@ class LLMMissionPlanner:
             execution_mode=str(payload.get("execution_mode") or "auto").strip().lower()
             if str(payload.get("execution_mode") or "").strip().lower() in {"auto", "agent_loop"}
             else "auto",
+            goal=self._goal_from_payload(payload.get("goal"), command),
         )
+
+    VERIFY_METRICS = {
+        "target_confirmed",
+        "position_reached",
+        "flying_at",
+        "landed",
+        "photo_taken",
+        "status_ok",
+        "mission_progress_complete",
+        "formation_stable",
+    }
+
+    def _goal_from_payload(self, raw_goal: Any, command: str) -> dict[str, Any]:
+        """Parse the LLM-proposed task contract, keeping only verifiable metrics.
+
+        Unknown metrics are dropped; LLM proposals never widen the verifier's
+        vocabulary (fail-safe: a metric the runtime cannot check is not a
+        completion gate).
+        """
+        if not isinstance(raw_goal, dict):
+            raw_goal = {}
+        criteria: list[dict[str, Any]] = []
+        raw_criteria = raw_goal.get("success_criteria") or []
+        if isinstance(raw_criteria, list):
+            for item in raw_criteria:
+                if not isinstance(item, dict):
+                    continue
+                metric = str(item.get("metric") or "").strip()
+                if metric not in self.VERIFY_METRICS:
+                    continue
+                cleaned: dict[str, Any] = {"metric": metric}
+                if metric == "position_reached":
+                    try:
+                        cleaned.update(
+                            {
+                                "x": float(item.get("x") or 0.0),
+                                "y": float(item.get("y") or 0.0),
+                                "z": self._ned_z(item.get("z"), -3.0),
+                                "tolerance": float(item.get("tolerance") or 1.5),
+                            }
+                        )
+                    except (TypeError, ValueError):
+                        continue
+                elif metric == "flying_at":
+                    try:
+                        cleaned["altitude"] = abs(float(item.get("altitude") or 3.0))
+                        cleaned["tolerance"] = float(item.get("tolerance") or 1.0)
+                    except (TypeError, ValueError):
+                        continue
+                elif metric == "target_confirmed":
+                    cleaned["target"] = str(item.get("target") or "")
+                criteria.append(cleaned)
+        return {
+            "objective": str(raw_goal.get("objective") or command)[:200],
+            "target": str(raw_goal.get("target") or ""),
+            "success_criteria": criteria,
+        }
 
     def _normalize_steps(self, command: str, steps: list[MissionStep], known_tools: set[str]) -> list[MissionStep]:
         steps = self._filter_unsolicited_steps(command, steps)
@@ -2268,28 +2924,20 @@ class LLMMissionPlanner:
         return 3.0
 
     def _command_target_class(self, command: str) -> str:
-        lower = command.lower()
-        if any(word in lower for word in ["卡车", "truck"]):
-            return "truck"
-        if any(word in lower for word in ["公交", "巴士", "bus"]):
-            return "bus"
-        if any(word in lower for word in ["车辆", "汽车", "可疑车", "车", "car", "vehicle"]):
-            return "car"
-        if any(word in lower for word in ["行人", "人员", "目标人", "person", "pedestrian", "human"]):
-            return "person"
-        return ""
+        return extract_target_class(command)
 
     def _filter_unsolicited_steps(self, command: str, steps: list[MissionStep]) -> list[MissionStep]:
         lower = command.lower()
+        intents = extract_intents(command)
 
         def has_any(words: list[str]) -> bool:
             return any(w in lower for w in words)
 
-        wants_photo = has_any(["photo", "capture", "image", "拍照", "图像", "截图", "照片"])
-        wants_search = has_any(["search", "find", "detect", "识别", "搜索", "寻找", "找", "目标"])
-        wants_track = has_any(["track", "follow", "跟踪", "追踪"])
-        wants_land = has_any(["land", "降落", "落地", "返航", "结束任务"])
-        wants_takeoff = has_any(["takeoff", "起飞", "升空"])
+        wants_photo = intents["photo"]
+        wants_search = intents["search"]
+        wants_track = intents["track"]
+        wants_land = intents["land"] or intents["return_home"]
+        wants_takeoff = intents["takeoff"]
         wants_disarm = has_any(["disarm", "锁定电机", "锁电机"])
         wants_disconnect = has_any(["disconnect", "断开"])
 

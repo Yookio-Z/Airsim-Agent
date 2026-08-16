@@ -97,6 +97,9 @@ def test_every_atomic_manifest_entry_has_a_registration_source() -> None:
         "airsim_task_status",
         "airsim_vlm_analyze_image",
         "airsim_vlm_confirm_target",
+        # registered dynamically by ToolRuntime._ensure_formation_tools on the
+        # AirSim backend (multi-vehicle formation control)
+        "formation_command",
     }
     atomics = _manifest_by_kind("atomic")
     unreachable = sorted(atomics - neutral - airsim_atomics)

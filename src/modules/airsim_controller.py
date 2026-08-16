@@ -17,7 +17,7 @@ import threading
 import time
 from concurrent.futures import ThreadPoolExecutor, TimeoutError as FutureTimeoutError
 from pathlib import Path
-from typing import Optional, Any
+from typing import Optional, Any, Callable
 
 import airsim
 
@@ -95,6 +95,9 @@ class AirSimController(FlightController):
         # worker that owns the client and all AirSim calls.
         self._executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="airsim_rpc")
         self._rpc_exec_lock = threading.Lock()
+        # External stop/cancel signal (emergency stop / task cancel). Polled
+        # while blocking flight commands run so they can be preempted.
+        self._stop_provider: Optional[Callable[[], bool]] = None
 
     # ------------------------------------------------------------------
     # 线程隔离 RPC 基础设施
@@ -674,6 +677,12 @@ class AirSimController(FlightController):
         return False
 
     def hover(self, vehicle_name: str = "") -> bool:
+        """Send hover to the vehicle(s) and return immediately.
+
+        The hover command is fire-and-forget: AirSim executes it regardless of
+        whether we wait, and not waiting keeps emergency-stop paths from queueing
+        behind slow RPC calls (formation shutdown hovers every drone).
+        """
         self.last_error = ""
         if not self._ensure_connected():
             self.last_error = "AirSim not connected"
@@ -684,9 +693,8 @@ class AirSimController(FlightController):
         try:
             names = self._resolve_vehicles(vehicle_name)
             for name in names:
-                self._rpc_call(
-                    lambda n=name: self._client.hoverAsync(vehicle_name=n).join(),
-                    timeout=8.0,
+                self._rpc(
+                    lambda n=name: self._client.hoverAsync(vehicle_name=n),
                 )
             return True
         except Exception as e:
@@ -705,19 +713,107 @@ class AirSimController(FlightController):
             dist = (x**2 + y**2 + z**2) ** 0.5
             flight_timeout = max(30, dist / max(velocity, 0.5) + 10.0)
             for name in names:
-                self._rpc_call(
+                task = self._rpc(
                     lambda n=name: self._client.moveToPositionAsync(
                         x, y, z, velocity,
                         timeout_sec=flight_timeout,
                         vehicle_name=n,
-                    ).join(),
-                    timeout=flight_timeout + 10.0,
+                    ),
+                    timeout=15.0,
                 )
+                if not self._wait_async_interruptible(task, name, flight_timeout + 10.0):
+                    return False
             time.sleep(1.0)
             return True
         except Exception as e:
             self.last_error = str(e)
             logger.error(f"move_to_position failed: {e}")
+            return False
+
+    def move_on_path(self, waypoints: list[dict], velocity: float = 2.0, vehicle_name: str = "") -> bool:
+        self.last_error = ""
+        if not self._ensure_connected():
+            self.last_error = "AirSim not connected"
+            return False
+        try:
+            self._ensure_control(vehicle_name)
+            names = self._resolve_vehicles(vehicle_name)
+            airsim_path = [
+                airsim.Vector3r(wp.get("x", 0), wp.get("y", 0), wp.get("z", 0))
+                for wp in waypoints
+            ]
+            total_dist = sum(
+                ((waypoints[i].get("x",0)-waypoints[i-1].get("x",0))**2 +
+                 (waypoints[i].get("y",0)-waypoints[i-1].get("y",0))**2 +
+                 (waypoints[i].get("z",0)-waypoints[i-1].get("z",0))**2) ** 0.5
+                for i in range(1, len(waypoints))
+            ) if len(waypoints) > 1 else 0
+            flight_timeout = max(30, total_dist / max(velocity, 0.5) + 10.0)
+            for name in names:
+                task = self._rpc(
+                    lambda n=name: self._client.moveOnPathAsync(
+                        airsim_path, velocity,
+                        timeout_sec=flight_timeout,
+                        vehicle_name=n,
+                    ),
+                    timeout=15.0,
+                )
+                if not self._wait_async_interruptible(task, name, flight_timeout + 10.0):
+                    return False
+            return True
+        except Exception as e:
+            self.last_error = str(e)
+            logger.error(f"move_on_path failed: {e}")
+            return False
+
+    def _wait_async_interruptible(self, task, vehicle_name: str, timeout: float) -> bool:
+        """Wait for an AirSim async task, preempting on external stop/cancel.
+
+        The task's ``join()`` must run on the single RPC worker (thread-affine
+        client), so it is submitted there and the caller polls for completion
+        and for the stop provider. On stop, a fire-and-forget hover preempts
+        the running move in the simulator and False is returned immediately;
+        the worker thread exits on its own once the simulator completes the
+        task (bounded by the task's own timeout_sec)."""
+        result_box: dict[str, Any] = {}
+
+        def _wait() -> None:
+            try:
+                task.join()
+                result_box["done"] = True
+            except Exception as exc:
+                result_box["error"] = exc
+
+        self._executor.submit(_wait)
+        deadline = time.time() + max(1.0, float(timeout))
+        while time.time() < deadline:
+            if self._stop_requested():
+                # hoverAsync is a send-only call; AirSim preempts the running
+                # move with the hover command. Best-effort: the RPC worker is
+                # busy joining the task, so we cannot route through _rpc.
+                try:
+                    self._client.hoverAsync(vehicle_name=vehicle_name)
+                except Exception as exc:
+                    self.last_error = str(exc)
+                self.last_error = "interrupted by emergency stop / cancel"
+                return False
+            if "done" in result_box:
+                return True
+            if result_box.get("error") is not None:
+                raise result_box["error"]
+            time.sleep(0.02)
+        self._reset_rpc_runtime()
+        raise TimeoutError(f"AirSim task timed out after {timeout:.0f}s")
+
+    def set_stop_provider(self, stop_provider: Callable[[], bool] | None = None) -> None:
+        """Wire an external stop/cancel signal into blocking flight commands."""
+        self._stop_provider = stop_provider
+
+    def _stop_requested(self) -> bool:
+        provider = getattr(self, "_stop_provider", None)
+        try:
+            return bool(provider and provider())
+        except Exception:
             return False
 
     def move_by_velocity(self, vx: float, vy: float, vz: float, duration: float = 0.0, vehicle_name: str = "") -> bool:

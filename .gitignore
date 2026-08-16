@@ -37,3 +37,8 @@ docs/px4_agent_handoff.md
 
 # 本地工具工作目录
 .workbuddy/
+
+# Coverage data
+.coverage
+.coverage.*
+htmlcov/

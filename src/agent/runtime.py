@@ -21,6 +21,7 @@ from src.modules.mavlink_autodiscovery import (
     discover_serial_mavlink_candidates,
     normalize_serial_baud,
 )
+from src.modules.formation import FLIGHT_ACTIONS as FORMATION_FLIGHT_ACTIONS
 from src.replay.session import ReplaySession, list_replay_sessions, read_replay_session
 
 from .agent_loop import AgentLoop
@@ -28,10 +29,13 @@ from .llm import LLMMissionPlanner, LLMUnavailableError
 from .loop_types import LoopState
 from .memory import AgentMemory
 from .planner import MissionPlan, MissionPlanner, MissionStep
+from .run_log import RunLog, RunLogStore
 from .skill_registry import SkillRegistry
+from .sub_agent import SubAgentRunner
 from .task_runs import TaskRunStore
 from .tool_cards import TOOL_CARDS
-from .tool_executor import ToolCallResult, ToolRuntime
+from .tool_executor import TOOL_OUTPUT_SCHEMAS, ToolCallResult, ToolRuntime
+from .llm_protocol import validate_json_schema
 from src.config import config
 
 
@@ -620,6 +624,15 @@ class AgentRuntime:
             execute_tool=self._execute_agent_tool,
             on_state=self._on_agent_loop_state,
         )
+        # the formation control loop stops on emergency stop / task cancel
+        self.tools.formation_set_stop_provider(
+            lambda: self.supervisor.is_emergency_stopped() or self._cancel_requested.is_set()
+        )
+        # single-vehicle blocking flight commands (fly_to / path / takeoff)
+        # also preempt on emergency stop / task cancel
+        self.tools.set_flight_stop_provider(
+            lambda: self.supervisor.is_emergency_stopped() or self._cancel_requested.is_set()
+        )
         self._lock = threading.RLock()
         self._events: list[RuntimeEvent] = []
         self._messages: list[ChatMessage] = []
@@ -633,6 +646,8 @@ class AgentRuntime:
         self._last_visual_frame: dict[str, Any] = {}
         # P5: pending high-risk approvals keyed by run_id
         self._pending_approvals: dict[str, ToolApprovalRequest] = {}
+        # Append-only run event log for the currently executing run (or None).
+        self._run_log: RunLog | None = None
         # Replay: telemetry recording around runs and manual flights
         self._active_replay: ReplaySession | None = None
         self._manual_replay: ReplaySession | None = None
@@ -1231,6 +1246,23 @@ class AgentRuntime:
                 run_id,
                 {"run_id": run_id, "command": command, "mode": "execute"},
             )
+        if run_id:
+            with self._lock:
+                self._run_log = RunLog(run_id)
+            tool_runtime = self.tools.status_snapshot()
+            self._run_log.write(
+                "run.start",
+                {
+                    "command": command,
+                    "mode": "execute" if execute else "plan",
+                    "model_id": model_id or "",
+                    "backend": str(tool_runtime.get("backend") or ""),
+                    "attachments": len(attachments or []),
+                },
+            )
+        else:
+            with self._lock:
+                self._run_log = None
         try:
             tool_runtime = self.tools.status_snapshot()
             agent_state = agent_state or self._agent_state_context(tool_runtime)
@@ -1330,6 +1362,7 @@ class AgentRuntime:
         finally:
             if replay_session is not None:
                 self._stop_replay_session()
+            self._close_run_log(run_id, execute)
             if execute and self._execution_thread_id == threading.get_ident():
                 self._execution_thread_id = 0
             if release_execution_slot and self._execution_slot.locked():
@@ -1337,6 +1370,62 @@ class AgentRuntime:
             if run_id:
                 with self._lock:
                     self._cancelled_request_ids.discard(run_id)
+
+    def _close_formation(self, reason: str) -> bool:
+        """Hover all formation drones and stop the control thread.
+
+        Called on run end, backend switches, and emergency stop so the swarm
+        never keeps flying without an owner. Returns True when a mission was
+        actually active.
+        """
+        try:
+            return self.tools.formation_shutdown(reason)
+        except Exception:
+            return False
+
+    def _close_run_log(self, run_id: str, execute: bool) -> None:
+        """Write the terminal run.end event, drop the active log reference,
+        and store one bounded transcript row in long-term memory."""
+        with self._lock:
+            run_log = self._run_log
+            current = self._current
+            if run_log is None:
+                return
+            self._run_log = None
+        payload: dict[str, Any] = {"status": "planned" if not execute else "stopped", "command": ""}
+        if current is not None and current.run_id == run_id:
+            payload = {
+                "status": current.status,
+                "command": current.command,
+                "summary": current.summary or "",
+                "failure_reason": current.failure_reason or "",
+                "verification_status": str((current.verification or {}).get("level") or ""),
+                "finished_at": current.finished_at or time.time(),
+                "phase": current.phase or "",
+            }
+            try:
+                tools = [
+                    str(row.get("tool") or "")
+                    for row in ((current.loop_state or {}).get("results") or [])
+                    if isinstance(row, dict)
+                ]
+                self.memory.remember_transcript(
+                    run_id,
+                    current.command,
+                    current.status,
+                    current.summary or "",
+                    tools,
+                    current.failure_reason or "",
+                )
+            except Exception:
+                pass
+            if "native tool calling unavailable" in (self.planner.last_error or ""):
+                run_log.write("protocol.degraded", {"reason": self.planner.last_error[:300]})
+        # a run ending with an active formation/coverage mission must not leave
+        # the swarm flying without an owner
+        if self._close_formation("run_end"):
+            run_log.write("formation.shutdown", {"reason": "run_end", "phase": payload.get("phase", "")})
+        run_log.write("run.end", payload)
 
     def _try_llm_plan(
         self,
@@ -1373,6 +1462,22 @@ class AgentRuntime:
         )
         if run_id:
             plan.run_id = run_id
+        run_log = self._run_log
+        if run_log is not None:
+            run_log.write(
+                "plan",
+                {
+                    "planner_source": plan.planner_source,
+                    "planner_model": plan.planner_model,
+                    "intent": plan.intent,
+                    "summary": plan.summary,
+                    "goal": plan.goal,
+                    "steps": [
+                        {"id": step.id, "label": step.label, "tool": step.tool, "params": step.params, "layer": step.layer}
+                        for step in plan.steps
+                    ],
+                },
+            )
         if str(plan.planner_source).startswith("rules"):
             self._append_event(
                 "warning",
@@ -1393,6 +1498,13 @@ class AgentRuntime:
         sees exactly what will be controlled (multi-vehicle aware)."""
         vehicle = str((params or {}).get("vehicle_name") or "")
         base = f"governed high-risk tool call: {tool}"
+        if tool == "formation_command":
+            action = str((params or {}).get("action") or "")
+            ids = str((params or {}).get("vehicle_ids") or "")
+            detail = f"action={action}"
+            if ids:
+                detail += f", vehicles={ids}"
+            return f"{base} ({detail})"
         if not vehicle:
             return base
         return f"{base} (vehicle={vehicle})"
@@ -1589,6 +1701,16 @@ class AgentRuntime:
         """Read one recorded session: metadata + capped telemetry frames."""
         return read_replay_session(str(name or ""))
 
+    def run_trace(self, run_id: str) -> dict[str, Any] | None:
+        """Replay one run's append-only event log for diagnostics/UI."""
+        reader = RunLogStore().read(str(run_id or ""))
+        if reader is None:
+            return None
+        return reader.replay()
+
+    def run_logs(self, limit: int = 50) -> list[dict[str, Any]]:
+        """List recent run event logs (ids + metadata, no payloads)."""
+        return RunLogStore().list(limit=limit)
 
     @staticmethod
     def _plan_has_observation_dependency(plan: MissionPlan | None) -> bool:
@@ -1843,6 +1965,7 @@ class AgentRuntime:
             execute=True,
             attachments=attachments,
             require_llm=True,
+            conversation_context=self._recent_chat_context(),
         )
         correction_plan = self._plan_from_loop_state(loop)
         if run.plan:
@@ -1859,6 +1982,13 @@ class AgentRuntime:
         run.finished_at = loop.finished_at or time.time()
         run.final_telemetry = dict(self.tools.status_snapshot().get("drone") or {})
         run.verification = self._verify_run_outcome(run)
+        # Loop-level task-contract verification (machine-checked completion
+        # criteria) feeds the same failed-verification gate as the plan path.
+        if loop.verification_status == "failed" and run.verification.get("level") != "failed":
+            run.verification = {
+                "level": "failed",
+                "summary": f"完成判据未满足：{loop.summary or loop.failure_reason or '任务目标未达成'}",
+            }
         if run.status == "completed" and run.verification.get("level") == "failed":
             run.status = "failed"
             run.failure_reason = run.verification.get("summary", "纠错后任务校验仍未通过")
@@ -1873,25 +2003,55 @@ class AgentRuntime:
         self._publish_run_update(run)
 
     def _plan_from_loop_state(self, loop: LoopState, planned: bool = False) -> MissionPlan:
-        results_by_step = {result.step_index: result for result in loop.results}
+        """Rebuild a plan from the loop's audit trail.
+
+        Decisions and results are paired by tool name with consumption order,
+        so corrective decisions and batch results are never lost from the
+        rebuilt plan; leftover results (e.g. batch extras) become their own
+        steps at the end.
+        """
         steps: list[MissionStep] = []
-        for index, decision in enumerate(loop.decisions, 1):
+        consumed: set[int] = set()
+
+        def status_for(result: Any) -> str:
+            if result is None:
+                return "pending"
+            return "planned" if planned and result.ok else ("completed" if result.ok else "failed")
+
+        for decision in loop.decisions:
             if decision.is_complete or not decision.action:
                 continue
-            result = results_by_step.get(index)
-            status = "pending"
-            if result:
-                status = "planned" if planned and result.ok else ("completed" if result.ok else "failed")
+            result = None
+            for ridx, row in enumerate(loop.results):
+                if ridx in consumed:
+                    continue
+                if row.tool == decision.action:
+                    result = row
+                    consumed.add(ridx)
+                    break
             steps.append(
                 MissionStep(
                     id=f"s{len(steps) + 1:02d}",
                     label=decision.reason or decision.action,
                     tool=decision.action,
-                    params=dict(decision.params),
+                    params=dict(decision.params or {}),
                     layer="agent_loop",
-                    status=status,
+                    status=status_for(result),
                     result=result.data if result else None,
-                    safety=result.safety if result else None,
+                )
+            )
+        for ridx, row in enumerate(loop.results):
+            if ridx in consumed:
+                continue
+            steps.append(
+                MissionStep(
+                    id=f"s{len(steps) + 1:02d}",
+                    label=row.tool,
+                    tool=row.tool,
+                    params=dict(row.params or {}),
+                    layer="agent_loop",
+                    status="completed" if row.ok else "failed",
+                    result=row.data,
                 )
             )
         return MissionPlan(
@@ -1939,7 +2099,11 @@ class AgentRuntime:
                 continue
             seen.add(name)
             deduped.append(card)
-        return deduped[:18]
+        # Agent-level cards (memory/subtask) always keep a slot.
+        agent_names = {"memory_recall", "memory_remember", "agent_subtask"}
+        agent_cards = [card for card in deduped if card.get("name") in agent_names]
+        regular = [card for card in deduped if card.get("name") not in agent_names]
+        return (regular[: max(0, 18 - len(agent_cards))] + agent_cards)[:18]
 
     def _allowed_planner_atomic_tools(
         self,
@@ -1985,6 +2149,11 @@ class AgentRuntime:
             allowed.add("drone_hover")
         if any(term in text for term in path_terms):
             allowed.add("drone_fly_path")
+        formation_terms = (
+            "formation", "swarm", "编队", "队形", "coverage", "覆盖", "区域扫描", "网格扫描", "分区扫描",
+        )
+        if any(term in text for term in formation_terms):
+            allowed.add("formation_command")
 
         if "skill:navigation" not in skill_names:
             allowed.update({"drone_arm", "drone_takeoff", "drone_fly_to", "drone_move_relative", "drone_hover"})
@@ -2116,6 +2285,28 @@ class AgentRuntime:
 
     def _on_agent_event(self, level: str, source: str, message: str, data: dict[str, Any]) -> None:
         self._append_event(level, source, message, data)
+        with self._lock:
+            run_log = self._run_log
+        if run_log is not None:
+            kind = str(data.get("kind") or "")
+            if kind == "loop.decision":
+                run_log.write("loop.decision", data)
+            elif kind == "tool.result":
+                run_log.write("tool.result", data)
+            elif kind == "observation":
+                run_log.write("observation", data)
+            elif kind == "replan":
+                run_log.write("replan", data)
+            elif kind == "verification":
+                run_log.write("verification", data)
+            elif kind == "async.poll":
+                run_log.write(
+                    "async.poll",
+                    {
+                        "task_id": str(data.get("task_id") or ""),
+                        "status": str(data.get("status") or ""),
+                    },
+                )
         if source != "async_task":
             return
         with self._lock:
@@ -2191,6 +2382,11 @@ class AgentRuntime:
             return {"ok": False, "error": str(exc)}
 
     def _manual_return_home(self) -> dict[str, Any]:
+        if self.tools.formation_active():
+            return {
+                "ok": False,
+                "error": "a formation/coverage mission is active; use formation_command(action=land_all) or hover_all before return home",
+            }
         runtime = self.tools.status_snapshot()
         connected = bool(runtime.get("connected")) and not bool(runtime.get("stale_connection"))
         drone = runtime.get("drone") if isinstance(runtime.get("drone"), dict) else {}
@@ -2305,13 +2501,21 @@ class AgentRuntime:
         if action == "emergency_stop":
             self.supervisor.emergency_stop()
             result = self.tools.execute("drone_hover", {}, dry_run=False, blocked_by_supervisor=False)
-            self._append_event("danger", "safety", "急停已触发，尝试悬停", result.to_dict())
+            # hover every formation drone too — the single-vehicle hover only
+            # covers the default vehicle
+            formation_stopped = self._close_formation("emergency_stop")
+            self._append_event(
+                "danger",
+                "safety",
+                "急停已触发，尝试悬停",
+                {**result.to_dict(), "formation_stopped": formation_stopped},
+            )
             if self._current:
                 self._current.status = "blocked"
                 self._current.phase = "blocked"
                 self._current.failure_reason = "emergency stop"
                 self._current.finished_at = time.time()
-            return {"ok": result.ok, "result": result.to_dict()}
+            return {"ok": result.ok, "result": result.to_dict(), "formation_stopped": formation_stopped}
         if action == "reset_emergency":
             self.supervisor.reset_emergency()
             self._append_event("info", "safety", "急停状态已复位")
@@ -2843,8 +3047,37 @@ class AgentRuntime:
         caller_owns_run = self._execution_thread_id == threading.get_ident()
         with self._lock:
             run = run or (self._current if caller_owns_run else None)
+
+        manual_safety_tools = {"drone_hover", "drone_land", "airsim_task_cancel"}
+        read_only_tools = set(self.tools.READ_ONLY_TOOLS) | {"airsim_task_status"}
+        if self._execution_slot.locked() and not caller_owns_run and tool not in read_only_tools | manual_safety_tools:
+            return self._blocked_tool_result(tool, params, "an Agent execution is active; use pause/hover/land or wait for completion")
+
+        # Formation conflict guard: while the deterministic formation/coverage
+        # control loop is commanding vehicles, single-vehicle flight tools are
+        # blocked so two control paths can never fight over the same drone.
+        # Hover/land/status/connect stay available as safe recovery actions.
+        formation_active = getattr(self.tools, "formation_active", None)
+        if (
+            callable(formation_active)
+            and formation_active()
+            and tool in self.tools.CONTROL_TOOLS
+            and tool not in {"drone_hover", "drone_land", "drone_get_status", "drone_disconnect", "drone_connect", "airsim_task_cancel"}
+        ):
+            return self._blocked_tool_result(
+                tool,
+                params,
+                "a formation/coverage mission is active; use formation_command(action=hover_all) or land_all before single-vehicle control",
+            )
+
         if tool.startswith("skill:"):
             return self._execute_skill_tool(tool, params, dry_run=dry_run, run=run)
+        if tool == "agent_subtask":
+            return self._execute_sub_agent_tool(params, dry_run=dry_run, run=run)
+        if tool == "memory_recall":
+            return self._execute_memory_recall(params, dry_run=dry_run)
+        if tool == "memory_remember":
+            return self._execute_memory_remember(params, dry_run=dry_run)
         if tool == "airsim_vlm_confirm_target":
             return self._execute_vlm_confirm_tool(params, dry_run=dry_run, run=run)
         if tool == "airsim_vlm_analyze_image":
@@ -2852,15 +3085,10 @@ class AgentRuntime:
         if dry_run:
             return self.tools.execute(tool, params, dry_run=True)
 
-        manual_safety_tools = {"drone_hover", "drone_land", "airsim_task_cancel"}
-        read_only_tools = set(self.tools.READ_ONLY_TOOLS) | {"airsim_task_status"}
-        if self._execution_slot.locked() and not caller_owns_run and tool not in read_only_tools | manual_safety_tools:
-            return self._blocked_tool_result(tool, params, "an Agent execution is active; use pause/hover/land or wait for completion")
-
         runtime = self.tools.status_snapshot()
         profile = runtime.get("backend_profile") or {}
         capabilities = profile.get("capabilities") or {}
-        risk_level = self._tool_risk_level(tool, capabilities, run)
+        risk_level = self._tool_risk_level(tool, capabilities, run, params)
         requires_approval = bool(capabilities.get("requires_operator_approval"))
         if risk_level == "high" and requires_approval and not approval_already_granted:
             if run is None:
@@ -2929,6 +3157,109 @@ class AgentRuntime:
             ),
         )
 
+    def _execute_memory_recall(self, params: dict[str, Any], dry_run: bool = False) -> ToolCallResult:
+        started = time.time()
+        query = str(params.get("query") or "").strip()
+        limit = 5
+        try:
+            limit = max(1, min(10, int(params.get("limit") or 5)))
+        except (TypeError, ValueError):
+            limit = 5
+        results = [] if dry_run else self.memory.recall(query, limit=limit)
+        data = {"status": "planned" if dry_run else "ok", "query": query, "count": len(results), "results": results}
+        return ToolCallResult("memory_recall", dict(params), True, data, started, time.time())
+
+    def _execute_memory_remember(self, params: dict[str, Any], dry_run: bool = False) -> ToolCallResult:
+        started = time.time()
+        key = str(params.get("key") or "").strip()
+        value = str(params.get("value") or "").strip()
+        if not key:
+            return ToolCallResult(
+                "memory_remember",
+                dict(params),
+                False,
+                {"status": "error", "message": "memory_remember requires a non-empty 'key'"},
+                started,
+                time.time(),
+                error_code="INVALID_PARAMS",
+            )
+        tags = params.get("tags")
+        if isinstance(tags, str):
+            tags = [item.strip() for item in tags.split(",") if item.strip()]
+        if not dry_run:
+            self.memory.remember_fact(key, value, tags)
+        data = {"status": "planned" if dry_run else "ok", "key": key, "message": f"fact '{key}' stored"}
+        return ToolCallResult("memory_remember", dict(params), True, data, started, time.time())
+
+    def _execute_sub_agent_tool(self, params: dict[str, Any], dry_run: bool = False, run: RunState | None = None) -> ToolCallResult:
+        """Delegate an open-ended subtask to a bounded sub-agent.
+
+        Runs synchronously in the caller's thread, so the execution slot and
+        approval context are shared with the parent loop. The sub-agent gets
+        its own run log and step budget; the parent only receives the report.
+        """
+        started = time.time()
+        goal = str(params.get("goal") or "").strip()
+        if not goal:
+            return ToolCallResult(
+                "agent_subtask",
+                dict(params),
+                False,
+                {"status": "error", "message": "agent_subtask requires a non-empty 'goal'"},
+                started,
+                time.time(),
+                error_code="INVALID_PARAMS",
+            )
+        max_steps = 6
+        try:
+            max_steps = max(2, min(12, int(params.get("max_steps") or 6)))
+        except (TypeError, ValueError):
+            max_steps = 6
+        model_id = str(params.get("model_id") or "").strip() or (run.model_id if run else "") or ""
+        if dry_run:
+            return ToolCallResult(
+                "agent_subtask",
+                dict(params),
+                True,
+                {"status": "planned", "goal": goal, "message": "dry run only"},
+                started,
+                time.time(),
+            )
+        tool_runtime = self.tools.status_snapshot()
+        capabilities = ((tool_runtime.get("backend_profile") or {}).get("capabilities")) or {}
+        tool_cards = self.tools.list_tool_cards()
+        parent_run_id = run.run_id if run else f"run_{int(time.time() * 1000)}"
+        runner = SubAgentRunner(
+            tools=self.tools,
+            planner=self.planner,
+            memory=self.memory,
+            execute_tool=lambda name, sub_params, sub_dry: self._execute_agent_tool(name, sub_params, dry_run=sub_dry, run=run),
+            should_stop=lambda: self.supervisor.is_emergency_stopped() or self._cancel_requested.is_set(),
+            should_pause=self.supervisor.should_pause,
+            on_ui_event=self._on_agent_event,
+            on_ui_state=self._on_agent_loop_state,
+        )
+        report = runner.run(
+            parent_run_id,
+            goal,
+            constraints=str(params.get("constraints") or ""),
+            tool_cards=tool_cards,
+            capabilities=capabilities,
+            model_id=model_id or None,
+            max_steps=max_steps,
+        )
+        ok = report.get("status") == "completed"
+        error_code = "" if ok else ("BLOCKED" if report.get("status") == "blocked" else "TOOL_ERROR")
+        return ToolCallResult(
+            "agent_subtask",
+            dict(params),
+            ok,
+            {"status": "ok" if ok else "failed", **report},
+            started,
+            time.time(),
+            error_code=error_code,
+        )
+
     def _execute_skill_tool(
         self,
         tool: str,
@@ -2964,6 +3295,7 @@ class AgentRuntime:
         tool: str,
         capabilities: dict[str, Any],
         run: RunState | None = None,
+        params: dict[str, Any] | None = None,
     ) -> str:
         card = TOOL_CARDS.get(tool)
         card_risk = str(card.risk if card else "low")
@@ -2978,6 +3310,10 @@ class AgentRuntime:
             risk = card_risk
         if tool == "drone_land" and capabilities.get("real_vehicle"):
             return "high"
+        if tool == "formation_command" and capabilities.get("real_vehicle"):
+            action = str((params or {}).get("action") or "status")
+            if action in {"set_drones", "set_formation"} or action in FORMATION_FLIGHT_ACTIONS:
+                return "high"
         return risk if risk in {"low", "medium", "high"} else "medium"
 
     def _max_risk(self, first: str, second: str) -> str:
@@ -3043,6 +3379,7 @@ class AgentRuntime:
             data={"status": "blocked", "message": message},
             started_at=now,
             finished_at=now,
+            error_code="BLOCKED",
         )
 
     def _execute_vlm_confirm_tool(
@@ -3114,6 +3451,18 @@ class AgentRuntime:
                 "source": context.get("image_source") or source or "last_image",
                 "image_saved_to": context.get("image_saved_to", ""),
             }
+            if not dry_run:
+                violations = validate_json_schema(data, TOOL_OUTPUT_SCHEMAS.get("airsim_vlm_confirm_target"))
+                if violations:
+                    return ToolCallResult(
+                        "airsim_vlm_confirm_target",
+                        params,
+                        False,
+                        {**data, "status": "error", "validation_errors": violations, "message": "VLM confirmation output failed shape validation"},
+                        started,
+                        time.time(),
+                        error_code="INVALID_TOOL_OUTPUT",
+                    )
             return ToolCallResult("airsim_vlm_confirm_target", params, True, data, started, time.time())
         except LLMUnavailableError as exc:
             return ToolCallResult(
@@ -3182,6 +3531,18 @@ class AgentRuntime:
                 "source": context.get("image_source") or str(params.get("source") or "last_image"),
                 "image_saved_to": context.get("image_saved_to", ""),
             }
+            if not dry_run:
+                violations = validate_json_schema(data, TOOL_OUTPUT_SCHEMAS.get("airsim_vlm_analyze_image"))
+                if violations:
+                    return ToolCallResult(
+                        "airsim_vlm_analyze_image",
+                        params,
+                        False,
+                        {**data, "status": "error", "validation_errors": violations, "message": "VLM analysis output failed shape validation"},
+                        started,
+                        time.time(),
+                        error_code="INVALID_TOOL_OUTPUT",
+                    )
             return ToolCallResult("airsim_vlm_analyze_image", params, True, data, started, time.time())
         except LLMUnavailableError as exc:
             return ToolCallResult(

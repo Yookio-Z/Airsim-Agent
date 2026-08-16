@@ -16,6 +16,8 @@ class LoopObservation:
     last_action_result: dict[str, Any] | None = None
     elapsed_since_start: float = 0.0
     timestamp: float = field(default_factory=time.time)
+    # Seconds since the newest image-bearing result; None when no frame exists.
+    frame_age_s: float | None = None
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -24,12 +26,19 @@ class LoopObservation:
             "last_action_result": self.last_action_result,
             "elapsed_since_start": round(self.elapsed_since_start, 3),
             "timestamp": self.timestamp,
+            "frame_age_s": self.frame_age_s,
         }
 
 
 @dataclass
 class LoopDecision:
-    """The next high-level action selected by the agent loop."""
+    """The next high-level action selected by the agent loop.
+
+    ``parallel_actions`` carries additional read-only tool calls that arrived
+    in the same model response (native function calling batch). They are
+    executed after the main action, each through the same guard/sanitize
+    pipeline; flight-control tools are never admitted into the batch.
+    """
 
     action: str = ""
     params: dict[str, Any] = field(default_factory=dict)
@@ -37,6 +46,7 @@ class LoopDecision:
     is_complete: bool = False
     needs_replan: bool = False
     reflection: str = ""
+    parallel_actions: list[dict[str, Any]] = field(default_factory=list)
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -46,6 +56,7 @@ class LoopDecision:
             "is_complete": self.is_complete,
             "needs_replan": self.needs_replan,
             "reflection": self.reflection,
+            "parallel_actions": [dict(item) for item in self.parallel_actions],
         }
 
 
@@ -91,6 +102,8 @@ class LoopState:
     finished_at: float = 0.0
     failure_reason: str = ""
     summary: str = ""
+    # "ok" / "failed" / "" when the task contract criteria were machine-verified
+    verification_status: str = ""
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -106,4 +119,5 @@ class LoopState:
             "finished_at": self.finished_at,
             "failure_reason": self.failure_reason,
             "summary": self.summary,
+            "verification_status": self.verification_status,
         }

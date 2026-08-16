@@ -1066,3 +1066,51 @@ if __name__ == "__main__":
     for test in tests:
         test()
         print(f"PASS {test.__name__}")
+
+
+def test_async_settle_exits_quickly_when_task_status_tool_missing() -> None:
+    """Non-AirSim backends do not register airsim_task_status: settling an
+    async descriptor must return immediately instead of spinning the whole
+    async_timeout polling an unknown tool."""
+
+    def task_status(_: dict[str, Any]) -> ToolCallResult:
+        return ToolCallResult(
+            "airsim_task_status",
+            {},
+            False,
+            {"status": "error", "message": "unknown tool: airsim_task_status"},
+            time.time(),
+            time.time(),
+            error_code="UNKNOWN_TOOL",
+        )
+
+    tools = FakeTools({
+        "drone_upload_mission": _result(
+            "drone_upload_mission",
+            True,
+            {"status": "started", "task_id": "search_1"},
+            terminal=False,
+            task_id="search_1",
+        ),
+        "airsim_task_status": task_status,
+    })
+    planner = SequencePlanner([
+        LoopDecision("drone_upload_mission", {"waypoints_json": "[]"}, "start async mission task"),
+        LoopDecision(action="", reason="mission task accepted", is_complete=True),
+    ])
+    loop = AgentLoop(
+        tools, planner, FakeMemory(), skills=FakeSkills(), async_timeout=60.0, async_poll_interval=0.05
+    )
+    started = time.time()
+    state = loop.run(
+        "run_no_status_tool",
+        "upload mission",
+        {"gps": True, "mode_control": True},
+        [{"name": name} for name in tools.handlers],
+        max_steps=4,
+    )
+    elapsed = time.time() - started
+    assert elapsed < 2.0, f"settle did not exit promptly ({elapsed:.1f}s)"
+    first = state.results[0]
+    assert first.data["status"] == "accepted"
+    assert "not available on this backend" in first.data["message"]

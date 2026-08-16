@@ -1,6 +1,6 @@
 # AirSim Agent
 
-An LLM-driven UAV agent runtime with MCP servers, multi-backend vehicle control
+An LLM-driven UAV agent runtime with multi-backend vehicle control
 (AirSim / PX4 MAVLink / PX4 + ROS2), and a web ground-control station (GCS).
 
 ## Overview
@@ -23,8 +23,10 @@ enters the high-frequency flight control loop.
 
 - **Agent runtime** - LLM-driven task understanding, capability-aware planning,
   L0-L4 task routing, task state/events, cancel/pause, and human approval flows.
-- **MCP servers** - Model Context Protocol servers for AirSim, PX4/MAVLink, and
-  PX4/ROS2 backends.
+- **Tool registry** - a manifest-driven tool surface (flight, telemetry,
+  perception, VLM, memory, sub-agent) served to the LLM through native
+  function calling or JSON-schema prompting, over AirSim / PX4 MAVLink /
+  PX4 ROS2 backends.
 - **Multi-backend control** - unified ground-station services over AirSim RPC,
   MAVLink (UDP/TCP/serial), and a PX4 ROS2 gateway (HTTP bridge on `:8766`).
 - **Autonomy & safety** - supervisor, safety arbiter, policy engine, obstacle
