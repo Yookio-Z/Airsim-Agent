@@ -1272,7 +1272,7 @@ class AgentRuntime:
             if run_id:
                 self._update_assistant_message(
                     run_id,
-                    "正在启动 Agent Loop 并准备工具调用...",
+                    "正在理解指令并准备执行计划...",
                     "running",
                     {
                         "mode": "execute" if execute else "plan",
@@ -1281,8 +1281,8 @@ class AgentRuntime:
                         "process_trace": [
                             {
                                 "timestamp": time.time(),
-                                "title": "启动 Agent Loop",
-                                "body": "模型将根据观察结果逐步选择工具；模型不可用时不会降级发出飞控指令。",
+                                "title": "理解指令",
+                                "body": "正在解析任务意图并生成可执行的工具序列；模型不可用时不会降级发出飞控指令。",
                                 "status": "running",
                             }
                         ],
@@ -1827,10 +1827,22 @@ class AgentRuntime:
             attachments=attachments or [],
         )
         if plan is None:
+            if execute:
+                # LLM 失效时的安全原则：不自动退化为规则规划继续飞行。
+                # 规则规划覆盖不了模型级任务理解，自动执行会把 LLM 失效的
+                # 影响面扩大到真实飞控；改为失败 + 安全悬停（由
+                # _plan_and_execute 的异常路径执行 _attempt_failure_hover）。
+                self._append_event(
+                    "danger",
+                    "planner",
+                    "LLM 规划不可用，已停止执行以保护无人机",
+                    {"command": command, "phase": "planning"},
+                )
+                raise LLMUnavailableError("LLM 规划不可用，已停止执行以保护无人机。请检查模型配置后重试。")
             plan = self.rule_planner.plan(command, capabilities=capabilities)
             plan.run_id = run_id
             plan.planner_source = "rules_plan_execute_fallback"
-            plan.assumptions.append("LLM 一次性规划不可用，使用本地规则规划器作为安全兜底。")
+            plan.assumptions.append("仅规划预览：LLM 不可用，使用本地规则规划器生成只读预览。")
         else:
             plan.assumptions.append("采用 Plan-Execute：LLM 一次性规划，runtime 串行执行并校验；失败时进入 Agent Loop 纠错。")
 

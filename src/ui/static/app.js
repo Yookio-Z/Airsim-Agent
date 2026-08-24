@@ -2021,7 +2021,7 @@ els.commandForm.addEventListener("submit", async (event) => {
     }
   } catch (error) {
     clearPendingCommand(pendingCommand);
-    if (!els.commandInput.value) els.commandInput.value = command;
+    // 输入框保持已清空状态：用户已按“发送”，指令不应再被放回框里
     await refresh().catch(() => {});
     showNotice(error.message || "任务提交失败", "error");
   } finally {
@@ -4369,6 +4369,10 @@ function updateMapView(state) {
   const drone = runtime.drone || {};
   const backendName = backendDisplayName(runtime);
   const linked = Boolean(runtime.connected) && !runtime.stale_connection;
+  // function-scoped: used both inside the multi-vehicle branch and at the
+  // status line below — a block-scoped declaration would throw
+  // "gps is not defined" (ReferenceError) inside the else branch consumers
+  const gps = droneGpsPosition(drone, runtime);
 
   const vehicles = Array.isArray(runtime.vehicles) ? runtime.vehicles : [];
   if (vehicles.length > 1) {
@@ -4389,7 +4393,6 @@ function updateMapView(state) {
     }
   } else {
   // 更新无人机位置 marker
-  const gps = droneGpsPosition(drone, runtime);
   if (gps) {
     // gps 为 [lat, lon]，MapLibre 用 [lng, lat]
     const lngLat = [gps[1], gps[0]];
@@ -5859,7 +5862,7 @@ function renderChatMessage(message, run, llm) {
   const showThinkingPill = active && mode === "chat" && !thoughts;
   return `
     <article class="chat-bubble agent${isError ? " error" : ""}" data-message-id="${escapeHtml(message.id || "")}">
-      ${isError ? `<div class="error-pill">模型或任务不可用</div>` : ""}
+      ${isError ? `<div class="error-pill">任务执行失败，详见对话内容</div>` : ""}
       ${showThinkingPill ? `<div class="thinking-pill"><span class="live-dot"></span> ${escapeHtml(humanStatus(message.status, phase, mode))}</div>` : ""}
       ${thoughts}
       ${text ? `<div class="agent-message">${renderMarkdown(text)}</div>` : ""}

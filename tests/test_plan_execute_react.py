@@ -217,3 +217,45 @@ def test_plan_from_payload_rejects_unknown_execution_mode() -> None:
     }
     plan = planner._plan_from_payload("起飞", payload, {"drone_takeoff"})
     assert plan.execution_mode == "auto"
+
+
+# ── bounded serialization (regression for RecursionError in /api/state) ──
+
+
+def test_mission_step_to_dict_bounded_for_pathological_depth() -> None:
+    """A sick LLM output nested ~1000 levels must not blow the recursion
+    limit during run serialization (this took down every /api/state poll)."""
+    from src.agent.planner import MissionStep
+
+    deep = {}
+    node = deep
+    for _ in range(1200):
+        node["data"] = {}
+        node = node["data"]
+    step = MissionStep(id="s1", label="fly", tool="drone_fly_to", params=deep, result={"nested": {"x": 1}})
+    dumped = step.to_dict()
+    assert dumped["tool"] == "drone_fly_to"
+    node = dumped["params"]
+    depth = 0
+    while isinstance(node, dict) and "[bounded]" not in node and "data" in node:
+        node = node["data"]
+        depth += 1
+    assert depth < 30  # bounded: the chain was cut far below the input depth
+    assert node.get("[bounded]") is True
+    assert dumped["result"]["nested"]["x"] == 1
+
+
+def test_mission_step_to_dict_self_reference_terminates() -> None:
+    from src.agent.planner import MissionStep
+
+    cyclic: dict = {}
+    cyclic["self"] = cyclic
+    step = MissionStep(id="s2", label="status", tool="drone_get_status", result=cyclic)
+    dumped = step.to_dict()
+    node = dumped["result"]
+    depth = 0
+    while isinstance(node, dict) and "[bounded]" not in node and "self" in node:
+        node = node["self"]
+        depth += 1
+    assert depth < 30  # the self-reference was materialized as a bounded chain
+    assert node.get("[bounded]") is True

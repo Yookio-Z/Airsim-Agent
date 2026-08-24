@@ -10,10 +10,36 @@ from __future__ import annotations
 import json
 import re
 import time
-from dataclasses import asdict, dataclass, field
+from dataclasses import dataclass, field
 from typing import Any
 
 from .command_slots import extract_command_slots, extract_intents, extract_target_class
+
+
+def _bounded_copy(value: Any, _depth: int = 0, _limit: int = 24) -> Any:
+    """Deep-copy a dict/list tree with a hard depth limit.
+
+    ``dataclasses.asdict`` recurses without a limit — a pathologically deep
+    or self-referencing value (e.g. a sick LLM output nested ~1000 levels)
+    blows the interpreter recursion limit and takes down every /api/state
+    poll (the frontend then freezes on the last step). Values beyond the
+    limit are replaced with a marker instead.
+    """
+    if _depth > _limit:
+        return {"[bounded]": True}
+    if isinstance(value, dict):
+        try:
+            return {k: _bounded_copy(v, _depth + 1, _limit) for k, v in value.items()}
+        except RecursionError:
+            return {"[bounded]": True}
+    if isinstance(value, list):
+        try:
+            return [_bounded_copy(v, _depth + 1, _limit) for v in value]
+        except RecursionError:
+            return [{"[bounded]": True}]
+    if isinstance(value, tuple):
+        return [_bounded_copy(v, _depth + 1, _limit) for v in value]
+    return value
 
 
 @dataclass
@@ -33,7 +59,17 @@ class MissionStep:
     needs_observation: bool = False
 
     def to_dict(self) -> dict[str, Any]:
-        return asdict(self)
+        return {
+            "id": self.id,
+            "label": self.label,
+            "tool": self.tool,
+            "params": _bounded_copy(self.params),
+            "layer": self.layer,
+            "status": self.status,
+            "result": _bounded_copy(self.result),
+            "safety": _bounded_copy(self.safety),
+            "needs_observation": self.needs_observation,
+        }
 
 
 @dataclass
