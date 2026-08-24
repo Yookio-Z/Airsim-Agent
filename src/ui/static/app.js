@@ -1964,7 +1964,13 @@ if (els.imagePreview) {
 els.commandForm.addEventListener("submit", async (event) => {
   event.preventDefault();
   if (isAgentWorkActive()) {
-    showNotice("任务正在处理，可点击右侧圆圈中断。", "info");
+    // 任务进行中：明确拒绝而不是静默忽略。清空输入框——否则 Enter 提交被
+    // 拦下时指令会一直留在框里，任务完成后用户以为已发送，还得手动删除。
+    const blockedCommand = els.commandInput.value.trim();
+    if (blockedCommand || pendingImages.length) {
+      els.commandInput.value = "";
+      showNotice("任务正在处理中，指令未发送。请等待当前任务完成后再发。", "error");
+    }
     syncCommandSubmitState();
     return;
   }

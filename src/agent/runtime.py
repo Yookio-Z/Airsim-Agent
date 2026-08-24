@@ -1978,7 +1978,9 @@ class AgentRuntime:
         run.loop_state = loop.to_dict()
         run.summary = loop.summary or run.summary
         run.status = loop.status if loop.status in {"completed", "failed", "blocked"} else "completed"
-        run.failure_reason = loop.failure_reason
+        # a recovered earlier failure must never leak into a completed run:
+        # the frontend renders the error badge from failure_reason
+        run.failure_reason = "" if run.status == "completed" else loop.failure_reason
         run.finished_at = loop.finished_at or time.time()
         run.final_telemetry = dict(self.tools.status_snapshot().get("drone") or {})
         run.verification = self._verify_run_outcome(run)
@@ -3606,19 +3608,21 @@ class AgentRuntime:
                 "updated_at": time.time(),
             }
 
-    def _find_visual_value(self, value: Any, keys: set[str]) -> Any:
+    def _find_visual_value(self, value: Any, keys: set[str], _depth: int = 0) -> Any:
+        if _depth > 24:
+            return None
         if isinstance(value, dict):
             for key in keys:
                 item = value.get(key)
                 if item:
                     return item
             for nested in value.values():
-                found = self._find_visual_value(nested, keys)
+                found = self._find_visual_value(nested, keys, _depth + 1)
                 if found:
                     return found
         elif isinstance(value, list):
             for nested in reversed(value):
-                found = self._find_visual_value(nested, keys)
+                found = self._find_visual_value(nested, keys, _depth + 1)
                 if found:
                     return found
         return None

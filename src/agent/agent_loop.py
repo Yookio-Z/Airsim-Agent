@@ -160,6 +160,9 @@ class AgentLoop:
                     state.failure_reason = decision.reflection or decision.reason or "task stopped without recovering from the previous failure"
                 else:
                     state.status = "completed"
+                    # a recovered earlier failure must never leak into the
+                    # final state: "completed" carries no failure reason
+                    state.failure_reason = ""
                     state.summary = decision.reason or decision.reflection or "agent loop completed"
                 break
             if not decision.action:
@@ -477,13 +480,15 @@ class AgentLoop:
         ]
         return min(ages) if ages else None
 
-    def _result_contains_image(self, value: Any) -> bool:
+    def _result_contains_image(self, value: Any, _depth: int = 0) -> bool:
+        if _depth > 24:
+            return False
         if isinstance(value, dict):
             if any(value.get(key) for key in ("image_base64", "image_saved_to", "saved_to", "approach_image_saved_to")):
                 return True
-            return any(self._result_contains_image(item) for item in value.values())
+            return any(self._result_contains_image(item, _depth + 1) for item in value.values())
         if isinstance(value, list):
-            return any(self._result_contains_image(item) for item in value)
+            return any(self._result_contains_image(item, _depth + 1) for item in value)
         return False
 
     def _latest_result_data(self, state: LoopState, tool: str) -> dict[str, Any]:
@@ -502,7 +507,9 @@ class AgentLoop:
             items.extend(self._iter_nested_tool_results(result.data))
         return items
 
-    def _iter_nested_tool_results(self, value: Any) -> list[dict[str, Any]]:
+    def _iter_nested_tool_results(self, value: Any, _depth: int = 0) -> list[dict[str, Any]]:
+        if _depth > 24:
+            return []
         items: list[dict[str, Any]] = []
         if isinstance(value, dict):
             if value.get("tool"):
@@ -511,13 +518,13 @@ class AgentLoop:
                 nested = value.get(key)
                 if isinstance(nested, list):
                     for item in reversed(nested):
-                        items.extend(self._iter_nested_tool_results(item))
+                        items.extend(self._iter_nested_tool_results(item, _depth + 1))
             data = value.get("data")
             if isinstance(data, (dict, list)):
-                items.extend(self._iter_nested_tool_results(data))
+                items.extend(self._iter_nested_tool_results(data, _depth + 1))
         elif isinstance(value, list):
             for item in reversed(value):
-                items.extend(self._iter_nested_tool_results(item))
+                items.extend(self._iter_nested_tool_results(item, _depth + 1))
         return items
 
     def _approach_decision_from_confirmation(
@@ -754,17 +761,19 @@ class AgentLoop:
         return bool(found) if isinstance(found, bool) else None
 
     @staticmethod
-    def _nested_value(value: Any, key: str) -> Any:
+    def _nested_value(value: Any, key: str, _depth: int = 0) -> Any:
+        if _depth > 24:
+            return None
         if isinstance(value, dict):
             if key in value:
                 return value[key]
             for item in value.values():
-                found = AgentLoop._nested_value(item, key)
+                found = AgentLoop._nested_value(item, key, _depth + 1)
                 if found is not None:
                     return found
         elif isinstance(value, list):
             for item in value:
-                found = AgentLoop._nested_value(item, key)
+                found = AgentLoop._nested_value(item, key, _depth + 1)
                 if found is not None:
                     return found
         return None
@@ -1021,7 +1030,9 @@ class AgentLoop:
         except Exception:
             pass
 
-    def _find_async_descriptor(self, value: Any) -> dict[str, Any] | None:
+    def _find_async_descriptor(self, value: Any, _depth: int = 0) -> dict[str, Any] | None:
+        if _depth > 24:
+            return None
         if isinstance(value, dict):
             status = str(value.get("status") or "").strip().lower()
             task_id = str(value.get("task_id") or "")
@@ -1029,12 +1040,12 @@ class AgentLoop:
             if task_id and (terminal is False or status in {"accepted", "started", "pending", "queued", "running", "in_progress"}):
                 return value
             for nested in value.values():
-                found = self._find_async_descriptor(nested)
+                found = self._find_async_descriptor(nested, _depth + 1)
                 if found:
                     return found
         elif isinstance(value, list):
             for nested in reversed(value):
-                found = self._find_async_descriptor(nested)
+                found = self._find_async_descriptor(nested, _depth + 1)
                 if found:
                     return found
         return None

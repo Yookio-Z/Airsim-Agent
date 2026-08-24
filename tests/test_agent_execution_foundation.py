@@ -1114,3 +1114,45 @@ def test_async_settle_exits_quickly_when_task_status_tool_missing() -> None:
     first = state.results[0]
     assert first.data["status"] == "accepted"
     assert "not available on this backend" in first.data["message"]
+
+
+def test_completed_loop_clears_stale_failure_reason() -> None:
+    """A run that fails mid-way and then recovers to completion must not
+    carry the old failure reason into its final state — the frontend renders
+    the error badge from failure_reason for an otherwise completed task."""
+    tools = FakeTools({
+        "drone_fly_to": _result("drone_fly_to", False, {"status": "failed", "message": "path blocked"}),
+        "drone_get_status": _result("drone_get_status", True, {"status": "ok"}),
+        "drone_hover": _result("drone_hover", True, {"status": "ok"}),
+    })
+    planner = SequencePlanner([
+        LoopDecision("drone_fly_to", {"x": 5, "y": 0, "z": -3}, "try route"),
+        LoopDecision("drone_hover", {}, "recover safely"),
+        LoopDecision(action="", reason="recovered and complete", is_complete=True),
+    ])
+    loop = AgentLoop(tools, planner, FakeMemory(), skills=FakeSkills())
+    state = loop.run(
+        "run_recover",
+        "fly then recover",
+        {"flight_control": True},
+        [{"name": name} for name in tools.handlers],
+        max_steps=5,
+    )
+    assert state.status == "completed"
+    assert state.failure_reason == ""
+
+
+def test_nested_value_depth_limited() -> None:
+    """Pathologically deep payloads (LLM output, tool results) must never
+    blow the interpreter recursion limit."""
+    deep = {"data": {}}
+    node = deep["data"]
+    for _ in range(2000):
+        node["data"] = {}
+        node = node["data"]
+    # a deeply nested structure must terminate instead of RecursionError
+    assert AgentLoop._nested_value(deep, "flying") is None
+    loop = AgentLoop(None, None, None)  # instance methods only need the receiver
+    assert loop._iter_nested_tool_results(deep) == []
+    assert loop._result_contains_image(deep) is False
+    assert loop._find_async_descriptor(deep) is None

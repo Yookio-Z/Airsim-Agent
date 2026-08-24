@@ -938,6 +938,12 @@ class LLMMissionPlanner:
         *,
         attempts: int = 3,
     ) -> tuple[dict[str, Any], dict[str, Any]]:
+        """Call ``chat_json`` with retries for recoverable outputs.
+
+        Slow models often return an empty/truncated response first; a short
+        backoff (0.35s) then retries into the same still-running window and
+        fails a second time. Use a longer, per-attempt backoff so the retry
+        lands after the model has actually finished generating."""
         last_error: Exception | None = None
         for attempt in range(max(1, attempts)):
             try:
@@ -946,7 +952,7 @@ class LLMMissionPlanner:
                 last_error = exc
                 if attempt >= attempts - 1 or not self._retryable_llm_error(exc):
                     raise
-                time.sleep(0.35 * (attempt + 1))
+                time.sleep(1.5 * (attempt + 1))
         assert last_error is not None
         raise last_error
 
