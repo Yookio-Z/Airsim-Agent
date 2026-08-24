@@ -1726,6 +1726,9 @@ class LLMMissionPlanner:
         on_reasoning=None,
         attachments: list[dict[str, Any]] | None = None,
         should_stop=None,
+        readonly_tools: list[dict[str, Any]] | None = None,
+        execute_readonly_tool: Callable[[str, dict[str, Any]], dict[str, Any]] | None = None,
+        on_tool_call: Callable[[str], None] | None = None,
     ) -> str:
         config = self._resolve_config(model_id)
         payload = {
@@ -1747,6 +1750,8 @@ class LLMMissionPlanner:
                     "不要把普通知识问答、图片理解、配置排错强行转成 AirSim/PX4 状态汇报。"
                     "Chat 模式不会执行飞控工具；如果用户要求起飞、移动、降落、搜索、跟踪等真实动作，提醒他切换到 Execute 模式。"
                     "如果用户上传图片并要求说明图片内容，直接根据图片作答；不要把用户附件当成无人机传感器画面，除非用户明确说明。"
+                    "你可以调用提供的只读查询工具（状态/车辆列表）获取实时数据；"
+                    "凡是涉及当前无人机状态、位置、数量的问题，必须先调用工具读取实时数据再回答，禁止仅凭上下文推测。"
                     "必须基于提供的信息作答，不要编造后端连接、车辆状态、位置或传感器结果。"
                     "可以参考 memory_snapshot.guidance 中的偏好和风险提示，但不要把历史任务当成当前事实。"
                     "中文回答，简洁自然。"
@@ -1769,6 +1774,38 @@ class LLMMissionPlanner:
                 attachments or [],
             ),
         })
+
+        # Read-only tool pre-round: let the model pull live data (status /
+        # vehicle list) through function calling, fold the results back into
+        # the context, then answer. Chat still never executes control tools —
+        # the whitelist is enforced by the caller.
+        if readonly_tools and execute_readonly_tool:
+            try:
+                probe_client = _create_client(config)
+                tool_calls, _text, _usage = probe_client.chat_tools(messages, readonly_tools)
+            except Exception:
+                tool_calls = []
+            executed: list[str] = []
+            for call in (tool_calls or [])[:3]:
+                name = str(call.get("name") or "").strip()
+                if not name:
+                    continue
+                args = call.get("arguments") if isinstance(call.get("arguments"), dict) else {}
+                if on_tool_call:
+                    try:
+                        on_tool_call(name)
+                    except Exception:
+                        pass
+                try:
+                    result = execute_readonly_tool(name, args)
+                except Exception as exc:
+                    result = {"ok": False, "data": {"status": "error", "message": str(exc)[:200]}}
+                executed.append(f"{name}: {json.dumps(result, ensure_ascii=False, default=str)[:1600]}")
+            if executed:
+                messages.append({
+                    "role": "user",
+                    "content": "[只读工具实时查询结果]\n" + "\n".join(executed) + "\n请基于以上实时数据回答用户问题。",
+                })
 
         chunks: list[str] = []
         try:

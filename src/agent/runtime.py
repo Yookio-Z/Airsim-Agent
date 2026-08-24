@@ -35,7 +35,7 @@ from .sub_agent import SubAgentRunner
 from .task_runs import TaskRunStore
 from .tool_cards import TOOL_CARDS
 from .tool_executor import TOOL_OUTPUT_SCHEMAS, ToolCallResult, ToolRuntime
-from .llm_protocol import validate_json_schema
+from .llm_protocol import function_tool_schema, tool_schema_from_spec, validate_json_schema
 from src.config import config
 
 
@@ -861,28 +861,53 @@ class AgentRuntime:
         if len(names) > 1 and len(names) <= 4:
             per_vehicle: list[str] = []
             ok_all = True
+            failures = 0
             for name in names:
-                sub = self.tools.execute("drone_get_status", {"vehicle_name": name}, dry_run=False, blocked_by_supervisor=False, allow_reconnect=False)
+                sub = self.tools.execute("drone_get_status", {"vehicle_name": name}, dry_run=False, blocked_by_supervisor=False)
                 if not sub.ok:
                     ok_all = False
-                    per_vehicle.append(f"{name}: 状态读取失败")
+                    failures += 1
+                    reason = str((sub.data or {}).get("message") or (sub.data or {}).get("error") or "未知原因")[:120]
+                    per_vehicle.append(f"{name}: 状态读取失败（{reason}）")
                     continue
                 per_vehicle.append(self._format_vehicle_line(name, sub.data))
-            answer = f"当前后端共 {len(names)} 架无人机：\n" + "\n".join(per_vehicle)
-            dashboard = self.tools.execute("drone_get_status", {}, dry_run=False, blocked_by_supervisor=False, allow_reconnect=False)
-            ok = dashboard.ok and ok_all
-            body = answer
-            process_trace = [
-                {
-                    "timestamp": time.time(),
-                    "title": "读取无人机状态",
-                    "body": body,
-                    "status": "completed" if ok else "failed",
-                    "tool": "drone_list_vehicles",
-                    "params": {},
-                    "kind": "tool",
-                }
-            ]
+            if failures == len(names):
+                # every per-vehicle read failed: the cached vehicle list is
+                # stale and the link is actually down — say so instead of a
+                # table of failures
+                answer = (
+                    f"检测到 {len(names)} 架无人机的缓存列表，但全部状态读取失败——"
+                    "后端连接实际已断开。请检查仿真器/飞控是否在运行，然后在连接面板重新连接。"
+                )
+                ok = False
+                body = answer
+                process_trace = [
+                    {
+                        "timestamp": time.time(),
+                        "title": "读取无人机状态",
+                        "body": body,
+                        "status": "failed",
+                        "tool": "drone_list_vehicles",
+                        "params": {},
+                        "kind": "tool",
+                    }
+                ]
+            else:
+                answer = f"当前后端共 {len(names)} 架无人机：\n" + "\n".join(per_vehicle)
+                dashboard = self.tools.execute("drone_get_status", {}, dry_run=False, blocked_by_supervisor=False)
+                ok = dashboard.ok and ok_all
+                body = answer
+                process_trace = [
+                    {
+                        "timestamp": time.time(),
+                        "title": "读取无人机状态",
+                        "body": body,
+                        "status": "completed" if ok else "failed",
+                        "tool": "drone_list_vehicles",
+                        "params": {},
+                        "kind": "tool",
+                    }
+                ]
         else:
             result = self.tools.execute("drone_get_status", {}, dry_run=False, blocked_by_supervisor=False)
             process_trace = [
@@ -948,7 +973,12 @@ class AgentRuntime:
         flying = telemetry.get("flying")
         state_text = "飞行中" if flying else "未飞行/已落地"
         armed = "已解锁" if telemetry.get("armed") else "未解锁"
-        alt_text = f"，高度约 {alt:.2f} m" if alt is not None else ""
+        if flying:
+            alt_text = f"，高度约 {alt:.2f} m" if alt is not None else ""
+        else:
+            # AirSim keeps the last airborne z after landing; reporting it as
+            # altitude would confuse operators ("landed at 2.9m")
+            alt_text = "，高度 0 m（已着陆）"
         return f"{name}：{armed}，{state_text}{alt_text}，位置 {pos_text}"
 
     def _format_status_readback_answer(self, telemetry: dict[str, Any], ok: bool = True) -> str:
@@ -982,9 +1012,16 @@ class AgentRuntime:
             if alt is not None:
                 gps_text += f"，海拔 {alt:.1f} m"
             gps_text += "。"
+        flying_now = bool(telemetry.get("flying"))
+        if flying_now:
+            altitude_text = f"高度约 {abs(z):.2f} m"
+        else:
+            # AirSim keeps the last airborne z after landing; do not report it
+            # as altitude ("landed at 2.9m" confuses operators)
+            altitude_text = "高度 0 m（已着陆）"
         return (
             f"已读取当前无人机状态：后端为 {backend}，{armed}，{flying}，模式 {mode}。"
-            f"当前位置 NED 为 N {x:.2f} / E {y:.2f} / D {z:.2f} m，高度约 {abs(z):.2f} m，"
+            f"当前位置 NED 为 N {x:.2f} / E {y:.2f} / D {z:.2f} m，{altitude_text}，"
             f"速度约 {speed:.2f} m/s{heading_text}{collision_text}。"
             f"{gps_text}"
         ).strip()
@@ -1003,13 +1040,38 @@ class AgentRuntime:
         agent_state = self._refresh_chat_state(agent_state)
         buffer: list[str] = []
         reasoning_buffer: list[str] = []
+        tool_trace: list[dict[str, Any]] = []
+        readonly_tools = self._chat_readonly_tools()
+
+        def execute_readonly_tool(name: str, args: dict[str, Any]) -> dict[str, Any]:
+            result = self.tools.execute(str(name), dict(args or {}), dry_run=False, allow_reconnect=True)
+            data = result.data if isinstance(result.data, dict) else {"result": str(result.data)[:400]}
+            return {"ok": bool(result.ok), "data": data}
+
+        def on_tool_call(name: str) -> None:
+            tool_trace.append(
+                {
+                    "timestamp": time.time(),
+                    "title": f"只读查询 {name}",
+                    "body": "chat 模式只读工具调用，获取实时数据",
+                    "status": "completed",
+                    "kind": "tool",
+                }
+            )
+            self._update_assistant_message(
+                request_id,
+                "".join(buffer),
+                "running",
+                details("responding"),
+                persist=False,
+            )
 
         def cancelled() -> bool:
             with self._lock:
                 return request_id in self._cancelled_request_ids
 
         def details(phase: str, process_status: str = "running") -> dict[str, Any]:
-            process_trace: list[dict[str, Any]] = []
+            process_trace: list[dict[str, Any]] = list(tool_trace)
             reasoning = self._compact_process_text("".join(reasoning_buffer).strip())
             if reasoning:
                 process_trace.append(
@@ -1020,7 +1082,7 @@ class AgentRuntime:
                         "status": process_status,
                     }
                 )
-            elif phase == "responding":
+            elif phase == "responding" and not tool_trace:
                 process_trace.append(
                     {
                         "timestamp": time.time(),
@@ -1065,6 +1127,9 @@ class AgentRuntime:
                 on_reasoning=on_reasoning,
                 attachments=attachments or [],
                 should_stop=cancelled,
+                readonly_tools=readonly_tools,
+                execute_readonly_tool=execute_readonly_tool,
+                on_tool_call=on_tool_call,
             )
             if not answer and buffer:
                 answer = "".join(buffer)
@@ -5381,6 +5446,28 @@ class AgentRuntime:
         except (TypeError, ValueError):
             heading_float = None
         self.memory.remember_position(position, heading_float, source=source)
+
+    def _chat_readonly_tools(self) -> list[dict[str, Any]]:
+        """Read-only query tools exposed to chat mode (function-calling
+        schemas). The whitelist is the safety boundary: chat can pull live
+        status data but can never arm/move/land a vehicle."""
+        allowed = {"drone_get_status", "drone_list_vehicles"}
+        schemas: list[dict[str, Any]] = []
+        try:
+            for spec in self.tools.list_tools():
+                name = str(spec.get("name") or "")
+                if name not in allowed:
+                    continue
+                schemas.append(
+                    function_tool_schema(
+                        name,
+                        str(spec.get("description") or name),
+                        tool_schema_from_spec(name, spec.get("parameters") or {}, {}),
+                    )
+                )
+        except Exception:
+            return []
+        return schemas
 
     def _refresh_chat_state(self, agent_state: dict[str, Any]) -> dict[str, Any]:
         """Refresh the read-only vehicle state once before answering a chat

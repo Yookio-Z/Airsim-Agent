@@ -276,8 +276,15 @@ def test_vehicle_line_format() -> None:
     from src.agent.runtime import AgentRuntime
 
     rt = object.__new__(AgentRuntime)
-    line = rt._format_vehicle_line(
+    landed = rt._format_vehicle_line(
         "Drone1",
         {"armed": False, "flying": False, "position_ned": {"x": 1.5, "y": -2.0, "z": -3.25}},
     )
-    assert "Drone1" in line and "未解锁" in line and "高度约 3.25 m" in line
+    # AirSim keeps the last airborne z after landing: a landed vehicle must
+    # never be reported with a non-zero altitude
+    assert "Drone1" in landed and "未解锁" in landed and "高度 0 m（已着陆）" in landed
+    flying = rt._format_vehicle_line(
+        "Drone2",
+        {"armed": True, "flying": True, "position_ned": {"x": 0.0, "y": 0.0, "z": -3.25}},
+    )
+    assert "高度约 3.25 m" in flying
