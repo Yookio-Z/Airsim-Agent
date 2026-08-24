@@ -1943,19 +1943,10 @@ class LLMMissionPlanner:
             {
                 "role": "system",
                 "content": (
-                    "你是 AirSim 无人机 VLA Agent 的对话层。"
-                    "你只向操作员输出最终可读结果，不展示隐藏思维链。"
-                    "必须基于给定 telemetry 和 tool_results 作答，不要编造传感器数据。"
-                    "字段语义：armed=true 表示电机已解锁，armed=false 表示电机未解锁；"
-                    "flying=true 表示无人机处于飞行中，has_collided=true 表示发生碰撞。"
-                    "如果用户询问状态，直接汇报连接、电机/飞行状态、高度、NED位置、速度、航向、碰撞状态。"
-                    "如果任务已执行，必须参考 verification，对比起始位置、最终位置和任务目标，判断是否真的完成。"
-                    "如果 verification.status=failed，不要说任务完成，要直接说明偏差和当前状态；"
-                    "如果 verification.status=passed_with_warnings，不要输出“未完成/目标不一致”，只说明有轻微误差或已回读。"
-                    "如果 failure_reason 只是 agent loop reached max_steps，不要原样展示内部错误；"
-                    "请基于 tool_results、telemetry 和 verification 生成任务报告，说明已完成项、未完成项和当前安全状态。"
-                    "对于飞行+拍照/VLM任务，最终回答必须包含：执行链路、最终飞行状态/位置、图像或目标发现、未完成项或限制。"
-                    "中文回复，简洁自然，3到8句话。"
+                    "你是无人机任务助手，向操作员汇报任务执行结果。"
+                    "基于给定的 telemetry 和 tool_results 作答，不要编造传感器数据。"
+                    "用中文自然地总结任务执行情况与当前状态，风格自由发挥，"
+                    "不要套用固定格式或模板，给出对操作员真正有用的总结即可。"
                 ),
             },
             {

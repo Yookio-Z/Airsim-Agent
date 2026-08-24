@@ -758,14 +758,6 @@ class AgentRuntime:
                     "mode": "chat",
                     "phase": "responding",
                     "agent_state": agent_state,
-                    "thought_trace": [
-                        {
-                            "timestamp": time.time(),
-                            "title": "读取上下文",
-                            "body": "正在读取会话与实时状态；需要准确数据时会调用只读查询工具。",
-                            "status": "running",
-                        }
-                    ],
                 },
             )
             thread = threading.Thread(
