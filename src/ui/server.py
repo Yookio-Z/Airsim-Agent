@@ -21,6 +21,7 @@ from urllib.parse import parse_qs, unquote, urlparse
 
 from src.agent import AgentRuntime
 from src.agent.llm import ModelRegistry
+from src.agent.planner import _bounded_copy
 from src.agent.skill_docs import parse_skill_doc
 
 
@@ -526,7 +527,10 @@ class AgentRequestHandler(BaseHTTPRequestHandler):
             raise
 
     def _send_json(self, data: dict, status: HTTPStatus = HTTPStatus.OK) -> None:
-        body = json.dumps(data, ensure_ascii=False).encode("utf-8")
+        # bounded serialization: a pathologically deep payload (sick LLM
+        # output) must never make json.dumps raise RecursionError and kill
+        # the request thread mid-poll (frontend freezes on no updates)
+        body = json.dumps(_bounded_copy(data), ensure_ascii=False).encode("utf-8")
         try:
             self.send_response(status)
             self.send_header("Content-Type", "application/json; charset=utf-8")
@@ -561,7 +565,7 @@ class AgentRequestHandler(BaseHTTPRequestHandler):
             RUNTIME.unsubscribe(subscriber)
 
     def _write_sse(self, event: str, data: dict) -> None:
-        payload = json.dumps(data, ensure_ascii=False, default=str)
+        payload = json.dumps(_bounded_copy(data), ensure_ascii=False, default=str)
         frame = f"event: {event}\ndata: {payload}\n\n".encode("utf-8")
         try:
             self.wfile.write(frame)

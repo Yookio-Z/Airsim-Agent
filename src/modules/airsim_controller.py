@@ -641,7 +641,7 @@ class AirSimController(FlightController):
                     ).join(),
                     timeout=35.0,
                 )
-                if not self._wait_until_landed(name, timeout=12.0):
+                if not self._wait_until_landed(name, timeout=20.0):
                     logger.warning(f"landAsync returned but vehicle is still flying: {name}")
                     return False
                 try:
@@ -654,7 +654,7 @@ class AirSimController(FlightController):
             logger.error(f"land failed: {e}")
             return False
 
-    def _wait_until_landed(self, vehicle_name: str, timeout: float = 12.0) -> bool:
+    def _wait_until_landed(self, vehicle_name: str, timeout: float = 20.0) -> bool:
         deadline = time.time() + timeout
         last_state = None
         while time.time() < deadline:
@@ -662,6 +662,12 @@ class AirSimController(FlightController):
                 state = self._rpc(self._client.getMultirotorState, vehicle_name)
                 last_state = state
                 if state.landed_state == 0:
+                    return True
+                # Some AirSim releases lag the landed_state enum after a
+                # successful touchdown; being on the ground by altitude is
+                # equally safe and avoids a spurious "landing failed".
+                pos = state.kinematics_estimated.position
+                if -float(pos.z_val) < 0.4:
                     return True
             except Exception:
                 pass

@@ -240,3 +240,53 @@ def test_stream_never_retries_non_transient_4xx() -> None:
     with pytest.raises(RuntimeError, match="400"):
         list(_stream_events_with_first_chunk_retry(client, []))
     assert client.calls == 1
+
+
+# ---------------------------------------------------------------------------
+# Streamed planning with reasoning passthrough + bounded SSE serialization
+# ---------------------------------------------------------------------------
+
+
+def test_plan_streaming_delivers_reasoning_tokens() -> None:
+    from src.agent.llm import LLMMissionPlanner, _stream_events_with_first_chunk_retry
+
+    class _StreamClient:
+        def stream_events(self, messages, max_tokens: int = 0):
+            yield {"type": "reasoning", "token": "先分析目标"}
+            yield {"type": "content", "token": '{"intent": "takeoff", "summary": "s", "steps": []}'}
+
+    planner = LLMMissionPlanner()
+    reasoning = []
+    client = _StreamClient()
+    parsed, _usage = planner._stream_plan(client, lambda scale: [{"role": "user", "content": "x"}], reasoning.append)
+    assert parsed["intent"] == "takeoff"
+    assert reasoning == ["先分析目标"]
+
+
+def test_plan_streaming_parse_failure_raises_for_fallback() -> None:
+    from src.agent.llm import LLMMissionPlanner
+
+    class _BrokenStreamClient:
+        def stream_events(self, messages, max_tokens: int = 0):
+            yield {"type": "content", "token": "not json at all"}
+
+    planner = LLMMissionPlanner()
+    with pytest.raises(RuntimeError, match="JSON parse failed"):
+        planner._stream_plan(_BrokenStreamClient(), lambda scale: [{"role": "user", "content": "x"}], lambda t: None)
+
+
+def test_bounded_serialization_keeps_sse_alive_for_deep_payloads() -> None:
+    """The SSE writer must never die on pathologically deep payloads —
+    json.dumps would raise RecursionError and the frontend would freeze."""
+    import json
+
+    from src.agent.planner import _bounded_copy
+
+    deep: dict = {}
+    node = deep
+    for _ in range(1500):
+        node["data"] = {}
+        node = node["data"]
+    payload = {"run_update": {"steps": [{"result": deep}]}}
+    dumped = json.dumps(_bounded_copy(payload), ensure_ascii=False, default=str)
+    assert '"[bounded]": true' in dumped  # the deep chain was cut, serialization survived

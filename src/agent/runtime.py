@@ -706,10 +706,25 @@ class AgentRuntime:
 
         busy_error = ""
         execution_slot_acquired = False
-        with self._lock:
-            if execute and self._current and self._current.status in {"queued", "running", "paused", "awaiting_approval"}:
-                busy_error = "已有任务正在执行，请先暂停、急停或等待完成。"
-        if execute and not busy_error:
+        if execute and self._execution_slot.locked():
+            # 打断语义：新指令提交时自动中断旧任务（用户要求"打断对话即后台
+            # 停止调用"）。_cancel_active_work 置取消旗标并标记旧 run；阻塞中
+            # 的飞行命令由 stop_provider 安全中断；随后等待旧线程退出并释放
+            # 执行槽（acquire 返回即旧线程已走完 finally），此时清除旗标启动
+            # 新任务不会放跑旧任务的收尾工作。
+            self._append_event(
+                "warning",
+                "system",
+                "检测到任务执行中，自动中断旧任务后执行新指令",
+                {"command": command[:80]},
+            )
+            self._cancel_active_work()
+            execution_slot_acquired = self._execution_slot.acquire(timeout=25.0)
+            if not execution_slot_acquired:
+                busy_error = "旧任务未能及时停止，请稍后重试。"
+            else:
+                self._cancel_requested.clear()
+        elif execute:
             execution_slot_acquired = self._execution_slot.acquire(blocking=False)
             if not execution_slot_acquired:
                 busy_error = "已有任务正在理解、规划或执行，请等待当前任务结束。"
@@ -1439,6 +1454,7 @@ class AgentRuntime:
         memory_snapshot: dict[str, Any],
         agent_state: dict[str, Any],
         attachments: list[dict[str, Any]],
+        reasoning_sink: Callable[[str], None] | None = None,
     ) -> MissionPlan | None:
         planner_tool_cards = self._planner_tool_cards(
             command,
@@ -1459,6 +1475,7 @@ class AgentRuntime:
             agent_state=agent_state,
             conversation_context=self._recent_chat_context(),
             attachments=attachments,
+            on_reasoning=reasoning_sink,
         )
         if run_id:
             plan.run_id = run_id
@@ -1815,6 +1832,7 @@ class AgentRuntime:
             agent_state or self._agent_state_context(tool_runtime),
             skill_guidance,
         )
+        reasoning_sink = self._plan_reasoning_sink(run_id, command)
         plan = self._try_llm_plan(
             command=command,
             telemetry=telemetry,
@@ -1825,7 +1843,11 @@ class AgentRuntime:
             memory_snapshot=memory_snapshot,
             agent_state={**agent_state, "planner_mode": "plan_execute"},
             attachments=attachments or [],
+            reasoning_sink=reasoning_sink,
         )
+        final_flush = getattr(reasoning_sink, "final_flush", None)
+        if callable(final_flush):
+            final_flush()
         if plan is None:
             if execute:
                 # LLM 失效时的安全原则：不自动退化为规则规划继续飞行。
@@ -5301,6 +5323,34 @@ class AgentRuntime:
         except (TypeError, ValueError):
             heading_float = None
         self.memory.remember_position(position, heading_float, source=source)
+
+    def _plan_reasoning_sink(self, run_id: str, command: str) -> Callable[[str], None]:
+        """Throttled reasoning-token sink for streamed planning.
+
+        Tokens are batched and flushed to the event panel every ~0.5s so the
+        operator sees the model's thinking during execute planning (a
+        per-token SSE write would flood the browser)."""
+        buffer: list[str] = []
+        last_flush: list[float] = [0.0]
+
+        def flush() -> None:
+            if not buffer:
+                return
+            text = "".join(buffer).strip()
+            buffer.clear()
+            if text:
+                self._append_event("info", "model_reasoning", text[-1500:], {"run_id": run_id, "command": command[:60]})
+
+        def sink(token: str) -> None:
+            buffer.append(token)
+            now = time.time()
+            if now - last_flush[0] >= 0.5:
+                last_flush[0] = now
+                flush()
+
+        # attach the final flush so the wrapper can drain the tail
+        sink.final_flush = flush  # type: ignore[attr-defined]
+        return sink
 
     def _safety_snapshot(self) -> dict[str, Any]:
         constraints = self.tools.safety.constraints

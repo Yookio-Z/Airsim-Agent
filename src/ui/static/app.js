@@ -1963,17 +1963,8 @@ if (els.imagePreview) {
 
 els.commandForm.addEventListener("submit", async (event) => {
   event.preventDefault();
-  if (isAgentWorkActive()) {
-    // 任务进行中：明确拒绝而不是静默忽略。清空输入框——否则 Enter 提交被
-    // 拦下时指令会一直留在框里，任务完成后用户以为已发送，还得手动删除。
-    const blockedCommand = els.commandInput.value.trim();
-    if (blockedCommand || pendingImages.length) {
-      els.commandInput.value = "";
-      showNotice("任务正在处理中，指令未发送。请等待当前任务完成后再发。", "error");
-    }
-    syncCommandSubmitState();
-    return;
-  }
+  // 打断语义：任务执行中也允许发送，服务端会自动中断旧任务后执行新指令
+  // （“打断对话即后台停止调用”）。输入框始终在提交后清空。
   const command = els.commandInput.value.trim();
   if (!command && !pendingImages.length) return;
   let selectedModel = modelsCache.find((model) => model.id === els.modelSelector.value);
@@ -2058,9 +2049,9 @@ function syncCommandSubmitState() {
   submitButton.disabled = false;
   submitButton.textContent = active ? "" : "↑";
   submitButton.title = active
-    ? "中断当前任务"
+    ? "任务执行中，发送将中断当前任务"
     : (commandMode === "execute" ? "执行任务 (Enter)" : "发送聊天 (Enter)");
-  submitButton.setAttribute("aria-label", active ? "中断当前任务" : "发送");
+  submitButton.setAttribute("aria-label", active ? "中断并发送新指令" : "发送");
 }
 
 async function cancelActiveWork() {

@@ -1021,6 +1021,37 @@ class LLMMissionPlanner:
             self.last_error = f"context overflow; retrying with a tighter budget: {exc}"
             return call(client, build_messages(0.5))
 
+    def _stream_plan(
+        self,
+        client: Any,
+        build_messages: Callable[[float], list[dict[str, Any]]],
+        on_reasoning: Callable[[str], None],
+        window_scale: float = 1.0,
+    ) -> tuple[dict[str, Any], dict[str, Any]]:
+        """Plan through the streaming endpoint so reasoning tokens are
+        delivered to the operator while the model thinks.
+
+        Falls back to nothing itself: empty content / parse errors raise so
+        callers can retry or degrade to the non-streaming path.
+        """
+        content: list[str] = []
+        for event in _stream_events_with_first_chunk_retry(client, build_messages(window_scale)):
+            token = str(event.get("token") or "")
+            if not token:
+                continue
+            if event.get("type") == "reasoning":
+                on_reasoning(token)
+            else:
+                content.append(token)
+        text = "".join(content).strip()
+        if not text:
+            raise RuntimeError("LLM returned empty content")
+        try:
+            parsed = json.loads(_extract_json(text))
+        except json.JSONDecodeError as e:
+            raise RuntimeError(f"LLM JSON parse failed: {e}: {text[:300]}") from e
+        return parsed, {}
+
     def supports_multimodal(self, model_id: str | None = None) -> bool:
         config = self._resolve_config(model_id)
         return self._enabled(config) and self._config_supports_multimodal(config)
@@ -1067,6 +1098,7 @@ class LLMMissionPlanner:
         agent_state: dict[str, Any] | None = None,
         conversation_context: list[dict[str, Any]] | None = None,
         attachments: list[dict[str, Any]] | None = None,
+        on_reasoning: Callable[[str], None] | None = None,
     ) -> MissionPlan:
         config = self._resolve_config(model_id)
         if not self._enabled(config):
@@ -1119,6 +1151,28 @@ class LLMMissionPlanner:
 
         try:
             client = _create_client(config)
+            if on_reasoning is not None:
+                # streamed planning: reasoning tokens reach the operator UI
+                # while the model thinks (execute mode otherwise shows only
+                # the static "正在理解指令..." placeholder for minutes)
+                try:
+                    parsed, usage = self._stream_plan(client, build_messages, on_reasoning)
+                except Exception as exc:
+                    if not is_context_overflow_error(exc):
+                        # stream failed mid-flight (rare): fall back to the
+                        # non-streaming path so planning is not lost
+                        parsed, usage = self._chat_with_overflow_recovery(client, build_messages, self._chat_json_with_retries)
+                    else:
+                        self.last_error = f"context overflow; retrying with a tighter budget: {exc}"
+                        parsed, usage = self._stream_plan(client, build_messages, on_reasoning, window_scale=0.5)
+                self.last_error = ""
+                self.last_usage = usage
+                self._record_usage(sent_messages[-1] if sent_messages else [], usage)
+                plan = self._plan_from_payload(command, parsed, {t["name"] for t in available_tools})
+                if config:
+                    plan.planner_source = str(config.get("provider", "llm"))
+                    plan.planner_model = str(config.get("model", ""))
+                return plan
             payload, usage = self._chat_with_overflow_recovery(client, build_messages, self._chat_json_with_retries)
             self.last_error = ""
             self.last_usage = usage
