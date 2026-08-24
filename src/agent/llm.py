@@ -451,12 +451,21 @@ def _stream_events_with_first_chunk_retry(
         except StopIteration:
             return
         except Exception as exc:
-            if attempt >= attempts - 1 or not _retryable_stream_error(exc):
+            # thinking models can take a long time before the first token:
+            # a timeout on attempt 1 should not burn a second full timeout —
+            # the caller (streamed planning) falls back to the non-streaming
+            # path, which is a single bounded request. 4xx also never retries.
+            if attempt >= attempts - 1 or not _retryable_stream_error(exc) or _stream_timeout_error(exc):
                 raise
             continue
         yield first
         yield from stream
         return
+
+
+def _stream_timeout_error(exc: Exception) -> bool:
+    message = str(exc).lower()
+    return "timeout" in message or "timed out" in message or "超时" in message
 
 
 class OpenAIClient:
@@ -593,7 +602,11 @@ class OpenAIClient:
         req = self._request(messages, extra)
         req.add_header("Accept", "text/event-stream")
         try:
-            with urllib.request.urlopen(req, timeout=float(self.config.get("timeout_sec", 25.0))) as resp:
+            # Streaming (especially with thinking enabled) can take much
+            # longer than a normal request before the FIRST token arrives;
+            # use a wider read timeout so planning is not killed early.
+            stream_timeout = max(float(self.config.get("timeout_sec", 25.0)), 60.0)
+            with urllib.request.urlopen(req, timeout=stream_timeout) as resp:
                 for raw_line in resp:
                     line = raw_line.decode("utf-8", errors="replace").strip()
                     if not line or not line.startswith("data:"):
@@ -1935,6 +1948,7 @@ class LLMMissionPlanner:
             "For vague movement or scan requests, choose conservative distance, altitude, and velocity instead of expanding the mission. "
             "Treat kind=atomic tools as one direct operation. Tools with execution_mode=async only start an operation; the runtime owns task_id polling, timeout, cancellation, and terminal outcome. "
             "If a requested capability is unavailable, produce a safe status/readback plan and explain the limitation in risk_notes. "
+            "The plan summary must state concrete numbers: vehicle count, coordinates, or altitude reached — never a bare '已完成/任务完成'."
             "Return JSON only."
         )
 

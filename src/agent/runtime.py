@@ -828,8 +828,13 @@ class AgentRuntime:
         status_terms = (
             "status", "state", "telemetry", "position", "location", "where", "connected", "connection",
             "状态", "位置", "在哪", "哪里", "高度", "坐标", "遥测", "连接", "航向", "速度", "是否在线",
+            "几架", "几台", "多少架", "多少台", "数量", "哪几架", "哪几台", "多少",
         )
-        if not any(term in text for term in status_terms):
+        # "三台/两架/共四台" 等数字+量词组合 -> 数量类只读问句
+        has_status_term = any(term in text for term in status_terms) or bool(
+            re.search(r"[0-9一二两三四五六七八九十百]+[台架]", text)
+        )
+        if not has_status_term:
             return False
         action_terms = (
             "takeoff", "fly", "move", "land", "rtl", "return", "photo", "capture", "search", "scan",
@@ -845,28 +850,63 @@ class AgentRuntime:
         agent_state: dict[str, Any],
     ) -> dict[str, Any]:
         started_at = time.time()
-        result = self.tools.execute("drone_get_status", {}, dry_run=False, blocked_by_supervisor=False)
-        process_trace = [
-            {
-                "timestamp": time.time(),
-                "title": "读取无人机状态",
-                "body": self._format_loop_result_body(result.data) or ("ok" if result.ok else "状态读取失败"),
-                "status": "completed" if result.ok else "failed",
-                "tool": "drone_get_status",
-                "params": {},
-                "kind": "tool",
-            }
-        ]
-        answer = self._format_status_readback_answer(result.data if result.ok else {}, result.ok)
-        if not result.ok:
-            message = str(result.data.get("message") or result.data.get("error") or "无人机状态读取失败")
-            answer = f"状态读取失败：{message}"
+        # multi-vehicle aware: report every vehicle, not only the default one
+        names: list[str] = []
+        try:
+            list_result = self.tools.execute("drone_list_vehicles", {}, dry_run=False, blocked_by_supervisor=False, allow_reconnect=False)
+            raw_names = (list_result.data or {}).get("vehicles") or []
+            names = [str(n) for n in raw_names if str(n)]
+        except Exception:
+            names = []
+        if len(names) > 1 and len(names) <= 4:
+            per_vehicle: list[str] = []
+            ok_all = True
+            for name in names:
+                sub = self.tools.execute("drone_get_status", {"vehicle_name": name}, dry_run=False, blocked_by_supervisor=False, allow_reconnect=False)
+                if not sub.ok:
+                    ok_all = False
+                    per_vehicle.append(f"{name}: 状态读取失败")
+                    continue
+                per_vehicle.append(self._format_vehicle_line(name, sub.data))
+            answer = f"当前后端共 {len(names)} 架无人机：\n" + "\n".join(per_vehicle)
+            dashboard = self.tools.execute("drone_get_status", {}, dry_run=False, blocked_by_supervisor=False, allow_reconnect=False)
+            ok = dashboard.ok and ok_all
+            body = answer
+            process_trace = [
+                {
+                    "timestamp": time.time(),
+                    "title": "读取无人机状态",
+                    "body": body,
+                    "status": "completed" if ok else "failed",
+                    "tool": "drone_list_vehicles",
+                    "params": {},
+                    "kind": "tool",
+                }
+            ]
+        else:
+            result = self.tools.execute("drone_get_status", {}, dry_run=False, blocked_by_supervisor=False)
+            process_trace = [
+                {
+                    "timestamp": time.time(),
+                    "title": "读取无人机状态",
+                    "body": self._format_loop_result_body(result.data) or ("ok" if result.ok else "状态读取失败"),
+                    "status": "completed" if result.ok else "failed",
+                    "tool": "drone_get_status",
+                    "params": {},
+                    "kind": "tool",
+                }
+            ]
+            answer = self._format_status_readback_answer(result.data if result.ok else {}, result.ok)
+            ok = result.ok
+            if not result.ok:
+                message = str(result.data.get("message") or result.data.get("error") or "无人机状态读取失败")
+                answer = f"状态读取失败：{message}"
         process_trace.append(
             {
                 "timestamp": time.time(),
                 "title": "状态总结",
                 "body": answer,
-                "status": "completed" if result.ok else "failed",
+                "status": "completed" if ok else "failed",
                 "tool": "",
                 "params": {},
                 "kind": "reasoning",
@@ -876,11 +916,11 @@ class AgentRuntime:
             "assistant",
             answer,
             run_id=request_id,
-            status="complete" if result.ok else "error",
+            status="complete" if ok else "error",
             details={
                 "mode": "execute",
-                "phase": "completed" if result.ok else "failed",
-                "run_status": "completed" if result.ok else "failed",
+                "phase": "completed" if ok else "failed",
+                "run_status": "completed" if ok else "failed",
                 "started_at": started_at,
                 "finished_at": time.time(),
                 "agent_state": agent_state,
@@ -890,12 +930,26 @@ class AgentRuntime:
             },
         )
         return {
-            "ok": bool(result.ok),
+            "ok": bool(ok),
             "mode": "execute",
             "run_id": request_id,
-            "status": "completed" if result.ok else "failed",
+            "status": "completed" if ok else "failed",
             "fast_readback": True,
         }
+
+    def _format_vehicle_line(self, name: str, telemetry: dict[str, Any]) -> str:
+        """One compact per-vehicle summary line for multi-vehicle readbacks."""
+        position = telemetry.get("position_ned") if isinstance(telemetry.get("position_ned"), dict) else {}
+        x = self._finite_float(position.get("x"))
+        y = self._finite_float(position.get("y"))
+        z = self._finite_float(position.get("z"))
+        pos_text = f"N {x:.2f} / E {y:.2f} / D {z:.2f}" if x is not None else "--"
+        alt = abs(z) if z is not None else None
+        flying = telemetry.get("flying")
+        state_text = "飞行中" if flying else "未飞行/已落地"
+        armed = "已解锁" if telemetry.get("armed") else "未解锁"
+        alt_text = f"，高度约 {alt:.2f} m" if alt is not None else ""
+        return f"{name}：{armed}，{state_text}{alt_text}，位置 {pos_text}"
 
     def _format_status_readback_answer(self, telemetry: dict[str, Any], ok: bool = True) -> str:
         if not ok:
@@ -943,6 +997,10 @@ class AgentRuntime:
         agent_state: dict[str, Any],
         attachments: list[dict[str, Any]] | None = None,
     ) -> None:
+        # Chat mode never executes flight-control tools, but a state question
+        # must not be answered from a stale/busy snapshot either. Refresh the
+        # read-only state once so the model answers from real data.
+        agent_state = self._refresh_chat_state(agent_state)
         buffer: list[str] = []
         reasoning_buffer: list[str] = []
 
@@ -5323,6 +5381,36 @@ class AgentRuntime:
         except (TypeError, ValueError):
             heading_float = None
         self.memory.remember_position(position, heading_float, source=source)
+
+    def _refresh_chat_state(self, agent_state: dict[str, Any]) -> dict[str, Any]:
+        """Refresh the read-only vehicle state once before answering a chat
+        question when the snapshot is busy or stale.
+
+        Chat mode does not execute control tools, but it must not answer from
+        fabricated/outdated numbers either — a single read-only status + list
+        call gives the model real telemetry to reason about.
+        """
+        try:
+            runtime = self.tools.status_snapshot()
+        except Exception:
+            return agent_state
+        if not runtime.get("connected") or runtime.get("stale_connection"):
+            return agent_state
+        busy = bool(runtime.get("busy"))
+        has_vehicle = bool((agent_state or {}).get("vehicle") or (runtime.get("vehicles")))
+        if not busy and has_vehicle:
+            return agent_state
+        result = self.tools.execute("drone_get_status", {}, dry_run=False, blocked_by_supervisor=False, allow_reconnect=False)
+        if not result.ok:
+            return agent_state
+        try:
+            fresh_runtime = self.tools.status_snapshot()
+        except Exception:
+            fresh_runtime = runtime
+        fresh = self._agent_state_context(fresh_runtime)
+        if fresh:
+            agent_state = fresh
+        return agent_state
 
     def _plan_reasoning_sink(self, run_id: str, command: str) -> Callable[[str], None]:
         """Throttled reasoning-token sink for streamed planning.

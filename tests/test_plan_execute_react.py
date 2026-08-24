@@ -259,3 +259,25 @@ def test_mission_step_to_dict_self_reference_terminates() -> None:
         depth += 1
     assert depth < 30  # the self-reference was materialized as a bounded chain
     assert node.get("[bounded]") is True
+
+def test_status_readback_matches_multi_vehicle_questions() -> None:
+    """'三台无人机嘛？' style questions must route to the fast readback
+    path and report every vehicle, not just the default one."""
+    from src.agent.runtime import AgentRuntime
+
+    rt = object.__new__(AgentRuntime)
+    for text in ("三台无人机嘛？", "现在有几架无人机", "一共几台无人机", "无人机数量是多少"):
+        assert rt._is_status_readback_command(text) is True, text
+    # flight intents stay out of the readback path
+    assert rt._is_status_readback_command("让无人机起飞三米") is False
+
+
+def test_vehicle_line_format() -> None:
+    from src.agent.runtime import AgentRuntime
+
+    rt = object.__new__(AgentRuntime)
+    line = rt._format_vehicle_line(
+        "Drone1",
+        {"armed": False, "flying": False, "position_ned": {"x": 1.5, "y": -2.0, "z": -3.25}},
+    )
+    assert "Drone1" in line and "未解锁" in line and "高度约 3.25 m" in line
