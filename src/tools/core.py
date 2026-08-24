@@ -458,13 +458,19 @@ def register_core_tools(
         return fmt_result(dict(method()))
 
     @mcp.tool()
-    def drone_get_status() -> str:
-        """Read normalized vehicle status."""
-        status = controller.get_status()
+    def drone_get_status(vehicle_name: str = "") -> str:
+        """Read normalized vehicle status (default vehicle; a specific name
+        reads that vehicle — multi-vehicle readbacks rely on this)."""
+        try:
+            status = controller.get_status(vehicle_name)
+        except TypeError:
+            # backends whose get_status has no vehicle_name parameter
+            status = controller.get_status()
         return fmt_result(
             {
                 "status": "ok",
                 "backend": controller.backend_name,
+                "vehicle_name": vehicle_name or getattr(status, "vehicle_name", ""),
                 **status.to_dict(),
             }
         )
