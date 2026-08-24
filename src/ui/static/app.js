@@ -5962,13 +5962,9 @@ function renderAgentThoughts(message, run, active) {
   }
   if (!processRows.length && message.status !== "error") return "";
   const detailId = `thought_${message.id || message.run_id || ""}`;
-  if (active) {
-    completedAutoFoldDetailIds.delete(detailId);
-  } else if (!completedAutoFoldDetailIds.has(detailId)) {
-    openDetailIds.delete(detailId);
-    completedAutoFoldDetailIds.add(detailId);
-  }
-  const openAttr = active || openDetailIds.has(detailId) ? " open" : "";
+  // 过程细节默认始终展开（主流 Agent 风格：思考与工具过程直接可回看），
+  // 用户可手动收起；不再在任务完成后自动折叠
+  const openAttr = " open";
   const phase = linkedRun?.phase || message.details?.phase || "";
   const summary = active ? "正在处理..." : `已处理${humanRunDuration(linkedRun, message)}`;
   const rows = processRows.map((item) => {

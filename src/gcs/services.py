@@ -385,7 +385,13 @@ class ToolMissionManager:
         state = self._telemetry.get_state()
         result = self._tools.execute(
             "drone_fly_path",
-            {"waypoints_json": json.dumps(waypoints), "velocity": velocity},
+            {
+                "waypoints_json": json.dumps(waypoints),
+                "velocity": velocity,
+                # 面板选定的目标机（空串 = 后端默认机）；多机后端必须传递，
+                # 否则任务永远落在第一架车上
+                "vehicle_name": self._draft_vehicle_name(),
+            },
             dry_run=False,
             blocked_by_supervisor=state.safety.emergency_stop,
         )
@@ -394,6 +400,10 @@ class ToolMissionManager:
         self._state.progress = 1.0 if manager_result.ok else self._state.progress
         self._state.message = manager_result.message
         return manager_result
+
+    def _draft_vehicle_name(self) -> str:
+        """Target vehicle from the draft ("" = backend default vehicle)."""
+        return str((self._draft.vehicle or "").strip()) if self._draft else ""
 
     def _execute_local_path(self, waypoints: list[dict[str, float]], velocity: float) -> ManagerResult:
         if self._draft is None:

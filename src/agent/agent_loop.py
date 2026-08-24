@@ -80,6 +80,7 @@ class AgentLoop:
         allowed_tools = self._allowed_tools(decision_cards)
         last_result: dict[str, Any] | None = None
         failure_count = 0
+        connection_failures = 0
         unresolved_failure = False
         replan_count = 0
         verify_corrected = False
@@ -204,6 +205,28 @@ class AgentLoop:
                 failure_count += 1
                 unresolved_failure = True
                 state.failure_reason = str(result_row.data.get("message") or f"{result_row.tool} failed")
+                # 连接熔断：后端断连/超时后继续决策只会烧 token（重连、拍照、
+                # 再重连的无限循环）。连续两次连接类失败直接终止任务，让操作
+                # 员先恢复链路。
+                error_code = str(result_row.data.get("error_code") or "")
+                message_l = state.failure_reason.lower()
+                connection_failure = error_code in {"NOT_CONNECTED", "CONNECTION", "TIMEOUT", "LINK_STALE"} or any(
+                    term in message_l for term in ("not connected", "connection", "timed out", "timeout", "未连接", "连接")
+                )
+                if connection_failure:
+                    connection_failures += 1
+                    if connection_failures >= 2:
+                        state.status = "failed"
+                        state.failure_reason = f"后端连接已断开，任务终止：{state.failure_reason[:160]}"
+                        self._event(
+                            "danger",
+                            "agent_loop",
+                            "连续连接失败，任务终止（避免空转烧 token）",
+                            {"failures": connection_failures},
+                        )
+                        break
+                else:
+                    connection_failures = 0
                 if failure_count >= 3:
                     state.status = "failed"
                     break

@@ -4975,6 +4975,10 @@ class AgentRuntime:
     ) -> None:
         payload: dict[str, Any] | None = None
         with self._lock:
+            # 已取消的任务：冻结增量写入（与 _update_assistant_message 的
+            # 中断竞态保护一致，避免把中断标记覆盖回 running）
+            if run_id in self._cancelled_request_ids:
+                return
             # 优先按 run_id 精确匹配
             target = None
             for message in reversed(self._messages):
@@ -5253,7 +5257,18 @@ class AgentRuntime:
             return any(step.tool == "drone_land" for step in steps[index + 1 :])
 
         if final_landing_expected:
-            landed = bool(end.get("flying") is False or end.get("landed_state") == "landed")
+            # land 工具内部已做最长 45s 的落地确认（并行轮询每架）——工具
+            # 成功即视为落地达标；落地后 AirSim 的遥测枚举/位置有滞后，
+            # 仅凭 end telemetry 会误判"未达目标"而空转纠错循环
+            land_step_ok = any(
+                step.tool == "drone_land" and step.status == "completed"
+                for step in steps
+            )
+            landed = bool(
+                end.get("flying") is False
+                or end.get("landed_state") == "landed"
+                or land_step_ok
+            )
             checks.append({
                 "name": "landed_state",
                 "ok": landed,
@@ -5499,47 +5514,52 @@ class AgentRuntime:
     def _plan_reasoning_sink(self, run_id: str, command: str) -> Callable[[str], None]:
         """Throttled reasoning-token sink for streamed planning.
 
-        Tokens are batched and flushed every ~0.5s. Each flush updates BOTH
-        the assistant message's process trace (so the operator sees the model
-        thinking inline in the conversation, mainstream-agent style) and the
-        event panel."""
+        Reasoning text is streamed directly into the conversation as it is
+        generated（主流 Agent 式：思考过程打字机式出现在正文里，可回看），
+        and mirrored to the event panel. When planning finishes the runtime
+        replaces the message content with the real plan/execution trace."""
         buffer: list[str] = []
+        emitted: list[str] = []
         last_flush: list[float] = [0.0]
+
+        planning_details: dict[str, Any] = {
+            "mode": "execute",
+            "phase": "planning",
+        }
 
         def flush() -> None:
             if not buffer:
                 return
-            text = "".join(buffer).strip()
+            text = "".join(buffer)
             buffer.clear()
             if not text:
                 return
+            emitted.append(text)
+            full = "".join(emitted)
             self._append_event("info", "model_reasoning", text[-1500:], {"run_id": run_id, "command": command[:60]})
-            # inline in the conversation card: the planning placeholder message
-            # gains a live "模型推理" entry while the model thinks
-            self._update_assistant_message(
+            # 打字机式追加进对话正文（可回看），同时保留过程 trace
+            self._append_assistant_delta(
                 run_id,
-                "正在理解指令并准备执行计划...",
-                "running",
+                text,
+                full,
                 {
-                    "mode": "execute",
-                    "phase": "planning",
+                    **planning_details,
                     "process_trace": [
                         {
                             "timestamp": time.time(),
                             "title": "模型推理",
-                            "body": self._compact_process_text(text[-1500:]),
+                            "body": self._compact_process_text(full[-1500:]),
                             "status": "running",
                             "kind": "reasoning",
                         }
                     ],
                 },
-                persist=False,
             )
 
         def sink(token: str) -> None:
             buffer.append(token)
             now = time.time()
-            if now - last_flush[0] >= 0.5:
+            if now - last_flush[0] >= 0.4:
                 last_flush[0] = now
                 flush()
 

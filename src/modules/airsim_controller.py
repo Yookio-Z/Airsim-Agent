@@ -591,28 +591,28 @@ class AirSimController(FlightController):
             altitude = max(0.5, abs(float(altitude)))
             self._ensure_control(vehicle_name)
             names = self._resolve_vehicles(vehicle_name)
+            # 多机并行：先把全部起飞/爬升任务发给模拟器（AirSim 并发执行），
+            # 再统一等待到位——逐架 join 会把 N 架的起飞时间串行相加
             for name in names:
-                self._rpc_call(
+                self._rpc(
                     lambda n=name: self._client.takeoffAsync(
                         timeout_sec=max(30, altitude * 5), vehicle_name=n
-                    ).join(),
-                    timeout=max(30, altitude * 5) + 10.0,
+                    ),
+                    timeout=15.0,
                 )
-                self._rpc_call(
+            for name in names:
+                self._rpc(
                     lambda n=name: self._client.moveToZAsync(
                         -altitude,
                         velocity=1.5,
                         timeout_sec=max(20, altitude * 6),
                         vehicle_name=n,
-                    ).join(),
-                    timeout=max(25, altitude * 6 + 8),
+                    ),
+                    timeout=15.0,
                 )
-                self._rpc_call(
-                    lambda n=name: self._client.hoverAsync(vehicle_name=n).join(),
-                    timeout=8.0,
-                )
-                if not self._wait_until_airborne_at_altitude(name, altitude, timeout=4.0):
-                    self.last_error = f"AirSim takeoff command returned but vehicle did not reach {altitude:.1f}m"
+            for name in names:
+                if not self._wait_until_airborne_at_altitude(name, altitude, timeout=max(30, altitude * 6)):
+                    self.last_error = f"AirSim takeoff command returned but {name} did not reach {altitude:.1f}m"
                     return False
             return True
         except Exception as e:
@@ -635,13 +635,17 @@ class AirSimController(FlightController):
                     self._rpc(self._client.enableApiControl, True, name)
                     time.sleep(0.2)
                     self._control_enabled.add(name)
-                self._rpc_call(
+            # 多机并行降落：先给全部车辆发出 landAsync（AirSim 并发执行），
+            # 再统一轮询落地确认——逐架 join 会把 N 架的降落时间串行相加
+            for name in names:
+                self._rpc(
                     lambda n=name: self._client.landAsync(
-                        timeout_sec=30, vehicle_name=n
-                    ).join(),
-                    timeout=35.0,
+                        timeout_sec=60, vehicle_name=n
+                    ),
+                    timeout=15.0,
                 )
-                if not self._wait_until_landed(name, timeout=20.0):
+            for name in names:
+                if not self._wait_until_landed(name, timeout=45.0):
                     logger.warning(f"landAsync returned but vehicle is still flying: {name}")
                     return False
                 try:
@@ -913,6 +917,22 @@ class AirSimController(FlightController):
             except Exception:
                 pass
 
+            # 多机注意：部分 AirSim 版本在地面未解锁状态下 getMultirotorState 的
+            # kinematics_estimated 对所有车返回第一架车的读数（飞行中才恢复按车），
+            # 因此地图定位必须用 getGpsData（全程按车正确，由 OriginGeopoint 换算）。
+            gps_data = None
+            try:
+                gnss = self._rpc(self._client.getGpsData, vehicle_name=name, timeout=4.0).gnss
+                geo = gnss.geo_point
+                if geo and abs(float(geo.latitude)) > 0.001 and abs(float(geo.longitude)) > 0.001:
+                    gps_data = {
+                        "lat": round(float(geo.latitude), 7),
+                        "lon": round(float(geo.longitude), 7),
+                        "alt": round(float(geo.altitude), 2),
+                    }
+            except Exception:
+                gps_data = None
+
             _, pitch, yaw = self._quat_to_euler(ori)
             heading_deg = math.degrees(yaw)
             if heading_deg < 0:
@@ -944,6 +964,7 @@ class AirSimController(FlightController):
                 armed=name in self._armed,
                 flying=landed == 1,
                 mode="airsim_simpleflight",
+                gps=gps_data,
                 extra=extra,
             )
         except Exception as e:

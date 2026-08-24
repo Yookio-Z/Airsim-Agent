@@ -2020,6 +2020,7 @@ class LLMMissionPlanner:
         return (
             "You are the decision layer of a UAV Agent Loop using ReAct / plan-execute-observe. "
             "At each step, choose exactly one next tool action, or mark the task complete after the latest observation proves the goal is handled. "
+            "CORRECTION DISCIPLINE: when entering a correction loop, FIRST read the current vehicle status (drone_get_status) and verify from the observation whether the goal action actually failed — never blindly repeat an action that the previous step already reported as completed (e.g. landing completed means the vehicle is on the ground; calling land again is wrong). If the observation shows the goal is already satisfied, mark is_complete=true instead of re-executing. "
             "You may additionally batch up to 2 independent read-only tool calls (drone_get_status, drone_list_vehicles, drone_get_mission_progress, airsim_take_photo, airsim_get_sensors, airsim_get_depth_map, airsim_vlm_analyze_image, airsim_vlm_confirm_target) "
             "in the 'actions' array (JSON mode) or as extra tool calls (native mode). "
             "Never place flight-control tools (arm, disarm, takeoff, land, hover, fly, move, rotate, set_mode, mission upload/start) in that batch — one flight tool per turn. "
