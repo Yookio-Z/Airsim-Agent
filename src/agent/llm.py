@@ -258,6 +258,8 @@ class ModelRegistry:
             "enabled": bool(api_key),
             "key_hint": f"••••{api_key[-4:]}" if api_key else "",
             "capability_mode": capability_mode,
+            "reasoning_effort": str(model.get("reasoning_effort") or ""),
+            "thinking_mode": str(model.get("thinking_mode") or ""),
             "multimodal": bool(inferred["multimodal"]),
             "capability_source": inferred["capability_source"],
             "input_modes": inferred["input_modes"],
@@ -477,6 +479,15 @@ class OpenAIClient:
             configured_max = self.config.get("max_tokens")
             if configured_max:
                 payload["max_tokens"] = int(configured_max)
+        # DeepSeek V4 / OpenAI reasoning-effort models: thinking mode and
+        # effort level are request-level settings (temperature etc. are
+        # ignored while thinking is enabled on DeepSeek).
+        thinking_mode = str(self.config.get("thinking_mode") or "").strip().lower()
+        reasoning_effort = str(self.config.get("reasoning_effort") or "").strip().lower()
+        if thinking_mode in {"enabled", "disabled"}:
+            payload["thinking"] = {"type": thinking_mode}
+        if reasoning_effort in {"low", "medium", "high", "max"}:
+            payload["reasoning_effort"] = reasoning_effort
         payload.update(payload_extra)
         body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
         return urllib.request.Request(
@@ -1914,6 +1925,7 @@ class LLMMissionPlanner:
             "If the task depends on current position or flight state, include drone_get_status before the action. "
             "For any flight mission, include connection and state readback. "
             "For takeoff/search/patrol, include drone_arm before drone_takeoff. "
+            "MULTI-VEHICLE RULE: when the operator's command targets several or every vehicle (全部/所有/每架/三架无人机/机群), set vehicle_name='all' on EVERY flight step (arm, takeoff, move, land, hover) so all vehicles act together; a missing or empty vehicle_name only moves the default (first) vehicle. After multi-vehicle actions, add a readback step and verify EVERY vehicle reached the expected state before reporting success. "
             "Use skill_guidance as Markdown operating knowledge, not as callable tools. "
             "For short ordered UAV workflows, follow the flight_sequence guidance when present while still choosing native tools from available_tool_cards. "
             "For visual tasks, follow any relevant Markdown guidance, then use airsim_take_photo plus airsim_vlm_analyze_image for open-ended image descriptions or airsim_vlm_confirm_target for named targets. "

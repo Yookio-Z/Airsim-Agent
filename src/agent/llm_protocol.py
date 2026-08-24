@@ -295,21 +295,21 @@ _TYPE_ALIASES = {
 FLIGHT_TOOL_CONSTRAINTS: dict[str, dict[str, dict[str, Any]]] = {
     "drone_takeoff": {
         "altitude": {"type": "number", "minimum": 0.5, "maximum": 120, "description": "Takeoff altitude in meters"},
-        "vehicle_name": {"type": "string", "description": "Target vehicle id when multiple vehicles exist"},
+        "vehicle_name": {"type": "string", "description": "Set 'all' to command EVERY vehicle (全部/所有无人机); a specific id targets one vehicle; empty means the default vehicle only"},
     },
     "drone_fly_to": {
         "x": {"type": "number", "description": "Target NED x (north, meters)"},
         "y": {"type": "number", "description": "Target NED y (east, meters)"},
         "z": {"type": "number", "description": "Target NED z (down, meters; negative altitude)"},
         "velocity": {"type": "number", "minimum": 0.2, "maximum": 20, "description": "Cruise velocity in m/s"},
-        "vehicle_name": {"type": "string", "description": "Target vehicle id when multiple vehicles exist"},
+        "vehicle_name": {"type": "string", "description": "Set 'all' to command EVERY vehicle (全部/所有无人机); a specific id targets one vehicle; empty means the default vehicle only"},
     },
     "drone_move_relative": {
         "forward_m": {"type": "number", "description": "Forward displacement in body frame, meters"},
         "right_m": {"type": "number", "description": "Right displacement in body frame, meters"},
         "up_m": {"type": "number", "description": "Up displacement in body frame, meters"},
         "velocity": {"type": "number", "minimum": 0.2, "maximum": 20, "description": "Velocity in m/s"},
-        "vehicle_name": {"type": "string", "description": "Target vehicle id when multiple vehicles exist"},
+        "vehicle_name": {"type": "string", "description": "Set 'all' to command EVERY vehicle (全部/所有无人机); a specific id targets one vehicle; empty means the default vehicle only"},
     },
     "drone_fly_velocity": {
         "vx": {"type": "number", "minimum": -20, "maximum": 20, "description": "Body-frame forward velocity m/s"},

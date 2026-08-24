@@ -290,3 +290,31 @@ def test_bounded_serialization_keeps_sse_alive_for_deep_payloads() -> None:
     payload = {"run_update": {"steps": [{"result": deep}]}}
     dumped = json.dumps(_bounded_copy(payload), ensure_ascii=False, default=str)
     assert '"[bounded]": true' in dumped  # the deep chain was cut, serialization survived
+
+
+def test_reasoning_effort_passed_through_to_request_payload() -> None:
+    """DeepSeek V4 thinking controls must reach the request body only when
+    the model config declares them."""
+    import json
+    import urllib.request
+
+    from src.agent.llm import OpenAIClient
+
+    client = OpenAIClient({
+        "base_url": "http://fake/v1",
+        "api_key": "k",
+        "model": "deepseek-v4-flash",
+        "thinking_mode": "enabled",
+        "reasoning_effort": "max",
+    })
+    req = client._request([{"role": "user", "content": "hi"}], {})
+    payload = json.loads(req.data.decode("utf-8"))
+    assert payload["thinking"] == {"type": "enabled"}
+    assert payload["reasoning_effort"] == "max"
+
+    # default model: no thinking controls are injected
+    plain = OpenAIClient({"base_url": "http://fake/v1", "api_key": "k", "model": "gpt-x"})
+    req2 = plain._request([{"role": "user", "content": "hi"}], {})
+    payload2 = json.loads(req2.data.decode("utf-8"))
+    assert "thinking" not in payload2
+    assert "reasoning_effort" not in payload2

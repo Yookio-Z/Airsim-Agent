@@ -191,3 +191,14 @@ def test_schema_limits_description_length():
         {"x": "d" * 500},
     )
     assert len(schema["properties"]["x"]["description"]) <= 160
+
+
+def test_vehicle_name_schema_teaches_all_semantics() -> None:
+    """The function-calling schema must teach the model the 'all' magic
+    value — otherwise multi-vehicle commands move only the default vehicle
+    (reported: 三架起飞后仅一架向前飞)."""
+    from src.agent.llm_protocol import FLIGHT_TOOL_CONSTRAINTS
+
+    for tool in ("drone_takeoff", "drone_fly_to", "drone_move_relative"):
+        desc = str(FLIGHT_TOOL_CONSTRAINTS[tool]["vehicle_name"]["description"])
+        assert "all" in desc and "EVERY" in desc, f"{tool}: {desc}"

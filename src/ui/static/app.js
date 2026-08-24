@@ -169,6 +169,8 @@ const els = {
   modelBaseUrl: $("modelBaseUrl"),
   modelApiKey: $("modelApiKey"),
   modelRevealKey: $("modelRevealKey"),
+  modelReasoningEffort: $("modelReasoningEffort"),
+  modelThinkingMode: $("modelThinkingMode"),
 };
 
 let latestState = null;
@@ -1712,9 +1714,19 @@ function renderModelSelector() {
 
   const selected = models.find((m) => m.id === selector.value) || models[0];
   if (selected && els.modelSelectorLabel) {
-    els.modelSelectorLabel.textContent = selected.name;
+    const effortLabel = reasoningEffortLabel(selected);
+    els.modelSelectorLabel.textContent = effortLabel ? `${selected.name} · ${effortLabel}` : selected.name;
   }
   renderModelMenu();
+}
+
+function reasoningEffortLabel(model) {
+  const mode = model?.thinking_mode || "";
+  const effort = model?.reasoning_effort || "";
+  if (mode === "disabled") return "无思考";
+  if (mode === "enabled" && !effort) return "思考";
+  const names = { low: "低思考", medium: "中思考", high: "高思考", max: "最大思考" };
+  return names[effort] || "";
 }
 
 function renderModelMenu() {
@@ -2008,6 +2020,9 @@ els.commandForm.addEventListener("submit", async (event) => {
     if (resp && resp.ok) {
       showNotice(mode === "execute" ? "任务已进入执行流程" : "Chat 已提交，正在生成回复", "success");
     } else {
+      // 服务端拒绝了提交：清掉“正在理解指令”的 pending 气泡，避免它
+      // 与错误消息并存变红，让用户误以为任务失败后还会继续执行
+      clearPendingCommand(pendingCommand);
       showNotice((resp && resp.result && resp.result.data && resp.result.data.message) || "指令处理失败", "error");
     }
   } catch (error) {
@@ -6233,6 +6248,8 @@ function openModelModal(modelId) {
   els.modelApiKey.placeholder = model?.key_hint
     ? `已保存 ${model.key_hint}，留空保持不变`
     : "输入 API Key";
+  if (els.modelReasoningEffort) els.modelReasoningEffort.value = model?.reasoning_effort || "";
+  if (els.modelThinkingMode) els.modelThinkingMode.value = model?.thinking_mode || "";
   if (els.modelRevealKey) {
     els.modelRevealKey.hidden = !model?.enabled;
     els.modelRevealKey.textContent = "显示";
@@ -6260,6 +6277,8 @@ async function submitModelForm() {
     api_type: els.modelApiType.value,
     base_url: els.modelBaseUrl.value.trim(),
   };
+  if (els.modelReasoningEffort) payload.reasoning_effort = els.modelReasoningEffort.value || "";
+  if (els.modelThinkingMode) payload.thinking_mode = els.modelThinkingMode.value || "";
   const apiKey = els.modelApiKey.value.trim();
   if (apiKey || !isEdit) {
     payload.api_key = apiKey;

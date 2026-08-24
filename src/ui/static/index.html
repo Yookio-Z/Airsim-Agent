@@ -794,6 +794,24 @@
               <button type="button" id="modelRevealKey" class="secondary">显示</button>
             </div>
           </div>
+          <div class="form-row">
+            <label for="modelThinkingMode">思考模式（DeepSeek V4 等）</label>
+            <select id="modelThinkingMode">
+              <option value="">模型默认</option>
+              <option value="enabled">开启思考</option>
+              <option value="disabled">关闭思考</option>
+            </select>
+          </div>
+          <div class="form-row">
+            <label for="modelReasoningEffort">思考等级</label>
+            <select id="modelReasoningEffort">
+              <option value="">模型默认</option>
+              <option value="low">低</option>
+              <option value="medium">中</option>
+              <option value="high">高</option>
+              <option value="max">最大（DeepSeek V4）</option>
+            </select>
+          </div>
           <div class="modal-actions">
             <button type="button" id="modelModalCancel" class="secondary">取消</button>
             <button type="submit" class="primary">保存</button>
