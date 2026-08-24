@@ -118,7 +118,13 @@ def register_core_tools(
     @mcp.tool()
     def drone_list_vehicles() -> str:
         """List vehicles known to the active backend."""
-        vehicles = controller.list_vehicles()
+        # LLM-facing tool: low call frequency, so a fresh re-read is fine
+        # (the UI keeps its own cached copy via the local list_vehicles());
+        # backends without the refresh parameter fall back to their default
+        try:
+            vehicles = controller.list_vehicles(refresh=True)
+        except TypeError:
+            vehicles = controller.list_vehicles()
         return fmt_result(
             {
                 "status": "ok",

@@ -131,18 +131,20 @@ def test_overflow_recovery_rebuilds_with_tighter_budget() -> None:
     planner = LLMMissionPlanner()
     scales: list[float] = []
     builds = {"n": 0}
+    client = object()
 
     def build_messages(scale: float):
         builds["n"] += 1
         scales.append(scale)
         return [{"role": "user", "content": "x" * int(1000 * scale)}]
 
-    def call(messages):
+    def call(c, messages):
+        assert c is client
         if len(messages[0]["content"]) > 500:
             raise RuntimeError("maximum context length exceeded")
         return {"ok": True}, {"prompt_tokens": 1}
 
-    result, usage = planner._chat_with_overflow_recovery(None, build_messages, call)
+    result, usage = planner._chat_with_overflow_recovery(client, build_messages, call)
     assert result == {"ok": True}
     assert scales == [1.0, 0.5]  # full budget first, halved budget on overflow
     assert "context overflow" in planner.last_error
@@ -151,17 +153,42 @@ def test_overflow_recovery_rebuilds_with_tighter_budget() -> None:
 def test_overflow_recovery_passes_through_other_errors() -> None:
     planner = LLMMissionPlanner()
     builds = {"n": 0}
+    client = object()
 
     def build_messages(scale: float):
         builds["n"] += 1
         return [{"role": "user", "content": "x"}]
 
-    def call(messages):
+    def call(c, messages):
         raise RuntimeError("LLM HTTP 429: rate limited")
 
     with pytest.raises(RuntimeError, match="429"):
-        planner._chat_with_overflow_recovery(None, build_messages, call)
+        planner._chat_with_overflow_recovery(client, build_messages, call)
     assert builds["n"] == 1  # non-overflow errors never rebuild the request
+
+
+def test_overflow_recovery_accepts_bound_chat_json_with_retries() -> None:
+    """Guard against the plan() integration signature bug: the bound method
+    ``self._chat_json_with_retries`` (2 args: client, messages) must work
+    when passed straight into the recovery helper — this exact wiring broke
+    execute-mode planning at runtime on 2026-08-24."""
+    planner = LLMMissionPlanner()
+
+    class _FakeClient:
+        def chat_json(self, messages):
+            if len(messages[0]["content"]) > 500:
+                raise RuntimeError("maximum context length exceeded")
+            return {"ok": True}, {"prompt_tokens": 1}
+
+    client = _FakeClient()
+
+    def build_messages(scale: float):
+        return [{"role": "user", "content": "x" * int(1000 * scale)}]
+
+    # the exact wiring used by plan()/decide_next_step():
+    result, usage = planner._chat_with_overflow_recovery(client, build_messages, planner._chat_json_with_retries)
+    assert result == {"ok": True}
+    assert "context overflow" in planner.last_error
 
 
 # ---------------------------------------------------------------------------

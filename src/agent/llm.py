@@ -997,17 +997,23 @@ class LLMMissionPlanner:
         self,
         client: Any,
         build_messages: Callable[[float], list[dict[str, Any]]],
-        call: Callable[[list[dict[str, Any]]], tuple[dict[str, Any], dict[str, Any]]],
+        call: Callable[[Any, list[dict[str, Any]]], tuple[dict[str, Any], dict[str, Any]]],
     ) -> tuple[dict[str, Any], dict[str, Any]]:
         """Call the LLM, retrying once with a halved context budget when the
-        provider reports a context-length overflow."""
+        provider reports a context-length overflow.
+
+        ``call`` receives ``(client, messages)`` — the same shape as
+        ``client.chat_json(messages)`` / ``client.chat_tools(...)`` so a
+        bound method like ``self._chat_json_with_retries`` (which takes
+        ``client`` first) can be passed directly.
+        """
         try:
-            return call(build_messages(1.0))
+            return call(client, build_messages(1.0))
         except Exception as exc:
             if not is_context_overflow_error(exc):
                 raise
             self.last_error = f"context overflow; retrying with a tighter budget: {exc}"
-            return call(build_messages(0.5))
+            return call(client, build_messages(0.5))
 
     def supports_multimodal(self, model_id: str | None = None) -> bool:
         config = self._resolve_config(model_id)

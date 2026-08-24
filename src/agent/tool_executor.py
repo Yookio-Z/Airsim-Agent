@@ -2172,6 +2172,11 @@ class ToolRuntime:
             connected = False
 
         cached = self._last_status_snapshot or {}
+        # vehicles: reuse the cached list only — a fresh per-vehicle status
+        # read is an RPC that would queue behind the tool call currently
+        # holding the lock. Without the cached list the frontend vehicle
+        # panel empties whenever any long tool call runs, flickering between
+        # "3 drones" and "none".
         snapshot = {
             "ready": ready,
             "init_error": self.init_error,
@@ -2183,6 +2188,7 @@ class ToolRuntime:
             "tool_cards": cached.get("tool_cards") or [],
             "backends": cached.get("backends") or self.backend_registry.list_public(),
             "drone": drone_status,
+            "vehicles": cached.get("vehicles") or [],
         }
         self._last_status_snapshot = snapshot
         return dict(snapshot)

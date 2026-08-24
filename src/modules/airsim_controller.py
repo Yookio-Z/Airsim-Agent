@@ -95,6 +95,7 @@ class AirSimController(FlightController):
         # worker that owns the client and all AirSim calls.
         self._executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="airsim_rpc")
         self._rpc_exec_lock = threading.Lock()
+        self._last_connected_check = 0.0
         # External stop/cancel signal (emergency stop / task cancel). Polled
         # while blocking flight commands run so they can be preempted.
         self._stop_provider: Optional[Callable[[], bool]] = None
@@ -436,6 +437,14 @@ class AirSimController(FlightController):
     def _ensure_connected(self) -> bool:
         """如果未连接或连接不健康，自动重连。"""
         if self.is_connected:
+            # The ping probe is an RPC: under the UI's 250ms polling × N
+            # requests, pinging on every call piles up pressure on the single
+            # RPC worker (and a stuck ping blocks everything until timeout).
+            # Once verified healthy, skip probing for 5 seconds.
+            now = time.time()
+            if now - self._last_connected_check < 5.0:
+                return True
+            self._last_connected_check = now
             if self._ping_check(3.0):
                 return True
             logger.warning("_ensure_connected: 连接不健康，重连...")
@@ -880,7 +889,10 @@ class AirSimController(FlightController):
 
         name = names[0]
         try:
-            state = self._rpc(self._client.getMultirotorState, name)
+            # tight RPC timeout: get_status is called on every UI poll per
+            # vehicle; a stuck AirSim response must not block the single RPC
+            # worker for the default 30s recovery window on every poll
+            state = self._rpc(self._client.getMultirotorState, name, timeout=4.0)
             pos = state.kinematics_estimated.position
             vel = state.kinematics_estimated.linear_velocity
             ori = state.kinematics_estimated.orientation
@@ -934,14 +946,28 @@ class AirSimController(FlightController):
             self._client = None
             return DroneStatus(extra={"connection_error": str(e)})
 
-    def list_vehicles(self) -> list[str]:
-        if not self._ensure_connected():
-            return []
-        try:
-            self._vehicles = self._rpc(self._client.listVehicles)
-            return self._vehicles or [""]
-        except Exception:
-            return self._vehicles or [""]
+    def list_vehicles(self, refresh: bool = False) -> list[str]:
+        """Return the known vehicle list.
+
+        Default reads the locally cached list populated at connect time —
+        the vehicle composition does not change while AirSim runs, and a
+        live RPC here would queue behind the single RPC worker on every
+        250ms UI poll (a stuck AirSim response then blocks ALL telemetry
+        until the 30s runtime reset, which shows up as the vehicle panel
+        flickering). Pass ``refresh=True`` for a force re-read.
+        """
+        if refresh:
+            if not self._ensure_connected():
+                return self._vehicles or []
+            try:
+                fresh = self._rpc(self._client.listVehicles, timeout=5.0)
+                if fresh:
+                    self._vehicles = list(fresh)
+            except Exception:
+                pass
+        if not self.is_connected:
+            return []  # keep the pre-cache semantics for tool-layer callers
+        return self._vehicles or [""]
 
     def set_mode(self, mode: str, vehicle_name: str = "") -> bool:
         logger.warning("AirSim does not support flight modes")
