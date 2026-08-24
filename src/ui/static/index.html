@@ -104,48 +104,69 @@
           <div id="waypointPanel" class="waypoint-panel">
             <header class="waypoint-panel-head">
               <div class="waypoint-panel-title">
-                <strong>航点</strong>
-                <select id="missionVehicleSelect" class="waypoint-vehicle-select" hidden title="选择目标载具（多机）"></select>
-                <div class="waypoint-actions">
-                  <button data-waypoint-action="deploy_start" title="上传并开始航线" aria-label="上传并开始航线">
-                    <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M4 17v2a2 2 0 0 0 2 2h5"/><polyline points="8 8 12 4 16 8"/><line x1="12" y1="4" x2="12" y2="15"/><polygon points="15 14 21 17.5 15 21 15 14" fill="currentColor" stroke="none"/></svg>
-                  </button>
-                  <button data-waypoint-action="clear_vehicle" title="删除本地航点并清空飞控任务" aria-label="删除本地航点并清空飞控任务" class="danger">
-                    <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="3 6 5 6 21 6"/><path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"/></svg>
-                  </button>
-                </div>
+                <strong>航点任务</strong>
+                <span id="waypointCount" class="waypoint-count" hidden>0</span>
               </div>
-              <button id="waypointPanelToggle" class="icon-button" title="折叠/展开" type="button">⌃</button>
+              <div class="waypoint-actions">
+                <button data-waypoint-action="deploy_start" class="wp-action-btn primary" title="上传并开始航线" aria-label="上传并开始航线">
+                  <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polygon points="6 3 20 12 6 21 6 3" fill="currentColor" stroke="none"/></svg>
+                  <span>开始</span>
+                </button>
+                <button data-waypoint-action="clear_vehicle" class="wp-action-btn danger" title="删除本地航点并清空飞控任务" aria-label="删除本地航点并清空飞控任务">
+                  <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="3 6 5 6 21 6"/><path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"/></svg>
+                  <span>清空</span>
+                </button>
+                <button id="waypointPanelToggle" class="icon-button" title="折叠/展开" type="button">⌃</button>
+              </div>
             </header>
+            <div id="wpVehicleRow" class="waypoint-vehicle-row" hidden>
+              <span class="waypoint-vehicle-label">目标机</span>
+              <div id="wpVehiclePicker" class="wp-vehicle-picker">
+                <button type="button" id="wpVehicleButton" class="wp-vehicle-button" title="选择执行任务的目标机">
+                  <span id="wpVehicleLabel" class="wp-vehicle-label-text">默认机</span>
+                  <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"><polyline points="6 9 12 15 18 9"/></svg>
+                </button>
+                <div id="wpVehicleMenu" class="wp-vehicle-menu" hidden></div>
+              </div>
+              <select id="missionVehicleSelect" class="waypoint-vehicle-select" hidden title="选择目标载具（多机）"></select>
+            </div>
             <div class="waypoint-panel-body">
               <div id="waypointList" class="waypoint-list"></div>
               <div id="waypointProperties" class="waypoint-properties hidden">
-                <header>航点属性</header>
-                <label>
-                  类型
-                  <select id="wpPropType">
-                    <option value="waypoint">航点</option>
-                    <option value="takeoff">起飞</option>
-                    <option value="land">降落</option>
-                    <option value="rtl">返航</option>
-                  </select>
-                </label>
-                <label>
-                  高度 (m)
-                  <input id="wpPropAlt" type="number" step="0.5" />
-                </label>
-                <label>
-                  速度 (m/s)
-                  <input id="wpPropSpeed" type="number" step="0.5" />
-                </label>
-                <label>
-                  悬停 (s)
-                  <input id="wpPropHold" type="number" step="0.5" />
-                </label>
-                <label>
-                  接受半径 (m)
-                  <input id="wpPropAccept" type="number" step="0.5" />
-                </label>
+                <header>
+                  <span>航点属性</span>
+                  <button type="button" id="wpPropDelete" class="wp-prop-delete" title="删除选中的航点">
+                    <svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><polyline points="3 6 5 6 21 6"/><path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"/></svg>
+                    删除
+                  </button>
+                </header>
+                <div class="wp-prop-grid">
+                  <label class="span-2">
+                    类型
+                    <select id="wpPropType">
+                      <option value="waypoint">航点</option>
+                      <option value="takeoff">起飞</option>
+                      <option value="land">降落</option>
+                      <option value="rtl">返航</option>
+                    </select>
+                  </label>
+                  <label>
+                    高度 (m)
+                    <input id="wpPropAlt" type="number" step="0.5" />
+                  </label>
+                  <label>
+                    速度 (m/s)
+                    <input id="wpPropSpeed" type="number" step="0.5" />
+                  </label>
+                  <label>
+                    悬停 (s)
+                    <input id="wpPropHold" type="number" step="0.5" />
+                  </label>
+                  <label>
+                    接受半径 (m)
+                    <input id="wpPropAccept" type="number" step="0.5" />
+                  </label>
+                </div>
               </div>
             </div>
           </div>

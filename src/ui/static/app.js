@@ -2558,6 +2558,19 @@ if (els.importSkillBtn && els.skillImportInput) {
   input.addEventListener("change", () => applyWaypointProperties());
 });
 
+// 属性区删除按钮：删除当前选中的航点
+const wpPropDeleteButton = document.getElementById("wpPropDelete");
+if (wpPropDeleteButton) {
+  wpPropDeleteButton.addEventListener("click", () => {
+    if (selectedWaypointIndex < 0 || selectedWaypointIndex >= missionWaypoints.length) return;
+    missionWaypoints.splice(selectedWaypointIndex, 1);
+    markMissionEdited();
+    selectedWaypointIndex = -1;
+    renderWaypoints();
+    drawMissionPath();
+  });
+}
+
 // 地图右侧航点面板折叠
 const waypointPanelToggle = document.getElementById("waypointPanelToggle");
 const waypointPanel = document.getElementById("waypointPanel");
@@ -2567,6 +2580,109 @@ if (waypointPanelToggle && waypointPanel) {
     waypointPanel.dataset.collapsed = String(collapsed);
     waypointPanelToggle.textContent = collapsed ? "⌄" : "⌃";
   });
+}
+
+// ---- 航点面板目标机选择（自定义下拉；原生 select 隐藏作状态存储，
+//      buildMissionDraftFromItems 仍读 missionVehicleSelect.value）----
+const wpVehiclePicker = document.getElementById("wpVehiclePicker");
+const wpVehicleButton = document.getElementById("wpVehicleButton");
+const wpVehicleMenu = document.getElementById("wpVehicleMenu");
+const wpVehicleLabel = document.getElementById("wpVehicleLabel");
+const wpVehicleRow = document.getElementById("wpVehicleRow");
+const missionVehicleSelect = document.getElementById("missionVehicleSelect");
+
+function vehicleStateMeta(vehicle) {
+  if (!vehicle) return { cls: "", text: "" };
+  if (vehicle.flying) return { cls: "flying", text: "空中" };
+  if (vehicle.armed) return { cls: "armed", text: "待飞" };
+  return { cls: "", text: "未解锁" };
+}
+
+// 当前任务目标机名（"" = 默认机；单机或下拉隐藏时恒为 ""）
+function currentMissionVehicleName() {
+  if (!missionVehicleSelect || missionVehicleSelect.hidden) return "";
+  return String(missionVehicleSelect.value || "");
+}
+
+function syncWpVehiclePicker(vehicles) {
+  if (!missionVehicleSelect || !wpVehiclePicker) return;
+  const list = Array.isArray(vehicles)
+    ? vehicles
+    : (Array.isArray(latestState?.tool_runtime?.vehicles) ? latestState.tool_runtime.vehicles : []);
+  const multi = list.length > 1 && !missionVehicleSelect.hidden;
+  if (wpVehicleRow) wpVehicleRow.hidden = !multi;
+  if (!multi) {
+    if (wpVehicleMenu) wpVehicleMenu.hidden = true;
+    return;
+  }
+  if (wpVehicleLabel) wpVehicleLabel.textContent = missionVehicleSelect.value || "默认机";
+  if (!wpVehicleMenu) return;
+  const byName = new Map(list.map((v) => [String(v.vehicle_name || ""), v]));
+  wpVehicleMenu.textContent = "";
+  for (const opt of missionVehicleSelect.options) {
+    const value = opt.value;
+    const meta = vehicleStateMeta(value ? byName.get(value) : null);
+    const item = document.createElement("button");
+    item.type = "button";
+    item.className = `wp-vehicle-option${value === (missionVehicleSelect.value || "") ? " selected" : ""}`;
+    item.dataset.value = value;
+    item.innerHTML = `
+      <span class="wp-vehicle-dot ${meta.cls}"></span>
+      <span class="wp-vehicle-name">${escapeHtml(value || "默认机")}</span>
+      <span class="wp-vehicle-state">${meta.text}</span>`;
+    wpVehicleMenu.appendChild(item);
+  }
+}
+
+if (wpVehicleButton) {
+  wpVehicleButton.addEventListener("click", (event) => {
+    event.stopPropagation();
+    if (wpVehicleMenu) wpVehicleMenu.hidden = !wpVehicleMenu.hidden;
+  });
+}
+if (wpVehicleMenu) {
+  wpVehicleMenu.addEventListener("click", (event) => {
+    const item = event.target.closest("[data-value]");
+    if (!item || !missionVehicleSelect) return;
+    if (missionVehicleSelect.value !== item.dataset.value) {
+      missionVehicleSelect.value = item.dataset.value;
+      missionVehicleSelect.dispatchEvent(new Event("change"));
+    }
+    wpVehicleMenu.hidden = true;
+  });
+}
+document.addEventListener("click", (event) => {
+  if (wpVehicleMenu && !wpVehicleMenu.hidden && wpVehiclePicker && !wpVehiclePicker.contains(event.target)) {
+    wpVehicleMenu.hidden = true;
+  }
+});
+if (missionVehicleSelect) {
+  missionVehicleSelect.addEventListener("change", () => {
+    syncWpVehiclePicker();
+    highlightMissionVehicleMarkers();
+    panMapToMissionVehicle();
+  });
+}
+
+// 地图 marker 高亮当前任务目标机
+function highlightMissionVehicleMarkers() {
+  const target = currentMissionVehicleName();
+  for (const [name, entry] of vehicleMarkers.entries()) {
+    const el = entry.marker?.getElement();
+    if (el) el.classList.toggle("selected", Boolean(target) && name === target);
+  }
+}
+
+// 面板切换目标机后把地图平移到该机位置
+function panMapToMissionVehicle() {
+  if (!maplibreMap) return;
+  const runtime = latestState?.tool_runtime || {};
+  const vehicles = Array.isArray(runtime.vehicles) ? runtime.vehicles : [];
+  if (vehicles.length <= 1) return;
+  const targetName = currentMissionVehicleName();
+  const target = vehicles.find((v) => String(v.vehicle_name || "") === targetName);
+  const pos = target ? vehicleMarkerPosition(target, runtime) : null;
+  if (pos) maplibreMap.panTo(pos, { animate: true });
 }
 
 els.canvas = document.querySelector("#missionMap");
@@ -2995,12 +3111,14 @@ function updateVehicleMarkers(vehicles, runtime) {
     const heading = normalizeHeadingDeg(droneHeadingDeg(vehicle));
     let entry = vehicleMarkers.get(name);
     if (!entry) {
+      // 无有效位置先不创建 marker（避免叠在 [0,0]），等遥测到位再上屏
+      if (!lngLat) continue;
       const marker = new maplibregl.Marker({
         element: createVehicleElement(name),
         anchor: "center",
         rotationAlignment: "map",
       })
-        .setLngLat(lngLat || [0, 0])
+        .setLngLat(lngLat)
         .setRotation(heading)
         .addTo(maplibreMap);
       entry = { marker, lngLat, heading };
@@ -3024,6 +3142,7 @@ function updateVehicleMarkers(vehicles, runtime) {
       vehicleTracks.delete(name);
     }
   }
+  highlightMissionVehicleMarkers();
 }
 
 function updateDroneMarker(lngLat, heading, options = {}) {
@@ -4035,6 +4154,7 @@ function renderVehicleList(toolRuntime = {}) {
       vehicleSelect.hidden = true;
       vehicleSelect.textContent = "";
     }
+    syncWpVehiclePicker(vehicles);
   }
   if (vehicles.length <= 1) {
     container.hidden = true;
@@ -4045,16 +4165,27 @@ function renderVehicleList(toolRuntime = {}) {
   container.hidden = false;
   container.textContent = "";
   syncCameraVehicleOptions(vehicles);
+  const missionTarget = currentMissionVehicleName();
   for (const vehicle of vehicles) {
     const name = String(vehicle.vehicle_name || "?");
     const state = vehicle.armed ? (vehicle.flying ? "空中" : "待飞") : "未解锁";
+    const meta = vehicleStateMeta(vehicle);
     const pos = vehicle.position_ned || {};
     const battery = vehicle.battery_voltage != null ? ` ${fmt(vehicle.battery_voltage)}V` : "";
-    const row = document.createElement("span");
-    row.className = "hud-vehicle-chip";
-    row.title = `载具 ${name} · N ${fmt(pos.x)} / E ${fmt(pos.y)} / D ${fmt(pos.z)}`;
-    row.textContent = `${name}: ${state}${battery}`;
-    container.appendChild(row);
+    const chip = document.createElement("button");
+    chip.type = "button";
+    chip.className = `hud-vehicle-chip${name === missionTarget ? " selected" : ""}`;
+    chip.title = `载具 ${name} · N ${fmt(pos.x)} / E ${fmt(pos.y)} / D ${fmt(pos.z)} · 点击设为目标机`;
+    chip.dataset.vehicle = name;
+    chip.innerHTML = `<span class="chip-dot ${meta.cls}"></span>${escapeHtml(name)}: ${state}${battery ? `<span class="chip-battery">${escapeHtml(battery.trim())}</span>` : ""}`;
+    chip.addEventListener("click", () => {
+      if (!vehicleSelect || vehicleSelect.hidden) return;
+      if (vehicleSelect.value !== name) {
+        vehicleSelect.value = name;
+        vehicleSelect.dispatchEvent(new Event("change"));
+      }
+    });
+    container.appendChild(chip);
   }
 }
 
@@ -4281,27 +4412,49 @@ function renderEvents(events) {
 
 
 
+const WAYPOINT_TYPE_LABELS = {
+  waypoint: "航点",
+  takeoff: "起飞",
+  land: "降落",
+  rtl: "返航",
+};
+
+function fmtWpNumber(value, fallback = 0) {
+  const num = Number(value);
+  if (!Number.isFinite(num)) return String(fallback);
+  return String(Math.round(num * 10) / 10);
+}
+
 function renderWaypoints() {
   syncWaypointActionLabels();
   renderMissionMetrics();
 
   if (!els.waypointList) return;
 
+  const countBadge = document.getElementById("waypointCount");
+  if (countBadge) {
+    countBadge.textContent = String(missionWaypoints.length);
+    countBadge.hidden = missionWaypoints.length === 0;
+  }
+
   if (!missionWaypoints.length) {
-    els.waypointList.innerHTML = `<div class="empty">点击地图添加航点</div>`;
+    els.waypointList.innerHTML = `<div class="empty">点击地图添加航点<br>双击航点可删除</div>`;
     hideWaypointProperties();
     return;
   }
 
   els.waypointList.innerHTML = missionWaypoints.map((wp, index) => {
     const selected = index === selectedWaypointIndex ? "selected" : "";
+    const typeLabel = WAYPOINT_TYPE_LABELS[wp.type] || "航点";
+    const meta = [`↑${fmtWpNumber(wp.alt_m)}m`, `${fmtWpNumber(wp.speed_mps, 2)}m/s`].join(" · ");
     return `
       <article class="waypoint-item ${selected}" data-waypoint-row="${index}">
         <span class="waypoint-index">${index + 1}</span>
         <div class="waypoint-main">
-          <strong>航点</strong>
+          <strong>${typeLabel}</strong>
+          <span class="waypoint-meta">${meta}</span>
         </div>
-        <button class="delete-waypoint" data-waypoint-delete="${index}" title="删除航点">×</button>
+        <button class="delete-waypoint" data-waypoint-delete="${index}" title="删除此航点">×</button>
       </article>
     `;
   }).join("");
@@ -4392,7 +4545,10 @@ function updateMapView(state) {
     droneLastTelemetryLngLat = null;
     updateVehicleMarkers(vehicles, runtime);
     if (!applicationSettings.map.show_vehicle_track) clearVehicleTrack();
-    const firstPos = vehicleMarkerPosition(vehicles[0], runtime);
+    // 首次定位跟随面板选中的目标机（未选则默认第一架）
+    const followTargetName = currentMissionVehicleName();
+    const followTarget = vehicles.find((v) => String(v.vehicle_name || "") === followTargetName) || vehicles[0];
+    const firstPos = vehicleMarkerPosition(followTarget, runtime);
     if (firstPos && linked && applicationSettings.map.follow_vehicle && !mapCenteredOnFirstVehicle && !maplibreMap._userPanned) {
       mapCenteredOnFirstVehicle = true;
       maplibreMap.jumpTo({ center: firstPos });

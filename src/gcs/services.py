@@ -413,7 +413,14 @@ class ToolMissionManager:
             return ManagerResult(False, "mission blocked by emergency stop", self._state.to_dict())
 
         takeoff_altitude = self._mission_takeoff_altitude(self._draft)
+        target_vehicle = self._draft_vehicle_name()
         vehicle = state.vehicle
+        if target_vehicle:
+            # 起飞判断必须针对任务目标机：默认机在空中不代表目标机不在地面
+            for entry in state.vehicles:
+                if entry.vehicle_id == target_vehicle:
+                    vehicle = entry
+                    break
         needs_takeoff = bool(takeoff_altitude and (vehicle is None or not vehicle.flying or not vehicle.armed))
         takeoff_result: ManagerResult | None = None
         if needs_takeoff:
@@ -421,7 +428,7 @@ class ToolMissionManager:
                 return ManagerResult(False, "local guided mission requires takeoff but drone_takeoff is unavailable", self._state.to_dict())
             raw_takeoff = self._tools.execute(
                 "drone_takeoff",
-                {"altitude": takeoff_altitude},
+                {"altitude": takeoff_altitude, "vehicle_name": target_vehicle},
                 dry_run=False,
                 blocked_by_supervisor=state.safety.emergency_stop,
             )
@@ -440,7 +447,11 @@ class ToolMissionManager:
         state = self._telemetry.get_state()
         result = self._tools.execute(
             "drone_fly_path",
-            {"waypoints_json": json.dumps(waypoints), "velocity": velocity},
+            {
+                "waypoints_json": json.dumps(waypoints),
+                "velocity": velocity,
+                "vehicle_name": target_vehicle,
+            },
             dry_run=False,
             blocked_by_supervisor=state.safety.emergency_stop,
         )
@@ -458,7 +469,8 @@ class ToolMissionManager:
         return manager_result
 
     def pause(self) -> ManagerResult:
-        result = self._tools.execute("drone_hover", {}, dry_run=False)
+        params = {"vehicle_name": self._draft_vehicle_name()} if self._draft_vehicle_name() else {}
+        result = self._tools.execute("drone_hover", params, dry_run=False)
         manager_result = _manager_result_from_tool(result)
         self._state.running = False
         self._state.message = manager_result.message

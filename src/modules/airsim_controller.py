@@ -96,6 +96,8 @@ class AirSimController(FlightController):
         self._executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="airsim_rpc")
         self._rpc_exec_lock = threading.Lock()
         self._last_connected_check = 0.0
+        # land 成功后记录落地事实（AirSim 落地后遥测滞后/位置残留，见 get_status）
+        self._landed_vehicles: set[str] = set()
         # External stop/cancel signal (emergency stop / task cancel). Polled
         # while blocking flight commands run so they can be preempted.
         self._stop_provider: Optional[Callable[[], bool]] = None
@@ -490,6 +492,8 @@ class AirSimController(FlightController):
             if name not in self._armed:
                 self._rpc(self._client.armDisarm, True, name)
                 self._armed.add(name)
+            # 解锁即离开落地确认状态（takeoff/land 的遥测重新可信）
+            self._landed_vehicles.discard(name)
 
     def _resolve_vehicles(self, vehicle_name: str = "") -> list[str]:
         if vehicle_name:
@@ -648,6 +652,7 @@ class AirSimController(FlightController):
                 if not self._wait_until_landed(name, timeout=45.0):
                     logger.warning(f"landAsync returned but vehicle is still flying: {name}")
                     return False
+                self._landed_vehicles.add(name)
                 try:
                     self._rpc(self._client.armDisarm, False, name)
                     self._armed.discard(name)
@@ -937,9 +942,17 @@ class AirSimController(FlightController):
             heading_deg = math.degrees(yaw)
             if heading_deg < 0:
                 heading_deg += 360.0
+            # AirSim 落地后 getMultirotorState 的遥测不可靠（landed_state 可能
+            # 滞后为 Flying、位置 z 残留甚至翻转）。land 成功后控制器记录落地
+            # 事实，直到下一次 arm 前都按"已着陆"上报，保证状态自洽。
+            landed_confirmed = name in getattr(self, "_landed_vehicles", set())
+            speed = math.sqrt(vel.x_val ** 2 + vel.y_val ** 2 + vel.z_val ** 2)
+            flying = (landed == 1) and not landed_confirmed and speed > 0.3
+            if landed_confirmed:
+                position = {"x": float(position.get("x", 0.0) or 0.0), "y": float(position.get("y", 0.0) or 0.0), "z": 0.0}
             extra = {
                 "heading_deg": round(heading_deg, 1),
-                "landed_state": "flying" if landed == 1 else "landed",
+                "landed_state": "flying" if flying else "landed",
                 "has_collided": getattr(state, 'collision', None) and state.collision.has_collided,
                 "api_control_enabled": name in self._control_enabled,
                 "vehicle_types": self._settings_vehicle_types,
@@ -962,7 +975,7 @@ class AirSimController(FlightController):
                     "yaw": round(yaw, 4),
                 },
                 armed=name in self._armed,
-                flying=landed == 1,
+                flying=flying,
                 mode="airsim_simpleflight",
                 gps=gps_data,
                 extra=extra,
