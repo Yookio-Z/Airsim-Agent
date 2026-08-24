@@ -474,6 +474,7 @@ class OpenAIClient:
     def __init__(self, config: dict[str, Any]) -> None:
         self.config = config
         self.last_retries = 0
+        self.last_reasoning = ""
 
     def _request(self, messages: list[dict[str, Any]], payload_extra: dict[str, Any]) -> urllib.request.Request:
         url = str(self.config.get("base_url", "https://api.openai.com")).rstrip("/") + "/chat/completions"
@@ -558,6 +559,10 @@ class OpenAIClient:
             raise
         message = ((response.get("choices") or [{}])[0].get("message")) or {}
         text = str(message.get("content") or "")
+        # DeepSeek-style reasoning models return chain-of-thought alongside
+        # tool calls; surface it so the agent loop can show the decision
+        # rationale in the operator's event stream
+        self.last_reasoning = str(message.get("reasoning_content") or "")
         tool_calls: list[dict[str, Any]] = []
         for call in message.get("tool_calls") or []:
             if not isinstance(call, dict):
@@ -1435,6 +1440,9 @@ class LLMMissionPlanner:
         else:
             tools_payload = openai_tools
         tool_calls, text, usage = client.chat_tools(messages, tools_payload)
+        # surface the model's decision rationale (reasoning_content) for the
+        # operator's event stream
+        self.last_reasoning = str(getattr(client, "last_reasoning", "") or "")
         self.last_error = ""
         self.last_usage = usage
         return self._decision_from_tool_calls(tool_calls, text, allowed_tools)

@@ -762,7 +762,7 @@ class AgentRuntime:
                         {
                             "timestamp": time.time(),
                             "title": "读取上下文",
-                            "body": "Chat 模式只基于会话和当前状态回答，不执行工具。",
+                            "body": "正在读取会话与实时状态；需要准确数据时会调用只读查询工具。",
                             "status": "running",
                         }
                     ],
@@ -2021,14 +2021,9 @@ class AgentRuntime:
         )
         if execute:
             self._begin_execution_trace(run, "任务适合一次性规划执行：先生成完整工具序列，再由 runtime 逐步执行、回读和校验。")
-            for card in skill_guidance[:3]:
-                self._append_process(
-                    run,
-                    "技能参考",
-                    f"{card.get('display_name') or card.get('name')}: {card.get('description') or 'Markdown guidance loaded'}",
-                    status="completed",
-                    kind="reasoning",
-                )
+            # skill guidance is injected into the planner prompt as background
+            # knowledge — it is NOT a tool call, so it must not be displayed
+            # as if a skill had been invoked
             if self._plan_requires_agent_loop(run.plan):
                 # The plan depends on mid-execution observations (photo ->
                 # decide -> move) or the planner declared agent_loop: a fixed
@@ -4794,6 +4789,12 @@ class AgentRuntime:
             # 优先按 run_id 精确匹配
             for message in reversed(self._messages):
                 if message.role == "assistant" and message.run_id == run_id:
+                    # a cancelled run's worker thread may still emit one last
+                    # progress update; writing "running" back over the
+                    # interrupted marker makes the orphan sweep flag it as an
+                    # error later ("任务进程已中断") — freeze it instead
+                    if status == "running" and run_id in self._cancelled_request_ids:
+                        return
                     message.content = content
                     message.status = status
                     message.details = details or message.details
@@ -4805,6 +4806,8 @@ class AgentRuntime:
             if not updated:
                 for message in reversed(self._messages):
                     if message.role == "assistant" and message.status == "running":
+                        if status == "running" and run_id in self._cancelled_request_ids:
+                            return
                         message.content = content
                         message.status = status
                         message.run_id = run_id
@@ -4904,12 +4907,14 @@ class AgentRuntime:
                 failure_reason=run.failure_reason,
                 verification=run.verification,
                 model_id=run.model_id or None,
-                force_fallback=True,
+                # LLM-written summary (streamed); final_answer_stream falls
+                # back to the template internally when the LLM is unavailable
+                force_fallback=False,
                 should_stop=lambda: self._is_run_cancelled(run.run_id),
             )
             if self._is_run_cancelled(run.run_id):
                 final_status = "cancelled"
-                answer = answer or "任务已中断。"
+                answer = "任务已中断。"
             run.status = final_status
             run.phase = final_status if final_status in {"completed", "planned", "failed", "blocked", "cancelled"} else "completed"
             run.assistant_message = answer
@@ -5502,9 +5507,10 @@ class AgentRuntime:
     def _plan_reasoning_sink(self, run_id: str, command: str) -> Callable[[str], None]:
         """Throttled reasoning-token sink for streamed planning.
 
-        Tokens are batched and flushed to the event panel every ~0.5s so the
-        operator sees the model's thinking during execute planning (a
-        per-token SSE write would flood the browser)."""
+        Tokens are batched and flushed every ~0.5s. Each flush updates BOTH
+        the assistant message's process trace (so the operator sees the model
+        thinking inline in the conversation, mainstream-agent style) and the
+        event panel."""
         buffer: list[str] = []
         last_flush: list[float] = [0.0]
 
@@ -5513,8 +5519,30 @@ class AgentRuntime:
                 return
             text = "".join(buffer).strip()
             buffer.clear()
-            if text:
-                self._append_event("info", "model_reasoning", text[-1500:], {"run_id": run_id, "command": command[:60]})
+            if not text:
+                return
+            self._append_event("info", "model_reasoning", text[-1500:], {"run_id": run_id, "command": command[:60]})
+            # inline in the conversation card: the planning placeholder message
+            # gains a live "模型推理" entry while the model thinks
+            self._update_assistant_message(
+                run_id,
+                "正在理解指令并准备执行计划...",
+                "running",
+                {
+                    "mode": "execute",
+                    "phase": "planning",
+                    "process_trace": [
+                        {
+                            "timestamp": time.time(),
+                            "title": "模型推理",
+                            "body": self._compact_process_text(text[-1500:]),
+                            "status": "running",
+                            "kind": "reasoning",
+                        }
+                    ],
+                },
+                persist=False,
+            )
 
         def sink(token: str) -> None:
             buffer.append(token)

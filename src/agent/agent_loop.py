@@ -124,6 +124,11 @@ class AgentLoop:
             decision = self._sanitize_decision(decision, allowed_tools)
             state.decisions.append(decision)
             self._notify_state(state)
+            reasoning_text = str(getattr(self.planner, "last_reasoning", "") or "").strip()
+            if reasoning_text:
+                # the model's decision rationale (DeepSeek reasoning_content),
+                # shown inline in the operator's event stream
+                self._event("info", "model_reasoning", reasoning_text[:1500], {"step": step_index})
             self._event("info", "agent_loop", f"Loop decision {step_index}: {decision.action or 'complete'}", decision.to_dict(), kind="loop.decision")
 
             if decision.is_complete:
