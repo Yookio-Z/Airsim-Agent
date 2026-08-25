@@ -88,6 +88,12 @@ class AirSimController(FlightController):
         self._armed: set[str] = set()
         self._control_enabled: set[str] = set()
         self._settings_vehicle_types: dict[str, str] = self._load_settings_vehicle_types()
+        # 每机返航点：首次看到某机"未解锁+已落地"时用其 GPS 记录初始位置（NED）。
+        # 多机任务/返航都以此为各机自己的 home，而不是全局单一返航点。
+        self._home_positions: dict[str, dict[str, float]] = {}
+        # 已派发航线（fire-and-forget）的完成跟踪：name -> {waypoints, dispatched_at, done, ...}
+        self._dispatched_paths: dict[str, dict[str, Any]] = {}
+        self._origin_geopoint: tuple[float, float, float] | None = self._load_origin_geopoint()
         self.last_error = ""
 
         # msgpackrpc.Client is thread-affine in practice: creating it in one
@@ -543,6 +549,67 @@ class AirSimController(FlightController):
                 result[str(name)] = vehicle_type
         return result
 
+    def _load_origin_geopoint(self) -> tuple[float, float, float] | None:
+        """读取 settings.json 的 OriginGeopoint（NED 原点经纬度），用于 GPS↔NED 换算。"""
+        path = self._airsim_settings_path()
+        if path is None or not path.exists():
+            return None
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+        except Exception:
+            return None
+        origin = data.get("OriginGeopoint")
+        if not isinstance(origin, dict):
+            return None
+        try:
+            lat = float(origin.get("Latitude"))
+            lon = float(origin.get("Longitude"))
+            alt = float(origin.get("Altitude", 0.0) or 0.0)
+        except (TypeError, ValueError):
+            return None
+        if abs(lat) < 0.001 or abs(lon) < 0.001:
+            return None
+        return (lat, lon, alt)
+
+    def gps_to_ned(self, lat: float, lon: float, alt: float = 0.0) -> dict[str, float] | None:
+        """GPS(度) → AirSim NED(米)，与 OriginGeopoint 对齐（平面近似）。"""
+        if self._origin_geopoint is None:
+            return None
+        lat0, lon0, alt0 = self._origin_geopoint
+        R = 6371000.0
+        north = math.radians(lat - lat0) * R
+        east = math.radians(lon - lon0) * R * math.cos(math.radians(lat0))
+        down = -(float(alt) - alt0)
+        return {"x": round(north, 3), "y": round(east, 3), "z": round(down, 3)}
+
+    def _record_home_position(self, name: str, status: dict) -> None:
+        """未解锁且已落地时记录该机的初始位置（仅首次），作为其专属返航点。
+
+        注意：部分 AirSim 版本地面状态下 kinematics_estimated 对多机返回同一读数，
+        因此这里必须用按车正确的 GPS 换算，而不是 position_ned。
+        """
+        if name in self._home_positions:
+            return
+        if status.get("armed") or status.get("flying"):
+            return
+        gps = status.get("gps")
+        if not isinstance(gps, dict):
+            return
+        try:
+            ned = self.gps_to_ned(float(gps.get("lat")), float(gps.get("lon")), float(gps.get("alt", 0.0) or 0.0))
+        except (TypeError, ValueError):
+            return
+        if ned is None:
+            return
+        self._home_positions[name] = ned
+
+    def home_position(self, vehicle_name: str = "") -> dict[str, float] | None:
+        """返回某机的初始点位（NED），即该机的返航点。"""
+        names = self._resolve_vehicles(vehicle_name)
+        if not names:
+            return None
+        return self._home_positions.get(names[0])
+
     def _airsim_settings_path(self) -> Path | None:
         explicit = os.environ.get("AIRSIM_SETTINGS_PATH")
         if explicit:
@@ -840,6 +907,142 @@ class AirSimController(FlightController):
         except Exception:
             return False
 
+    # ------------------------------------------------------------------
+    # 非阻塞派发（fire-and-forget）：多机同时起飞/执行各自航线用。
+    # AirSim 的 Async 指令在模拟器侧执行，RPC 派发后立即返回，不 join。
+    # ------------------------------------------------------------------
+
+    def dispatch_takeoff(self, altitude: float, vehicle_name: str = "") -> bool:
+        """派发起飞（不等待完成）。多机并发起飞的基础。"""
+        self.last_error = ""
+        if not self._ensure_connected():
+            self.last_error = "AirSim not connected"
+            return False
+        try:
+            names = self._resolve_vehicles(vehicle_name)
+            for name in names:
+                self._ensure_control(name)
+                self._rpc(
+                    lambda n=name: self._client.takeoffAsync(max(0.5, abs(float(altitude))), vehicle_name=n),
+                    timeout=10.0,
+                )
+            return True
+        except Exception as e:
+            self.last_error = str(e)
+            logger.error(f"dispatch_takeoff failed: {e}")
+            return False
+
+    def dispatch_move_on_path(self, waypoints: list[dict], velocity: float = 2.0, vehicle_name: str = "") -> bool:
+        """派发航线（不等待完成）。每架机各自执行自己的路径。"""
+        self.last_error = ""
+        if not self._ensure_connected():
+            self.last_error = "AirSim not connected"
+            return False
+        if not waypoints:
+            self.last_error = "waypoints is empty"
+            return False
+        try:
+            self._ensure_control(vehicle_name)
+            names = self._resolve_vehicles(vehicle_name)
+            airsim_path = [
+                airsim.Vector3r(wp.get("x", 0), wp.get("y", 0), wp.get("z", 0))
+                for wp in waypoints
+            ]
+            total_dist = sum(
+                ((waypoints[i].get("x",0)-waypoints[i-1].get("x",0))**2 +
+                 (waypoints[i].get("y",0)-waypoints[i-1].get("y",0))**2 +
+                 (waypoints[i].get("z",0)-waypoints[i-1].get("z",0))**2) ** 0.5
+                for i in range(1, len(waypoints))
+            ) if len(waypoints) > 1 else 0
+            flight_timeout = max(30, total_dist / max(velocity, 0.5) + 10.0)
+            for name in names:
+                self._rpc(
+                    lambda n=name: self._client.moveOnPathAsync(
+                        airsim_path, velocity,
+                        timeout_sec=flight_timeout,
+                        vehicle_name=n,
+                    ),
+                    timeout=10.0,
+                )
+                # 记录派发，供完成跟踪（update_flight_task_progress）使用
+                self._dispatched_paths[name] = {
+                    "waypoints": [dict(wp) for wp in waypoints],
+                    "velocity": float(velocity),
+                    "dispatched_at": time.time(),
+                    "done": False,
+                    "near_count": 0,
+                }
+            return True
+        except Exception as e:
+            self.last_error = str(e)
+            logger.error(f"dispatch_move_on_path failed: {e}")
+            return False
+
+    def is_flying(self, vehicle_name: str = "") -> bool:
+        status = self.get_status(vehicle_name)
+        return bool(status.flying)
+
+    def update_flight_task_progress(self, vehicles: list[dict]) -> dict[str, dict[str, Any]]:
+        """用最新逐车遥测更新已派发航线的执行状态（纯计算，无 RPC）。
+
+        判定完成：连续多次距最后航点 < 1.2m 且速度接近 0（悬停到位）。
+        返回 {vehicle_name: {state, waypoint_count, dist_to_target, speed}}。
+        """
+        for vehicle in vehicles or []:
+            if not isinstance(vehicle, dict):
+                continue
+            name = str(vehicle.get("vehicle_name") or "")
+            info = self._dispatched_paths.get(name)
+            if not info or info.get("done"):
+                continue
+            pos = vehicle.get("position_ned") if isinstance(vehicle.get("position_ned"), dict) else {}
+            vel = vehicle.get("velocity_ned") if isinstance(vehicle.get("velocity_ned"), dict) else {}
+            final = info["waypoints"][-1]
+            dist = math.sqrt(
+                (float(pos.get("x", 0.0) or 0.0) - float(final.get("x", 0.0))) ** 2
+                + (float(pos.get("y", 0.0) or 0.0) - float(final.get("y", 0.0))) ** 2
+                + (float(pos.get("z", 0.0) or 0.0) - float(final.get("z", 0.0))) ** 2
+            )
+            speed = math.sqrt(
+                float(vel.get("vx", 0.0) or 0.0) ** 2
+                + float(vel.get("vy", 0.0) or 0.0) ** 2
+                + float(vel.get("vz", 0.0) or 0.0) ** 2
+            )
+            if dist < 1.2 and speed < 0.5:
+                info["near_count"] = int(info.get("near_count", 0)) + 1
+            else:
+                info["near_count"] = 0
+            if info["near_count"] >= 3:
+                info["done"] = True
+                info["done_at"] = time.time()
+            info["last_dist"] = round(dist, 2)
+            info["last_speed"] = round(speed, 2)
+
+        return {
+            name: {
+                "state": "done" if info.get("done") else "flying",
+                "waypoint_count": len(info["waypoints"]),
+                "dist_to_target": info.get("last_dist"),
+                "speed": info.get("last_speed"),
+                "dispatched_at": info.get("dispatched_at"),
+            }
+            for name, info in self._dispatched_paths.items()
+        }
+
+    def wait_until_flying(self, vehicle_name: str = "", timeout: float = 15.0) -> bool:
+        """轮询等待某机进入飞行状态（起飞派发后确认用）。"""
+        deadline = time.time() + max(1.0, float(timeout))
+        while time.time() < deadline:
+            if self._stop_requested():
+                return False
+            try:
+                if self.is_flying(vehicle_name):
+                    return True
+            except Exception:
+                pass
+            time.sleep(0.4)
+        return False
+
     def move_by_velocity(self, vx: float, vy: float, vz: float, duration: float = 0.0, vehicle_name: str = "") -> bool:
         self.last_error = ""
         if not self._ensure_connected():
@@ -947,7 +1150,10 @@ class AirSimController(FlightController):
             # 事实，直到下一次 arm 前都按"已着陆"上报，保证状态自洽。
             landed_confirmed = name in getattr(self, "_landed_vehicles", set())
             speed = math.sqrt(vel.x_val ** 2 + vel.y_val ** 2 + vel.z_val ** 2)
-            flying = (landed == 1) and not landed_confirmed and speed > 0.3
+            # 悬停时速度≈0 但 z 明显在原点上方——只看速度会把悬停误判成落地，
+            # 导致返航被 "vehicle is not airborne" 拒绝。速度或高度任一在空即算飞行。
+            airborne_by_altitude = pos.z_val < -0.5
+            flying = (landed == 1) and not landed_confirmed and (speed > 0.3 or airborne_by_altitude)
             if landed_confirmed:
                 position = {"x": float(position.get("x", 0.0) or 0.0), "y": float(position.get("y", 0.0) or 0.0), "z": 0.0}
             extra = {
@@ -961,7 +1167,7 @@ class AirSimController(FlightController):
             if world_position is not None:
                 extra["world_position"] = world_position
 
-            return DroneStatus(
+            status_dict = DroneStatus(
                 position_ned=position,
                 velocity_ned={
                     "vx": round(vel.x_val, 3),
@@ -980,6 +1186,11 @@ class AirSimController(FlightController):
                 gps=gps_data,
                 extra=extra,
             )
+            self._record_home_position(name, status_dict.to_dict())
+            home = self._home_positions.get(name)
+            if home is not None:
+                status_dict.extra["home_position_ned"] = dict(home)
+            return status_dict
         except Exception as e:
             logger.error(f"get_status failed: {e}")
             self._connected = False

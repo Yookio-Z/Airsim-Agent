@@ -401,6 +401,13 @@ class AgentRequestHandler(BaseHTTPRequestHandler):
                 expected_backend=str(payload.get("expected_backend", "")),
             ))
             return
+        if path == "/api/gcs/mission/start_multi":
+            assignments = payload.get("assignments")
+            self._send_json(RUNTIME.gcs_mission_start_multi(
+                assignments,
+                expected_backend=str(payload.get("expected_backend", "")),
+            ))
+            return
         if path == "/api/gcs/mission/progress":
             self._send_json(RUNTIME.gcs_mission_progress())
             return

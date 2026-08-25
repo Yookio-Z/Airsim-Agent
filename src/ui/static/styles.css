@@ -437,6 +437,14 @@ body.resizing .h-resizer::after {
   display: flex;
   align-items: baseline;
   gap: 6px;
+  /* 单项不换行：添加航点后 BRG/DIST PREV 出值变宽时，
+   * 由 chips 行横跨整行释放的空间吸收，指标行保持一排 */
+  white-space: nowrap;
+}
+
+/* 多机 chips：横跨整行，避免把第一列撑宽挤压中间指标区 */
+.top-hud .hud-vehicle-list {
+  grid-column: 1 / -1;
 }
 
 .hud-item small {
@@ -889,33 +897,33 @@ body[data-profile-collapsed="true"] .mission-profile {
 }
 
 /* 地图右侧航点面板（QGC 风格，半透明浮层）
-   布局：head(自动) / 目标机行(自动) / body(list 弹性滚动 + 属性区自适应) */
+   布局：head(自动) / body(list 弹性滚动 + 属性区自适应，修复互相挤压) */
 .waypoint-panel {
   position: absolute;
   right: 10px;
   top: 130px;
-  width: 242px;
+  width: 214px;
   max-height: min(640px, calc(100% - 150px));
   display: flex;
   flex-direction: column;
-  border-radius: 12px;
-  border: 1px solid rgba(255, 255, 255, 0.09);
-  background: rgba(13, 16, 22, 0.72);
-  -webkit-backdrop-filter: blur(14px);
-  backdrop-filter: blur(14px);
-  box-shadow: 0 10px 32px rgba(0, 0, 0, 0.42);
+  border-radius: 10px;
+  border: 1px solid var(--line-soft);
+  background: rgba(16, 18, 24, 0.45);
+  -webkit-backdrop-filter: blur(10px);
+  backdrop-filter: blur(10px);
+  box-shadow: 0 8px 28px rgba(0, 0, 0, 0.35);
   z-index: 6;
   overflow: hidden;
 }
 
 .waypoint-panel-head {
-  min-height: 36px;
-  padding: 6px 8px 6px 11px;
+  min-height: 32px;
+  padding: 5px 9px;
   display: flex;
   align-items: center;
   justify-content: space-between;
   gap: 6px;
-  background: rgba(255, 255, 255, 0.03);
+  background: rgba(255, 255, 255, 0.025);
   border-bottom: 1px solid rgba(255, 255, 255, 0.05);
   flex: 0 0 auto;
 }
@@ -925,77 +933,55 @@ body[data-profile-collapsed="true"] .mission-profile {
   align-items: center;
   gap: 6px;
   min-width: 0;
+  flex: 1;
 }
 
 .waypoint-panel-head strong {
   font-size: 11px;
   font-weight: 800;
   letter-spacing: 1.5px;
-  color: rgba(237, 244, 255, 0.85);
+  color: rgba(237, 244, 255, 0.82);
   white-space: nowrap;
-}
-
-.waypoint-count {
-  min-width: 17px;
-  height: 15px;
-  padding: 0 5px;
-  border-radius: 999px;
-  display: inline-grid;
-  place-items: center;
-  background: rgba(85, 223, 244, 0.16);
-  color: var(--cyan);
-  font-size: 9px;
-  font-weight: 700;
+  flex: 0 0 auto;
 }
 
 .waypoint-actions {
   display: flex;
   align-items: center;
-  gap: 5px;
+  flex-wrap: nowrap;
+  gap: 8px;
   flex: 0 0 auto;
 }
 
-.wp-action-btn {
-  height: 24px;
-  padding: 0 8px;
-  display: inline-flex;
-  align-items: center;
-  gap: 4px;
+.waypoint-actions button {
+  width: 26px;
+  height: 26px;
+  min-height: 26px;
+  padding: 0;
   border: 1px solid rgba(255, 255, 255, 0.1);
   border-radius: 6px;
   background: rgba(255, 255, 255, 0.05);
-  color: rgba(237, 244, 255, 0.85);
-  font-size: 10px;
-  font-weight: 600;
-  letter-spacing: 0.4px;
+  color: rgba(237, 244, 255, 0.82);
+  display: grid;
+  place-items: center;
   cursor: pointer;
   flex: 0 0 auto;
   transition: background 120ms ease, border-color 120ms ease, color 120ms ease;
 }
 
-.wp-action-btn.primary {
-  background: rgba(85, 223, 244, 0.13);
-  border-color: rgba(85, 223, 244, 0.32);
+.waypoint-actions button:hover {
+  background: rgba(85, 223, 244, 0.14);
+  border-color: rgba(85, 223, 244, 0.35);
   color: var(--cyan);
 }
 
-.wp-action-btn.primary:hover {
-  background: rgba(85, 223, 244, 0.24);
-  border-color: rgba(85, 223, 244, 0.5);
-}
-
-.wp-action-btn.danger {
-  color: rgba(255, 130, 130, 0.9);
-}
-
-.wp-action-btn.danger:hover {
+.waypoint-actions button.danger:hover {
   background: rgba(255, 107, 107, 0.14);
-  border-color: rgba(255, 107, 107, 0.4);
+  border-color: rgba(255, 107, 107, 0.35);
   color: var(--danger);
 }
 
-.waypoint-panel-head > button.icon-button,
-.waypoint-actions button.icon-button {
+.waypoint-panel-head > button.icon-button {
   min-width: 20px;
   min-height: 20px;
   padding: 0;
@@ -1003,145 +989,6 @@ body[data-profile-collapsed="true"] .mission-profile {
   background: transparent;
   color: rgba(141, 152, 173, 0.8);
   font-size: 12px;
-  cursor: pointer;
-}
-
-.waypoint-actions button.icon-button:hover {
-  color: rgba(237, 244, 255, 0.9);
-}
-
-/* 目标机选择行（仅多机模式显示） */
-.waypoint-vehicle-row {
-  display: flex;
-  align-items: center;
-  gap: 7px;
-  padding: 6px 11px;
-  border-bottom: 1px solid rgba(255, 255, 255, 0.05);
-  background: rgba(255, 255, 255, 0.015);
-  flex: 0 0 auto;
-}
-
-.waypoint-vehicle-row[hidden] {
-  display: none;
-}
-
-.waypoint-vehicle-label {
-  font-size: 10px;
-  color: rgba(141, 152, 173, 0.9);
-  white-space: nowrap;
-  flex: 0 0 auto;
-}
-
-.wp-vehicle-picker {
-  position: relative;
-  flex: 1;
-  min-width: 0;
-}
-
-.wp-vehicle-button {
-  width: 100%;
-  height: 25px;
-  padding: 0 7px;
-  display: inline-flex;
-  align-items: center;
-  justify-content: space-between;
-  gap: 6px;
-  border: 1px solid rgba(255, 255, 255, 0.12);
-  border-radius: 6px;
-  background: rgba(10, 14, 22, 0.62);
-  color: var(--ink);
-  font-size: 11px;
-  cursor: pointer;
-  transition: border-color 120ms ease, background 120ms ease;
-}
-
-.wp-vehicle-button:hover {
-  border-color: rgba(85, 223, 244, 0.4);
-  background: rgba(10, 14, 22, 0.8);
-}
-
-.wp-vehicle-label-text {
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-}
-
-.wp-vehicle-button svg {
-  flex: 0 0 auto;
-  color: rgba(141, 152, 173, 0.9);
-}
-
-.wp-vehicle-menu {
-  position: absolute;
-  top: calc(100% + 4px);
-  left: 0;
-  right: 0;
-  padding: 3px;
-  border: 1px solid rgba(255, 255, 255, 0.12);
-  border-radius: 8px;
-  background: rgba(13, 17, 24, 0.96);
-  box-shadow: 0 10px 26px rgba(0, 0, 0, 0.5);
-  display: flex;
-  flex-direction: column;
-  gap: 1px;
-  z-index: 8;
-}
-
-.wp-vehicle-option {
-  display: flex;
-  align-items: center;
-  gap: 6px;
-  min-height: 24px;
-  padding: 0 6px;
-  border: 0;
-  border-radius: 5px;
-  background: transparent;
-  color: rgba(237, 244, 255, 0.85);
-  font-size: 11px;
-  cursor: pointer;
-  text-align: left;
-}
-
-.wp-vehicle-option:hover {
-  background: rgba(85, 223, 244, 0.1);
-}
-
-.wp-vehicle-option.selected {
-  background: rgba(85, 223, 244, 0.16);
-  color: var(--cyan);
-}
-
-.wp-vehicle-option .wp-vehicle-name {
-  flex: 1;
-  min-width: 0;
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-  text-align: left;
-}
-
-.wp-vehicle-option .wp-vehicle-state {
-  font-size: 9px;
-  color: rgba(141, 152, 173, 0.85);
-  flex: 0 0 auto;
-}
-
-.wp-vehicle-dot {
-  width: 6px;
-  height: 6px;
-  border-radius: 50%;
-  background: rgba(141, 152, 173, 0.7);
-  flex: 0 0 auto;
-}
-
-.wp-vehicle-dot.armed {
-  background: #55dff4;
-  box-shadow: 0 0 5px rgba(85, 223, 244, 0.8);
-}
-
-.wp-vehicle-dot.flying {
-  background: #64e1ae;
-  box-shadow: 0 0 5px rgba(100, 225, 174, 0.8);
 }
 
 .waypoint-panel-body {
@@ -1152,8 +999,7 @@ body[data-profile-collapsed="true"] .mission-profile {
   overflow: hidden;
 }
 
-.waypoint-panel[data-collapsed="true"] .waypoint-panel-body,
-.waypoint-panel[data-collapsed="true"] .waypoint-vehicle-row {
+.waypoint-panel[data-collapsed="true"] .waypoint-panel-body {
   display: none;
 }
 
@@ -1193,14 +1039,12 @@ body[data-profile-collapsed="true"] .mission-profile {
 }
 
 .waypoint-panel .waypoint-item {
-  min-height: 34px;
-  padding: 4px 6px;
-  display: grid;
-  grid-template-columns: 20px minmax(0, 1fr) 20px;
-  align-items: center;
-  gap: 7px;
+  min-height: 28px;
+  padding: 3px 6px;
+  grid-template-columns: 18px minmax(0, 1fr) 18px;
+  gap: 5px;
   background: rgba(255, 255, 255, 0.03);
-  border-color: rgba(255, 255, 255, 0.05);
+  border-color: rgba(255, 255, 255, 0.04);
 }
 
 .waypoint-panel .waypoint-item:hover {
@@ -1240,9 +1084,9 @@ body[data-profile-collapsed="true"] .mission-profile {
 
 /* 逐点删除按钮：常显（低透明度），悬停加强 —— 之前默认 opacity:0 像"不能删" */
 .waypoint-panel .delete-waypoint {
-  width: 20px;
-  height: 20px;
-  min-height: 20px;
+  width: 18px;
+  height: 18px;
+  min-height: 18px;
   padding: 0;
   display: grid;
   place-items: center;
@@ -1250,7 +1094,7 @@ body[data-profile-collapsed="true"] .mission-profile {
   border-radius: 5px;
   background: transparent;
   color: rgba(237, 244, 255, 0.55);
-  font-size: 14px;
+  font-size: 13px;
   line-height: 1;
   cursor: pointer;
   opacity: 0.75;
@@ -1289,35 +1133,11 @@ body[data-profile-collapsed="true"] .mission-profile {
 }
 
 .waypoint-panel .waypoint-properties header {
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
   margin-bottom: 6px;
   color: var(--muted);
   font-size: 10px;
   font-weight: 700;
   letter-spacing: 0.5px;
-}
-
-.wp-prop-delete {
-  display: inline-flex;
-  align-items: center;
-  gap: 3px;
-  height: 20px;
-  padding: 0 7px;
-  border: 1px solid rgba(255, 107, 107, 0.28);
-  border-radius: 5px;
-  background: rgba(255, 107, 107, 0.08);
-  color: rgba(255, 130, 130, 0.92);
-  font-size: 9px;
-  font-weight: 600;
-  cursor: pointer;
-  transition: background 120ms ease, border-color 120ms ease;
-}
-
-.wp-prop-delete:hover {
-  background: rgba(255, 107, 107, 0.2);
-  border-color: rgba(255, 107, 107, 0.5);
 }
 
 .wp-prop-grid {
@@ -6155,16 +5975,70 @@ body.dragging-system-settings #systemSettingsModal .modal-head {
 }
 
 
-/* 多机：航点面板目标载具下拉（仅多机模式显示） */
-.waypoint-vehicle-select {
-  margin-left: 8px;
-  padding: 2px 6px;
+/* 面板标题旁的当前目标机徽标（颜色与该机航线一致） */
+.mission-target-badge {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  flex: 0 1 auto;
+  min-width: 0;
+  max-width: 110px;
+  padding: 1px 7px;
   border: 1px solid rgba(255, 255, 255, 0.14);
-  border-radius: 4px;
+  border-radius: 999px;
   background: rgba(10, 16, 24, 0.7);
-  color: var(--text-secondary, #aeb8c3);
-  font-size: 12px;
-  max-width: 140px;
+  font-size: 10px;
+  font-weight: 600;
+  color: var(--ink);
+  white-space: nowrap;
+}
+
+.mission-target-badge[hidden] {
+  display: none;
+}
+
+.mission-target-badge .dot {
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: #55dff4;
+  flex: 0 0 auto;
+}
+
+.mission-target-badge .name {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+/* 地图上每机返航点标记（H = 该机初始位置） */
+.wp-vehicle-home {
+  width: 15px;
+  height: 15px;
+  border-radius: 50%;
+  display: grid;
+  place-items: center;
+  background: rgba(8, 14, 20, 0.88);
+  border: 1.5px solid var(--home-color, #55dff4);
+  color: var(--home-color, #55dff4);
+  font-size: 8px;
+  font-weight: 800;
+  line-height: 1;
+  box-shadow: 0 1px 4px rgba(0, 0, 0, 0.6);
+  pointer-events: auto;
+}
+
+.hud-vehicle-chip .chip-plan-count {
+  min-width: 14px;
+  height: 14px;
+  padding: 0 3px;
+  border-radius: 999px;
+  display: inline-grid;
+  place-items: center;
+  background: rgba(255, 255, 255, 0.12);
+  font-size: 9px;
+  font-weight: 700;
+  color: var(--ink);
 }
 
 /* AirSim settings.json（连接详情 → 平铺、受连接类型约束，只读模板名 + 可选预览） */
@@ -6379,4 +6253,26 @@ body.dragging-system-settings #systemSettingsModal .modal-head {
 .airsim-template-result.error {
   background: rgba(255, 107, 107, 0.08);
   border-color: rgba(255, 107, 107, 0.3);
+}
+
+/* markdown 表格（chat/execute 消息正文） */
+.md-table {
+  border-collapse: collapse;
+  margin: 8px 0;
+  font-size: 13px;
+}
+.md-table th,
+.md-table td {
+  border: 1px solid rgba(255, 255, 255, 0.14);
+  padding: 5px 10px;
+  text-align: left;
+}
+.md-table th {
+  background: rgba(255, 255, 255, 0.05);
+}
+
+/* 过程卡片中的长推理文本：保留换行、可回看完整思考 */
+.thought-row p.long-text {
+  white-space: pre-wrap;
+  word-break: break-word;
 }

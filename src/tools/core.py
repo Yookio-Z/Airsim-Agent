@@ -374,6 +374,72 @@ def register_core_tools(
         return fmt_result(payload)
 
     @mcp.tool()
+    def drone_dispatch_takeoff(altitude: float = 3.0, vehicle_name: str = "") -> str:
+        """Dispatch a non-blocking takeoff (fire-and-forget; returns immediately).
+
+        多机并发起飞用：先对每架车 dispatch_takeoff，等各机 airborne 后再逐机
+        dispatch_path。需要等待起飞完成才能继续时，用 drone_takeoff（阻塞版）。
+        """
+        dispatch = getattr(controller, "dispatch_takeoff", None)
+        if not callable(dispatch):
+            return fmt_result(
+                {
+                    "status": "error",
+                    "backend": controller.backend_name,
+                    "message": "dispatch takeoff is not supported by this backend",
+                }
+            )
+        altitude = max(0.5, abs(float(altitude or 3.0)))
+        ok, targets = _run_for_vehicles(vehicle_name, lambda name: dispatch(altitude, name))
+        return fmt_result(
+            {
+                "status": "ok" if ok else "error",
+                "backend": controller.backend_name,
+                "message": f"takeoff dispatched ({altitude}m, non-blocking)" if ok else "takeoff dispatch failed",
+                "vehicles": targets,
+            }
+        )
+
+    @mcp.tool()
+    def drone_dispatch_path(waypoints_json: str, velocity: float = 2.0, vehicle_name: str = "") -> str:
+        """Dispatch a non-blocking waypoint path (fire-and-forget; returns immediately).
+
+        多机各自执行各自航线用：每架车派发自己的路径后立即返回，不等待完成。
+        需要确认路径飞完再继续时，用 drone_fly_path（阻塞版）。
+        `waypoints_json` must be a JSON array of objects with x, y, and z.
+        """
+        dispatch = getattr(controller, "dispatch_move_on_path", None)
+        if not callable(dispatch):
+            return fmt_result(
+                {
+                    "status": "error",
+                    "backend": controller.backend_name,
+                    "message": "dispatch path is not supported by this backend",
+                }
+            )
+        try:
+            waypoints = json.loads(waypoints_json)
+        except json.JSONDecodeError as exc:
+            return fmt_result({"status": "error", "message": f"invalid waypoint JSON: {exc}"})
+
+        if not isinstance(waypoints, list) or not waypoints:
+            return fmt_result({"status": "error", "message": "waypoints must be a non-empty list"})
+
+        ok, targets = _run_for_vehicles(
+            vehicle_name,
+            lambda name: dispatch([dict(wp) for wp in waypoints if isinstance(wp, dict)], velocity, name),
+        )
+        payload = {
+            "status": "ok" if ok else "error",
+            "backend": controller.backend_name,
+            "message": f"path dispatched ({len(waypoints)} waypoints, non-blocking)" if ok else "path dispatch failed",
+            "vehicles": targets,
+        }
+        if not ok:
+            payload.update(status_payload())
+        return fmt_result(payload)
+
+    @mcp.tool()
     def drone_upload_mission(waypoints_json: str) -> str:
         """Upload a backend mission.
 
@@ -459,8 +525,30 @@ def register_core_tools(
 
     @mcp.tool()
     def drone_get_status(vehicle_name: str = "") -> str:
-        """Read normalized vehicle status (default vehicle; a specific name
-        reads that vehicle — multi-vehicle readbacks rely on this)."""
+        """Read vehicle status. Without vehicle_name this returns EVERY
+        vehicle in one call (preferred: one query covers the whole fleet);
+        with a specific name it reads that vehicle only."""
+        if not vehicle_name:
+            try:
+                names = [str(n) for n in (controller.list_vehicles() or []) if str(n)]
+            except Exception:
+                names = []
+            if len(names) > 1:
+                vehicles = []
+                for name in names:
+                    try:
+                        vehicles.append({"vehicle_name": name, **controller.get_status(name).to_dict()})
+                    except Exception as exc:
+                        vehicles.append({"vehicle_name": name, "status": "error", "message": str(exc)[:160]})
+                return fmt_result(
+                    {
+                        "status": "ok",
+                        "backend": controller.backend_name,
+                        "vehicle_count": len(vehicles),
+                        "vehicles": vehicles,
+                        **(vehicles[0] if vehicles else {}),
+                    }
+                )
         try:
             status = controller.get_status(vehicle_name)
         except TypeError:

@@ -102,9 +102,10 @@ TOOL_CARDS: dict[str, ToolCard] = {
     ),
     "drone_get_status": ToolCard(
         name="drone_get_status",
-        purpose="Read vehicle telemetry and flight state.",
-        when_to_use="Before and after actions, or when the operator asks for status.",
-        outputs="Position, velocity, attitude, armed/flying state, mode, GPS, and battery when available.",
+        purpose="Read vehicle telemetry and flight state. Without vehicle_name this returns EVERY vehicle in one call (preferred for multi-vehicle status questions).",
+        when_to_use="Before and after actions, or when the operator asks for status. One call without vehicle_name covers the whole fleet.",
+        outputs="Position, velocity, attitude, armed/flying state, mode, GPS, and battery when available. Multi-vehicle backends return a per-vehicle list.",
+        inputs={"vehicle_name": "留空=一次查询全部车辆（推荐）；或具体载具名"},
         required_capabilities=["telemetry"],
         cost="low",
     ),

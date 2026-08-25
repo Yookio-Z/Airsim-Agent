@@ -181,6 +181,11 @@ let commandMode = localStorage.getItem("airsim-agent-command-mode") || "chat";
 // { id, type: "waypoint"|"takeoff"|"land"|"rtl", lat, lon, alt_m, speed_mps, hold_s, acceptance_radius_m, actions, metadata }
 // AirSim 后端下也会维护 x/y/z (local NED) 字段，用于向后兼容。
 let missionWaypoints = [];
+// 多机航线：missionPlans 保存"非当前目标机"的航线，键为载具名；
+// 当前正在编辑的航线始终放在 missionWaypoints，切换目标机时互换。
+let missionPlans = {};
+// 当前规划目标机（"" = 未选择/单机默认）。由左上角无人机 chips 点击切换。
+let missionTargetVehicle = "";
 let missionFence = [];
 let mapZoom = 1;
 let noticeTimer = null;
@@ -222,6 +227,8 @@ let droneRenderedHeading = null;
 let droneLastTelemetryLngLat = null;
 // 多机：每机一个 marker / 轨迹（多机模式启用，单机模式保持 droneMarker 单机路径）
 let vehicleMarkers = new Map();
+// 每机返航点标记（H 图标，位置 = 该机初始位置 home_position_ned）
+let vehicleHomeMarkers = new Map();
 let vehicleTracks = new Map();
 let vehicleMultiMode = false;
 const SHOW_ACTIVE_LEG = true;
@@ -2558,19 +2565,6 @@ if (els.importSkillBtn && els.skillImportInput) {
   input.addEventListener("change", () => applyWaypointProperties());
 });
 
-// 属性区删除按钮：删除当前选中的航点
-const wpPropDeleteButton = document.getElementById("wpPropDelete");
-if (wpPropDeleteButton) {
-  wpPropDeleteButton.addEventListener("click", () => {
-    if (selectedWaypointIndex < 0 || selectedWaypointIndex >= missionWaypoints.length) return;
-    missionWaypoints.splice(selectedWaypointIndex, 1);
-    markMissionEdited();
-    selectedWaypointIndex = -1;
-    renderWaypoints();
-    drawMissionPath();
-  });
-}
-
 // 地图右侧航点面板折叠
 const waypointPanelToggle = document.getElementById("waypointPanelToggle");
 const waypointPanel = document.getElementById("waypointPanel");
@@ -2582,89 +2576,74 @@ if (waypointPanelToggle && waypointPanel) {
   });
 }
 
-// ---- 航点面板目标机选择（自定义下拉；原生 select 隐藏作状态存储，
-//      buildMissionDraftFromItems 仍读 missionVehicleSelect.value）----
-const wpVehiclePicker = document.getElementById("wpVehiclePicker");
-const wpVehicleButton = document.getElementById("wpVehicleButton");
-const wpVehicleMenu = document.getElementById("wpVehicleMenu");
-const wpVehicleLabel = document.getElementById("wpVehicleLabel");
-const wpVehicleRow = document.getElementById("wpVehicleRow");
-const missionVehicleSelect = document.getElementById("missionVehicleSelect");
+// ---- 多机航线规划目标机：由左上角无人机 chips 点击切换（无下拉框）----
+// 每架机一条航线一种颜色，一键派发后各机执行各自航线。
 
-function vehicleStateMeta(vehicle) {
-  if (!vehicle) return { cls: "", text: "" };
-  if (vehicle.flying) return { cls: "flying", text: "空中" };
-  if (vehicle.armed) return { cls: "armed", text: "待飞" };
-  return { cls: "", text: "未解锁" };
+const VEHICLE_ROUTE_PALETTE = ["#55dff4", "#f0b84a", "#64e1ae", "#ff5b6e", "#b18cff", "#ffd166"];
+
+// 每架机的航线颜色（按遥测车辆顺序稳定分配）
+function vehicleRouteColor(name) {
+  const key = String(name || "");
+  const vehicles = Array.isArray(latestState?.tool_runtime?.vehicles) ? latestState.tool_runtime.vehicles : [];
+  const idx = vehicles.findIndex((v) => String(v.vehicle_name || "") === key);
+  if (idx >= 0) return VEHICLE_ROUTE_PALETTE[idx % VEHICLE_ROUTE_PALETTE.length];
+  let hash = 0;
+  for (const ch of key) hash = (hash * 31 + ch.charCodeAt(0)) >>> 0;
+  return VEHICLE_ROUTE_PALETTE[hash % VEHICLE_ROUTE_PALETTE.length];
 }
 
-// 当前任务目标机名（"" = 默认机；单机或下拉隐藏时恒为 ""）
+// 当前规划目标机名（"" = 未选择/单机默认）
 function currentMissionVehicleName() {
-  if (!missionVehicleSelect || missionVehicleSelect.hidden) return "";
-  return String(missionVehicleSelect.value || "");
+  return String(missionTargetVehicle || "");
 }
 
-function syncWpVehiclePicker(vehicles) {
-  if (!missionVehicleSelect || !wpVehiclePicker) return;
-  const list = Array.isArray(vehicles)
-    ? vehicles
-    : (Array.isArray(latestState?.tool_runtime?.vehicles) ? latestState.tool_runtime.vehicles : []);
-  const multi = list.length > 1 && !missionVehicleSelect.hidden;
-  if (wpVehicleRow) wpVehicleRow.hidden = !multi;
-  if (!multi) {
-    if (wpVehicleMenu) wpVehicleMenu.hidden = true;
+// 是否多机规划模式（后端报了多架车）
+function isMultiVehiclePlanning() {
+  const vehicles = Array.isArray(latestState?.tool_runtime?.vehicles) ? latestState.tool_runtime.vehicles : [];
+  return vehicles.length > 1;
+}
+
+// 面板标题旁的当前目标机徽标
+function updateMissionTargetBadge() {
+  const badge = document.getElementById("missionTargetBadge");
+  if (!badge) return;
+  const target = currentMissionVehicleName();
+  badge.hidden = !target;
+  if (!target) return;
+  const dot = badge.querySelector(".dot");
+  const name = badge.querySelector(".name");
+  const color = vehicleRouteColor(target);
+  if (dot) dot.style.background = color;
+  if (dot) dot.style.boxShadow = `0 0 6px ${color}`;
+  if (name) name.textContent = target;
+  badge.style.borderColor = `${color}66`;
+}
+
+// 点击 chips 切换目标机：暂存当前航线 → 载入目标机航线
+function switchMissionTarget(name) {
+  const target = String(name || "");
+  if (target === missionTargetVehicle) {
+    panMapToMissionVehicle();
     return;
   }
-  if (wpVehicleLabel) wpVehicleLabel.textContent = missionVehicleSelect.value || "默认机";
-  if (!wpVehicleMenu) return;
-  const byName = new Map(list.map((v) => [String(v.vehicle_name || ""), v]));
-  wpVehicleMenu.textContent = "";
-  for (const opt of missionVehicleSelect.options) {
-    const value = opt.value;
-    const meta = vehicleStateMeta(value ? byName.get(value) : null);
-    const item = document.createElement("button");
-    item.type = "button";
-    item.className = `wp-vehicle-option${value === (missionVehicleSelect.value || "") ? " selected" : ""}`;
-    item.dataset.value = value;
-    item.innerHTML = `
-      <span class="wp-vehicle-dot ${meta.cls}"></span>
-      <span class="wp-vehicle-name">${escapeHtml(value || "默认机")}</span>
-      <span class="wp-vehicle-state">${meta.text}</span>`;
-    wpVehicleMenu.appendChild(item);
+  if (missionTargetVehicle) {
+    if (missionWaypoints.length) missionPlans[missionTargetVehicle] = missionWaypoints;
+    else delete missionPlans[missionTargetVehicle];
   }
+  missionTargetVehicle = target;
+  missionWaypoints = (missionPlans[target] || []).slice();
+  delete missionPlans[target];
+  selectedWaypointIndex = -1;
+  markMissionEdited();
+  hideWaypointProperties();
+  renderWaypoints();
+  drawMissionPath();
+  updateMissionTargetBadge();
+  highlightMissionVehicleMarkers();
+  panMapToMissionVehicle();
 }
 
-if (wpVehicleButton) {
-  wpVehicleButton.addEventListener("click", (event) => {
-    event.stopPropagation();
-    if (wpVehicleMenu) wpVehicleMenu.hidden = !wpVehicleMenu.hidden;
-  });
-}
-if (wpVehicleMenu) {
-  wpVehicleMenu.addEventListener("click", (event) => {
-    const item = event.target.closest("[data-value]");
-    if (!item || !missionVehicleSelect) return;
-    if (missionVehicleSelect.value !== item.dataset.value) {
-      missionVehicleSelect.value = item.dataset.value;
-      missionVehicleSelect.dispatchEvent(new Event("change"));
-    }
-    wpVehicleMenu.hidden = true;
-  });
-}
-document.addEventListener("click", (event) => {
-  if (wpVehicleMenu && !wpVehicleMenu.hidden && wpVehiclePicker && !wpVehiclePicker.contains(event.target)) {
-    wpVehicleMenu.hidden = true;
-  }
-});
-if (missionVehicleSelect) {
-  missionVehicleSelect.addEventListener("change", () => {
-    syncWpVehiclePicker();
-    highlightMissionVehicleMarkers();
-    panMapToMissionVehicle();
-  });
-}
-
-// 地图 marker 高亮当前任务目标机
+// 地图 marker 高亮当前规划目标机
 function highlightMissionVehicleMarkers() {
   const target = currentMissionVehicleName();
   for (const [name, entry] of vehicleMarkers.entries()) {
@@ -2673,7 +2652,7 @@ function highlightMissionVehicleMarkers() {
   }
 }
 
-// 面板切换目标机后把地图平移到该机位置
+// 切换目标机后把地图平移到该机位置
 function panMapToMissionVehicle() {
   if (!maplibreMap) return;
   const runtime = latestState?.tool_runtime || {};
@@ -2727,6 +2706,7 @@ function initMissionMap() {
         "vehicle-track-source": { type: "geojson", data: { type: "FeatureCollection", features: [] } },
         "active-leg-source": { type: "geojson", data: { type: "FeatureCollection", features: [] } },
         "fence-source": { type: "geojson", data: { type: "FeatureCollection", features: [] } },
+        "plan-source": { type: "geojson", data: { type: "FeatureCollection", features: [] } },
       },
       layers: [
         { id: "tiles", type: "raster", source: "tiles", minzoom: 0, maxzoom: cfg.maxZoom },
@@ -2858,6 +2838,33 @@ function initMissionMap() {
         "line-opacity": 0.85,
       },
     });
+
+    // 多机规划航线层：每机一条彩色航线（当前目标机高亮，其余半透明）
+    // 插在 wp-halo 之下：航线线在航点图标下面
+    maplibreMap.addLayer({
+      id: "plan-lines",
+      type: "line",
+      source: "plan-source",
+      filter: ["==", ["get", "kind"], "line"],
+      paint: {
+        "line-color": ["get", "color"],
+        "line-width": ["case", ["==", ["get", "active"], true], 2.5, 2],
+        "line-opacity": ["case", ["==", ["get", "active"], true], 0.95, 0.45],
+      },
+    }, "wp-halo");
+    maplibreMap.addLayer({
+      id: "plan-dots",
+      type: "circle",
+      source: "plan-source",
+      filter: ["==", ["get", "kind"], "dot"],
+      paint: {
+        "circle-color": ["get", "color"],
+        "circle-radius": ["case", ["==", ["get", "active"], true], 4.5, 3.5],
+        "circle-opacity": ["case", ["==", ["get", "active"], true], 0.95, 0.55],
+        "circle-stroke-width": 1,
+        "circle-stroke-color": "rgba(6, 14, 22, 0.8)",
+      },
+    }, "wp-halo");
 
     // Home marker（动态目标用 marker OK，固定不动不闪）
     const homeEl = document.createElement("div");
@@ -3143,6 +3150,46 @@ function updateVehicleMarkers(vehicles, runtime) {
     }
   }
   highlightMissionVehicleMarkers();
+  updateVehicleHomeMarkers(vehicles, runtime);
+}
+
+// 每机返航点标记：位置 = 该机初始位置（home_position_ned，由后端首次地面记录）
+function createVehicleHomeElement(name, color) {
+  const el = document.createElement("div");
+  el.className = "wp-vehicle-home";
+  el.style.setProperty("--home-color", color);
+  el.textContent = "H";
+  el.title = `${name} 的返航点（初始位置）`;
+  return el;
+}
+
+function updateVehicleHomeMarkers(vehicles, runtime) {
+  if (!maplibreMap || !Array.isArray(vehicles)) return;
+  const liveNames = new Set();
+  for (const vehicle of vehicles) {
+    const name = String(vehicle.vehicle_name || "");
+    if (!name) continue;
+    const home = vehicle.home_position_ned;
+    if (!home || !Number.isFinite(Number(home.x)) || !Number.isFinite(Number(home.y))) continue;
+    const gps = nedToGps(Number(home.x), Number(home.y), Number(home.z || 0));
+    const lngLat = [gps.lon, gps.lat];
+    liveNames.add(name);
+    let marker = vehicleHomeMarkers.get(name);
+    if (!marker) {
+      marker = new maplibregl.Marker({ element: createVehicleHomeElement(name, vehicleRouteColor(name)), anchor: "center" })
+        .setLngLat(lngLat)
+        .addTo(maplibreMap);
+      vehicleHomeMarkers.set(name, marker);
+    } else {
+      marker.setLngLat(lngLat);
+    }
+  }
+  for (const [name, marker] of vehicleHomeMarkers.entries()) {
+    if (!liveNames.has(name)) {
+      marker.remove();
+      vehicleHomeMarkers.delete(name);
+    }
+  }
 }
 
 function updateDroneMarker(lngLat, heading, options = {}) {
@@ -3271,6 +3318,10 @@ function addWaypointFromMap(latlng) {
   const contract = runtime.operation_contract || {};
   if (contract.vehicle_kind === "real_px4" && applicationSettings.safety.require_gps_for_global_mission && !contract.global_mission_ready) {
     showNotice("真实 PX4 的 GPS 位置尚不可靠，不能创建全局航点", "error");
+    return;
+  }
+  if (isMultiVehiclePlanning() && !currentMissionVehicleName()) {
+    showNotice("请先点击左上角的无人机，选择要规划航线的那一架", "error");
     return;
   }
   const index = missionWaypoints.length;
@@ -3414,15 +3465,15 @@ function resetActiveTargetProgress() {
   lastMissionProgress = null;
 }
 
-function buildLocalMissionItems() {
+function buildLocalMissionItems(route = missionWaypoints) {
   const items = [];
-  const firstAltitude = Math.max(0.5, Number(missionWaypoints[0]?.alt_m || 3));
+  const firstAltitude = Math.max(0.5, Number(route[0]?.alt_m || 3));
   const drone = latestState?.tool_runtime?.drone || {};
   const droneHome = currentDroneGeo(drone);
-  const hasTakeoff = missionWaypoints.some((wp) => wp.type === "takeoff");
+  const hasTakeoff = route.some((wp) => wp.type === "takeoff");
   if (!drone.flying && !hasTakeoff) {
-    const takeoffLat = droneHome?.lat ?? missionWaypoints[0]?.lat ?? AIRSIM_HOME_LAT;
-    const takeoffLon = droneHome?.lon ?? missionWaypoints[0]?.lon ?? AIRSIM_HOME_LON;
+    const takeoffLat = droneHome?.lat ?? route[0]?.lat ?? AIRSIM_HOME_LAT;
+    const takeoffLon = droneHome?.lon ?? route[0]?.lon ?? AIRSIM_HOME_LON;
     items.push({
       id: "local_takeoff",
       type: "takeoff",
@@ -3433,7 +3484,7 @@ function buildLocalMissionItems() {
       y: 0,
       z: -firstAltitude,
       alt_m: firstAltitude,
-      speed_mps: Number(missionWaypoints[0]?.speed_mps || 2),
+      speed_mps: Number(route[0]?.speed_mps || 2),
       hold_s: 0,
       acceptance_radius_m: 2,
       actions: [],
@@ -3441,7 +3492,7 @@ function buildLocalMissionItems() {
     });
   }
 
-  missionWaypoints.forEach((wp, index) => {
+  route.forEach((wp, index) => {
     items.push({
       id: wp.id || `wp_${String(index + 1).padStart(3, "0")}`,
       type: wp.type || "waypoint",
@@ -3466,7 +3517,48 @@ function buildLocalMissionItems() {
 
 
 
+// 收集多机任务：当前航线 + 暂存的所有目标机航线
+function collectMissionAssignments() {
+  const assignments = [];
+  const collect = (vehicle, route) => {
+    if (!vehicle) return;
+    const items = buildLocalMissionItems(Array.isArray(route) ? route : []);
+    if (items.length) assignments.push({ vehicle, items });
+  };
+  collect(currentMissionVehicleName(), missionWaypoints);
+  for (const [vehicle, route] of Object.entries(missionPlans)) {
+    if (vehicle === currentMissionVehicleName()) continue;
+    collect(vehicle, route);
+  }
+  return assignments;
+}
+
 async function deployAndStartMission() {
+  const runtime = requireLiveFlightLink();
+  // 多机模式：当前目标机已选择 → 一键派发所有机的航线（各机执行各自的）
+  if (isMultiVehiclePlanning() && currentMissionVehicleName()) {
+    const assignments = collectMissionAssignments();
+    if (!assignments.length) throw new Error("没有可派发的航线，请先为目标机添加航点");
+    const summary = assignments
+      .map((a) => `${a.vehicle}: ${a.items.filter((it) => it.type !== "takeoff").length} 航点`)
+      .join("；");
+    const ok = await confirmDialog({
+      title: "上传并开始多机航线",
+      message: `将同时派发各机航线并立即执行：${summary}。每架飞机执行完自己的航线后悬停。是否继续？`,
+      confirmLabel: "上传并开始",
+      danger: true,
+    });
+    if (!ok) return null;
+    const result = await post("/api/gcs/mission/start_multi", {
+      assignments,
+      expected_backend: runtime.backend,
+    });
+    extractApiSuccess(result, "多机航线已派发");
+    markMissionExecutionStarted();
+    activeFlightTaskVehicles = assignments.map((a) => a.vehicle);
+    return result;
+  }
+  // 单机流程（原逻辑）
   const uploadResult = await uploadMissionToVehicle();
   extractApiSuccess(uploadResult, "任务已上传");
   markMissionExecutionStarted();
@@ -3486,12 +3578,14 @@ async function deployAndStartMission() {
 
 function clearLocalMissionDraft() {
   missionWaypoints = [];
+  missionPlans = {};
   missionFence = [];
   selectedWaypointIndex = -1;
   markMissionEdited();
   renderWaypoints();
   drawMissionPath();
   drawFence();
+  updateMissionTargetBadge();
 }
 
 async function clearMissionEverywhere() {
@@ -3514,7 +3608,7 @@ function buildMissionDraftFromItems(items) {
   })();
   return {
     name: "UI mission",
-    vehicle: document.getElementById("missionVehicleSelect")?.value || "",
+    vehicle: currentMissionVehicleName(),
     home,
     items: items.map((it) => ({
       id: it.id,
@@ -3611,9 +3705,27 @@ async function refreshTelemetryOnly() {
     renderTopbar(run, toolRuntime, latestState.supervisor || {}, latestState.llm || {});
     renderTelemetry(drone, toolRuntime);
     updateMapView(latestState);
+    checkFlightTaskCompletion(toolRuntime);
   } finally {
     telemetryRefreshInFlight = false;
   }
+}
+
+// 多机航线完成监控：本轮派发的所有机都到达各自终点并悬停后提示一次，
+// 并复位任务执行状态（missionExecutionActive）。
+let activeFlightTaskVehicles = [];
+
+function checkFlightTaskCompletion(toolRuntime = {}) {
+  if (!activeFlightTaskVehicles.length) return;
+  const tasks = toolRuntime.flight_tasks || {};
+  const states = activeFlightTaskVehicles.map((name) => tasks[name]);
+  // 派发瞬间遥测里还没有对应任务数据，先不判定
+  if (states.some((s) => !s)) return;
+  if (!states.every((s) => s.state === "done")) return;
+  const names = activeFlightTaskVehicles.join("、");
+  activeFlightTaskVehicles = [];
+  markMissionEdited();
+  showNotice(`✅ 航线飞行结束：${names} 已到达各自终点并悬停`, "success");
 }
 
 function restartMainTelemetryRefresh() {
@@ -4128,35 +4240,17 @@ function renderVehicleList(toolRuntime = {}) {
       datalist.appendChild(option);
     }
   }
-  // 航点面板的目标载具下拉：仅多机模式显示（单机不挤占 header）
-  const vehicleSelect = document.getElementById("missionVehicleSelect");
-  if (vehicleSelect) {
-    if (vehicles.length > 1) {
-      const previous = vehicleSelect.value;
-      vehicleSelect.textContent = "";
-      const defaultOption = document.createElement("option");
-      defaultOption.value = "";
-      defaultOption.textContent = "默认机";
-      vehicleSelect.appendChild(defaultOption);
-      for (const vehicle of vehicles) {
-        const name = String(vehicle.vehicle_name || "");
-        if (!name) continue;
-        const option = document.createElement("option");
-        option.value = name;
-        option.textContent = name;
-        vehicleSelect.appendChild(option);
-      }
-      if (previous && [...vehicleSelect.options].some((o) => o.value === previous)) {
-        vehicleSelect.value = previous;
-      }
-      vehicleSelect.hidden = false;
-    } else {
-      vehicleSelect.hidden = true;
-      vehicleSelect.textContent = "";
-    }
-    syncWpVehiclePicker(vehicles);
-  }
+  // 多机模式：顶部 chips 即目标机选择器（点击切换规划目标，每机一色）
   if (vehicles.length <= 1) {
+    // 退化为单机：清掉多机规划状态，航线回到默认单机流程
+    if (missionTargetVehicle || Object.keys(missionPlans).length) {
+      missionTargetVehicle = "";
+      missionPlans = {};
+      markMissionEdited();
+      renderWaypoints();
+      drawMissionPath();
+    }
+    updateMissionTargetBadge();
     container.hidden = true;
     container.textContent = "";
     syncCameraVehicleOptions(vehicles);
@@ -4169,24 +4263,22 @@ function renderVehicleList(toolRuntime = {}) {
   for (const vehicle of vehicles) {
     const name = String(vehicle.vehicle_name || "?");
     const state = vehicle.armed ? (vehicle.flying ? "空中" : "待飞") : "未解锁";
-    const meta = vehicleStateMeta(vehicle);
     const pos = vehicle.position_ned || {};
     const battery = vehicle.battery_voltage != null ? ` ${fmt(vehicle.battery_voltage)}V` : "";
+    const routeColor = vehicleRouteColor(name);
+    const planned = (currentMissionVehicleName() === name ? missionWaypoints.length : (missionPlans[name]?.length || 0));
     const chip = document.createElement("button");
     chip.type = "button";
     chip.className = `hud-vehicle-chip${name === missionTarget ? " selected" : ""}`;
-    chip.title = `载具 ${name} · N ${fmt(pos.x)} / E ${fmt(pos.y)} / D ${fmt(pos.z)} · 点击设为目标机`;
+    chip.title = `载具 ${name} · ${state} · 点击规划该机航线`
+      + (planned ? `（已画 ${planned} 个航点）` : "")
+      + ` · N ${fmt(pos.x)} / E ${fmt(pos.y)} / D ${fmt(pos.z)}`;
     chip.dataset.vehicle = name;
-    chip.innerHTML = `<span class="chip-dot ${meta.cls}"></span>${escapeHtml(name)}: ${state}${battery ? `<span class="chip-battery">${escapeHtml(battery.trim())}</span>` : ""}`;
-    chip.addEventListener("click", () => {
-      if (!vehicleSelect || vehicleSelect.hidden) return;
-      if (vehicleSelect.value !== name) {
-        vehicleSelect.value = name;
-        vehicleSelect.dispatchEvent(new Event("change"));
-      }
-    });
+    chip.innerHTML = `<span class="chip-dot" style="background:${routeColor};box-shadow:0 0 5px ${routeColor}"></span>${escapeHtml(name)}: ${state}${battery ? `<span class="chip-battery">${escapeHtml(battery.trim())}</span>` : ""}${planned ? `<span class="chip-plan-count">${planned}</span>` : ""}`;
+    chip.addEventListener("click", () => switchMissionTarget(name));
     container.appendChild(chip);
   }
+  updateMissionTargetBadge();
 }
 
 function syncCameraVehicleOptions(vehicles) {
@@ -4419,26 +4511,17 @@ const WAYPOINT_TYPE_LABELS = {
   rtl: "返航",
 };
 
-function fmtWpNumber(value, fallback = 0) {
-  const num = Number(value);
-  if (!Number.isFinite(num)) return String(fallback);
-  return String(Math.round(num * 10) / 10);
-}
-
 function renderWaypoints() {
   syncWaypointActionLabels();
   renderMissionMetrics();
 
   if (!els.waypointList) return;
 
-  const countBadge = document.getElementById("waypointCount");
-  if (countBadge) {
-    countBadge.textContent = String(missionWaypoints.length);
-    countBadge.hidden = missionWaypoints.length === 0;
-  }
-
   if (!missionWaypoints.length) {
-    els.waypointList.innerHTML = `<div class="empty">点击地图添加航点<br>双击航点可删除</div>`;
+    const hint = isMultiVehiclePlanning() && !currentMissionVehicleName()
+      ? `点击左上角的无人机选择目标机<br>再点击地图添加航点`
+      : `点击地图添加航点<br>双击航点可删除`;
+    els.waypointList.innerHTML = `<div class="empty">${hint}</div>`;
     hideWaypointProperties();
     return;
   }
@@ -4446,13 +4529,11 @@ function renderWaypoints() {
   els.waypointList.innerHTML = missionWaypoints.map((wp, index) => {
     const selected = index === selectedWaypointIndex ? "selected" : "";
     const typeLabel = WAYPOINT_TYPE_LABELS[wp.type] || "航点";
-    const meta = [`↑${fmtWpNumber(wp.alt_m)}m`, `${fmtWpNumber(wp.speed_mps, 2)}m/s`].join(" · ");
     return `
       <article class="waypoint-item ${selected}" data-waypoint-row="${index}">
         <span class="waypoint-index">${index + 1}</span>
         <div class="waypoint-main">
           <strong>${typeLabel}</strong>
-          <span class="waypoint-meta">${meta}</span>
         </div>
         <button class="delete-waypoint" data-waypoint-delete="${index}" title="删除此航点">×</button>
       </article>
@@ -4624,17 +4705,44 @@ function drawMissionPath() {
   const wpSource = maplibreMap.getSource("wp-source");
   if (!pathSource || !wpSource) return;
 
-  // 更新航线连线（拖拽中也更新，让连线跟随航点）
-  if (missionWaypoints.length >= 2) {
-    const coords = missionWaypoints.map((wp) => [wp.lon, wp.lat]);
-    pathSource.setData({
-      type: "FeatureCollection",
-      features: [
-        { type: "Feature", properties: {}, geometry: { type: "LineString", coordinates: coords } },
-      ],
-    });
-  } else {
-    pathSource.setData({ type: "FeatureCollection", features: [] });
+  // 航线统一由 plan-source 按机配色绘制（每机一色，当前目标机高亮），
+  // 旧的白色 path-line 不再使用，保持 source 存在以兼容既有 layer 定义。
+  pathSource.setData({ type: "FeatureCollection", features: [] });
+
+  const planSource = maplibreMap.getSource("plan-source");
+  if (planSource) {
+    const features = [];
+    const activeTarget = currentMissionVehicleName();
+    const addRoute = (vehicle, route) => {
+      if (!Array.isArray(route) || !route.length) return;
+      const color = vehicleRouteColor(vehicle);
+      const isActive = (vehicle || "") === activeTarget;
+      if (route.length >= 2) {
+        features.push({
+          type: "Feature",
+          properties: { vehicle, color, active: isActive, kind: "line" },
+          geometry: { type: "LineString", coordinates: route.map((wp) => [wp.lon, wp.lat]) },
+        });
+      }
+      for (const wp of route) {
+        features.push({
+          type: "Feature",
+          properties: { vehicle, color, active: isActive, kind: "dot" },
+          geometry: { type: "Point", coordinates: [wp.lon, wp.lat] },
+        });
+      }
+    };
+    if (!activeTarget) {
+      // 单机模式：当前航线即全部
+      addRoute("", missionWaypoints);
+    } else {
+      for (const [vehicle, route] of Object.entries(missionPlans)) {
+        if (vehicle === activeTarget) continue;
+        addRoute(vehicle, route);
+      }
+      addRoute(activeTarget, missionWaypoints);
+    }
+    planSource.setData({ type: "FeatureCollection", features });
   }
 
   // 航点 GeoJSON features（id 用于 setFeatureState，type 用于 sprite 配色）
@@ -5892,6 +6000,14 @@ function renderMarkdown(value) {
     if (lines.length && lines.every((line) => /^\d+[.)]\s+/.test(line))) {
       return `<ol>${lines.map((line) => `<li>${renderInlineMarkdown(line.replace(/^\d+[.)]\s+/, ""))}</li>`).join("")}</ol>`;
     }
+    // markdown 表格：首行表头，第二行 |---|---| 分隔，其余为数据行
+    if (lines.length >= 2 && lines.every((line) => /^\|.*\|$/.test(line)) && /^\|[\s:|-]+\|$/.test(lines[1])) {
+      const parseRow = (row) => row.replace(/^\||\|$/g, "").split("|").map((cell) => cell.trim());
+      const headers = parseRow(lines[0]);
+      const rows = lines.slice(2).map(parseRow);
+      const cell = (value, tag) => `<${tag}>${renderInlineMarkdown(value)}</${tag}>`;
+      return `<table class="md-table"><thead><tr>${headers.map((h) => cell(h, "th")).join("")}</tr></thead><tbody>${rows.map((r) => `<tr>${headers.map((_, i) => cell(r[i] ?? "", "td")).join("")}</tr>`).join("")}</tbody></table>`;
+    }
     const normalized = block.replace(/^#{1,6}\s+/gm, "");
     return `<p>${normalized.split(/\n/).map((line) => renderInlineMarkdown(line)).join("<br>")}</p>`;
   }).join("");
@@ -6127,7 +6243,11 @@ function renderAgentThoughts(message, run, active) {
     const status = item.status || "completed";
     const kind = item.kind || "reasoning";
     const badge = processKindLabel(kind);
-    const body = item.body ? `<p>${escapeHtml(item.body)}</p>` : "";
+    const bodyText = String(item.body || "");
+    // 长推理文本保留换行（模型思考块可回看完整内容）
+    const body = bodyText
+      ? `<p class="${bodyText.includes("\n") || bodyText.length > 160 ? "long-text" : ""}">${escapeHtml(bodyText)}</p>`
+      : "";
     return `
       <div class="thought-row ${escapeHtml(status)} kind-${escapeHtml(kind)}">
         <span></span>
@@ -9334,18 +9454,24 @@ async function handleWaypointAction(action, button) {
   }
 
   if (action === "deploy_start") {
-    if (!missionWaypoints.length) {
+    if (!missionWaypoints.length && !Object.keys(missionPlans).length) {
       showNotice("请先添加航点", "error");
       return;
     }
-    const ok = await confirmDialog({
-      title: "上传并开始航线",
-      message: "此操作会替换飞控上的当前 mission，并立即开始执行。是否继续？",
-      confirmLabel: "上传并开始",
-      danger: true,
-    });
-    if (!ok) return;
-    await runButton(button, deployAndStartMission, "航线已上传并开始执行");
+    // 多机模式的确认框（含各机航点汇总）在 deployAndStartMission 内弹出
+    const multiDispatch = isMultiVehiclePlanning() && currentMissionVehicleName();
+    if (!multiDispatch) {
+      const ok = await confirmDialog({
+        title: "上传并开始航线",
+        message: "此操作会替换飞控上的当前 mission，并立即开始执行。是否继续？",
+        confirmLabel: "上传并开始",
+        danger: true,
+      });
+      if (!ok) return;
+    }
+    // 单机模式 drone_fly_path 阻塞到飞完才返回 → 提示"执行完成";
+    // 多机为非阻塞派发 → 提示"已派发",结束时的提示由航线完成监控给出
+    await runButton(button, deployAndStartMission, multiDispatch ? "多机航线已派发，各机执行各自航线" : "航线执行完成");
     return;
   }
 

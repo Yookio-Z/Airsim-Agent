@@ -9,12 +9,13 @@ and real-vehicle adapters behind the same managers.
 from __future__ import annotations
 
 import json
+import time
 from typing import Any, Callable
 
 from src.agent.tool_executor import ToolCallResult, ToolRuntime
 
 from .managers import ManagerResult
-from .mission import GeoPoint, MissionPlanDraft
+from .mission import GeoPoint, MissionItem, MissionPlanDraft
 from .state import GroundStationState, LinkState, MissionState, SafetyState, VehicleTelemetry
 
 
@@ -404,6 +405,114 @@ class ToolMissionManager:
     def _draft_vehicle_name(self) -> str:
         """Target vehicle from the draft ("" = backend default vehicle)."""
         return str((self._draft.vehicle or "").strip()) if self._draft else ""
+
+    def start_multi(self, assignments: list[dict[str, Any]] | None) -> ManagerResult:
+        """多机各自航线并发执行：每机先并发派发起飞，再各自派发自己的路径。
+
+        assignments: [{"vehicle": "Drone1", "items": [MissionItem...]}, ...]
+        全程使用非阻塞派发工具（drone_dispatch_takeoff / drone_dispatch_path），
+        每架机执行完自己的航线后悬停等待，互不阻塞。
+        """
+        if not isinstance(assignments, list) or not assignments:
+            return ManagerResult(False, "no mission assignments", {})
+        state = self._telemetry.get_state()
+        state.safety = self._safety.state()
+        if state.safety.emergency_stop:
+            return ManagerResult(False, "mission blocked by emergency stop", self._state.to_dict())
+        validation = self._safety.validate_command("drone_dispatch_path", {}, state)
+        if not validation.ok:
+            return validation
+
+        # 1. 每机航点 → 本地 NED 路径（AirSim 航点本身就是 local_ned，直接转换）
+        plans: list[dict[str, Any]] = []
+        for entry in assignments:
+            if not isinstance(entry, dict):
+                continue
+            vehicle = str(entry.get("vehicle") or "").strip()
+            raw_items = [it for it in (entry.get("items") or []) if isinstance(it, dict)]
+            if not raw_items:
+                continue
+            mission_items = [MissionItem.from_dict(it) for it in raw_items]
+            draft = MissionPlanDraft(vehicle=vehicle, items=mission_items)
+            waypoints, velocity = self._draft_to_local_path(draft)
+            if not waypoints:
+                label = vehicle or "默认机"
+                return ManagerResult(False, f"{label} 的航线无法转换为本地 NED 路径（缺少坐标）", {})
+            plans.append({
+                "vehicle": vehicle,
+                "waypoints": waypoints,
+                "velocity": velocity,
+                "takeoff_altitude": self._mission_takeoff_altitude(draft) or 3.0,
+            })
+        if not plans:
+            return ManagerResult(False, "没有非空的航线任务", {})
+
+        # 2. 阶段 A：对未在空中的机并发派发起飞（fire-and-forget）
+        vehicles_state = {v.vehicle_id: v for v in state.vehicles}
+        dispatched_takeoffs: list[str] = []
+        for plan in plans:
+            vehicle = plan["vehicle"]
+            telemetry = vehicles_state.get(vehicle)
+            if telemetry is not None and telemetry.flying and telemetry.armed:
+                continue
+            result = self._tools.execute(
+                "drone_dispatch_takeoff",
+                {"altitude": plan["takeoff_altitude"], "vehicle_name": vehicle},
+                dry_run=False,
+                blocked_by_supervisor=state.safety.emergency_stop,
+            )
+            if result.ok:
+                dispatched_takeoffs.append(vehicle)
+            else:
+                return ManagerResult(
+                    False,
+                    f"{vehicle or '默认机'} 起飞派发失败: {result.data.get('message', '')}",
+                    {"assignments": plans, "failed_takeoff": vehicle},
+                )
+
+        # 3. 阶段 B：等待派发了起飞的机进入空中（有上限，不阻塞已空中的机）
+        if dispatched_takeoffs:
+            deadline = time.time() + 25.0
+            pending = set(dispatched_takeoffs)
+            while pending and time.time() < deadline:
+                time.sleep(1.0)
+                snapshot = self._telemetry.get_state()
+                airborne = {v.vehicle_id for v in snapshot.vehicles if v.flying}
+                pending -= airborne
+            # 超时的机不再等，路径照常派发（AirSim 会在起飞完成后执行路径）
+
+        # 4. 阶段 C：逐机派发各自路径（fire-and-forget，互不阻塞）
+        results: list[dict[str, Any]] = []
+        failed: list[str] = []
+        for plan in plans:
+            result = self._tools.execute(
+                "drone_dispatch_path",
+                {
+                    "waypoints_json": json.dumps(plan["waypoints"]),
+                    "velocity": plan["velocity"],
+                    "vehicle_name": plan["vehicle"],
+                },
+                dry_run=False,
+                blocked_by_supervisor=state.safety.emergency_stop,
+            )
+            entry = {
+                "vehicle": plan["vehicle"],
+                "waypoint_count": len(plan["waypoints"]),
+                "velocity": plan["velocity"],
+                "ok": bool(result.ok),
+                "message": result.data.get("message", ""),
+            }
+            results.append(entry)
+            if not result.ok:
+                failed.append(plan["vehicle"] or "默认机")
+
+        ok = not failed
+        summary = "、".join(f"{r['vehicle'] or '默认机'}({r['waypoint_count']}点)" for r in results)
+        message = f"多机任务已派发: {summary}" if ok else f"部分派发失败: {', '.join(failed)}"
+        self._state.running = True
+        self._state.message = message
+        self._state.details = {"execution_mode": "multi_vehicle_dispatch", "assignments": results}
+        return ManagerResult(ok, message, {"assignments": results, "mission": self._state.to_dict()})
 
     def _execute_local_path(self, waypoints: list[dict[str, float]], velocity: float) -> ManagerResult:
         if self._draft is None:

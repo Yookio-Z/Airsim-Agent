@@ -1963,6 +1963,23 @@ class AgentRuntime:
         final_flush = getattr(reasoning_sink, "final_flush", None)
         if callable(final_flush):
             final_flush()
+        reasoning_full = str(getattr(reasoning_sink, "full_text", "") or "").strip()
+        if run_id:
+            # 规划推理全文归档进消息的思考块（完成后正文换成结果，思考仍可回看）
+            self._update_assistant_message(
+                run_id,
+                "正在执行计划...",
+                "running",
+                {
+                    "mode": "execute",
+                    "phase": "planning",
+                    "process_trace": (
+                        [{"timestamp": time.time(), "title": "模型思考", "body": reasoning_full[:6000],
+                          "status": "completed", "kind": "reasoning"}]
+                        if reasoning_full else []
+                    ),
+                },
+            )
         if plan is None:
             if execute:
                 # LLM 失效时的安全原则：不自动退化为规则规划继续飞行。
@@ -2538,90 +2555,121 @@ class AgentRuntime:
         drone = runtime.get("drone") if isinstance(runtime.get("drone"), dict) else {}
         if not connected:
             return {"ok": False, "error": "flight controller link is offline or stale"}
-        if not isinstance(drone, dict) or not drone or drone.get("error"):
-            return {"ok": False, "error": str(drone.get("error") or "vehicle status unavailable")}
 
-        current = drone.get("position_ned") if isinstance(drone.get("position_ned"), dict) else {}
-        current_x = self._ned_value(current, "x", 0.0) or 0.0
-        current_y = self._ned_value(current, "y", 0.0) or 0.0
-        current_z = self._ned_value(current, "z", 0.0) or 0.0
-        altitude = abs(current_z)
-        armed = bool(drone.get("armed"))
-        flying = bool(drone.get("flying"))
         min_altitude = float(getattr(self.tools.safety.constraints, "min_altitude", 0.5) or 0.5)
         max_altitude = float(getattr(self.tools.safety.constraints, "max_altitude", 50.0) or 50.0)
+        controller = getattr(self.tools, "controller", None)
 
-        if not flying and not armed and altitude < min_altitude:
-            self._append_event("info", "tool", "无人机已在地面，无需返航", {"drone": drone})
-            return {"ok": True, "message": "vehicle already on ground", "drone": drone}
-        if not flying and altitude < min_altitude:
+        vehicles = [v for v in (runtime.get("vehicles") or []) if isinstance(v, dict) and not v.get("error")]
+        flying = [v for v in vehicles if v.get("flying")]
+
+        if not flying:
+            if not drone or drone.get("error"):
+                return {"ok": False, "error": str(drone.get("error") or "vehicle status unavailable")}
+            armed = bool(drone.get("armed"))
+            pos = drone.get("position_ned") if isinstance(drone.get("position_ned"), dict) else {}
+            altitude = abs(self._ned_value(pos, "z", 0.0) or 0.0)
+            if not armed and altitude < min_altitude:
+                self._append_event("info", "tool", "无人机已在地面，无需返航", {"drone": drone})
+                return {"ok": True, "message": "vehicle already on ground", "drone": drone}
             return {"ok": False, "error": "vehicle is not airborne; return_home command was not sent", "drone": drone}
 
+        # 每架在空中的机各自返航到自己的初始点位（首次记录的地面位置）。
+        # 多机并发：非阻塞派发，互不等待。
         memory = self.memory.snapshot()
         session = memory.get("session") if isinstance(memory, dict) else {}
-        start_position = session.get("last_task_start_position_ned") if isinstance(session, dict) else None
-        target_source = "last_task_start_position_ned"
-        target_x = self._ned_value(start_position, "x")
-        target_y = self._ned_value(start_position, "y")
-        if target_x is None or target_y is None:
-            home_x, home_y = self.tools.safety.constraints.home_position
-            target_x = float(home_x)
-            target_y = float(home_y)
-            target_source = "safety_home_position"
+        memory_start = session.get("last_task_start_position_ned") if isinstance(session, dict) else None
+        speed = max(1.0, min(3.0, float(getattr(self.tools.safety.constraints, "max_velocity", 3.0) or 3.0)))
 
-        if current_z < -min_altitude:
-            target_z = -min(max(altitude, min_altitude), max_altitude)
-        else:
-            target_z = -min(max(3.0, min_altitude), max_altitude)
-        target = {"x": round(float(target_x), 3), "y": round(float(target_y), 3), "z": round(float(target_z), 3)}
-        horizontal_error = math.hypot(current_x - target["x"], current_y - target["y"])
-        if horizontal_error < 0.6:
-            hover_result = self.tools.execute("drone_hover", {}, dry_run=False, blocked_by_supervisor=False)
-            self._append_event(
-                "info" if hover_result.ok else "warning",
-                "tool",
-                "无人机已在返航点附近，执行悬停",
-                {"target_position_ned": target, "target_source": target_source, "hover": hover_result.to_dict()},
+        results: list[dict[str, Any]] = []
+        for vehicle in flying:
+            name = str(vehicle.get("vehicle_name") or "")
+            label = name or "默认机"
+            pos = vehicle.get("position_ned") if isinstance(vehicle.get("position_ned"), dict) else {}
+            current_x = self._ned_value(pos, "x", 0.0) or 0.0
+            current_y = self._ned_value(pos, "y", 0.0) or 0.0
+            current_z = self._ned_value(pos, "z", 0.0) or 0.0
+            altitude = abs(current_z)
+            if current_z < -min_altitude:
+                target_z = -min(max(altitude, min_altitude), max_altitude)
+            else:
+                target_z = -min(max(3.0, min_altitude), max_altitude)
+
+            home = None
+            if controller is not None and hasattr(controller, "home_position"):
+                try:
+                    home = controller.home_position(name)
+                except Exception:
+                    home = None
+
+            if isinstance(home, dict) and home.get("x") is not None:
+                target = {
+                    "x": round(float(home.get("x", 0.0)), 3),
+                    "y": round(float(home.get("y", 0.0)), 3),
+                    "z": round(float(target_z), 3),
+                }
+                target_source = "vehicle_initial_position"
+            elif len(flying) == 1:
+                # 无该机记录时的单机回退：上次任务起点 / 安全 home
+                target_x = self._ned_value(memory_start, "x")
+                target_y = self._ned_value(memory_start, "y")
+                if target_x is None or target_y is None:
+                    home_x, home_y = self.tools.safety.constraints.home_position
+                    target_x, target_y = float(home_x), float(home_y)
+                    target_source = "safety_home_position"
+                else:
+                    target_source = "last_task_start_position_ned"
+                target = {"x": round(float(target_x), 3), "y": round(float(target_y), 3), "z": round(float(target_z), 3)}
+            else:
+                results.append({
+                    "vehicle": name, "ok": False,
+                    "message": "no recorded initial position for this vehicle",
+                })
+                continue
+
+            horizontal_error = math.hypot(current_x - target["x"], current_y - target["y"])
+            if horizontal_error < 0.6:
+                hover_result = self.tools.execute(
+                    "drone_hover", {"vehicle_name": name}, dry_run=False, blocked_by_supervisor=False,
+                )
+                results.append({
+                    "vehicle": name, "ok": bool(hover_result.ok),
+                    "message": "already near return point; holding position",
+                    "target_position_ned": target, "target_source": target_source,
+                })
+                continue
+
+            move_result = self.tools.execute(
+                "drone_dispatch_path",
+                {
+                    "waypoints_json": json.dumps([target]),
+                    "velocity": speed,
+                    "vehicle_name": name,
+                },
+                dry_run=False,
+                blocked_by_supervisor=False,
             )
-            return {
-                "ok": hover_result.ok,
-                "message": "already near return point; holding position",
+            results.append({
+                "vehicle": name,
+                "ok": bool(move_result.ok),
+                "message": move_result.data.get("message", "return home dispatched"),
                 "target_position_ned": target,
                 "target_source": target_source,
-                "hover": hover_result.to_dict(),
-            }
+            })
 
-        speed = min(3.0, float(getattr(self.tools.safety.constraints, "max_velocity", 3.0) or 3.0))
-        move_result = self.tools.execute(
-            "drone_fly_to",
-            {**target, "velocity": max(1.0, speed)},
-            dry_run=False,
-            blocked_by_supervisor=False,
-        )
-        self._remember_position_from_payload(move_result.data, source="return_home")
-        hover_result = None
-        if move_result.ok:
-            hover_result = self.tools.execute("drone_hover", {}, dry_run=False, blocked_by_supervisor=False)
-        ok = move_result.ok and (hover_result is None or hover_result.ok)
+        ok = all(r.get("ok") for r in results) and bool(results)
+        if len(results) == 1:
+            message = "return home command completed" if ok else str(results[0].get("message") or "return home failed")
+        else:
+            names = "、".join(str(r.get("vehicle") or "默认机") for r in results)
+            message = f"多机返航已派发（各回各的初始点）: {names}" if ok else f"部分返航派发失败: {names}"
         self._append_event(
             "info" if ok else "warning",
             "tool",
-            "手动返航",
-            {
-                "target_position_ned": target,
-                "target_source": target_source,
-                "move": move_result.to_dict(),
-                "hover": hover_result.to_dict() if hover_result else None,
-            },
+            "手动返航" if len(results) == 1 else "多机手动返航",
+            {"vehicles": results},
         )
-        return {
-            "ok": ok,
-            "message": "return home command completed" if ok else "return home command failed",
-            "target_position_ned": target,
-            "target_source": target_source,
-            "result": move_result.to_dict(),
-            "hover": hover_result.to_dict() if hover_result else None,
-        }
+        return {"ok": ok, "message": message, "vehicles": results}
 
     def control(self, action: str, expected_backend: str = "") -> dict[str, Any]:
         action = action.strip().lower()
@@ -3943,6 +3991,27 @@ class AgentRuntime:
             "info" if result.ok else "warning",
             "gcs.mission",
             "任务已启动" if result.ok else "任务启动失败",
+            result.to_dict(),
+        )
+        return {"ok": result.ok, "result": result.to_dict()}
+
+    def gcs_mission_start_multi(
+        self,
+        assignments: list[Any] | None = None,
+        expected_backend: str = "",
+    ) -> dict[str, Any]:
+        """多机各自航线并发执行：每机 takeoff(如需) + 各自路径，非阻塞派发。"""
+        mismatch = self._backend_mismatch(expected_backend)
+        if mismatch:
+            return mismatch
+        if not isinstance(assignments, list):
+            return {"ok": False, "error": "assignments must be a list"}
+        clean = [entry for entry in assignments if isinstance(entry, dict)]
+        result = self.gcs.mission.start_multi(clean)
+        self._append_event(
+            "info" if result.ok else "warning",
+            "gcs.mission",
+            "多机任务已派发" if result.ok else "多机任务派发失败",
             result.to_dict(),
         )
         return {"ok": result.ok, "result": result.to_dict()}
@@ -5514,18 +5583,14 @@ class AgentRuntime:
     def _plan_reasoning_sink(self, run_id: str, command: str) -> Callable[[str], None]:
         """Throttled reasoning-token sink for streamed planning.
 
-        Reasoning text is streamed directly into the conversation as it is
-        generated（主流 Agent 式：思考过程打字机式出现在正文里，可回看），
-        and mirrored to the event panel. When planning finishes the runtime
-        replaces the message content with the real plan/execution trace."""
+        Reasoning text streams directly into the conversation body（打字机式，
+        主流 Agent 风格：思考过程在正文里实时可见、可回看）。The full text is
+        collected on ``sink.full_text``; when planning finishes the runtime
+        archives it into the message's thought trace（"模型思考"块）and the
+        live body is replaced by the actual result — no duplicate display."""
         buffer: list[str] = []
         emitted: list[str] = []
         last_flush: list[float] = [0.0]
-
-        planning_details: dict[str, Any] = {
-            "mode": "execute",
-            "phase": "planning",
-        }
 
         def flush() -> None:
             if not buffer:
@@ -5536,24 +5601,14 @@ class AgentRuntime:
                 return
             emitted.append(text)
             full = "".join(emitted)
+            sink.full_text = full  # type: ignore[attr-defined]
             self._append_event("info", "model_reasoning", text[-1500:], {"run_id": run_id, "command": command[:60]})
-            # 打字机式追加进对话正文（可回看），同时保留过程 trace
+            # 打字机式追加进对话正文（完成后由正式结果替换，全文归档到思考块）
             self._append_assistant_delta(
                 run_id,
                 text,
                 full,
-                {
-                    **planning_details,
-                    "process_trace": [
-                        {
-                            "timestamp": time.time(),
-                            "title": "模型推理",
-                            "body": self._compact_process_text(full[-1500:]),
-                            "status": "running",
-                            "kind": "reasoning",
-                        }
-                    ],
-                },
+                {"mode": "execute", "phase": "planning"},
             )
 
         def sink(token: str) -> None:
@@ -5565,6 +5620,7 @@ class AgentRuntime:
 
         # attach the final flush so the wrapper can drain the tail
         sink.final_flush = flush  # type: ignore[attr-defined]
+        sink.full_text = ""
         return sink
 
     def _safety_snapshot(self) -> dict[str, Any]:

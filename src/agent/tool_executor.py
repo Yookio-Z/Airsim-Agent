@@ -202,12 +202,14 @@ class ToolRuntime:
         "drone_arm",
         "drone_disarm",
         "drone_takeoff",
+        "drone_dispatch_takeoff",
         "drone_land",
         "drone_hover",
         "drone_fly_to",
         "drone_fly_velocity",
         "drone_move_relative",
         "drone_fly_path",
+        "drone_dispatch_path",
         "drone_upload_mission",
         "drone_clear_mission",
         "drone_start_mission",
@@ -1556,6 +1558,13 @@ class ToolRuntime:
             if result.corrected and "z" in result.corrected:
                 corrected["altitude"] = abs(float(result.corrected["z"]))
 
+        elif name == "drone_dispatch_takeoff":
+            altitude = abs(float(params.get("altitude", 3.0)))
+            result = self.safety.validate_position(0.0, 0.0, -altitude)
+            merge(result)
+            if result.corrected and "z" in result.corrected:
+                corrected["altitude"] = abs(float(result.corrected["z"]))
+
         elif name == "drone_fly_to":
             x = float(params.get("x", 0.0))
             y = float(params.get("y", 0.0))
@@ -1620,6 +1629,29 @@ class ToolRuntime:
                 corrected["velocity"] = abs(float(vel.corrected["vx"]))
 
         elif name == "drone_fly_path":
+            try:
+                waypoints = json.loads(str(params.get("waypoints_json", "[]")))
+                changed = False
+                safe_waypoints = []
+                for wp in waypoints:
+                    x = float(wp.get("x", 0.0))
+                    y = float(wp.get("y", 0.0))
+                    z = float(wp.get("z", -3.0))
+                    result = self.safety.validate_position(x, y, z)
+                    merge(result)
+                    if result.corrected:
+                        x = float(result.corrected.get("x", x))
+                        y = float(result.corrected.get("y", y))
+                        z = float(result.corrected.get("z", z))
+                        changed = True
+                    safe_waypoints.append({"x": x, "y": y, "z": z})
+                if changed:
+                    corrected["waypoints_json"] = json.dumps(safe_waypoints, ensure_ascii=False)
+            except Exception as e:
+                level = "danger"
+                violations.append(f"waypoint JSON could not be parsed: {e}")
+
+        elif name == "drone_dispatch_path":
             try:
                 waypoints = json.loads(str(params.get("waypoints_json", "[]")))
                 changed = False
@@ -1855,6 +1887,15 @@ class ToolRuntime:
                     if self._status_is_stale(drone_status):
                         stale_connection = True
                         connected = False
+            vehicles_status = self._vehicles_status(connected)
+            # 已派发航线（fire-and-forget）的完成跟踪，供 UI 提示"飞行结束"
+            flight_tasks: dict[str, Any] = {}
+            update_tasks = getattr(self.controller, "update_flight_task_progress", None)
+            if callable(update_tasks):
+                try:
+                    flight_tasks = update_tasks(vehicles_status) or {}
+                except Exception:
+                    flight_tasks = {}
             snapshot = {
                 "ready": ready,
                 "init_error": self.init_error,
@@ -1866,7 +1907,8 @@ class ToolRuntime:
                 "tool_cards": self.list_tool_cards() if ready else [],
                 "backends": self.backend_registry.list_public(),
                 "drone": drone_status,
-                "vehicles": self._vehicles_status(connected),
+                "vehicles": vehicles_status,
+                "flight_tasks": flight_tasks,
                 "operation_contract": self._operation_contract(drone_status),
             }
             self._last_status_snapshot = snapshot
@@ -2177,6 +2219,14 @@ class ToolRuntime:
         # holding the lock. Without the cached list the frontend vehicle
         # panel empties whenever any long tool call runs, flickering between
         # "3 drones" and "none".
+        vehicles_cached = cached.get("vehicles") or []
+        flight_tasks_busy: dict[str, Any] = {}
+        update_tasks_busy = getattr(controller, "update_flight_task_progress", None)
+        if callable(update_tasks_busy):
+            try:
+                flight_tasks_busy = update_tasks_busy(vehicles_cached) or {}
+            except Exception:
+                flight_tasks_busy = {}
         snapshot = {
             "ready": ready,
             "init_error": self.init_error,
@@ -2188,7 +2238,8 @@ class ToolRuntime:
             "tool_cards": cached.get("tool_cards") or [],
             "backends": cached.get("backends") or self.backend_registry.list_public(),
             "drone": drone_status,
-            "vehicles": cached.get("vehicles") or [],
+            "vehicles": vehicles_cached,
+            "flight_tasks": flight_tasks_busy,
         }
         self._last_status_snapshot = snapshot
         return dict(snapshot)
@@ -2253,7 +2304,18 @@ class ToolRuntime:
         return name.startswith("drone_") or name.startswith("airsim_")
 
     def _is_connection_error(self, data: dict[str, Any]) -> bool:
-        text = json.dumps(data, ensure_ascii=False, default=str).lower()
+        # 只扫错误语义字段。payload 里恒有的结构化字段（backend="AirSim"、
+        # 载具名等）会让 "airsim" 这类标记误命中——例如后端不支持某工具时
+        # 返回的 "not supported" 也带 backend 字段，曾被误判成连接错误，
+        # 触发不必要的断开重连（UI 表现为 AirSim OFFLINE 一下又重连）。
+        fields: list[str] = []
+        for key in ("message", "error", "error_detail", "path_error"):
+            value = data.get(key)
+            if isinstance(value, str):
+                fields.append(value)
+            elif isinstance(value, dict):
+                fields.append(json.dumps(value, ensure_ascii=False, default=str))
+        text = " ".join(fields).lower()
         return any(marker in text for marker in self.CONNECTION_ERROR_MARKERS)
 
     @staticmethod
