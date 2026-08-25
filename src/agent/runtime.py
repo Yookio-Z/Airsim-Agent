@@ -1091,11 +1091,13 @@ class AgentRuntime:
 
         def on_reasoning(token: str) -> None:
             reasoning_buffer.append(token)
+            # 推理进独立 reasoning_text 字段（前端思考块渲染），不占正文
             self._update_assistant_message(
                 request_id,
                 "".join(buffer),
                 "running",
-                details("responding"),
+                {"mode": "chat", "phase": "responding",
+                 "reasoning_text": "".join(reasoning_buffer)[-8000:]},
                 persist=False,
             )
 
@@ -2543,7 +2545,88 @@ class AgentRuntime:
             self._append_event("warning", "tool", "任务异常后安全悬停失败", {"reason": reason, "error": str(exc)})
             return {"ok": False, "error": str(exc)}
 
-    def _manual_return_home(self) -> dict[str, Any]:
+    def _manual_land(self, targets: list[str] | None = None) -> dict[str, Any]:
+        """降落目标机（空 = 全部载具）：并发派发降落，逐机验证落地后上锁。
+
+        只有当目标列表里的每一台都确认落地才算完成，避免"降了一台就报完成"。
+        """
+        runtime = self.tools.status_snapshot()
+        connected = bool(runtime.get("connected")) and not bool(runtime.get("stale_connection"))
+        if not connected:
+            return {"ok": False, "error": "flight controller link is offline or stale"}
+        vehicles = [v for v in (runtime.get("vehicles") or []) if isinstance(v, dict) and not v.get("error")]
+        by_name = {str(v.get("vehicle_name") or ""): v for v in vehicles}
+        names = [str(t).strip() for t in (targets or []) if str(t).strip()] or list(by_name.keys()) or [""]
+
+        to_land: list[str] = []
+        to_disarm: list[str] = []
+        results: list[dict[str, Any]] = []
+        for name in names:
+            v = by_name.get(name)
+            if v is None and len(names) == 1:
+                v = runtime.get("drone") if isinstance(runtime.get("drone"), dict) else None
+            flying = bool((v or {}).get("flying"))
+            armed = bool((v or {}).get("armed"))
+            if flying:
+                to_land.append(name)
+            elif armed:
+                to_disarm.append(name)
+            else:
+                results.append({"vehicle": name or "默认机", "state": "already_grounded_disarmed", "ok": True})
+
+        controller = getattr(self.tools, "controller", None)
+        dispatch_land = getattr(controller, "dispatch_land", None) if controller is not None else None
+        for name in to_land:
+            if callable(dispatch_land):
+                if not dispatch_land(name):
+                    return {"ok": False, "error": f"{name or '默认机'} 降落派发失败", "vehicles": results}
+            else:
+                r = self.tools.execute(
+                    "drone_land", {"vehicle_name": name} if name else {},
+                    dry_run=False, blocked_by_supervisor=False,
+                )
+                if not r.ok:
+                    return {"ok": False, "error": f"{name or '默认机'} 降落指令失败", "vehicles": results}
+
+        # 轮询验证：目标列表里每台都必须确认落地
+        pending = set(to_land)
+        deadline = time.time() + 120.0
+        while pending and time.time() < deadline:
+            time.sleep(1.5)
+            snap = self.tools.status_snapshot()
+            for v in snap.get("vehicles") or []:
+                n = str(v.get("vehicle_name") or "")
+                if n in pending:
+                    pos = v.get("position_ned") if isinstance(v.get("position_ned"), dict) else {}
+                    alt = abs(float(pos.get("z", 0.0) or 0.0))
+                    if not v.get("flying") and alt < 0.8:
+                        pending.discard(n)
+
+        landed = [n for n in to_land if n not in pending]
+        for name in to_disarm:
+            r = self.tools.execute(
+                "drone_disarm", {"vehicle_name": name} if name else {},
+                dry_run=False, blocked_by_supervisor=False,
+            )
+            results.append({"vehicle": name or "默认机", "state": "grounded_disarmed", "ok": bool(r.ok)})
+        for name in landed:
+            r = self.tools.execute(
+                "drone_disarm", {"vehicle_name": name} if name else {},
+                dry_run=False, blocked_by_supervisor=False,
+            )
+            results.append({"vehicle": name or "默认机", "state": "landed_disarmed", "ok": bool(r.ok)})
+
+        ok = not pending and all(r.get("ok") for r in results)
+        if pending:
+            message = f"降落超时未确认: {', '.join(sorted(pending))}"
+        elif len(results) == 1:
+            message = "已降落并锁定"
+        else:
+            message = f"全部降落并锁定: {len(results)} 台"
+        self._append_event("warning", "tool", "手动降落", {"vehicles": results, "message": message})
+        return {"ok": ok, "message": message, "vehicles": results}
+
+    def _manual_return_home(self, targets: list[str] | None = None) -> dict[str, Any]:
         if self.tools.formation_active():
             return {
                 "ok": False,
@@ -2560,7 +2643,11 @@ class AgentRuntime:
         controller = getattr(self.tools, "controller", None)
 
         vehicles = [v for v in (runtime.get("vehicles") or []) if isinstance(v, dict) and not v.get("error")]
-        flying = [v for v in vehicles if v.get("flying")]
+        target_set = {str(t).strip() for t in (targets or []) if str(t).strip()}
+        flying = [
+            v for v in vehicles
+            if v.get("flying") and (not target_set or str(v.get("vehicle_name") or "") in target_set)
+        ]
 
         if not flying:
             if not drone or drone.get("error"):
@@ -2628,20 +2715,30 @@ class AgentRuntime:
 
             horizontal_error = math.hypot(current_x - target["x"], current_y - target["y"])
             if horizontal_error < 0.6:
-                hover_result = self.tools.execute(
-                    "drone_hover", {"vehicle_name": name}, dry_run=False, blocked_by_supervisor=False,
+                # 已在初始点上方 → 直接降落并锁定
+                land_result = self.tools.execute(
+                    "drone_land", {"vehicle_name": name} if name else {},
+                    dry_run=False, blocked_by_supervisor=False,
                 )
+                disarm_result = None
+                if land_result.ok:
+                    disarm_result = self.tools.execute(
+                        "drone_disarm", {"vehicle_name": name} if name else {},
+                        dry_run=False, blocked_by_supervisor=False,
+                    )
+                ok_near = land_result.ok and (disarm_result is None or disarm_result.ok)
                 results.append({
-                    "vehicle": name, "ok": bool(hover_result.ok),
-                    "message": "already near return point; holding position",
+                    "vehicle": name, "ok": bool(ok_near),
+                    "message": "already at return point; landed and disarmed",
                     "target_position_ned": target, "target_source": target_source,
                 })
                 continue
 
+            # 返航完整语义：飞回初始点 → 到位后自动降落 → 上锁（后台监视线程完成）
             move_result = self.tools.execute(
-                "drone_dispatch_path",
+                "drone_dispatch_return_land",
                 {
-                    "waypoints_json": json.dumps([target]),
+                    **target,
                     "velocity": speed,
                     "vehicle_name": name,
                 },
@@ -2651,17 +2748,17 @@ class AgentRuntime:
             results.append({
                 "vehicle": name,
                 "ok": bool(move_result.ok),
-                "message": move_result.data.get("message", "return home dispatched"),
+                "message": move_result.data.get("message", "return + land dispatched"),
                 "target_position_ned": target,
                 "target_source": target_source,
             })
 
         ok = all(r.get("ok") for r in results) and bool(results)
         if len(results) == 1:
-            message = "return home command completed" if ok else str(results[0].get("message") or "return home failed")
+            message = "返航已派发：到位后将自动降落锁定" if ok else str(results[0].get("message") or "return home failed")
         else:
             names = "、".join(str(r.get("vehicle") or "默认机") for r in results)
-            message = f"多机返航已派发（各回各的初始点）: {names}" if ok else f"部分返航派发失败: {names}"
+            message = f"返航已派发（到位后各自降落锁定）: {names}" if ok else f"部分返航派发失败: {names}"
         self._append_event(
             "info" if ok else "warning",
             "tool",
@@ -2670,11 +2767,13 @@ class AgentRuntime:
         )
         return {"ok": ok, "message": message, "vehicles": results}
 
-    def control(self, action: str, expected_backend: str = "") -> dict[str, Any]:
+    def control(self, action: str, expected_backend: str = "", vehicles: list[Any] | None = None) -> dict[str, Any]:
         action = action.strip().lower()
         mismatch = self._backend_mismatch(expected_backend)
         if mismatch:
             return mismatch
+        # 目标机列表（空 = 全部载具）；来自 UI 多选 chips
+        target_vehicles = [str(v).strip() for v in (vehicles or []) if str(v).strip()]
         if action in {"cancel", "stop", "interrupt"}:
             return self._cancel_active_work()
         if action == "pause":
@@ -2714,13 +2813,20 @@ class AgentRuntime:
             self._append_event("info", "safety", "急停状态已复位")
             return {"ok": True}
         if action == "hover":
-            result = self.tools.execute("drone_hover", {}, dry_run=False, blocked_by_supervisor=False)
-            self._append_event("info", "tool", "手动悬停", result.to_dict())
-            return {"ok": result.ok, "result": result.to_dict()}
+            results = []
+            for name in target_vehicles or [""]:
+                result = self.tools.execute(
+                    "drone_hover", {"vehicle_name": name} if name else {},
+                    dry_run=False, blocked_by_supervisor=False,
+                )
+                results.append(result.to_dict())
+            ok = all(r["ok"] for r in results)
+            self._append_event("info", "tool", "手动悬停", {"vehicles": results})
+            return {"ok": ok, "result": {"vehicles": results}}
         if action == "land":
-            result = self.tools.execute("drone_land", {}, dry_run=False, blocked_by_supervisor=False)
-            self._append_event("warning", "tool", "手动降落", result.to_dict())
-            return {"ok": result.ok, "result": result.to_dict()}
+            result = self._manual_land(target_vehicles)
+            self._append_event("warning", "tool", "手动降落", result)
+            return {"ok": result.get("ok", False), "result": result}
         if action in {"return_home", "rtl"}:
             cancel_result = self._cancel_active_work() if self._active_run_is_interruptible() else None
             runtime = self.tools.status_snapshot()
@@ -2740,7 +2846,7 @@ class AgentRuntime:
                     "result": rtl_result.to_dict(),
                 }
             else:
-                result = self._manual_return_home()
+                result = self._manual_return_home(target_vehicles)
                 result["control_channel"] = "local NED guided path"
             if cancel_result:
                 result["cancelled_active_task"] = cancel_result
@@ -4857,7 +4963,7 @@ class AgentRuntime:
                         return
                     message.content = content
                     message.status = status
-                    message.details = details or message.details
+                    message.details = {**(message.details or {}), **(details or {})}
                     message.updated_at = time.time()
                     updated = self._message_public_dict(message)
                     self._dedupe_assistant_run_messages_locked(run_id, message.id)
@@ -4871,7 +4977,7 @@ class AgentRuntime:
                         message.content = content
                         message.status = status
                         message.run_id = run_id
-                        message.details = details or message.details
+                        message.details = {**(message.details or {}), **(details or {})}
                         message.updated_at = time.time()
                         updated = self._message_public_dict(message)
                         self._dedupe_assistant_run_messages_locked(run_id, message.id)
@@ -5063,7 +5169,7 @@ class AgentRuntime:
                 target.content = content
                 target.status = "running"
                 target.run_id = run_id
-                target.details = details or target.details
+                target.details = {**(target.details or {}), **(details or {})}
                 target.updated_at = time.time()
                 payload = {
                     "id": target.id,
@@ -5582,11 +5688,9 @@ class AgentRuntime:
     def _plan_reasoning_sink(self, run_id: str, command: str) -> Callable[[str], None]:
         """Throttled reasoning-token sink for streamed planning.
 
-        Reasoning text streams directly into the conversation body（打字机式，
-        主流 Agent 风格：思考过程在正文里实时可见、可回看）。The full text is
-        collected on ``sink.full_text``; when planning finishes the runtime
-        archives it into the message's thought trace（"模型思考"块）and the
-        live body is replaced by the actual result — no duplicate display."""
+        Reasoning streams into the message's ``reasoning_text`` details field
+        （前端思考块：默认折叠、标题行滚动最新一句、展开看全文——dsh 插件
+        同款交互）。正文 content 不被推理占据，规划完成后直接呈现结果。"""
         buffer: list[str] = []
         emitted: list[str] = []
         last_flush: list[float] = [0.0]
@@ -5602,12 +5706,12 @@ class AgentRuntime:
             full = "".join(emitted)
             sink.full_text = full  # type: ignore[attr-defined]
             self._append_event("info", "model_reasoning", text[-1500:], {"run_id": run_id, "command": command[:60]})
-            # 打字机式追加进对话正文（完成后由正式结果替换，全文归档到思考块）
-            self._append_assistant_delta(
+            self._update_assistant_message(
                 run_id,
-                text,
-                full,
-                {"mode": "execute", "phase": "planning"},
+                "思考中…",
+                "running",
+                {"mode": "execute", "phase": "planning", "reasoning_text": full[-8000:]},
+                persist=False,
             )
 
         def sink(token: str) -> None:

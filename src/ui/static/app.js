@@ -2265,11 +2265,28 @@ document.addEventListener("click", async (event) => {
   }
 
   if (button.dataset.tool) {
+    const tool = button.dataset.tool;
     const params = parseParams(button.dataset.params);
+    const targets = controlTargetList();
     await runButton(
       button,
-      () => invokeFlightTool(button.dataset.tool, params),
-      `${button.dataset.tool} 已执行`,
+      async () => {
+        // 多选(或未选=全部)时:解锁/起飞逐台下发;起飞用非阻塞派发,多机同时升空
+        if (targets.length > 1 && (tool === "drone_takeoff" || tool === "drone_arm")) {
+          let last = null;
+          for (const name of targets) {
+            if (tool === "drone_takeoff") {
+              last = await invokeFlightTool("drone_dispatch_takeoff", { ...params, vehicle_name: name });
+            } else {
+              last = await invokeFlightTool(tool, { ...params, vehicle_name: name });
+            }
+          }
+          return last;
+        }
+        const targetParam = targets.length ? { vehicle_name: targets[0] } : {};
+        return invokeFlightTool(tool, { ...params, ...targetParam });
+      },
+      `${tool} 已执行`,
     );
     return;
   }
@@ -2650,6 +2667,36 @@ function highlightMissionVehicleMarkers() {
     const el = entry.marker?.getElement();
     if (el) el.classList.toggle("selected", Boolean(target) && name === target);
   }
+}
+
+// ---- 多选控制集：左侧小工具(起飞/降落/返航/悬停)作用于选中的机 ----
+// 未选中任何机 = 作用于全部；最新点选的机同时成为航线规划目标。
+let controlSelection = new Set();
+
+function controlTargetList() {
+  if (controlSelection.size) return [...controlSelection];
+  const vehicles = Array.isArray(latestState?.tool_runtime?.vehicles) ? latestState.tool_runtime.vehicles : [];
+  return vehicles.map((v) => String(v.vehicle_name || "")).filter(Boolean);
+}
+
+function controlTargetLabel() {
+  if (!controlSelection.size) return "全部无人机";
+  return [...controlSelection].join("、");
+}
+
+function toggleControlSelection(name) {
+  if (controlSelection.has(name)) {
+    controlSelection.delete(name);
+    // 取消的正好是规划目标 → 目标移交给剩余选中中的最后一台
+    if (missionTargetVehicle === name) {
+      const next = [...controlSelection].pop() || "";
+      if (next !== missionTargetVehicle) switchMissionTarget(next);
+    }
+  } else {
+    controlSelection.add(name);
+    if (missionTargetVehicle !== name) switchMissionTarget(name);
+  }
+  renderVehicleList();
 }
 
 // 切换目标机后把地图平移到该机位置
@@ -3401,16 +3448,24 @@ async function invokeFlightTool(tool, params = {}) {
 
 async function invokeFlightControl(action) {
   const normalized = String(action || "").toLowerCase();
+  const targets = controlTargetList();
+  const targetLabel = controlTargetLabel();
   if (["hover", "land", "return_home", "rtl"].includes(normalized)) {
     const runtime = requireLiveFlightLink();
     const capabilities = runtime.backend_profile?.capabilities || {};
-    if (normalized === "land" && capabilities.real_vehicle && capabilities.requires_operator_approval) {
-      return invokeFlightTool("drone_land", {});
-    }
-    if (["return_home", "rtl"].includes(normalized) && capabilities.real_vehicle) {
+    if (normalized === "land") {
       const approved = await confirmDialog({
-        title: "确认真实飞控返航",
-        message: `将通过 ${runtime.operation_contract?.return_channel || runtime.backend} 触发飞控原生 RTL。`,
+        title: "确认降落",
+        message: `将使 ${targetLabel} 就地降落，逐台确认落地后自动锁定。是否继续？`,
+        confirmLabel: "确认降落",
+        danger: true,
+      });
+      if (!approved) throw new Error("操作已取消");
+    }
+    if (["return_home", "rtl"].includes(normalized)) {
+      const approved = await confirmDialog({
+        title: "确认返航",
+        message: `将使 ${targetLabel} 返回各自初始点，到位后自动降落锁定。是否继续？`,
         confirmLabel: "确认返航",
         danger: true,
       });
@@ -3419,6 +3474,7 @@ async function invokeFlightControl(action) {
   }
   return post("/api/control", {
     action: normalized,
+    vehicles: targets,
     expected_backend: activeFlightRuntime().backend || "",
   });
 }
@@ -4114,7 +4170,7 @@ function updateFlightControlButtons(toolRuntime = {}) {
       : contract.command_channel;
     button.title = disabled
       ? (!linked ? linkReason : "飞控正在执行任务")
-      : `${button.dataset.baseTitle}${channel ? ` · ${channel}` : ""}`;
+      : `${button.dataset.baseTitle}${channel ? ` · ${channel}` : ""} · 目标: ${controlTargetLabel()}`;
   });
 }
 
@@ -4267,15 +4323,16 @@ function renderVehicleList(toolRuntime = {}) {
     const battery = vehicle.battery_voltage != null ? ` ${fmt(vehicle.battery_voltage)}V` : "";
     const routeColor = vehicleRouteColor(name);
     const planned = (currentMissionVehicleName() === name ? missionWaypoints.length : (missionPlans[name]?.length || 0));
+    const inControlSet = controlSelection.has(name);
     const chip = document.createElement("button");
     chip.type = "button";
-    chip.className = `hud-vehicle-chip${name === missionTarget ? " selected" : ""}`;
-    chip.title = `载具 ${name} · ${state} · 点击规划该机航线`
-      + (planned ? `（已画 ${planned} 个航点）` : "")
-      + ` · N ${fmt(pos.x)} / E ${fmt(pos.y)} / D ${fmt(pos.z)}`;
+    chip.className = `hud-vehicle-chip${inControlSet ? " selected" : ""}${name === missionTarget ? " target" : ""}`;
+    chip.title = `载具 ${name} · ${state}`
+      + (planned ? ` · 已画 ${planned} 个航点` : "")
+      + `\n点击 = 选中/取消控制目标(可多选);最新选中的为航线规划目标`;
     chip.dataset.vehicle = name;
     chip.innerHTML = `<span class="chip-dot" style="background:${routeColor};box-shadow:0 0 5px ${routeColor}"></span>${escapeHtml(name)}: ${state}${battery ? `<span class="chip-battery">${escapeHtml(battery.trim())}</span>` : ""}${planned ? `<span class="chip-plan-count">${planned}</span>` : ""}`;
-    chip.addEventListener("click", () => switchMissionTarget(name));
+    chip.addEventListener("click", () => toggleControlSelection(name));
     container.appendChild(chip);
   }
   updateMissionTargetBadge();
@@ -6032,19 +6089,214 @@ function showNotice(message, level = "info") {
 
 refresh().catch((error) => showNotice(error.message || "状态加载失败", "error"));
 
+// ---------------------------------------------------------------------------
+// 会话流渲染（增量持久节点版）
+//
+// 此前的全量 innerHTML 重建有两个致命问题：思考块的展开状态随重建丢失
+// （"过一会自动折叠"）、整个对话闪烁。现在每条消息一个持久 DOM 节点
+// （turnNodes 按 message.id 索引），增量更新内部区块：
+//   ┌ turn ─────────────────────────────┐
+//   │ ▸ 思考块（默认折叠，标题滚动最新一句，展开看全文）│
+//   │ ✓ 工具/校验步骤（单行，追加式）              │
+//   │ [最终回答 markdown（平滑分批释放）]           │
+//   └───────────────────────────────────┘
+// ---------------------------------------------------------------------------
+
+const turnNodes = new Map();
+
+function buildUserTurn(message) {
+  const root = document.createElement("article");
+  root.className = "chat-bubble user";
+  root.dataset.messageId = message.id || "";
+  const content = document.createElement("div");
+  content.className = "bubble-content";
+  const textEl = document.createElement("div");
+  textEl.className = "bubble-text";
+  content.appendChild(textEl);
+  root.appendChild(content);
+  return { root, textEl, kind: "user", lastContent: "" };
+}
+
+function updateUserTurn(entry, message) {
+  const content = String(message.content || "");
+  if (content === entry.lastContent) return;
+  entry.lastContent = content;
+  entry.textEl.innerHTML = `${renderMessageAttachments(message.attachments || [])}<p>${escapeHtml(content)}</p>`;
+}
+
+function buildAgentTurn(message) {
+  const root = document.createElement("article");
+  root.className = "chat-bubble agent turn";
+  root.dataset.messageId = message.id || "";
+
+  const errorPill = document.createElement("div");
+  errorPill.className = "error-pill";
+  errorPill.textContent = "任务执行失败，详见对话内容";
+  errorPill.style.display = "none";
+
+  // 思考块：默认折叠，标题行 = 状态 + 最新一句（两端渐隐由 CSS mask）
+  const thinkFold = document.createElement("details");
+  thinkFold.className = "think-fold";
+  thinkFold.style.display = "none";
+  const thinkSummary = document.createElement("summary");
+  const thinkState = document.createElement("span");
+  thinkState.className = "think-state";
+  thinkState.textContent = "思考中…";
+  const thinkLatest = document.createElement("span");
+  thinkLatest.className = "think-latest";
+  thinkSummary.appendChild(thinkState);
+  thinkSummary.appendChild(thinkLatest);
+  const thinkFull = document.createElement("pre");
+  thinkFull.className = "think-full";
+  thinkFold.appendChild(thinkSummary);
+  thinkFold.appendChild(thinkFull);
+
+  const toolLines = document.createElement("div");
+  toolLines.className = "tool-lines";
+
+  const answerBody = document.createElement("div");
+  answerBody.className = "answer-body";
+
+  root.appendChild(errorPill);
+  root.appendChild(thinkFold);
+  root.appendChild(toolLines);
+  root.appendChild(answerBody);
+  return {
+    root,
+    kind: "agent",
+    errorPill,
+    thinkFold,
+    thinkState,
+    thinkLatest,
+    thinkFull,
+    toolLines,
+    answerBody,
+    renderedTrace: 0,
+    lastAnswer: "",
+    lastReasoning: "",
+    lastStatus: "",
+  };
+}
+
+function latestThinkLine(text) {
+  const t = String(text || "").trimEnd();
+  const n = t.lastIndexOf("\n");
+  const line = n === -1 ? t : t.slice(n + 1);
+  return line.length > 90 ? line.slice(-90) : line;
+}
+
+function firstThinkLine(text) {
+  const t = String(text || "").trim();
+  const n = t.indexOf("\n");
+  return (n === -1 ? t : t.slice(0, n)).slice(0, 90);
+}
+
+function toolLineNode(item) {
+  const row = document.createElement("div");
+  row.className = `tool-line ${item.status || "completed"} kind-${item.kind || "tool"}`;
+  const badge = document.createElement("em");
+  badge.className = "tool-badge";
+  badge.textContent = processKindLabel(item.kind || "tool");
+  const title = document.createElement("strong");
+  title.textContent = item.tool ? humanToolLabel(item.tool, item.title) : humanThoughtTitle(item.title || "");
+  const body = document.createElement("span");
+  body.className = "tool-line-body";
+  body.textContent = humanThoughtBody(item.body || "", item.tool || "");
+  row.appendChild(badge);
+  row.appendChild(title);
+  if (body.textContent) row.appendChild(body);
+  return row;
+}
+
+function updateAgentTurn(entry, message, run, llm) {
+  const details = message.details || {};
+  const reasoning = String(details.reasoning_text || "");
+  const running = ["running", "responding", "queued"].includes(message.status);
+  const isError = message.status === "error";
+
+  // 错误徽标
+  entry.errorPill.style.display = isError ? "" : "none";
+
+  // 思考块：有推理内容才出现；运行中标题滚动最新一句，完成后定格首句
+  if (reasoning) {
+    entry.thinkFold.style.display = "";
+    if (reasoning !== entry.lastReasoning) {
+      entry.lastReasoning = reasoning;
+      entry.thinkFull.textContent = reasoning;
+      entry.thinkLatest.textContent = running ? latestThinkLine(reasoning) : firstThinkLine(reasoning);
+      entry.thinkState.textContent = running ? "思考中…" : "已思考 · 点击查看全文";
+      // 摘要行滚动到最新（running 时跟随句尾）
+      entry.thinkLatest.scrollLeft = running ? entry.thinkLatest.scrollWidth : 0;
+    }
+  } else {
+    entry.thinkFold.style.display = "none";
+  }
+
+  // 工具/校验步骤：增量追加（跳过推理类条目——已在思考块里）
+  const linkedRun = run && message.run_id && run.run_id === message.run_id ? run : null;
+  const processTrace = Array.isArray(linkedRun?.process_trace) && linkedRun.process_trace.length
+    ? linkedRun.process_trace
+    : (Array.isArray(details.process_trace) ? details.process_trace : []);
+  const visible = processTrace.filter((item) => {
+    if ((item.kind || "") === "reasoning") return false;
+    if (item.tool === "memory_store") return false;
+    const title = humanThoughtTitle(item.title || "");
+    return Boolean(title) && !/模型思考|模型推理/.test(item.title || "");
+  });
+  while (entry.renderedTrace < visible.length) {
+    entry.toolLines.appendChild(toolLineNode(visible[entry.renderedTrace]));
+    entry.renderedTrace += 1;
+  }
+
+  // 正文：平滑分批释放（smoothShownContent），完成后为全量
+  const text = smoothShownContent(message).trim();
+  if (text !== entry.lastAnswer) {
+    entry.lastAnswer = text;
+    entry.answerBody.innerHTML = text ? renderMarkdown(text) : "";
+    entry.answerBody.style.display = text ? "" : "none";
+  }
+
+  entry.root.classList.toggle("error", isError);
+  entry.lastStatus = message.status;
+}
+
 function renderChat(messages, run, llm) {
   const serverMessages = Array.isArray(messages) ? messages : [];
   reconcilePendingMessages(serverMessages);
   const list = [...serverMessages, ...localPendingMessages];
-  const hasMessages = list.length > 0;
+
+  if (!list.length) {
+    els.chatThread.innerHTML = `<div class="chat-empty">开始一段新的对话</div>`;
+    turnNodes.clear();
+    return;
+  }
+  if (els.chatThread.firstElementChild?.classList?.contains("chat-empty")) {
+    els.chatThread.innerHTML = "";
+  }
+
+  const liveIds = new Set();
+  for (const message of list) {
+    const id = message.id || `idx_${message.role}_${list.indexOf(message)}`;
+    liveIds.add(id);
+    let entry = turnNodes.get(id);
+    if (!entry) {
+      entry = message.role === "user" ? buildUserTurn(message) : buildAgentTurn(message);
+      entry.root.dataset.messageId = message.id || id;
+      turnNodes.set(id, entry);
+      els.chatThread.appendChild(entry.root);
+    }
+    if (entry.kind === "agent") updateAgentTurn(entry, message, run, llm);
+    else updateUserTurn(entry, message);
+  }
+  for (const [id, entry] of [...turnNodes]) {
+    if (!liveIds.has(id)) {
+      entry.root.remove();
+      turnNodes.delete(id);
+    }
+  }
 
   const scrollTargetId = pendingScrollTargetId;
   const shouldScroll = !scrollTargetId && (forceNextChatScroll || shouldStickToChatBottom());
-  if (!hasMessages) {
-    els.chatThread.innerHTML = `<div class="chat-empty">开始一段新的对话</div>`;
-  } else {
-    els.chatThread.innerHTML = list.map((message) => renderChatMessage(message, run, llm)).join("");
-  }
   if (scrollTargetId) scrollMessageIntoView(scrollTargetId);
   else if (shouldScroll) scrollChatToEnd();
   forceNextChatScroll = false;

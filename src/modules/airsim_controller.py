@@ -80,9 +80,10 @@ class AirSimController(FlightController):
     """AirSim RPC 飞行控制后端（线程隔离版）。"""
 
     # 跨重连保留的按车状态（类级存储）：控制器实例在 reconnect 时会重建，
-    # 空中飞机的返航点/派发跟踪不能跟着丢。
+    # 空中飞机的返航点/派发跟踪不能跟着丢。返航点另存磁盘，进程重启也不丢。
     _shared_home_positions: dict[str, dict[str, float]] = {}
     _shared_dispatched_paths: dict[str, dict[str, Any]] = {}
+    _home_store_loaded = False
 
     def __init__(self, ip: str = "127.0.0.1", port: int = 41452) -> None:
         self._ip = ip
@@ -583,15 +584,48 @@ class AirSimController(FlightController):
         down = -(float(alt) - alt0)
         return {"x": round(north, 3), "y": round(east, 3), "z": round(down, 3)}
 
+    def _home_store_path(self) -> Path:
+        return Path(__file__).resolve().parents[1] / "data" / "vehicle_homes.json"
+
+    def _load_home_store(self) -> None:
+        """进程启动后首次读取磁盘上的返航点（跨重启保留）。"""
+        if AirSimController._home_store_loaded:
+            return
+        AirSimController._home_store_loaded = True
+        try:
+            path = self._home_store_path()
+            if path.exists():
+                data = json.loads(path.read_text(encoding="utf-8"))
+                if isinstance(data, dict):
+                    for name, ned in data.items():
+                        if isinstance(ned, dict) and name and name not in AirSimController._shared_home_positions:
+                            AirSimController._shared_home_positions[str(name)] = {
+                                "x": float(ned.get("x", 0.0)),
+                                "y": float(ned.get("y", 0.0)),
+                                "z": float(ned.get("z", 0.0)),
+                            }
+        except Exception as e:
+            logger.warning(f"home store load failed: {e}")
+
+    def _save_home_store(self) -> None:
+        try:
+            path = self._home_store_path()
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(json.dumps(AirSimController._shared_home_positions, ensure_ascii=False, indent=2), encoding="utf-8")
+        except Exception as e:
+            logger.warning(f"home store save failed: {e}")
+
     def _record_home_position(self, name: str, status: dict) -> None:
-        """未解锁且已落地时记录该机的初始位置（仅首次），作为其专属返航点。
+        """未飞行时记录该机的初始位置（仅首次），作为其专属返航点。
 
         注意：部分 AirSim 版本地面状态下 kinematics_estimated 对多机返回同一读数，
         因此这里必须用按车正确的 GPS 换算，而不是 position_ned。
+        已解锁但仍在地面的机同样记录——解锁瞬间正是"初始点位"。
         """
+        self._load_home_store()
         if name in AirSimController._shared_home_positions:
             return
-        if status.get("armed") or status.get("flying"):
+        if status.get("flying"):
             return
         gps = status.get("gps")
         if not isinstance(gps, dict):
@@ -603,9 +637,11 @@ class AirSimController(FlightController):
         if ned is None:
             return
         AirSimController._shared_home_positions[name] = ned
+        self._save_home_store()
 
     def home_position(self, vehicle_name: str = "") -> dict[str, float] | None:
         """返回某机的初始点位（NED），即该机的返航点。"""
+        self._load_home_store()
         names = self._resolve_vehicles(vehicle_name)
         if not names:
             return None
@@ -982,6 +1018,84 @@ class AirSimController(FlightController):
     def is_flying(self, vehicle_name: str = "") -> bool:
         status = self.get_status(vehicle_name)
         return bool(status.flying)
+
+    def dispatch_land(self, vehicle_name: str = "") -> bool:
+        """派发降落（fire-and-forget）。多机同时降落用，完成验证由调用方轮询。"""
+        self.last_error = ""
+        if not self._ensure_connected():
+            self.last_error = "AirSim not connected"
+            return False
+        try:
+            names = self._resolve_vehicles(vehicle_name)
+            for name in names:
+                self._rpc(
+                    lambda n=name: self._client.landAsync(timeout_sec=60, vehicle_name=n),
+                    timeout=10.0,
+                )
+            return True
+        except Exception as e:
+            self.last_error = str(e)
+            logger.error(f"dispatch_land failed: {e}")
+            return False
+
+    def dispatch_return_and_land(
+        self, x: float, y: float, z: float, velocity: float = 3.0, vehicle_name: str = ""
+    ) -> bool:
+        """派发返航：先飞回 (x,y,z)，到位后自动降落并锁定（后台监视线程完成）。
+
+        返航语义 = 到达初始点 + 降落 + 上锁，全程异步，不阻塞调用方。
+        """
+        ok = self.dispatch_move_on_path([{"x": x, "y": y, "z": z}], velocity, vehicle_name)
+        if not ok:
+            return False
+        names = self._resolve_vehicles(vehicle_name)
+        for name in names:
+            monitor = threading.Thread(
+                target=self._return_land_monitor,
+                args=(name, float(x), float(y), float(z)),
+                daemon=True,
+                name=f"return_land_{name}",
+            )
+            monitor.start()
+        return True
+
+    def _return_land_monitor(self, name: str, x: float, y: float, z: float) -> None:
+        """等待返航到位 → 降落 → 上锁。独立守护线程，单机超时 180s。"""
+        deadline = time.time() + 180.0
+        arrived = False
+        while time.time() < deadline:
+            if self._stop_requested():
+                return
+            try:
+                status = self.get_status(name).to_dict()
+                pos = status.get("position_ned") or {}
+                vel = status.get("velocity_ned") or {}
+                dist = math.sqrt(
+                    (float(pos.get("x", 0.0) or 0.0) - x) ** 2
+                    + (float(pos.get("y", 0.0) or 0.0) - y) ** 2
+                    + (float(pos.get("z", 0.0) or 0.0) - z) ** 2
+                )
+                speed = math.sqrt(
+                    float(vel.get("vx", 0.0) or 0.0) ** 2
+                    + float(vel.get("vy", 0.0) or 0.0) ** 2
+                    + float(vel.get("vz", 0.0) or 0.0) ** 2
+                )
+                if dist < 1.2 and speed < 0.5:
+                    arrived = True
+                    break
+            except Exception:
+                pass
+            time.sleep(0.5)
+        if not arrived:
+            logger.warning(f"return_land_monitor: {name} 未在超时前到位，跳过自动降落")
+            return
+        try:
+            time.sleep(0.5)
+            if self.land(vehicle_name=name):
+                self.disarm(vehicle_name=name)
+                logger.info(f"return_land_monitor: {name} 已返航降落并锁定")
+        except Exception as e:
+            logger.error(f"return_land_monitor: {name} 降落/锁定失败: {e}")
 
     def update_flight_task_progress(self, vehicles: list[dict]) -> dict[str, dict[str, Any]]:
         """用最新逐车遥测更新已派发航线的执行状态（纯计算，无 RPC）。

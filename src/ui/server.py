@@ -294,7 +294,12 @@ class AgentRequestHandler(BaseHTTPRequestHandler):
 
         if path == "/api/control":
             action = str(payload.get("action", ""))
-            self._send_json(RUNTIME.control(action, expected_backend=str(payload.get("expected_backend", ""))))
+            vehicles = payload.get("vehicles")
+            self._send_json(RUNTIME.control(
+                action,
+                expected_backend=str(payload.get("expected_backend", "")),
+                vehicles=vehicles if isinstance(vehicles, list) else None,
+            ))
             return
         if path == "/api/camera/frame":
             params = payload.get("params", {})

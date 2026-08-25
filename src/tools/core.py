@@ -440,6 +440,62 @@ def register_core_tools(
         return fmt_result(payload)
 
     @mcp.tool()
+    def drone_dispatch_land(vehicle_name: str = "") -> str:
+        """Dispatch a non-blocking land (fire-and-forget; returns immediately).
+
+        多机同时降落用；完成验证由调用方轮询遥测。需要等待降落完成时用 drone_land。
+        """
+        dispatch = getattr(controller, "dispatch_land", None)
+        if not callable(dispatch):
+            return fmt_result(
+                {
+                    "status": "error",
+                    "backend": controller.backend_name,
+                    "message": "dispatch land is not supported by this backend",
+                }
+            )
+        ok, targets = _run_for_vehicles(vehicle_name, dispatch)
+        return fmt_result(
+            {
+                "status": "ok" if ok else "error",
+                "backend": controller.backend_name,
+                "message": "land dispatched (non-blocking)" if ok else "land dispatch failed",
+                "vehicles": targets,
+            }
+        )
+
+    @mcp.tool()
+    def drone_dispatch_return_land(
+        x: float, y: float, z: float, velocity: float = 3.0, vehicle_name: str = ""
+    ) -> str:
+        """Dispatch return-to-home: fly to (x,y,z), then auto land + disarm on arrival.
+
+        返航完整语义 = 到达指定点后自动降落并上锁（后台监视线程完成，立即返回）。
+        """
+        dispatch = getattr(controller, "dispatch_return_and_land", None)
+        if not callable(dispatch):
+            return fmt_result(
+                {
+                    "status": "error",
+                    "backend": controller.backend_name,
+                    "message": "dispatch return+land is not supported by this backend",
+                }
+            )
+        ok = dispatch(float(x), float(y), float(z), float(velocity), vehicle_name)
+        return fmt_result(
+            {
+                "status": "ok" if ok else "error",
+                "backend": controller.backend_name,
+                "message": (
+                    "return+land dispatched (non-blocking; lands and disarms on arrival)"
+                    if ok
+                    else "return+land dispatch failed"
+                ),
+                "target": {"x": float(x), "y": float(y), "z": float(z)},
+            }
+        )
+
+    @mcp.tool()
     def drone_upload_mission(waypoints_json: str) -> str:
         """Upload a backend mission.
 

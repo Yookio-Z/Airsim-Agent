@@ -210,6 +210,8 @@ class ToolRuntime:
         "drone_move_relative",
         "drone_fly_path",
         "drone_dispatch_path",
+        "drone_dispatch_land",
+        "drone_dispatch_return_land",
         "drone_upload_mission",
         "drone_clear_mission",
         "drone_start_mission",
@@ -1673,6 +1675,17 @@ class ToolRuntime:
             except Exception as e:
                 level = "danger"
                 violations.append(f"waypoint JSON could not be parsed: {e}")
+
+        elif name == "drone_dispatch_return_land":
+            x = float(params.get("x", 0.0))
+            y = float(params.get("y", 0.0))
+            z = float(params.get("z", -3.0))
+            result = self.safety.validate_position(x, y, z)
+            merge(result)
+            if result.corrected:
+                for key in ("x", "y", "z"):
+                    if key in result.corrected:
+                        corrected[key] = result.corrected[key]
 
         elif name == "drone_upload_mission":
             try:

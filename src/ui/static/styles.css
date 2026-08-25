@@ -5945,7 +5945,15 @@ body.dragging-system-settings #systemSettingsModal .modal-head {
   color: var(--ink);
 }
 
+/* 已选入控制集(小工具作用目标):青色描边 */
 .hud-vehicle-chip.selected {
+  border-color: rgba(85, 223, 244, 0.6);
+  background: rgba(85, 223, 244, 0.1);
+  color: var(--ink);
+}
+
+/* 当前航线规划目标:金色 */
+.hud-vehicle-chip.target {
   border-color: rgba(240, 184, 74, 0.6);
   background: rgba(240, 184, 74, 0.1);
   color: #f0d59a;
@@ -6317,4 +6325,105 @@ body.dragging-system-settings #systemSettingsModal .modal-head {
   border-radius: 6px;
   padding: 8px 10px;
   margin: 6px 0 2px;
+}
+
+/* ---------------------------------------------------------------------------
+   会话流（增量持久节点版）：思考折叠块 + 工具单行 + 正文
+   --------------------------------------------------------------------------- */
+.chat-bubble.turn {
+  background: rgba(255, 255, 255, 0.025);
+  border: 1px solid rgba(255, 255, 255, 0.07);
+  border-radius: 10px;
+  padding: 10px 14px;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.turn .think-fold {
+  border-bottom: 1px solid rgba(255, 255, 255, 0.06);
+  padding-bottom: 6px;
+  margin-bottom: 2px;
+}
+.turn .think-fold summary {
+  cursor: pointer;
+  list-style: none;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-width: 0;
+  user-select: none;
+  font-size: 13px;
+  color: rgba(255, 255, 255, 0.6);
+}
+.turn .think-fold summary::-webkit-details-marker {
+  display: none;
+}
+.turn .think-fold[open] .think-state {
+  color: rgba(255, 255, 255, 0.85);
+}
+.turn .think-state {
+  flex: 0 0 auto;
+}
+.turn .think-latest {
+  flex: 1 1 auto;
+  min-width: 0;
+  overflow: hidden;
+  white-space: nowrap;
+  text-overflow: clip;
+  direction: rtl;
+  text-align: left;
+  color: rgba(255, 255, 255, 0.42);
+  font-size: 12.5px;
+}
+.turn .think-full {
+  white-space: pre-wrap;
+  word-break: break-word;
+  max-height: 380px;
+  overflow: auto;
+  font-size: 12.5px;
+  line-height: 1.55;
+  color: rgba(255, 255, 255, 0.68);
+  background: rgba(255, 255, 255, 0.03);
+  border-radius: 6px;
+  padding: 8px 10px;
+  margin: 8px 0 2px;
+}
+
+.turn .tool-lines {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+.turn .tool-line {
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+  font-size: 13px;
+  padding: 3px 0;
+  border-bottom: 1px dashed rgba(255, 255, 255, 0.05);
+}
+.turn .tool-line:last-child {
+  border-bottom: none;
+}
+.turn .tool-line .tool-badge {
+  flex: 0 0 auto;
+  font-style: normal;
+  font-size: 11px;
+  color: rgba(120, 200, 255, 0.9);
+}
+.turn .tool-line.kind-verify .tool-badge {
+  color: rgba(240, 184, 74, 0.9);
+}
+.turn .tool-line .tool-line-body {
+  color: rgba(255, 255, 255, 0.5);
+  font-size: 12.5px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.turn .answer-body {
+  font-size: 14px;
+  line-height: 1.6;
 }
