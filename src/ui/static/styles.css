@@ -5258,10 +5258,16 @@ body.dragging-system-settings #systemSettingsModal .modal-head {
   }
 
   .app-shell {
-    height: auto;
-    min-height: 100vh;
+    /* 窄面板：单列满视口，对话列占满（输入框/设置贴底可见）。
+       地图列在此宽度下隐藏——对话可用性优先。 */
+    height: 100vh;
+    overflow: hidden;
     grid-template-columns: 1fr;
-    grid-template-rows: minmax(300px, 1fr) auto auto;
+    grid-template-rows: minmax(0, 1fr);
+  }
+
+  .map-column {
+    display: none;
   }
 
   .v-resizer {

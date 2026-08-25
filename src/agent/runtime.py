@@ -2683,9 +2683,12 @@ class AgentRuntime:
 
         vehicles = [v for v in (runtime.get("vehicles") or []) if isinstance(v, dict) and not v.get("error")]
         target_set = {str(t).strip() for t in (targets or []) if str(t).strip()}
+        # 返航目标：在空中的 + 待飞(解锁但在地面,如任务中碰撞落地)的都纳入;
+        # 已锁定在地面(disarmed)的无需返航
         flying = [
             v for v in vehicles
-            if v.get("flying") and (not target_set or str(v.get("vehicle_name") or "") in target_set)
+            if (v.get("flying") or v.get("armed"))
+            and (not target_set or str(v.get("vehicle_name") or "") in target_set)
         ]
 
         if not flying:
@@ -2711,6 +2714,7 @@ class AgentRuntime:
             name = str(vehicle.get("vehicle_name") or "")
             label = name or "默认机"
             pos = vehicle.get("position_ned") if isinstance(vehicle.get("position_ned"), dict) else {}
+            status_flying = bool(vehicle.get("flying"))
             current_x = self._ned_value(pos, "x", 0.0) or 0.0
             current_y = self._ned_value(pos, "y", 0.0) or 0.0
             current_z = self._ned_value(pos, "z", 0.0) or 0.0
@@ -2753,8 +2757,8 @@ class AgentRuntime:
                 continue
 
             horizontal_error = math.hypot(current_x - target["x"], current_y - target["y"])
-            if horizontal_error < 0.6:
-                # 已在初始点上方 → 直接降落并锁定
+            if horizontal_error < 0.6 and status_flying:
+                # 空中且已在初始点上方 → 直接降落并锁定
                 land_result = self.tools.execute(
                     "drone_land", {"vehicle_name": name} if name else {},
                     dry_run=False, blocked_by_supervisor=False,
