@@ -6134,7 +6134,8 @@ function renderChatMessage(message, run, llm) {
   const isError = message.status === "error";
   const thoughts = renderAgentThoughts(message, run, active);
   const details = renderAgentDetails(message, run, llm);
-  const text = String(message.content || "").trim();
+  // 平滑流式：流式中的消息只渲染已释放部分（分批淡入），完成后为全量
+  const text = smoothShownContent(message).trim();
   const phase = linkedRun?.phase || message.details?.phase || "";
   const mode = linkedRun?.mode || message.details?.mode || "";
   const showThinkingPill = active && mode === "chat" && !thoughts;
@@ -6667,6 +6668,132 @@ function shouldStickToChatBottom() {
   return distance < 96;
 }
 
+// ---------------------------------------------------------------------------
+// Smooth streaming（借鉴 dsh-plugin-smooth-stream 的分批呈现算法）
+//
+// LLM 的 delta 到达速度远快于人阅读速度。这里不再逐 delta 全量重绘，而是：
+//   1. delta 只更新目标内容（targets），渲染循环每 160ms 释放一批；
+//   2. 释放点选在段落/行边界，且绝不切在未闭合代码块或表格中间
+//      （extendToSafeMarkdown），Markdown 永远不会渲染到一半；
+//   3. 新释放的正文带淡入动画；流式期间匀速跟随滚动，用户上滚即交还控制。
+// ---------------------------------------------------------------------------
+
+const smoothStream = {
+  targets: new Map(),
+  shown: new Map(),
+  timer: null,
+};
+
+function isFenceLine(line) {
+  return /^\s*(```|~~~)/.test(line);
+}
+
+function isTableLine(line) {
+  return /^\s*\|.*\|\s*$/.test(line);
+}
+
+function extendToSafeMarkdown(text, pos) {
+  if (pos >= text.length) return pos;
+  let fenceFrom = -1;
+  let inFence = false;
+  let inTable = false;
+  let tableFrom = -1;
+  const lines = text.split("\n");
+  let offset = 0;
+  for (const line of lines) {
+    const start = offset;
+    offset += line.length + 1;
+    if (isFenceLine(line)) {
+      inFence = !inFence;
+      if (inFence) fenceFrom = start;
+      else fenceFrom = -1;
+      inTable = false;
+      tableFrom = -1;
+      if (start >= pos) break;
+      continue;
+    }
+    if (!inFence && isTableLine(line)) {
+      if (!inTable) {
+        inTable = true;
+        tableFrom = start;
+      }
+    } else if (inTable && line.trim() === "") {
+      inTable = false;
+      tableFrom = -1;
+    } else if (inTable && !isTableLine(line)) {
+      inTable = false;
+      tableFrom = -1;
+    }
+    if (start >= pos) break;
+  }
+  if (inFence) return fenceFrom > 0 ? fenceFrom : pos;
+  if (inTable) return tableFrom > 0 ? tableFrom : pos;
+  return pos;
+}
+
+function smoothParagraphTarget(text, shown, minChars = 24) {
+  const need = shown + minChars;
+  if (text.length < need) return shown;
+  let pos = -1;
+  const para = text.indexOf("\n\n", need);
+  if (para !== -1) pos = para + 2;
+  else {
+    const nl = text.indexOf("\n", need);
+    if (nl !== -1) pos = nl + 1;
+  }
+  if (pos === -1) return shown;
+  pos = extendToSafeMarkdown(text, pos);
+  return pos > shown ? pos : shown;
+}
+
+function smoothQueueDelta(message) {
+  const id = message.id || message.run_id;
+  if (!id) return;
+  smoothStream.targets.set(id, String(message.content || ""));
+  if (!smoothStream.shown.has(id)) smoothStream.shown.set(id, 0);
+  smoothStartLoop();
+}
+
+function smoothFlushMessage(id) {
+  smoothStream.targets.delete(id);
+  smoothStream.shown.delete(id);
+}
+
+// 渲染层取该消息当前应显示的内容（流式中的消息显示已释放部分）
+function smoothShownContent(message) {
+  const id = message.id || message.run_id;
+  if (id && smoothStream.targets.has(id)) {
+    const target = smoothStream.targets.get(id) || "";
+    const shown = smoothStream.shown.get(id) || 0;
+    return target.slice(0, shown);
+  }
+  return String(message.content || "");
+}
+
+function smoothStartLoop() {
+  if (smoothStream.timer) return;
+  smoothStream.timer = window.setInterval(() => {
+    let active = false;
+    for (const [id, target] of smoothStream.targets) {
+      const shown = smoothStream.shown.get(id) || 0;
+      if (shown >= target.length) continue;
+      active = true;
+      const pos = smoothParagraphTarget(target, shown);
+      if (pos > shown) {
+        smoothStream.shown.set(id, pos);
+        scheduleChatRender();
+        if (shouldStickToChatBottom() && els.chatThread) {
+          els.chatThread.scrollTop = els.chatThread.scrollHeight;
+        }
+      }
+    }
+    if (!active) {
+      window.clearInterval(smoothStream.timer);
+      smoothStream.timer = null;
+    }
+  }, 160);
+}
+
 function connectEventStream() {
   if (!window.EventSource || streamSource) return;
   streamSource = new EventSource("/api/stream");
@@ -6796,13 +6923,20 @@ function handleStreamEvent(type, payload) {
 
   if (type === "message_create" || type === "message_update") {
     upsertMessage(payload);
+    if (payload.message && ["complete", "error", "cancelled"].includes(payload.message.status)) {
+      smoothFlushMessage(payload.message.id);
+    }
     scheduleChatRender();
     return;
   }
 
   if (type === "message_delta") {
-    if (payload.message) upsertMessage(payload.message);
-    else updateMessageContent(payload.id, payload.content);
+    if (payload.message) {
+      upsertMessage(payload.message);
+      smoothQueueDelta(payload.message);
+    } else {
+      updateMessageContent(payload.id, payload.content);
+    }
     scheduleChatRender();
     return;
   }

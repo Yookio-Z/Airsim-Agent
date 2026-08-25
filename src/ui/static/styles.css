@@ -6276,3 +6276,18 @@ body.dragging-system-settings #systemSettingsModal .modal-head {
   white-space: pre-wrap;
   word-break: break-word;
 }
+
+/* 平滑流式：新释放的正文批次淡入 */
+.agent-message {
+  animation: streamFadeIn 320ms ease;
+}
+@keyframes streamFadeIn {
+  from {
+    opacity: 0.35;
+    transform: translateY(4px);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}

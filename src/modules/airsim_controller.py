@@ -79,6 +79,11 @@ class _RpcProxy:
 class AirSimController(FlightController):
     """AirSim RPC 飞行控制后端（线程隔离版）。"""
 
+    # 跨重连保留的按车状态（类级存储）：控制器实例在 reconnect 时会重建，
+    # 空中飞机的返航点/派发跟踪不能跟着丢。
+    _shared_home_positions: dict[str, dict[str, float]] = {}
+    _shared_dispatched_paths: dict[str, dict[str, Any]] = {}
+
     def __init__(self, ip: str = "127.0.0.1", port: int = 41452) -> None:
         self._ip = ip
         self._port = port
@@ -88,11 +93,7 @@ class AirSimController(FlightController):
         self._armed: set[str] = set()
         self._control_enabled: set[str] = set()
         self._settings_vehicle_types: dict[str, str] = self._load_settings_vehicle_types()
-        # 每机返航点：首次看到某机"未解锁+已落地"时用其 GPS 记录初始位置（NED）。
-        # 多机任务/返航都以此为各机自己的 home，而不是全局单一返航点。
-        self._home_positions: dict[str, dict[str, float]] = {}
-        # 已派发航线（fire-and-forget）的完成跟踪：name -> {waypoints, dispatched_at, done, ...}
-        self._dispatched_paths: dict[str, dict[str, Any]] = {}
+        # 每机返航点与派发航线跟踪使用类级存储（跨重连保留），见类定义处。
         self._origin_geopoint: tuple[float, float, float] | None = self._load_origin_geopoint()
         self.last_error = ""
 
@@ -588,7 +589,7 @@ class AirSimController(FlightController):
         注意：部分 AirSim 版本地面状态下 kinematics_estimated 对多机返回同一读数，
         因此这里必须用按车正确的 GPS 换算，而不是 position_ned。
         """
-        if name in self._home_positions:
+        if name in AirSimController._shared_home_positions:
             return
         if status.get("armed") or status.get("flying"):
             return
@@ -601,14 +602,14 @@ class AirSimController(FlightController):
             return
         if ned is None:
             return
-        self._home_positions[name] = ned
+        AirSimController._shared_home_positions[name] = ned
 
     def home_position(self, vehicle_name: str = "") -> dict[str, float] | None:
         """返回某机的初始点位（NED），即该机的返航点。"""
         names = self._resolve_vehicles(vehicle_name)
         if not names:
             return None
-        return self._home_positions.get(names[0])
+        return AirSimController._shared_home_positions.get(names[0])
 
     def _airsim_settings_path(self) -> Path | None:
         explicit = os.environ.get("AIRSIM_SETTINGS_PATH")
@@ -965,7 +966,7 @@ class AirSimController(FlightController):
                     timeout=10.0,
                 )
                 # 记录派发，供完成跟踪（update_flight_task_progress）使用
-                self._dispatched_paths[name] = {
+                AirSimController._shared_dispatched_paths[name] = {
                     "waypoints": [dict(wp) for wp in waypoints],
                     "velocity": float(velocity),
                     "dispatched_at": time.time(),
@@ -992,7 +993,7 @@ class AirSimController(FlightController):
             if not isinstance(vehicle, dict):
                 continue
             name = str(vehicle.get("vehicle_name") or "")
-            info = self._dispatched_paths.get(name)
+            info = AirSimController._shared_dispatched_paths.get(name)
             if not info or info.get("done"):
                 continue
             pos = vehicle.get("position_ned") if isinstance(vehicle.get("position_ned"), dict) else {}
@@ -1026,7 +1027,7 @@ class AirSimController(FlightController):
                 "speed": info.get("last_speed"),
                 "dispatched_at": info.get("dispatched_at"),
             }
-            for name, info in self._dispatched_paths.items()
+            for name, info in AirSimController._shared_dispatched_paths.items()
         }
 
     def wait_until_flying(self, vehicle_name: str = "", timeout: float = 15.0) -> bool:
@@ -1187,7 +1188,7 @@ class AirSimController(FlightController):
                 extra=extra,
             )
             self._record_home_position(name, status_dict.to_dict())
-            home = self._home_positions.get(name)
+            home = AirSimController._shared_home_positions.get(name)
             if home is not None:
                 status_dict.extra["home_position_ned"] = dict(home)
             return status_dict
