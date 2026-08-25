@@ -43,3 +43,4 @@ docs/px4_agent_handoff.md
 .coverage.*
 htmlcov/
 _cmd*.json
+shots/
