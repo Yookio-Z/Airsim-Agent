@@ -2669,31 +2669,33 @@ function highlightMissionVehicleMarkers() {
   }
 }
 
-// ---- 多选控制集：左侧小工具(起飞/降落/返航/悬停)作用于选中的机 ----
-// 未选中任何机 = 作用于全部；最新点选的机同时成为航线规划目标。
-let controlSelection = new Set();
+// ---- 目标机选择（单选）：点芯片选中一台，再点一下取消 ----
+// 未选中 = 左侧小工具作用于全部无人机；选中 = 只作用于该机。
+// 选中的机同时就是航线规划目标。
+let controlSelectionVehicle = "";
 
 function controlTargetList() {
-  if (controlSelection.size) return [...controlSelection];
+  if (controlSelectionVehicle) return [controlSelectionVehicle];
   const vehicles = Array.isArray(latestState?.tool_runtime?.vehicles) ? latestState.tool_runtime.vehicles : [];
   return vehicles.map((v) => String(v.vehicle_name || "")).filter(Boolean);
 }
 
 function controlTargetLabel() {
-  if (!controlSelection.size) return "全部无人机";
-  return [...controlSelection].join("、");
+  return controlSelectionVehicle || "全部无人机";
 }
 
 function toggleControlSelection(name) {
-  if (controlSelection.has(name)) {
-    // 取消控制集成员；航线规划目标保持不变（只在点其他芯片时切换），
-    // 避免点两下同一台就把目标清空、导致无法继续添加航点
-    controlSelection.delete(name);
-  } else {
-    controlSelection.add(name);
-    if (missionTargetVehicle !== name) switchMissionTarget(name);
-  }
-  renderVehicleList();
+  const next = controlSelectionVehicle === name ? "" : name;
+  controlSelectionVehicle = next;
+  if (missionTargetVehicle !== next) switchMissionTarget(next);
+  updateChipStates();
+}
+
+// 只更新芯片选中态，不重建 DOM（避免上方状态栏闪烁）
+function updateChipStates() {
+  document.querySelectorAll("#vehicleList .hud-vehicle-chip[data-vehicle]").forEach((chip) => {
+    chip.classList.toggle("selected", chip.dataset.vehicle === controlSelectionVehicle);
+  });
 }
 
 // 切换目标机后把地图平移到该机位置
@@ -3446,29 +3448,7 @@ async function invokeFlightTool(tool, params = {}) {
 async function invokeFlightControl(action) {
   const normalized = String(action || "").toLowerCase();
   const targets = controlTargetList();
-  const targetLabel = controlTargetLabel();
-  if (["hover", "land", "return_home", "rtl"].includes(normalized)) {
-    const runtime = requireLiveFlightLink();
-    const capabilities = runtime.backend_profile?.capabilities || {};
-    if (normalized === "land") {
-      const approved = await confirmDialog({
-        title: "确认降落",
-        message: `将使 ${targetLabel} 就地降落，逐台确认落地后自动锁定。是否继续？`,
-        confirmLabel: "确认降落",
-        danger: true,
-      });
-      if (!approved) throw new Error("操作已取消");
-    }
-    if (["return_home", "rtl"].includes(normalized)) {
-      const approved = await confirmDialog({
-        title: "确认返航",
-        message: `将使 ${targetLabel} 返回各自初始点，到位后自动降落锁定。是否继续？`,
-        confirmLabel: "确认返航",
-        danger: true,
-      });
-      if (!approved) throw new Error("操作已取消");
-    }
-  }
+  requireLiveFlightLink();
   return post("/api/control", {
     action: normalized,
     vehicles: targets,
@@ -4160,7 +4140,8 @@ function updateFlightControlButtons(toolRuntime = {}) {
     const control = button.dataset.control || "";
     const needsLink = Boolean(tool) || ["hover", "land", "return_home", "rtl"].includes(control);
     if (!needsLink) return;
-    const disabled = !linked || (Boolean(tool) && Boolean(toolRuntime.busy));
+    // busy 瞬时值会让按钮闪烁禁用，指令本身由执行器排队，不再据此禁用
+    const disabled = !linked;
     button.disabled = disabled;
     const channel = control === "return_home"
       ? contract.return_channel
@@ -4320,10 +4301,9 @@ function renderVehicleList(toolRuntime = {}) {
     const battery = vehicle.battery_voltage != null ? ` ${fmt(vehicle.battery_voltage)}V` : "";
     const routeColor = vehicleRouteColor(name);
     const planned = (currentMissionVehicleName() === name ? missionWaypoints.length : (missionPlans[name]?.length || 0));
-    const inControlSet = controlSelection.has(name);
     const chip = document.createElement("button");
     chip.type = "button";
-    chip.className = `hud-vehicle-chip${inControlSet ? " selected" : ""}${name === missionTarget ? " target" : ""}`;
+    chip.className = `hud-vehicle-chip${name === controlSelectionVehicle ? " selected" : ""}`;
     chip.title = `载具 ${name} · ${state}`
       + (planned ? ` · 已画 ${planned} 个航点` : "")
       + `\n点击 = 选中/取消控制目标(可多选);最新选中的为航线规划目标`;
@@ -4331,19 +4311,6 @@ function renderVehicleList(toolRuntime = {}) {
     chip.innerHTML = `<span class="chip-dot" style="background:${routeColor};box-shadow:0 0 5px ${routeColor}"></span>${escapeHtml(name)}: ${state}${battery ? `<span class="chip-battery">${escapeHtml(battery.trim())}</span>` : ""}${planned ? `<span class="chip-plan-count">${planned}</span>` : ""}`;
     chip.addEventListener("click", () => toggleControlSelection(name));
     container.appendChild(chip);
-  }
-  // 清除选择按钮：小工具恢复作用于全部无人机
-  if (controlSelection.size) {
-    const allBtn = document.createElement("button");
-    allBtn.type = "button";
-    allBtn.className = "hud-vehicle-chip hud-chip-all";
-    allBtn.title = "清除选择：小工具恢复作用于全部无人机";
-    allBtn.textContent = "全部";
-    allBtn.addEventListener("click", () => {
-      controlSelection.clear();
-      renderVehicleList();
-    });
-    container.appendChild(allBtn);
   }
   updateMissionTargetBadge();
 }
@@ -6251,6 +6218,24 @@ function updateAgentTurn(entry, message, run, llm) {
   // 错误徽标
   entry.errorPill.style.display = isError ? "" : "none";
 
+  // 工具/校验步骤：先增量追加（跳过推理类条目——已在思考块里），
+  // 再判定过程折叠块可见性——顺序不能反，否则首轮判定时步骤数为 0
+  // 会把折叠块误隐藏，之后又被快速路径跳过永不恢复
+  const linkedRun = run && message.run_id && run.run_id === message.run_id ? run : null;
+  const processTrace = Array.isArray(linkedRun?.process_trace) && linkedRun.process_trace.length
+    ? linkedRun.process_trace
+    : (Array.isArray(details.process_trace) ? details.process_trace : []);
+  const visible = processTrace.filter((item) => {
+    if ((item.kind || "") === "reasoning") return false;
+    if (item.tool === "memory_store") return false;
+    const title = humanThoughtTitle(item.title || "");
+    return Boolean(title) && !/模型思考|模型推理/.test(item.title || "");
+  });
+  while (entry.renderedTrace < visible.length) {
+    entry.toolLines.appendChild(toolLineNode(visible[entry.renderedTrace]));
+    entry.renderedTrace += 1;
+  }
+
   // 过程折叠块：思考全文 + 工具/校验步骤。
   // 运行中自动展开（标题行滚动最新思考句）；完成后自动收起，只留总结；
   // 用户手动切换过则尊重用户选择。
@@ -6281,22 +6266,6 @@ function updateAgentTurn(entry, message, run, llm) {
     }
   } else {
     entry.procFold.style.display = "none";
-  }
-
-  // 工具/校验步骤：增量追加（跳过推理类条目——已在思考块里）
-  const linkedRun = run && message.run_id && run.run_id === message.run_id ? run : null;
-  const processTrace = Array.isArray(linkedRun?.process_trace) && linkedRun.process_trace.length
-    ? linkedRun.process_trace
-    : (Array.isArray(details.process_trace) ? details.process_trace : []);
-  const visible = processTrace.filter((item) => {
-    if ((item.kind || "") === "reasoning") return false;
-    if (item.tool === "memory_store") return false;
-    const title = humanThoughtTitle(item.title || "");
-    return Boolean(title) && !/模型思考|模型推理/.test(item.title || "");
-  });
-  while (entry.renderedTrace < visible.length) {
-    entry.toolLines.appendChild(toolLineNode(visible[entry.renderedTrace]));
-    entry.renderedTrace += 1;
   }
 
   // 正文：平滑分批释放（smoothShownContent）；运行中推理不占正文，

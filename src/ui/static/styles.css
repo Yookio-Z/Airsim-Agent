@@ -5269,7 +5269,11 @@ body.dragging-system-settings #systemSettingsModal .modal-head {
   }
 
   .agent-column {
+    /* 窄面板下恢复高度链：否则列被内容撑开（数万 px），输入框与
+       设置按钮被推出视口，chat-thread 也失去内部滚动 */
+    height: 100vh;
     min-height: 420px;
+    overflow: hidden;
     border-left: 0;
     border-top: 1px solid var(--line);
   }
@@ -5945,15 +5949,8 @@ body.dragging-system-settings #systemSettingsModal .modal-head {
   color: var(--ink);
 }
 
-/* 已选入控制集(小工具作用目标):青色描边 */
+/* 选中的目标机（航线规划 + 小工具作用目标） */
 .hud-vehicle-chip.selected {
-  border-color: rgba(85, 223, 244, 0.6);
-  background: rgba(85, 223, 244, 0.1);
-  color: var(--ink);
-}
-
-/* 当前航线规划目标:金色 */
-.hud-vehicle-chip.target {
   border-color: rgba(240, 184, 74, 0.6);
   background: rgba(240, 184, 74, 0.1);
   color: #f0d59a;
@@ -6426,13 +6423,6 @@ body.dragging-system-settings #systemSettingsModal .modal-head {
 .turn .answer-body {
   font-size: 14px;
   line-height: 1.6;
-}
-
-/* chips 行尾的"全部"按钮：清除多选控制集 */
-.hud-vehicle-chip.hud-chip-all {
-  border-style: dashed;
-  color: rgba(141, 152, 173, 0.9);
-  background: transparent;
 }
 
 /* 过程折叠块（思考全文 + 工具步骤）：运行中展开、完成收起 */
