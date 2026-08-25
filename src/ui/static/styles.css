@@ -6291,3 +6291,30 @@ body.dragging-system-settings #systemSettingsModal .modal-head {
     transform: translateY(0);
   }
 }
+
+/* 模型思考折叠块：默认收起，展开看全文（不刷屏） */
+.reasoning-fold {
+  margin: 2px 0;
+}
+.reasoning-fold summary {
+  cursor: pointer;
+  color: rgba(255, 255, 255, 0.55);
+  font-size: 12px;
+  user-select: none;
+}
+.reasoning-fold summary:hover {
+  color: rgba(255, 255, 255, 0.8);
+}
+.reasoning-fold .fold-body {
+  white-space: pre-wrap;
+  word-break: break-word;
+  max-height: 420px;
+  overflow: auto;
+  font-size: 12.5px;
+  line-height: 1.55;
+  color: rgba(255, 255, 255, 0.72);
+  background: rgba(255, 255, 255, 0.03);
+  border-radius: 6px;
+  padding: 8px 10px;
+  margin: 6px 0 2px;
+}

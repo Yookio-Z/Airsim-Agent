@@ -1964,22 +1964,6 @@ class AgentRuntime:
         if callable(final_flush):
             final_flush()
         reasoning_full = str(getattr(reasoning_sink, "full_text", "") or "").strip()
-        if run_id:
-            # 规划推理全文归档进消息的思考块（完成后正文换成结果，思考仍可回看）
-            self._update_assistant_message(
-                run_id,
-                "正在执行计划...",
-                "running",
-                {
-                    "mode": "execute",
-                    "phase": "planning",
-                    "process_trace": (
-                        [{"timestamp": time.time(), "title": "模型思考", "body": reasoning_full[:6000],
-                          "status": "completed", "kind": "reasoning"}]
-                        if reasoning_full else []
-                    ),
-                },
-            )
         if plan is None:
             if execute:
                 # LLM 失效时的安全原则：不自动退化为规则规划继续飞行。
@@ -2028,6 +2012,21 @@ class AgentRuntime:
             "Plan-Execute route selected",
             {"run_id": run.run_id, "execute": execute, "planner_source": plan.planner_source, **route},
         )
+        if reasoning_full:
+            # 规划推理全文归档到 run 上（此前写在消息 details 里会被
+            # _begin_execution_trace 的 process_trace 覆盖而丢失）：
+            # thought_trace 存全文供回看，process_trace 首条进时间线折叠块
+            self._append_thought(run, "模型思考", reasoning_full)
+            run.process_trace.insert(
+                0,
+                {
+                    "timestamp": time.time(),
+                    "title": "模型思考",
+                    "body": reasoning_full[:8000],
+                    "status": "completed",
+                    "kind": "reasoning",
+                },
+            )
         if execute:
             self._begin_execution_trace(run, "任务适合一次性规划执行：先生成完整工具序列，再由 runtime 逐步执行、回读和校验。")
             # skill guidance is injected into the planner prompt as background

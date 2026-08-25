@@ -6246,9 +6246,13 @@ function renderAgentThoughts(message, run, active) {
     const badge = processKindLabel(kind);
     const bodyText = String(item.body || "");
     // 长推理文本保留换行（模型思考块可回看完整内容）
-    const body = bodyText
-      ? `<p class="${bodyText.includes("\n") || bodyText.length > 160 ? "long-text" : ""}">${escapeHtml(bodyText)}</p>`
-      : "";
+    // 长推理文本默认折叠（平铺全文刷屏难受）；短摘要照常平铺
+    const isLongReasoning = kind === "reasoning" && (bodyText.length > 200 || bodyText.includes("\n"));
+    const body = !bodyText
+      ? ""
+      : isLongReasoning
+        ? `<details class="reasoning-fold"><summary>模型思考 · 点击展开全文</summary><pre class="fold-body">${escapeHtml(bodyText)}</pre></details>`
+        : `<p class="${bodyText.length > 160 ? "long-text" : ""}">${escapeHtml(bodyText)}</p>`;
     return `
       <div class="thought-row ${escapeHtml(status)} kind-${escapeHtml(kind)}">
         <span></span>
