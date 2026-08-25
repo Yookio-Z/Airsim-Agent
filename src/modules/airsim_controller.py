@@ -493,13 +493,16 @@ class AirSimController(FlightController):
         self._ensure_internal_airsim_flight_control(vehicle_name)
         names = self._resolve_vehicles(vehicle_name)
         for name in names:
-            if name not in self._control_enabled:
-                self._rpc(self._client.enableApiControl, True, name)
-                time.sleep(0.3)
-                self._control_enabled.add(name)
-            if name not in self._armed:
-                self._rpc(self._client.armDisarm, True, name)
-                self._armed.add(name)
+            # enableApiControl / armDisarm 必须每次都重发（幂等指令）：
+            # 模拟器侧可能在降落循环后丢失 API 控制权（"entering hover mode
+            # for safety"），内存集合认为已使能会导致
+            # "Vehicle cannot be armed via API because API has not been given control"，
+            # 起飞指令被模拟器无视（表现为部分飞机不起飞）。
+            self._rpc(self._client.enableApiControl, True, name)
+            self._control_enabled.add(name)
+            self._rpc(self._client.armDisarm, True, name)
+            self._armed.add(name)
+            time.sleep(0.3)
             # 解锁即离开落地确认状态（takeoff/land 的遥测重新可信）
             self._landed_vehicles.discard(name)
 
@@ -739,10 +742,11 @@ class AirSimController(FlightController):
         try:
             names = self._resolve_vehicles(vehicle_name)
             for name in names:
-                if name not in self._control_enabled:
-                    self._rpc(self._client.enableApiControl, True, name)
-                    time.sleep(0.2)
-                    self._control_enabled.add(name)
+                # 与 _ensure_control 相同：enableApiControl 每次重发（幂等），
+                # 防止模拟器侧已丢失 API 控制权而内存集合未同步
+                self._rpc(self._client.enableApiControl, True, name)
+                time.sleep(0.2)
+                self._control_enabled.add(name)
             # 多机并行降落：先给全部车辆发出 landAsync（AirSim 并发执行），
             # 再统一轮询落地确认——逐架 join 会把 N 架的降落时间串行相加
             for name in names:
@@ -950,17 +954,33 @@ class AirSimController(FlightController):
     # ------------------------------------------------------------------
 
     def dispatch_takeoff(self, altitude: float, vehicle_name: str = "") -> bool:
-        """派发起飞（不等待完成）。多机并发起飞的基础。"""
+        """派发起飞（不等待完成）。多机并发起飞的基础。
+
+        注意：部分 AirSim 版本在"降落→解锁→再起飞"循环后 takeoffAsync 只翻转
+        状态不实际爬升，因此与阻塞版 takeoff() 一致，补一段 moveToZ 真正爬升。
+        """
         self.last_error = ""
         if not self._ensure_connected():
             self.last_error = "AirSim not connected"
             return False
         try:
+            altitude = max(0.5, abs(float(altitude)))
             names = self._resolve_vehicles(vehicle_name)
             for name in names:
                 self._ensure_control(name)
                 self._rpc(
-                    lambda n=name: self._client.takeoffAsync(max(0.5, abs(float(altitude))), vehicle_name=n),
+                    lambda n=name: self._client.takeoffAsync(timeout_sec=max(30, altitude * 5), vehicle_name=n),
+                    timeout=10.0,
+                )
+            # 实际爬升到目标高度（fire-and-forget）
+            for name in names:
+                self._rpc(
+                    lambda n=name: self._client.moveToZAsync(
+                        -altitude,
+                        velocity=1.5,
+                        timeout_sec=max(20, altitude * 6),
+                        vehicle_name=n,
+                    ),
                     timeout=10.0,
                 )
             return True

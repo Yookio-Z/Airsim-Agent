@@ -6427,3 +6427,81 @@ body.dragging-system-settings #systemSettingsModal .modal-head {
   font-size: 14px;
   line-height: 1.6;
 }
+
+/* chips 行尾的"全部"按钮：清除多选控制集 */
+.hud-vehicle-chip.hud-chip-all {
+  border-style: dashed;
+  color: rgba(141, 152, 173, 0.9);
+  background: transparent;
+}
+
+/* 过程折叠块（思考全文 + 工具步骤）：运行中展开、完成收起 */
+.turn .proc-fold {
+  border: 1px solid rgba(255, 255, 255, 0.07);
+  border-radius: 8px;
+  background: rgba(255, 255, 255, 0.02);
+}
+.turn .proc-fold summary {
+  cursor: pointer;
+  list-style: none;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 7px 10px;
+  font-size: 13px;
+  color: rgba(255, 255, 255, 0.62);
+  user-select: none;
+  min-width: 0;
+}
+.turn .proc-fold summary::-webkit-details-marker {
+  display: none;
+}
+.turn .proc-fold[open] summary {
+  border-bottom: 1px solid rgba(255, 255, 255, 0.06);
+}
+.turn .proc-fold .proc-icon {
+  flex: 0 0 auto;
+  font-size: 13px;
+}
+.turn .proc-fold .proc-state {
+  flex: 0 0 auto;
+  color: rgba(255, 255, 255, 0.8);
+}
+.turn .proc-fold .proc-latest {
+  flex: 1 1 auto;
+  min-width: 0;
+  overflow: hidden;
+  white-space: nowrap;
+  direction: rtl;
+  text-align: left;
+  color: rgba(255, 255, 255, 0.38);
+  font-size: 12px;
+  -webkit-mask-image: linear-gradient(to left, transparent 0, #000 28px);
+  mask-image: linear-gradient(to left, transparent 0, #000 28px);
+}
+.turn .proc-fold .think-full {
+  white-space: pre-wrap;
+  word-break: break-word;
+  max-height: 380px;
+  overflow: auto;
+  font-size: 12.5px;
+  line-height: 1.55;
+  color: rgba(255, 255, 255, 0.66);
+  padding: 8px 12px;
+  margin: 0;
+}
+.turn .proc-fold .tool-lines {
+  padding: 4px 12px 8px;
+}
+
+/* 消息内容不溢出容器 */
+.chat-bubble.turn,
+.chat-bubble.turn .answer-body {
+  min-width: 0;
+  max-width: 100%;
+  overflow-wrap: anywhere;
+}
+.chat-bubble.turn .answer-body table.md-table {
+  display: block;
+  overflow-x: auto;
+}

@@ -1762,7 +1762,7 @@ class LLMMissionPlanner:
                     "凡是涉及当前无人机状态、位置、数量的问题，必须先调用工具读取实时数据再回答，禁止仅凭上下文推测。"
                     "必须基于提供的信息作答，不要编造后端连接、车辆状态、位置或传感器结果。"
                     "可以参考 memory_snapshot.guidance 中的偏好和风险提示，但不要把历史任务当成当前事实。"
-                    "中文回答，简洁自然。"
+                    "中文回答，简洁自然。思考过程（reasoning）也用中文。"
                 ),
             }
         ]
@@ -1985,7 +1985,7 @@ class LLMMissionPlanner:
             "Treat kind=atomic tools as one direct operation. Tools with execution_mode=async only start an operation; the runtime owns task_id polling, timeout, cancellation, and terminal outcome. "
             "If a requested capability is unavailable, produce a safe status/readback plan and explain the limitation in risk_notes. "
             "The plan summary must state concrete numbers: vehicle count, coordinates, or altitude reached — never a bare '已完成/任务完成'."
-            "Return JSON only."
+            "Think and reason in Chinese (中文思考). Return JSON only."
         )
 
     def _schema_hint(self) -> dict[str, Any]:
@@ -2041,7 +2041,7 @@ class LLMMissionPlanner:
             "If the backend lacks a requested capability, stop safely and explain the limitation in reflection. "
             "The reason/reflection fields are displayed live to the operator as public process text; write concise, useful, non-sensitive decision text there. "
             "When is_complete=true, put a concise Chinese task report in reason. Include executed sequence, final state/position, image finding, and any limitation/failure. "
-            "Return JSON only."
+            "Think and reason in Chinese (中文思考). Return JSON only."
         )
 
     def _loop_decision_schema_hint(self) -> dict[str, Any]:

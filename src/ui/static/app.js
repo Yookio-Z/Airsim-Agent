@@ -2686,12 +2686,9 @@ function controlTargetLabel() {
 
 function toggleControlSelection(name) {
   if (controlSelection.has(name)) {
+    // 取消控制集成员；航线规划目标保持不变（只在点其他芯片时切换），
+    // 避免点两下同一台就把目标清空、导致无法继续添加航点
     controlSelection.delete(name);
-    // 取消的正好是规划目标 → 目标移交给剩余选中中的最后一台
-    if (missionTargetVehicle === name) {
-      const next = [...controlSelection].pop() || "";
-      if (next !== missionTargetVehicle) switchMissionTarget(next);
-    }
   } else {
     controlSelection.add(name);
     if (missionTargetVehicle !== name) switchMissionTarget(name);
@@ -4334,6 +4331,19 @@ function renderVehicleList(toolRuntime = {}) {
     chip.innerHTML = `<span class="chip-dot" style="background:${routeColor};box-shadow:0 0 5px ${routeColor}"></span>${escapeHtml(name)}: ${state}${battery ? `<span class="chip-battery">${escapeHtml(battery.trim())}</span>` : ""}${planned ? `<span class="chip-plan-count">${planned}</span>` : ""}`;
     chip.addEventListener("click", () => toggleControlSelection(name));
     container.appendChild(chip);
+  }
+  // 清除选择按钮：小工具恢复作用于全部无人机
+  if (controlSelection.size) {
+    const allBtn = document.createElement("button");
+    allBtn.type = "button";
+    allBtn.className = "hud-vehicle-chip hud-chip-all";
+    allBtn.title = "清除选择：小工具恢复作用于全部无人机";
+    allBtn.textContent = "全部";
+    allBtn.addEventListener("click", () => {
+      controlSelection.clear();
+      renderVehicleList();
+    });
+    container.appendChild(allBtn);
   }
   updateMissionTargetBadge();
 }
@@ -6134,49 +6144,65 @@ function buildAgentTurn(message) {
   errorPill.textContent = "任务执行失败，详见对话内容";
   errorPill.style.display = "none";
 
-  // 思考块：默认折叠，标题行 = 状态 + 最新一句（两端渐隐由 CSS mask）
-  const thinkFold = document.createElement("details");
-  thinkFold.className = "think-fold";
-  thinkFold.style.display = "none";
-  const thinkSummary = document.createElement("summary");
-  const thinkState = document.createElement("span");
-  thinkState.className = "think-state";
-  thinkState.textContent = "思考中…";
-  const thinkLatest = document.createElement("span");
-  thinkLatest.className = "think-latest";
-  thinkSummary.appendChild(thinkState);
-  thinkSummary.appendChild(thinkLatest);
+  // 过程折叠块：思考全文 + 工具/校验步骤都在里面。
+  // 运行中自动展开（实时看思考与工具追加）；完成后自动收起，只留最终总结；
+  // 用户手动切换过（userToggled）则尊重用户选择。
+  const procFold = document.createElement("details");
+  procFold.className = "proc-fold";
+  procFold.style.display = "none";
+  const procSummary = document.createElement("summary");
+  const procIcon = document.createElement("span");
+  procIcon.className = "proc-icon";
+  procIcon.textContent = "🧠";
+  const procState = document.createElement("span");
+  procState.className = "proc-state";
+  procState.textContent = "思考过程";
+  const procLatest = document.createElement("span");
+  procLatest.className = "proc-latest";
+  procSummary.appendChild(procIcon);
+  procSummary.appendChild(procState);
+  procSummary.appendChild(procLatest);
   const thinkFull = document.createElement("pre");
   thinkFull.className = "think-full";
-  thinkFold.appendChild(thinkSummary);
-  thinkFold.appendChild(thinkFull);
-
   const toolLines = document.createElement("div");
   toolLines.className = "tool-lines";
+  procFold.appendChild(procSummary);
+  procFold.appendChild(thinkFull);
+  procFold.appendChild(toolLines);
+  procFold.addEventListener("toggle", () => {
+    if (entry._programmatic) {
+      entry._programmatic = false;
+      return;
+    }
+    entry.userToggled = true;
+  });
 
   const answerBody = document.createElement("div");
   answerBody.className = "answer-body";
 
   root.appendChild(errorPill);
-  root.appendChild(thinkFold);
-  root.appendChild(toolLines);
+  root.appendChild(procFold);
   root.appendChild(answerBody);
-  return {
+  const entry = {
     root,
     kind: "agent",
     errorPill,
-    thinkFold,
-    thinkState,
-    thinkLatest,
+    procFold,
+    procState,
+    procLatest,
     thinkFull,
     toolLines,
     answerBody,
     renderedTrace: 0,
+    userToggled: false,
+    _programmatic: false,
+    startedAt: Date.now() / 1000,
     lastAnswer: "",
     lastReasoning: "",
     lastRunning: undefined,
     lastStatus: "",
   };
+  return entry;
 }
 
 function latestThinkLine(text) {
@@ -6225,21 +6251,36 @@ function updateAgentTurn(entry, message, run, llm) {
   // 错误徽标
   entry.errorPill.style.display = isError ? "" : "none";
 
-  // 思考块：有推理内容才出现；运行中标题滚动最新一句，完成后定格首句
-  if (reasoning) {
-    entry.thinkFold.style.display = "";
+  // 过程折叠块：思考全文 + 工具/校验步骤。
+  // 运行中自动展开（标题行滚动最新思考句）；完成后自动收起，只留总结；
+  // 用户手动切换过则尊重用户选择。
+  const hasProcess = Boolean(reasoning) || entry.renderedTrace > 0;
+  if (hasProcess) {
+    entry.procFold.style.display = "";
     const wasRunning = entry.lastRunning;
-    if (reasoning !== entry.lastReasoning || wasRunning !== running) {
+    if (running) {
+      entry.procState.textContent = "思考与执行中…";
+      entry.procLatest.textContent = reasoning ? latestThinkLine(reasoning) : "";
+      if (!entry.procFold.open && !entry.userToggled) {
+        entry._programmatic = true;
+        entry.procFold.open = true;
+      }
+    } else {
+      const dur = Math.max(1, Math.round(Date.now() / 1000 - entry.startedAt));
+      entry.procState.textContent = `思考与执行过程 · 约 ${dur}s`;
+      entry.procLatest.textContent = "";
+      if (entry.procFold.open && !entry.userToggled) {
+        entry._programmatic = true;
+        entry.procFold.open = false; // 完成后折叠全部过程，只留最终总结
+      }
+    }
+    if (reasoning !== entry.lastReasoning) {
       entry.lastReasoning = reasoning;
-      entry.lastRunning = running;
       entry.thinkFull.textContent = reasoning;
-      entry.thinkLatest.textContent = running ? latestThinkLine(reasoning) : firstThinkLine(reasoning);
-      entry.thinkState.textContent = running ? "思考中…" : "已思考 · 点击查看全文";
-      // 摘要行滚动到最新（running 时跟随句尾）
-      entry.thinkLatest.scrollLeft = running ? entry.thinkLatest.scrollWidth : 0;
+      entry.procLatest.textContent = running ? latestThinkLine(reasoning) : "";
     }
   } else {
-    entry.thinkFold.style.display = "none";
+    entry.procFold.style.display = "none";
   }
 
   // 工具/校验步骤：增量追加（跳过推理类条目——已在思考块里）
@@ -6258,7 +6299,8 @@ function updateAgentTurn(entry, message, run, llm) {
     entry.renderedTrace += 1;
   }
 
-  // 正文：平滑分批释放（smoothShownContent），完成后为全量
+  // 正文：平滑分批释放（smoothShownContent）；运行中推理不占正文，
+  // 完成后填入 LLM 总结
   const text = smoothShownContent(message).trim();
   if (text !== entry.lastAnswer) {
     entry.lastAnswer = text;

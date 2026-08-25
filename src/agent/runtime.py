@@ -2449,6 +2449,30 @@ class AgentRuntime:
 
     def _on_agent_event(self, level: str, source: str, message: str, data: dict[str, Any]) -> None:
         self._append_event(level, source, message, data)
+        # ReAct 每步决策的推理（reasoning_content）追加进当前消息的
+        # reasoning_text——前端思考块一个折叠块看全程思考
+        if source == "model_reasoning" and self._current is not None:
+            run = self._current
+            with self._lock:
+                if not isinstance(run.agent_state, dict):
+                    run.agent_state = {}
+                prev = str(run.agent_state.get("_reasoning_text") or "")
+                run.agent_state["_reasoning_text"] = (prev + "\n" + message).strip()[:12000]
+                full = run.agent_state["_reasoning_text"]
+                target_message = next(
+                    (m for m in reversed(self._messages) if m.run_id == run.run_id and m.role == "assistant"),
+                    None,
+                )
+            if target_message is not None:
+                det = target_message.details or {}
+                self._update_assistant_message(
+                    run.run_id,
+                    target_message.content or "",
+                    "running" if target_message.status == "running" else target_message.status,
+                    {"mode": det.get("mode", "execute"), "phase": det.get("phase", "executing"),
+                     "reasoning_text": full},
+                    persist=False,
+                )
         with self._lock:
             run_log = self._run_log
         if run_log is not None:
@@ -2588,7 +2612,19 @@ class AgentRuntime:
                 if not r.ok:
                     return {"ok": False, "error": f"{name or '默认机'} 降落指令失败", "vehicles": results}
 
-        # 轮询验证：目标列表里每台都必须确认落地
+        # 轮询验证：目标列表里每台都必须确认落地。
+        # 地面 NED z 随地形/出生点变化（3~6m 都有），用该机 home 的 z 作地面基准。
+        controller = getattr(self.tools, "controller", None)
+        ground_z = {}
+        home_read = getattr(controller, "home_position", None) if controller is not None else None
+        for name in to_land:
+            if callable(home_read):
+                try:
+                    home = home_read(name)
+                except Exception:
+                    home = None
+                if isinstance(home, dict):
+                    ground_z[name] = float(home.get("z", 0.0))
         pending = set(to_land)
         deadline = time.time() + 120.0
         while pending and time.time() < deadline:
@@ -2598,8 +2634,11 @@ class AgentRuntime:
                 n = str(v.get("vehicle_name") or "")
                 if n in pending:
                     pos = v.get("position_ned") if isinstance(v.get("position_ned"), dict) else {}
-                    alt = abs(float(pos.get("z", 0.0) or 0.0))
-                    if not v.get("flying") and alt < 0.8:
+                    z = float(pos.get("z", 0.0) or 0.0)
+                    near_ground = True
+                    if n in ground_z:
+                        near_ground = abs(z - ground_z[n]) < 1.5
+                    if not v.get("flying") and near_ground:
                         pending.discard(n)
 
         landed = [n for n in to_land if n not in pending]
