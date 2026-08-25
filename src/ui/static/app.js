@@ -6174,6 +6174,7 @@ function buildAgentTurn(message) {
     renderedTrace: 0,
     lastAnswer: "",
     lastReasoning: "",
+    lastRunning: undefined,
     lastStatus: "",
   };
 }
@@ -6209,6 +6210,13 @@ function toolLineNode(item) {
 }
 
 function updateAgentTurn(entry, message, run, llm) {
+  // 已完成消息的快速路径：状态与内容都没变就不再逐区块更新
+  const fastSkip =
+    entry.lastStatus === message.status &&
+    entry.lastAnswer === String(message.content || "") &&
+    entry.lastReasoning === String(message.details?.reasoning_text || "") &&
+    entry.renderedTrace > 0;
+  if (fastSkip && !["running", "responding", "queued"].includes(message.status)) return;
   const details = message.details || {};
   const reasoning = String(details.reasoning_text || "");
   const running = ["running", "responding", "queued"].includes(message.status);
@@ -6220,8 +6228,10 @@ function updateAgentTurn(entry, message, run, llm) {
   // 思考块：有推理内容才出现；运行中标题滚动最新一句，完成后定格首句
   if (reasoning) {
     entry.thinkFold.style.display = "";
-    if (reasoning !== entry.lastReasoning) {
+    const wasRunning = entry.lastRunning;
+    if (reasoning !== entry.lastReasoning || wasRunning !== running) {
       entry.lastReasoning = reasoning;
+      entry.lastRunning = running;
       entry.thinkFull.textContent = reasoning;
       entry.thinkLatest.textContent = running ? latestThinkLine(reasoning) : firstThinkLine(reasoning);
       entry.thinkState.textContent = running ? "思考中…" : "已思考 · 点击查看全文";
