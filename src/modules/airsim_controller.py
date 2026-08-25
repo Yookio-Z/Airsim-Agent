@@ -1064,24 +1064,64 @@ class AirSimController(FlightController):
         """派发返航：先飞回 (x,y,z)，到位后自动降落并锁定（后台监视线程完成）。
 
         返航语义 = 到达初始点 + 降落 + 上锁，全程异步，不阻塞调用方。
+        空中机先发 hover 唤醒（任务结束悬停久了 SimpleFlight 安全看门狗会进入
+        "hover mode for safety"，忽略后续指令，hover 重置看门狗恢复控制）；
+        地面待飞机先爬升再返航。
         """
-        ok = self.dispatch_move_on_path([{"x": x, "y": y, "z": z}], velocity, vehicle_name)
-        if not ok:
+        self.last_error = ""
+        if not self._ensure_connected():
+            self.last_error = "AirSim not connected"
             return False
         names = self._resolve_vehicles(vehicle_name)
         for name in names:
+            self._ensure_control(name)
+            try:
+                status = self.get_status(name).to_dict()
+            except Exception:
+                status = {}
+            path: list[dict[str, float]] = []
+            if status.get("flying"):
+                # 唤醒：重置 SimpleFlight 的 API 看门狗（悬停中发 hover 无副作用）
+                try:
+                    self._rpc(lambda n=name: self._client.hoverAsync(vehicle_name=n), timeout=10.0)
+                    time.sleep(0.3)
+                except Exception:
+                    pass
+                path.append({"x": float(x), "y": float(y), "z": float(z)})
+            else:
+                # 地面待飞机：从当前位置(GPS 换算，地面 kinematics 多机读数不可靠)
+                # 先垂直爬升到巡航高度，再飞回初始点
+                climb = {"x": float(x), "y": float(y), "z": min(float(z), -1.0)}
+                try:
+                    gnss = self._rpc(self._client.getGpsData, vehicle_name=name, timeout=4.0).gnss
+                    geo = gnss.geo_point
+                    cur = self.gps_to_ned(float(geo.latitude), float(geo.longitude), float(geo.altitude))
+                    if cur:
+                        climb = {"x": cur["x"], "y": cur["y"], "z": min(float(z), -1.0)}
+                except Exception:
+                    pass
+                path.append(climb)
+                path.append({"x": float(x), "y": float(y), "z": float(z)})
+            if not self.dispatch_move_on_path(path, velocity, name):
+                return False
             monitor = threading.Thread(
                 target=self._return_land_monitor,
-                args=(name, float(x), float(y), float(z)),
+                args=(name, float(x), float(y), float(z), float(velocity)),
                 daemon=True,
                 name=f"return_land_{name}",
             )
             monitor.start()
         return True
 
-    def _return_land_monitor(self, name: str, x: float, y: float, z: float) -> None:
-        """等待返航到位 → 降落 → 上锁。独立守护线程，单机超时 180s。"""
+    def _return_land_monitor(self, name: str, x: float, y: float, z: float, velocity: float = 3.0) -> None:
+        """等待返航到位 → 降落 → 上锁。独立守护线程，单机超时 180s。
+
+        若派发后 8 秒内完全没位移（安全看门狗吞掉了指令），自动重发一次返航路径。
+        """
         deadline = time.time() + 180.0
+        started = time.time()
+        start_pos = None
+        retried = False
         arrived = False
         while time.time() < deadline:
             if self._stop_requested():
@@ -1090,19 +1130,35 @@ class AirSimController(FlightController):
                 status = self.get_status(name).to_dict()
                 pos = status.get("position_ned") or {}
                 vel = status.get("velocity_ned") or {}
-                dist = math.sqrt(
-                    (float(pos.get("x", 0.0) or 0.0) - x) ** 2
-                    + (float(pos.get("y", 0.0) or 0.0) - y) ** 2
-                    + (float(pos.get("z", 0.0) or 0.0) - z) ** 2
-                )
+                px = float(pos.get("x", 0.0) or 0.0)
+                py = float(pos.get("y", 0.0) or 0.0)
+                pz = float(pos.get("z", 0.0) or 0.0)
+                dist = math.sqrt((px - x) ** 2 + (py - y) ** 2 + (pz - z) ** 2)
                 speed = math.sqrt(
                     float(vel.get("vx", 0.0) or 0.0) ** 2
                     + float(vel.get("vy", 0.0) or 0.0) ** 2
                     + float(vel.get("vz", 0.0) or 0.0) ** 2
                 )
+                if start_pos is None:
+                    start_pos = (px, py, pz)
                 if dist < 1.2 and speed < 0.5:
                     arrived = True
                     break
+                # 8 秒无位移 → 指令被安全看门狗吞掉，重发一次
+                if not retried and time.time() - started > 8.0:
+                    moved = math.sqrt(
+                        (px - start_pos[0]) ** 2 + (py - start_pos[1]) ** 2 + (pz - start_pos[2]) ** 2
+                    )
+                    if moved < 0.5:
+                        retried = True
+                        logger.warning(f"return_land_monitor: {name} 无位移，重发返航路径")
+                        self._ensure_control(name)
+                        try:
+                            self._rpc(lambda n=name: self._client.hoverAsync(vehicle_name=n), timeout=10.0)
+                            time.sleep(0.3)
+                        except Exception:
+                            pass
+                        self.dispatch_move_on_path([{"x": x, "y": y, "z": z}], velocity, name)
             except Exception:
                 pass
             time.sleep(0.5)

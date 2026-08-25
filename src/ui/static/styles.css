@@ -5270,10 +5270,14 @@ body.dragging-system-settings #systemSettingsModal .modal-head {
 
   .agent-column {
     /* 窄面板下恢复高度链：否则列被内容撑开（数万 px），输入框与
-       设置按钮被推出视口，chat-thread 也失去内部滚动 */
+       设置按钮被推出视口，chat-thread 也失去内部滚动。
+       sticky 吸附视口：滚动到对话列时占满整屏，输入框/设置随时可见 */
     height: 100vh;
     min-height: 420px;
     overflow: hidden;
+    position: sticky;
+    top: 0;
+    z-index: 30;
     border-left: 0;
     border-top: 1px solid var(--line);
   }
