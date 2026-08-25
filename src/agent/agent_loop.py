@@ -80,7 +80,6 @@ class AgentLoop:
         allowed_tools = self._allowed_tools(decision_cards)
         last_result: dict[str, Any] | None = None
         failure_count = 0
-        connection_failures = 0
         unresolved_failure = False
         replan_count = 0
         verify_corrected = False
@@ -214,19 +213,21 @@ class AgentLoop:
                     term in message_l for term in ("not connected", "connection", "timed out", "timeout", "未连接", "连接")
                 )
                 if connection_failure:
-                    connection_failures += 1
-                    if connection_failures >= 2:
-                        state.status = "failed"
-                        state.failure_reason = f"后端连接已断开，任务终止：{state.failure_reason[:160]}"
-                        self._event(
-                            "danger",
-                            "agent_loop",
-                            "连续连接失败，任务终止（避免空转烧 token）",
-                            {"failures": connection_failures},
-                        )
-                        break
-                else:
-                    connection_failures = 0
+                    # 一次连接类失败即熔断：后端断连后继续决策只会空转烧
+                    # token（重连、拍图、再重连的循环），立即终止并提醒
+                    # 操作员检查 AirSim/飞控。
+                    state.status = "failed"
+                    state.failure_reason = (
+                        "检测到后端连接断开，任务已终止。"
+                        "AirSim/飞控服务可能已断开，请检查服务后在连接面板重新连接，再重新下发任务。"
+                    )
+                    self._event(
+                        "danger",
+                        "agent_loop",
+                        "连接断开，任务已终止（请检查 AirSim/飞控服务）",
+                        {"tool": result_row.tool, "message": state.failure_reason[:160]},
+                    )
+                    break
                 if failure_count >= 3:
                     state.status = "failed"
                     break
