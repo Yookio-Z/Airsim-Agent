@@ -94,6 +94,11 @@ class AirSimController(FlightController):
         self._armed: set[str] = set()
         self._control_enabled: set[str] = set()
         self._settings_vehicle_types: dict[str, str] = self._load_settings_vehicle_types()
+        # 每机出生点（UE 坐标，来自 settings.json）——返航点的权威来源
+        self._settings_spawns: dict[str, tuple[float, float, float]] = self._load_settings_spawns()
+        # UE→NED 标定偏移：用任一在地面飞机的 GPS 反推（多机取平均，±5mm 一致性）
+        self._ue_ned_offset: tuple[float, float] | None = None
+        self._ue_offset_samples: list[tuple[float, float]] = []
         # 每机返航点与派发航线跟踪使用类级存储（跨重连保留），见类定义处。
         self._origin_geopoint: tuple[float, float, float] | None = self._load_origin_geopoint()
         self.last_error = ""
@@ -554,6 +559,32 @@ class AirSimController(FlightController):
                 result[str(name)] = vehicle_type
         return result
 
+    def _load_settings_spawns(self) -> dict[str, tuple[float, float, float]]:
+        """读取 settings.json 中每机的出生点（UE X/Y/Z）。"""
+        path = self._airsim_settings_path()
+        if path is None or not path.exists():
+            return {}
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+        except Exception:
+            return {}
+        vehicles = data.get("Vehicles")
+        if not isinstance(vehicles, dict):
+            return {}
+        result: dict[str, tuple[float, float, float]] = {}
+        for name, spec in vehicles.items():
+            if not isinstance(spec, dict):
+                continue
+            try:
+                result[str(name)] = (
+                    float(spec.get("X", 0) or 0),
+                    float(spec.get("Y", 0) or 0),
+                    float(spec.get("Z", 0) or 0),
+                )
+            except (TypeError, ValueError):
+                continue
+        return result
+
     def _load_origin_geopoint(self) -> tuple[float, float, float] | None:
         """读取 settings.json 的 OriginGeopoint（NED 原点经纬度），用于 GPS↔NED 换算。"""
         path = self._airsim_settings_path()
@@ -619,19 +650,20 @@ class AirSimController(FlightController):
             logger.warning(f"home store save failed: {e}")
 
     def _record_home_position(self, name: str, status: dict) -> None:
-        """未飞行时记录该机的初始位置（仅首次），作为其专属返航点。
+        """用地面飞机的 GPS 标定 UE→NED 偏移（多次采样取平均）。
 
-        注意：部分 AirSim 版本地面状态下 kinematics_estimated 对多机返回同一读数，
-        因此这里必须用按车正确的 GPS 换算，而不是 position_ned。
-        已解锁但仍在地面的机同样记录——解锁瞬间正是"初始点位"。
+        返航点 = settings.json 出生点(UE) + 标定偏移，与"首次落地位置"彻底脱钩：
+        服务重启、飞机悬停在外、甚至换模拟器地图，出生点都由配置权威决定，不会污染。
         """
-        self._load_home_store()
-        if name in AirSimController._shared_home_positions:
-            return
         if status.get("flying"):
+            return
+        if self._ue_ned_offset is not None and len(self._ue_offset_samples) >= 5:
             return
         gps = status.get("gps")
         if not isinstance(gps, dict):
+            return
+        spawn = self._settings_spawns.get(name)
+        if spawn is None:
             return
         try:
             ned = self.gps_to_ned(float(gps.get("lat")), float(gps.get("lon")), float(gps.get("alt", 0.0) or 0.0))
@@ -639,15 +671,43 @@ class AirSimController(FlightController):
             return
         if ned is None:
             return
-        AirSimController._shared_home_positions[name] = ned
-        self._save_home_store()
+        # 该机停在出生点附近（距理论出生点 < 1m）才参与标定，排除已移动的机；
+        # 三机样本一致性 ±5mm，位移的机（哪怕整体平移）会被拒绝
+        dx = ned["x"] - spawn[0]
+        dy = ned["y"] - spawn[1]
+        if math.hypot(dx, dy) > 1.0:
+            return
+        self._ue_offset_samples.append((dx, dy))
+        self._ue_ned_offset = (
+            sum(s[0] for s in self._ue_offset_samples) / len(self._ue_offset_samples),
+            sum(s[1] for s in self._ue_offset_samples) / len(self._ue_offset_samples),
+        )
+
+    def _spawn_home_ned(self, name: str) -> dict[str, float] | None:
+        """由出生点 + 标定偏移推导该机返航点（NED）。"""
+        if self._ue_ned_offset is None:
+            return None
+        spawn = self._settings_spawns.get(name)
+        if spawn is None:
+            return None
+        return {
+            "x": round(spawn[0] + self._ue_ned_offset[0], 3),
+            "y": round(spawn[1] + self._ue_ned_offset[1], 3),
+            "z": 0.0,
+        }
 
     def home_position(self, vehicle_name: str = "") -> dict[str, float] | None:
-        """返回某机的初始点位（NED），即该机的返航点。"""
+        """返回某机的初始点位（NED），即该机的返航点。
+
+        优先用出生点标定推导（权威）；无标定/无出生点配置时回退磁盘记录。
+        """
         self._load_home_store()
         names = self._resolve_vehicles(vehicle_name)
         if not names:
             return None
+        derived = self._spawn_home_ned(names[0])
+        if derived is not None:
+            return derived
         return AirSimController._shared_home_positions.get(names[0])
 
     def _airsim_settings_path(self) -> Path | None:
@@ -1403,7 +1463,7 @@ class AirSimController(FlightController):
                 extra=extra,
             )
             self._record_home_position(name, status_dict.to_dict())
-            home = AirSimController._shared_home_positions.get(name)
+            home = self.home_position(name)
             if home is not None:
                 status_dict.extra["home_position_ned"] = dict(home)
             return status_dict

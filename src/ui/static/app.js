@@ -6149,27 +6149,32 @@ function buildAgentTurn(message) {
   procSummary.appendChild(procIcon);
   procSummary.appendChild(procState);
   procSummary.appendChild(procLatest);
+
+  // 思考折叠块（内层）：默认收起，展开看推理全文——与工具调用区分
+  const thinkFold2 = document.createElement("details");
+  thinkFold2.className = "think-fold2";
+  const thinkSummary = document.createElement("summary");
+  const thinkIcon = document.createElement("span");
+  thinkIcon.className = "think-icon";
+  thinkIcon.textContent = "🧠";
+  const thinkState = document.createElement("span");
+  thinkState.className = "think-state";
+  thinkState.textContent = "思考过程";
+  const thinkLatest = document.createElement("span");
+  thinkLatest.className = "think-latest";
+  thinkSummary.appendChild(thinkIcon);
+  thinkSummary.appendChild(thinkState);
+  thinkSummary.appendChild(thinkLatest);
   const thinkFull = document.createElement("pre");
   thinkFull.className = "think-full";
+  thinkFold2.appendChild(thinkSummary);
+  thinkFold2.appendChild(thinkFull);
+
   const toolLines = document.createElement("div");
   toolLines.className = "tool-lines";
   procFold.appendChild(procSummary);
-  procFold.appendChild(thinkFull);
+  procFold.appendChild(thinkFold2);
   procFold.appendChild(toolLines);
-  procFold.addEventListener("toggle", () => {
-    if (entry._programmatic) {
-      entry._programmatic = false;
-      return;
-    }
-    entry.userToggled = true;
-  });
-
-  const answerBody = document.createElement("div");
-  answerBody.className = "answer-body";
-
-  root.appendChild(errorPill);
-  root.appendChild(procFold);
-  root.appendChild(answerBody);
   const entry = {
     root,
     kind: "agent",
@@ -6194,6 +6199,20 @@ function buildAgentTurn(message) {
     lastRunning: undefined,
     lastStatus: "",
   };
+  procFold.addEventListener("toggle", () => {
+    if (entry._programmatic) {
+      entry._programmatic = false;
+      return;
+    }
+    entry.userToggled = true;
+  });
+  thinkFold2.addEventListener("toggle", () => {
+    if (entry._programmaticThink) {
+      entry._programmaticThink = false;
+      return;
+    }
+    entry.thinkUserToggled = true;
+  });
   return entry;
 }
 
