@@ -84,6 +84,7 @@ class AirSimController(FlightController):
     _shared_home_positions: dict[str, dict[str, float]] = {}
     _shared_dispatched_paths: dict[str, dict[str, Any]] = {}
     _home_store_loaded = False
+    _ue_ned_ground_z: float | None = None
 
     def __init__(self, ip: str = "127.0.0.1", port: int = 41452) -> None:
         self._ip = ip
@@ -677,11 +678,13 @@ class AirSimController(FlightController):
         dy = ned["y"] - spawn[1]
         if math.hypot(dx, dy) > 1.0:
             return
-        self._ue_offset_samples.append((dx, dy))
+        self._ue_offset_samples.append((dx, dy, ned["z"]))
         self._ue_ned_offset = (
             sum(s[0] for s in self._ue_offset_samples) / len(self._ue_offset_samples),
             sum(s[1] for s in self._ue_offset_samples) / len(self._ue_offset_samples),
         )
+        # 地面 NED z（该环境原点可能高于地面 3~6m，绝不能假设 z=0 是地面）
+        self._ue_ned_ground_z = sum(s[2] for s in self._ue_offset_samples) / len(self._ue_offset_samples)
 
     def _spawn_home_ned(self, name: str) -> dict[str, float] | None:
         """由出生点 + 标定偏移推导该机返航点（NED）。"""
@@ -690,10 +693,11 @@ class AirSimController(FlightController):
         spawn = self._settings_spawns.get(name)
         if spawn is None:
             return None
+        ground_z = self._ue_ned_ground_z if self._ue_ned_ground_z is not None else 0.0
         return {
             "x": round(spawn[0] + self._ue_ned_offset[0], 3),
             "y": round(spawn[1] + self._ue_ned_offset[1], 3),
-            "z": 0.0,
+            "z": round(ground_z, 3),
         }
 
     def home_position(self, vehicle_name: str = "") -> dict[str, float] | None:
@@ -874,9 +878,11 @@ class AirSimController(FlightController):
                     return True
                 # Some AirSim releases lag the landed_state enum after a
                 # successful touchdown; being on the ground by altitude is
-                # equally safe and avoids a spurious "landing failed".
+                # equally safe. 地面 z 用标定值（原点可能高于地面数米，
+                # 绝不能用 z>0 当落地，否则 3m 悬停会被误判落地并提前上锁）。
                 pos = state.kinematics_estimated.position
-                if -float(pos.z_val) < 0.4:
+                ground_ref = self._ue_ned_ground_z if self._ue_ned_ground_z is not None else 0.0
+                if float(pos.z_val) > (ground_ref - 0.4):
                     return True
             except Exception:
                 pass
@@ -1426,9 +1432,11 @@ class AirSimController(FlightController):
             # 事实，直到下一次 arm 前都按"已着陆"上报，保证状态自洽。
             landed_confirmed = name in getattr(self, "_landed_vehicles", set())
             speed = math.sqrt(vel.x_val ** 2 + vel.y_val ** 2 + vel.z_val ** 2)
-            # 悬停时速度≈0 但 z 明显在原点上方——只看速度会把悬停误判成落地，
-            # 导致返航被 "vehicle is not airborne" 拒绝。速度或高度任一在空即算飞行。
-            airborne_by_altitude = pos.z_val < -0.5
+            # 悬停时速度≈0 但明显高于地面——只看速度会把悬停误判成落地，
+            # 导致返航被 "vehicle is not airborne" 拒绝。速度或相对高度任一满足即算飞行。
+            # 相对高度基于标定地面（该环境 NED 原点可能高于地面 3~6m）。
+            ground_z = self._ue_ned_ground_z if self._ue_ned_ground_z is not None else 0.0
+            airborne_by_altitude = pos.z_val < (ground_z - 0.3)
             flying = (landed == 1) and not landed_confirmed and (speed > 0.3 or airborne_by_altitude)
             if landed_confirmed:
                 position = {"x": float(position.get("x", 0.0) or 0.0), "y": float(position.get("y", 0.0) or 0.0), "z": 0.0}

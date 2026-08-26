@@ -6175,6 +6175,10 @@ function buildAgentTurn(message) {
   procFold.appendChild(procSummary);
   procFold.appendChild(thinkFold2);
   procFold.appendChild(toolLines);
+
+  const answerBody = document.createElement("div");
+  answerBody.className = "answer-body";
+
   const entry = {
     root,
     kind: "agent",
@@ -6213,6 +6217,10 @@ function buildAgentTurn(message) {
     }
     entry.thinkUserToggled = true;
   });
+
+  root.appendChild(errorPill);
+  root.appendChild(procFold);
+  root.appendChild(answerBody);
   return entry;
 }
 
