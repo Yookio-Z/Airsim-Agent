@@ -6177,12 +6177,17 @@ function buildAgentTurn(message) {
     procFold,
     procState,
     procLatest,
+    thinkFold2,
+    thinkState,
+    thinkLatest,
     thinkFull,
     toolLines,
     answerBody,
     renderedTrace: 0,
     userToggled: false,
+    thinkUserToggled: false,
     _programmatic: false,
+    _programmaticThink: false,
     startedAt: Date.now() / 1000,
     lastAnswer: "",
     lastReasoning: "",
@@ -6256,22 +6261,20 @@ function updateAgentTurn(entry, message, run, llm) {
     entry.renderedTrace += 1;
   }
 
-  // 过程折叠块：思考全文 + 工具/校验步骤。
-  // 运行中自动展开（标题行滚动最新思考句）；完成后自动收起，只留总结；
-  // 用户手动切换过则尊重用户选择。
+  // 外层过程折叠块：思考 + 工具/校验步骤全部收在里面。
+  // 运行中自动展开（内层思考块同步展开、标题滚动最新思考句）；
+  // 完成后自动收起，只留最终总结；用户手动切换过则尊重用户选择。
   const hasProcess = Boolean(reasoning) || entry.renderedTrace > 0;
   if (hasProcess) {
     entry.procFold.style.display = "";
-    const wasRunning = entry.lastRunning;
+    const dur = Math.max(1, Math.round(Date.now() / 1000 - entry.startedAt));
     if (running) {
-      entry.procState.textContent = "思考与执行中…";
-      entry.procLatest.textContent = reasoning ? latestThinkLine(reasoning) : "";
+      entry.procState.textContent = `思考与执行中 · 约 ${dur}s`;
       if (!entry.procFold.open && !entry.userToggled) {
         entry._programmatic = true;
         entry.procFold.open = true;
       }
     } else {
-      const dur = Math.max(1, Math.round(Date.now() / 1000 - entry.startedAt));
       entry.procState.textContent = `思考与执行过程 · 约 ${dur}s`;
       entry.procLatest.textContent = "";
       if (entry.procFold.open && !entry.userToggled) {
@@ -6279,13 +6282,42 @@ function updateAgentTurn(entry, message, run, llm) {
         entry.procFold.open = false; // 完成后折叠全部过程，只留最终总结
       }
     }
-    if (reasoning !== entry.lastReasoning) {
-      entry.lastReasoning = reasoning;
-      entry.thinkFull.textContent = reasoning;
-      entry.procLatest.textContent = running ? latestThinkLine(reasoning) : "";
+
+    // 内层思考折叠块：推理全文；运行中自动展开并滚动最新一句
+    if (reasoning) {
+      entry.thinkFold2.style.display = "";
+      if (reasoning !== entry.lastReasoning) {
+        entry.lastReasoning = reasoning;
+        entry.thinkFull.textContent = reasoning;
+        entry.thinkLatest.textContent = running ? latestThinkLine(reasoning) : firstThinkLine(reasoning);
+        entry.thinkLatest.scrollLeft = running ? entry.thinkLatest.scrollWidth : 0;
+      }
+      if (running && !entry.thinkFold2.open && !entry.thinkUserToggled) {
+        entry._programmaticThink = true;
+        entry.thinkFold2.open = true;
+      }
+      if (!running && entry.thinkFold2.open && !entry.thinkUserToggled) {
+        entry._programmaticThink = true;
+        entry.thinkFold2.open = false; // 完成后思考也收起（外层已折叠全部过程）
+      }
+    } else {
+      entry.thinkFold2.style.display = "none";
     }
   } else {
     entry.procFold.style.display = "none";
+    entry.thinkFold2.style.display = "none";
+  }
+
+  // 内层思考块的 toggle 归属（用户手动 vs 程序设置）
+  if (!entry._thinkToggleWired && entry.thinkFold2) {
+    entry._thinkToggleWired = true;
+    entry.thinkFold2.addEventListener("toggle", () => {
+      if (entry._programmaticThink) {
+        entry._programmaticThink = false;
+        return;
+      }
+      entry.thinkUserToggled = true;
+    });
   }
 
   // 正文：平滑分批释放（smoothShownContent）；运行中推理不占正文，

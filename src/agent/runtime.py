@@ -2022,6 +2022,17 @@ class AgentRuntime:
         plan_reasoning = str(getattr(plan, "reasoning", "") or "").strip()
         if not plan_reasoning:
             plan_reasoning = f"任务理解：{plan.summary}"
+        # 模型有时把 reasoning 字段写成整个 plan JSON 草稿——解析取其中的
+        # reasoning/summary 文本，避免思考块里出现一大段 JSON
+        if plan_reasoning.lstrip().startswith("{"):
+            try:
+                parsed_reasoning = json.loads(plan_reasoning)
+                if isinstance(parsed_reasoning, dict):
+                    extracted = str(parsed_reasoning.get("reasoning") or parsed_reasoning.get("summary") or "").strip()
+                    if extracted:
+                        plan_reasoning = extracted
+            except Exception:
+                pass
         reasoning_parts.append(plan_reasoning)
         step_tools = [step.tool for step in (plan.steps or []) if step.tool and step.tool != "memory_store"]
         if step_tools:

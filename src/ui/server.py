@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import logging
 import errno
 import json
 import mimetypes
@@ -982,6 +983,8 @@ def _load_saved_backend() -> str:
 
 
 def main() -> None:
+    # INFO 级别：返航/降落监视线程的执行轨迹需要可见，否则无法诊断
+    logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(name)s: %(message)s")
     parser = argparse.ArgumentParser(description="AirSim VLA Agent Web UI")
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=8765)

@@ -1133,8 +1133,10 @@ class AirSimController(FlightController):
         """
         deadline = time.time() + 180.0
         arrived = False
+        logger.info(f"return_land_monitor[{name}]: 引导返航启动, 目标=({x:.2f}, {y:.2f}, {z:.2f})")
         while time.time() < deadline:
             if self._stop_requested():
+                logger.info(f"return_land_monitor[{name}]: 收到停止信号退出")
                 return
             try:
                 status = self.get_status(name).to_dict()
@@ -1153,6 +1155,7 @@ class AirSimController(FlightController):
                 # 再垂直降落在初始点上。0.8m 是"到位"半径，目标始终是各自的初始点。
                 if dist_xy < 0.8 and speed < 0.5:
                     arrived = True
+                    logger.info(f"return_land_monitor[{name}]: 到位 (水平 {dist_xy:.2f}m, 速度 {speed:.2f}m/s), 准备降落")
                     break
                 # 引导指令：喂看门狗 + 持续指向初始点
                 self._rpc(
@@ -1167,7 +1170,7 @@ class AirSimController(FlightController):
                 logger.warning(f"return_land_monitor: {name} 引导指令异常: {e}")
             time.sleep(1.2)
         if not arrived:
-            logger.warning(f"return_land_monitor: {name} 未在超时前到位，跳过自动降落")
+            logger.warning(f"return_land_monitor[{name}]: 未在超时前到位，跳过自动降落")
             return
         try:
             # 精对准：到位后再补一条终点指令，收掉最后 ~1m 的水平偏差
@@ -1189,7 +1192,7 @@ class AirSimController(FlightController):
                 pass
             if self.land(vehicle_name=name):
                 self.disarm(vehicle_name=name)
-                logger.info(f"return_land_monitor: {name} 已返航降落并锁定")
+                logger.info(f"return_land_monitor[{name}]: 已返航降落并锁定")
         except Exception as e:
             logger.error(f"return_land_monitor: {name} 降落/锁定失败: {e}")
 
