@@ -1996,7 +1996,7 @@ class LLMMissionPlanner:
         return {
             "intent": "short snake_case intent",
             "summary": "one concise Chinese summary",
-            "reasoning": "brief non-sensitive planning rationale in Chinese",
+            "reasoning": "REQUIRED. 2-4 句中文规划理由：任务理解、关键决策依据（为什么选这些工具/参数）",
             "assumptions": ["operator-visible assumptions"],
             "risk_notes": ["safety or ambiguity notes"],
             "execution_mode": (

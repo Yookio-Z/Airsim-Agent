@@ -2015,11 +2015,17 @@ class AgentRuntime:
             {"run_id": run.run_id, "execute": execute, "planner_source": plan.planner_source, **route},
         )
         # 思考块内容组合（保证展开必有内容）：
-        #   1. LLM 规划理由 plan.reasoning（中文，规划 JSON 必含）
-        #   2. 思考词元流（reasoning_content，模型开启思考时才有）
+        #   1. LLM 规划理由 plan.reasoning（中文）；模型省略时用任务理解兜底
+        #   2. 执行计划概览（步骤序列）
+        #   3. 思考词元流（reasoning_content，模型开启思考时才有）
         reasoning_parts: list[str] = []
-        if getattr(plan, "reasoning", "") and str(plan.reasoning).strip():
-            reasoning_parts.append(str(plan.reasoning).strip())
+        plan_reasoning = str(getattr(plan, "reasoning", "") or "").strip()
+        if not plan_reasoning:
+            plan_reasoning = f"任务理解：{plan.summary}"
+        reasoning_parts.append(plan_reasoning)
+        step_tools = [step.tool for step in (plan.steps or []) if step.tool and step.tool != "memory_store"]
+        if step_tools:
+            reasoning_parts.append("执行计划（" + str(len(step_tools)) + " 步）：" + " → ".join(step_tools))
         if reasoning_full:
             reasoning_parts.append(reasoning_full)
         reasoning_full = "\n\n".join(reasoning_parts)

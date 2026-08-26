@@ -83,6 +83,7 @@ textarea:focus {
 }
 
 .app-shell {
+  min-width: 720px;
   height: 100vh;
   padding: 0;
   display: grid;
@@ -6424,7 +6425,16 @@ body.dragging-system-settings #systemSettingsModal .modal-head {
 .turn .tool-line.kind-verify .tool-badge {
   color: rgba(240, 184, 74, 0.9);
 }
+.turn .tool-line {
+  flex-wrap: nowrap;
+}
+.turn .tool-line strong {
+  flex: 0 0 auto;
+  white-space: nowrap;
+}
 .turn .tool-line .tool-line-body {
+  flex: 1 1 auto;
+  min-width: 0;
   color: rgba(255, 255, 255, 0.5);
   font-size: 12.5px;
   overflow: hidden;
