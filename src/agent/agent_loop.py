@@ -125,10 +125,12 @@ class AgentLoop:
             state.decisions.append(decision)
             self._notify_state(state)
             reasoning_text = str(getattr(self.planner, "last_reasoning", "") or "").strip()
-            if reasoning_text:
-                # the model's decision rationale (DeepSeek reasoning_content),
-                # shown inline in the operator's event stream
-                self._event("info", "model_reasoning", reasoning_text[:1500], {"step": step_index})
+            # 决策理由（decision.reason/reflection，中文）也是"LLM 的思考"——
+            # 与 reasoning_content 一起进思考块，保证展开必有内容
+            decision_rationale = str(decision.reason or decision.reflection or "").strip()
+            combined_reasoning = "\n".join(part for part in (reasoning_text, decision_rationale) if part)
+            if combined_reasoning:
+                self._event("info", "model_reasoning", combined_reasoning[:1500], {"step": step_index})
             self._event("info", "agent_loop", f"Loop decision {step_index}: {decision.action or 'complete'}", decision.to_dict(), kind="loop.decision")
 
             if decision.is_complete:

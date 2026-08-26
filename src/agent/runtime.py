@@ -2014,10 +2014,20 @@ class AgentRuntime:
             "Plan-Execute route selected",
             {"run_id": run.run_id, "execute": execute, "planner_source": plan.planner_source, **route},
         )
+        # 思考块内容组合（保证展开必有内容）：
+        #   1. LLM 规划理由 plan.reasoning（中文，规划 JSON 必含）
+        #   2. 思考词元流（reasoning_content，模型开启思考时才有）
+        reasoning_parts: list[str] = []
+        if getattr(plan, "reasoning", "") and str(plan.reasoning).strip():
+            reasoning_parts.append(str(plan.reasoning).strip())
+        if reasoning_full:
+            reasoning_parts.append(reasoning_full)
+        reasoning_full = "\n\n".join(reasoning_parts)
         if reasoning_full:
             # 规划推理全文归档到 run 上（此前写在消息 details 里会被
             # _begin_execution_trace 的 process_trace 覆盖而丢失）：
-            # thought_trace 存全文供回看，process_trace 首条进时间线折叠块
+            # thought_trace 存全文供回看，process_trace 首条进时间线折叠块；
+            # 并同步进消息 details.reasoning_text（前端思考块数据源）
             self._append_thought(run, "模型思考", reasoning_full)
             run.process_trace.insert(
                 0,
@@ -2028,6 +2038,13 @@ class AgentRuntime:
                     "status": "completed",
                     "kind": "reasoning",
                 },
+            )
+            self._update_assistant_message(
+                run.run_id,
+                "正在执行计划...",
+                "running",
+                {"mode": "execute", "phase": "planning", "reasoning_text": reasoning_full[:8000]},
+                persist=False,
             )
         if execute:
             self._begin_execution_trace(run, "任务适合一次性规划执行：先生成完整工具序列，再由 runtime 逐步执行、回读和校验。")

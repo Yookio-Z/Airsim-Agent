@@ -3449,11 +3449,15 @@ async function invokeFlightControl(action) {
   const normalized = String(action || "").toLowerCase();
   const targets = controlTargetList();
   requireLiveFlightLink();
-  return post("/api/control", {
+  const result = await post("/api/control", {
     action: normalized,
     vehicles: targets,
     expected_backend: activeFlightRuntime().backend || "",
   });
+  if ((normalized === "return_home" || normalized === "rtl") && result?.ok && targets.length) {
+    activeReturnHomeVehicles = [...targets];
+  }
+  return result;
 }
 
 async function runButton(button, fn, successMessage) {
@@ -3739,6 +3743,7 @@ async function refreshTelemetryOnly() {
     renderTelemetry(drone, toolRuntime);
     updateMapView(latestState);
     checkFlightTaskCompletion(toolRuntime);
+    checkReturnHomeCompletion(toolRuntime);
   } finally {
     telemetryRefreshInFlight = false;
   }
@@ -3747,6 +3752,21 @@ async function refreshTelemetryOnly() {
 // 多机航线完成监控：本轮派发的所有机都到达各自终点并悬停后提示一次，
 // 并复位任务执行状态（missionExecutionActive）。
 let activeFlightTaskVehicles = [];
+
+// 返航完成监控：派发返航后，等所有目标机落地锁定再提示
+let activeReturnHomeVehicles = [];
+
+function checkReturnHomeCompletion(toolRuntime = {}) {
+  if (!activeReturnHomeVehicles.length) return;
+  const vehicles = Array.isArray(toolRuntime.vehicles) ? toolRuntime.vehicles : [];
+  if (!vehicles.length) return;
+  const byName = new Map(vehicles.map((v) => [String(v.vehicle_name || ""), v]));
+  const states = activeReturnHomeVehicles.map((n) => byName.get(n));
+  if (states.some((s) => s === undefined)) return;
+  if (!states.every((v) => !v.flying && !v.armed)) return;
+  activeReturnHomeVehicles = [];
+  showNotice("✅ 返航完成：已全部到达初始点并降落锁定", "success");
+}
 
 function checkFlightTaskCompletion(toolRuntime = {}) {
   if (!activeFlightTaskVehicles.length) return;

@@ -514,6 +514,10 @@ class OpenAIClient:
         # chat_json 不限制 max_tokens，让推理模型有足够空间输出完整 JSON
         req = self._request(messages, {"response_format": {"type": "json_object"}})
         response = self._do_request(req)
+        # 推理模型的思考内容（DeepSeek reasoning_content）透出到 client 属性，
+        # 供流式回退路径也能把思考归档进前端思考块
+        message = ((response.get("choices") or [{}])[0].get("message")) or {}
+        self.last_reasoning = str(message.get("reasoning_content") or "")
         content = self._first_content(response)
         if not content:
             raise RuntimeError("LLM returned empty content")

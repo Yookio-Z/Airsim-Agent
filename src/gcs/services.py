@@ -290,7 +290,11 @@ class ToolMissionManager:
         if "drone_upload_mission" in _tool_names(self._tools):
             result = self._tools.execute(
                 "drone_upload_mission",
-                {"waypoints_json": json.dumps([item.to_dict() for item in self._draft.items])},
+                {
+                    "waypoints_json": json.dumps([item.to_dict() for item in self._draft.items]),
+                    # PX4 等原生 mission 后端按车上传（空串 = 默认机）
+                    "vehicle_name": self._draft_vehicle_name(),
+                },
                 dry_run=False,
             )
             manager_result = _manager_result_from_tool(result)
@@ -337,7 +341,11 @@ class ToolMissionManager:
         self._draft = None
         self._state = MissionState(message="local mission cleared")
         if "drone_clear_mission" in _tool_names(self._tools):
-            result = self._tools.execute("drone_clear_mission", {}, dry_run=False)
+            result = self._tools.execute(
+                "drone_clear_mission",
+                {"vehicle_name": self._draft_vehicle_name()},
+                dry_run=False,
+            )
             manager_result = _manager_result_from_tool(result)
             if manager_result.ok:
                 return manager_result
@@ -373,7 +381,11 @@ class ToolMissionManager:
             return self._execute_local_path(waypoints, velocity)
 
         if "drone_start_mission" in _tool_names(self._tools):
-            result = self._tools.execute("drone_start_mission", {}, dry_run=False)
+            result = self._tools.execute(
+                "drone_start_mission",
+                {"vehicle_name": self._draft_vehicle_name()},
+                dry_run=False,
+            )
             manager_result = _manager_result_from_tool(result)
             self._state.running = manager_result.ok
             self._state.message = manager_result.message

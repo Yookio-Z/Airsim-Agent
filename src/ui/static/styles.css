@@ -29,7 +29,9 @@ body {
   overflow: hidden;
 }
 
+/* 最低工作宽度：低于此值出横向滚动（内容不挤压），保证对话可读 */
 body {
+  min-width: 720px;
   margin: 0;
   background: var(--bg);
   color: var(--ink);

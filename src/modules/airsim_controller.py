@@ -747,6 +747,14 @@ class AirSimController(FlightController):
                 self._rpc(self._client.enableApiControl, True, name)
                 time.sleep(0.2)
                 self._control_enabled.add(name)
+            # 唤醒：悬停超过看门狗窗口后 SimpleFlight 进入安全悬停态并忽略
+            # 后续指令（"API call was not received"），先发 hover 重置看门狗
+            for name in names:
+                try:
+                    self._rpc(lambda n=name: self._client.hoverAsync(vehicle_name=n), timeout=10.0)
+                except Exception:
+                    pass
+                time.sleep(0.2)
             # 多机并行降落：先给全部车辆发出 landAsync（AirSim 并发执行），
             # 再统一轮询落地确认——逐架 join 会把 N 架的降落时间串行相加
             for name in names:
@@ -1047,6 +1055,13 @@ class AirSimController(FlightController):
             return False
         try:
             names = self._resolve_vehicles(vehicle_name)
+            # 唤醒看门狗（悬停久了安全悬停态会忽略 landAsync）
+            for name in names:
+                try:
+                    self._rpc(lambda n=name: self._client.hoverAsync(vehicle_name=n), timeout=10.0)
+                except Exception:
+                    pass
+                time.sleep(0.2)
             for name in names:
                 self._rpc(
                     lambda n=name: self._client.landAsync(timeout_sec=60, vehicle_name=n),
@@ -1203,7 +1218,9 @@ class AirSimController(FlightController):
                 info["near_count"] = int(info.get("near_count", 0)) + 1
             else:
                 info["near_count"] = 0
-            if info["near_count"] >= 3:
+            # 飞机已落地(降落/被返航接管) → 路径任务自然结束,不留滞留记录
+            grounded = (not vehicle.get("flying")) and (not vehicle.get("armed")) and speed < 0.5
+            if info["near_count"] >= 3 or grounded:
                 info["done"] = True
                 info["done_at"] = time.time()
             info["last_dist"] = round(dist, 2)

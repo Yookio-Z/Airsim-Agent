@@ -496,8 +496,8 @@ def register_core_tools(
         )
 
     @mcp.tool()
-    def drone_upload_mission(waypoints_json: str) -> str:
-        """Upload a backend mission.
+    def drone_upload_mission(waypoints_json: str, vehicle_name: str = "") -> str:
+        """Upload a backend mission (vehicle_name: 空=默认机, 或具体载具名).
 
         The payload can be an array of MissionItem objects or a MissionPlanDraft
         object with `items` or `waypoints`.
@@ -521,7 +521,13 @@ def register_core_tools(
             waypoints = payload
         if not isinstance(waypoints, list):
             return fmt_result({"status": "error", "message": "mission items must be a list"})
-        return fmt_result(dict(method([item for item in waypoints if isinstance(item, dict)])))
+        clean = [item for item in waypoints if isinstance(item, dict)]
+        try:
+            result = method(clean, vehicle_name=vehicle_name)
+        except TypeError:
+            # 旧控制器签名不支持按车上传
+            result = method(clean)
+        return fmt_result(dict(result))
 
     @mcp.tool()
     def drone_download_mission() -> str:
@@ -538,8 +544,8 @@ def register_core_tools(
         return fmt_result(dict(method()))
 
     @mcp.tool()
-    def drone_clear_mission() -> str:
-        """Clear the current backend mission."""
+    def drone_clear_mission(vehicle_name: str = "") -> str:
+        """Clear the current backend mission (vehicle_name: 空=默认机, 或具体载具名)."""
         method = getattr(controller, "clear_mission", None)
         if not callable(method):
             return fmt_result(
@@ -549,11 +555,15 @@ def register_core_tools(
                     "message": "mission clear is not supported by this backend",
                 }
             )
-        return fmt_result(dict(method()))
+        try:
+            result = method(vehicle_name=vehicle_name)
+        except TypeError:
+            result = method()
+        return fmt_result(dict(result))
 
     @mcp.tool()
-    def drone_start_mission() -> str:
-        """Start the mission already uploaded to the backend."""
+    def drone_start_mission(vehicle_name: str = "") -> str:
+        """Start the mission already uploaded to the backend (vehicle_name: 空=默认机, 或具体载具名)."""
         method = getattr(controller, "start_mission", None)
         if not callable(method):
             return fmt_result(
@@ -563,7 +573,11 @@ def register_core_tools(
                     "message": "mission start is not supported by this backend",
                 }
             )
-        return fmt_result(dict(method()))
+        try:
+            result = method(vehicle_name=vehicle_name)
+        except TypeError:
+            result = method()
+        return fmt_result(dict(result))
 
     @mcp.tool()
     def drone_get_mission_progress() -> str:
