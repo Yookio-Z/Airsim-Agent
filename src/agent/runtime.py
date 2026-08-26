@@ -2025,14 +2025,25 @@ class AgentRuntime:
         # 模型有时把 reasoning 字段写成整个 plan JSON 草稿——解析取其中的
         # reasoning/summary 文本，避免思考块里出现一大段 JSON
         if plan_reasoning.lstrip().startswith("{"):
+            extracted = ""
             try:
                 parsed_reasoning = json.loads(plan_reasoning)
                 if isinstance(parsed_reasoning, dict):
                     extracted = str(parsed_reasoning.get("reasoning") or parsed_reasoning.get("summary") or "").strip()
-                    if extracted:
-                        plan_reasoning = extracted
             except Exception:
                 pass
+            if not extracted:
+                # 截断/不合法的 JSON 草稿：正则直接抠 "reasoning" 字段值
+                m = re.search(r'"reasoning"\s*:\s*"((?:[^"\\]|\\.)*)"', plan_reasoning)
+                if m:
+                    extracted = (
+                        m.group(1)
+                        .replace("\\n", "\n")
+                        .replace("\\t", " ")
+                        .replace('\\"', '"')
+                    )
+            if extracted:
+                plan_reasoning = extracted
         reasoning_parts.append(plan_reasoning)
         step_tools = [step.tool for step in (plan.steps or []) if step.tool and step.tool != "memory_store"]
         if step_tools:

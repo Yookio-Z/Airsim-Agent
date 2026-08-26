@@ -650,13 +650,14 @@ class AirSimController(FlightController):
         except Exception as e:
             logger.warning(f"home store save failed: {e}")
 
-    def _record_home_position(self, name: str, status: dict) -> None:
-        """用地面飞机的 GPS 标定 UE→NED 偏移（多次采样取平均）。
+    def _record_home_position(self, name: str, status: dict, landed_raw: int = 0) -> None:
+        """用真实触地飞机(模拟器 landed_state==0)的 GPS 标定 UE→NED 偏移与地面高度。
 
         返航点 = settings.json 出生点(UE) + 标定偏移，与"首次落地位置"彻底脱钩：
-        服务重启、飞机悬停在外、甚至换模拟器地图，出生点都由配置权威决定，不会污染。
+        服务重启、飞机悬停在外，出生点都由配置权威决定，不会污染。
+        悬停中的飞机绝不参与标定（其 z 不能当地面）。
         """
-        if status.get("flying"):
+        if landed_raw != 0:
             return
         if self._ue_ned_offset is not None and len(self._ue_offset_samples) >= 5:
             return
@@ -881,8 +882,9 @@ class AirSimController(FlightController):
                 # equally safe. 地面 z 用标定值（原点可能高于地面数米，
                 # 绝不能用 z>0 当落地，否则 3m 悬停会被误判落地并提前上锁）。
                 pos = state.kinematics_estimated.position
-                ground_ref = self._ue_ned_ground_z if self._ue_ned_ground_z is not None else 0.0
-                if float(pos.z_val) > (ground_ref - 0.4):
+                # 高度捷径仅在完成地面标定后可用（否则原点高度未知，
+                # 悬停 3m 会被误判为落地并提前上锁）
+                if self._ue_ned_ground_z is not None and float(pos.z_val) > (self._ue_ned_ground_z - 0.4):
                     return True
             except Exception:
                 pass
@@ -1470,7 +1472,7 @@ class AirSimController(FlightController):
                 gps=gps_data,
                 extra=extra,
             )
-            self._record_home_position(name, status_dict.to_dict())
+            self._record_home_position(name, status_dict.to_dict(), landed)
             home = self.home_position(name)
             if home is not None:
                 status_dict.extra["home_position_ned"] = dict(home)
