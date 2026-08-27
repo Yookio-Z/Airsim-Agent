@@ -4760,6 +4760,37 @@ function updateMapView(state) {
   // "gps is not defined" (ReferenceError) inside the else branch consumers
   const gps = droneGpsPosition(drone, runtime);
 
+  if (!linked) {
+    // 未连接/链路过期/正在切换后端：清除旧的无人机与多机标记、轨迹和
+    // H 点，避免把过去链路的残影当作当前状态显示
+    stopDroneAnimation();
+    droneRenderedLngLat = null;
+    droneLastTelemetryLngLat = null;
+    if (droneMarker) {
+      droneMarker.remove();
+      droneMarker = null;
+    }
+    for (const entry of vehicleMarkers.values()) {
+      try {
+        entry.marker.remove();
+      } catch (e) { /* already removed */ }
+    }
+    vehicleMarkers.clear();
+    vehicleTracks.clear();
+    for (const marker of vehicleHomeMarkers.values()) {
+      try {
+        marker.remove();
+      } catch (e) { /* already removed */ }
+    }
+    vehicleHomeMarkers.clear();
+    if (homeMarker) {
+      homeMarker.remove();
+      homeMarker = null;
+    }
+    clearVehicleTrack();
+    clearActiveLeg();
+  }
+
   const vehicles = Array.isArray(runtime.vehicles) ? runtime.vehicles : [];
   if (vehicles.length > 1) {
     // 多机模式：每机 marker + 独立轨迹（单机逻辑保留给 vehicles.length <= 1）

@@ -838,28 +838,39 @@ class MavlinkController(FlightController):
             return True
         if self._is_px4() and not self._prepare_px4_mode_for_arm():
             return False
-        self._mavlink.mav.command_long_send(
-            self._mavlink.target_system,
-            self._mavlink.target_component,
-            mavutil.mavlink.MAV_CMD_COMPONENT_ARM_DISARM,
-            0,
-            1,
-            0,
-            0,
-            0,
-            0,
-            0,
-            0,
-        )
-        ack_ok = self._wait_command_ack(mavutil.mavlink.MAV_CMD_COMPONENT_ARM_DISARM, timeout=5.0)
-        if not ack_ok:
-            return False
-        armed = self._wait_until(lambda: self._is_armed(), timeout=6.0)
-        if not armed:
-            self._last_action_error = self._with_status_text(
-                "Flight controller accepted the arm command but did not enter armed state; check PX4 preflight checks and the safety switch."
+        # PX4 commander 在预检/状态机冷却窗口（~1s）内会以
+        # MAV_RESULT_TEMPORARILY_REJECTED 拒绝 arm，之后重试通常成功；
+        # 重试间隔留出冷却期，并把飞控 STATUSTEXT 并入错误信息
+        attempts = 3 if self._is_px4() else 1
+        for attempt in range(attempts):
+            self._mavlink.mav.command_long_send(
+                self._mavlink.target_system,
+                self._mavlink.target_component,
+                mavutil.mavlink.MAV_CMD_COMPONENT_ARM_DISARM,
+                0,
+                1,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
             )
-        return armed
+            ack_ok = self._wait_command_ack(mavutil.mavlink.MAV_CMD_COMPONENT_ARM_DISARM, timeout=5.0)
+            if ack_ok:
+                armed = self._wait_until(lambda: self._is_armed(), timeout=6.0)
+                if armed:
+                    return True
+                self._last_action_error = self._with_status_text(
+                    "Flight controller accepted the arm command but did not enter armed state; check PX4 preflight checks and the safety switch."
+                )
+                return False
+            if attempt < attempts - 1:
+                logger.warning(
+                    f"arm attempt {attempt + 1} rejected: {self._last_action_error}; retrying after PX4 arming window"
+                )
+                time.sleep(1.2)
+        return False
 
     def disarm(self, vehicle_name: str = "") -> bool:
         """多机：vehicle_name（""=默认机 / all=全部 / px4_sysN）解析后逐机执行。"""
@@ -916,12 +927,12 @@ class MavlinkController(FlightController):
         ok = True
         for sysid in targets:
             self._set_target(sysid)
-            if not self._takeoff_one(altitude):
+            if not self._takeoff_one(altitude, vehicle_name):
                 ok = False
                 break
         return ok
 
-    def _takeoff_one(self, altitude: float = 3.0) -> bool:
+    def _takeoff_one(self, altitude: float = 3.0, vehicle_name: str = "") -> bool:
         self._last_action_error = ""
         if not self.is_connected:
             self._last_action_error = "MAVLink is not connected"
@@ -3761,10 +3772,16 @@ class MavlinkController(FlightController):
 
         if remote_port:
             explicit_host = remote_host.strip().strip("[]") or target_host
-            return self._expand_windows_wsl_targets(explicit_host, int(remote_port))
+            try:
+                return self._expand_windows_wsl_targets(explicit_host, int(remote_port))
+            except Exception:
+                return [(explicit_host, int(remote_port))]
 
         if 14550 <= port <= 14559:
-            return self._expand_windows_wsl_targets(target_host, 18570 + (port - 14550))
+            try:
+                return self._expand_windows_wsl_targets(target_host, 18570 + (port - 14550))
+            except Exception:
+                return [(target_host, 18570 + (port - 14550))]
         if prefix == "udpout:" and 18570 <= port <= 18579:
             return self._expand_windows_wsl_targets(target_host, port)
         return []
@@ -3788,9 +3805,14 @@ class MavlinkController(FlightController):
                 check=False,
                 capture_output=True,
                 text=True,
+                errors="replace",
                 timeout=1.5,
             )
         except (OSError, subprocess.SubprocessError):
+            return []
+        # wsl.exe 输出可能含非法 UTF-8 字节（ANSI/UTF-16 混杂），解码失败时
+        # stdout 会是 None——判空防止 None.split() 把整个连接流程打崩
+        if not completed.stdout:
             return []
         addresses: list[str] = []
         for token in completed.stdout.split():

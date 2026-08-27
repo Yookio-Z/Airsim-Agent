@@ -1869,6 +1869,14 @@ class ToolRuntime:
             if self._last_status_snapshot:
                 cached = dict(self._last_status_snapshot)
                 cached["busy"] = True
+                # 后端切换/重连期间锁被占用：绝不能把旧链路的车辆与无人机
+                # 数据当作当前状态返回（否则 UI 会把上一个后端的残影画在
+                # 卫星图上，表现为"状态停留在过去"）
+                cached["connected"] = False
+                cached["stale_connection"] = True
+                cached["drone"] = None
+                cached["vehicles"] = []
+                cached["flight_tasks"] = {}
                 return cached
             return {
                 "ready": self.available,
