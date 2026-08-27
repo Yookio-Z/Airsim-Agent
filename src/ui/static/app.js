@@ -3153,13 +3153,76 @@ function vehicleMarkerPosition(vehicle, runtime) {
   return [gps[1], gps[0]]; // [lng, lat]
 }
 
+// 多机标记防重叠（保形放大）：出生点/返航点间距只有几米，卫星图缩放下必然
+// 叠成一个点。对彼此间距 ≤ 15m 的聚簇，围绕簇中心按同一比例放大显示，
+// 保持真实相对布局与朝向（AirSim 里是一条线，地图上仍是一条线，只是拉宽到
+// 直径 ~30m 便于肉眼分辨）。只影响显示坐标，真实位置数据/轨迹不变。
+function deOverlapMarkers(positions) {
+  // positions: [{ name, lngLat: [lng, lat] }]
+  const result = new Map();
+  if (positions.length < 2) {
+    for (const p of positions) result.set(p.name, p.lngLat);
+    return result;
+  }
+  const TARGET_DIAMETER_M = 30;
+  const clusters = [];
+  for (const p of positions) {
+    let cluster = null;
+    for (const cand of clusters) {
+      if (cand.some((q) => haversineMeters(p.lngLat[1], p.lngLat[0], q.lngLat[1], q.lngLat[0]) <= 15)) {
+        cluster = cand;
+        break;
+      }
+    }
+    if (!cluster) {
+      cluster = [];
+      clusters.push(cluster);
+    }
+    cluster.push(p);
+  }
+  for (const cluster of clusters) {
+    if (cluster.length === 1) {
+      result.set(cluster[0].name, cluster[0].lngLat);
+      continue;
+    }
+    const cLat = cluster.reduce((s, p) => s + p.lngLat[1], 0) / cluster.length;
+    const cLng = cluster.reduce((s, p) => s + p.lngLat[0], 0) / cluster.length;
+    let maxDist = 0;
+    for (let i = 0; i < cluster.length; i++) {
+      for (let j = i + 1; j < cluster.length; j++) {
+        const d = haversineMeters(
+          cluster[i].lngLat[1], cluster[i].lngLat[0],
+          cluster[j].lngLat[1], cluster[j].lngLat[0]
+        );
+        if (d > maxDist) maxDist = d;
+      }
+    }
+    const scale = TARGET_DIAMETER_M / Math.max(1.0, maxDist);
+    for (const p of cluster) {
+      const dLat = (p.lngLat[1] - cLat) * scale;
+      const dLon = (p.lngLat[0] - cLng) * scale;
+      result.set(p.name, [cLng + dLon, cLat + dLat]);
+    }
+  }
+  return result;
+}
+
 // 多机模式：每机一个 marker（即时更新，不做插值动画，保持简单可靠）
 function updateVehicleMarkers(vehicles, runtime) {
   if (!maplibreMap || !Array.isArray(vehicles) || vehicles.length === 0) return;
   const liveNames = new Set();
+  const positions = [];
   for (const vehicle of vehicles) {
     const name = String(vehicle.vehicle_name || "");
+    if (!name) continue;
     liveNames.add(name);
+    const lngLat = vehicleMarkerPosition(vehicle, runtime);
+    if (lngLat) positions.push({ name, lngLat });
+  }
+  const displayLngLats = deOverlapMarkers(positions);
+  for (const vehicle of vehicles) {
+    const name = String(vehicle.vehicle_name || "");
+    if (!liveNames.has(name)) continue;
     const lngLat = vehicleMarkerPosition(vehicle, runtime);
     const heading = normalizeHeadingDeg(droneHeadingDeg(vehicle));
     let entry = vehicleMarkers.get(name);
@@ -3171,18 +3234,18 @@ function updateVehicleMarkers(vehicles, runtime) {
         anchor: "center",
         rotationAlignment: "map",
       })
-        .setLngLat(lngLat)
+        .setLngLat(displayLngLats.get(name) || lngLat)
         .setRotation(heading)
         .addTo(maplibreMap);
       entry = { marker, lngLat, heading };
       vehicleMarkers.set(name, entry);
     }
     if (lngLat) {
-      entry.marker.setLngLat(lngLat).setRotation(heading);
+      entry.marker.setLngLat(displayLngLats.get(name) || lngLat).setRotation(heading);
       entry.lngLat = lngLat;
       entry.heading = heading;
     }
-    // 每机轨迹
+    // 每机轨迹（真实坐标，不随防重叠外扩漂移）
     if (applicationSettings.map.show_vehicle_track && lngLat) {
       updateVehicleTrack(lngLat, vehicle, true, name);
     }
@@ -3209,25 +3272,54 @@ function createVehicleHomeElement(name, color) {
   return el;
 }
 
+// 各机 H 点的地图经纬度：后端两种格式都兼容——
+// AirSim 用 home_position_ned（NED，本地换算），PX4/真机用
+// home_position（MAVLink HOME_POSITION 的 lat/lon）。
+function vehicleHomeLngLat(vehicle) {
+  const hn = vehicle?.home_position_ned;
+  if (hn && Number.isFinite(Number(hn.x)) && Number.isFinite(Number(hn.y))) {
+    const g = nedToGps(Number(hn.x), Number(hn.y), Number(hn.z || 0));
+    return [g.lon, g.lat];
+  }
+  const hp = vehicle?.home_position || {};
+  if (Number.isFinite(Number(hp.lat)) && Number.isFinite(Number(hp.lon))) {
+    return [Number(hp.lon), Number(hp.lat)];
+  }
+  return null;
+}
+
 function updateVehicleHomeMarkers(vehicles, runtime) {
   if (!maplibreMap || !Array.isArray(vehicles)) return;
   const liveNames = new Set();
+  // 各机 H 点（精确位置）与该机当前真实位置：无人机在自家 H 上时 H 被
+  // 无人机图标占据（不显示）——初始/返航落地时二者天然重合，不需分离；
+  // 无人机飞走后 H 原地显示，表示返航点。
   for (const vehicle of vehicles) {
     const name = String(vehicle.vehicle_name || "");
     if (!name) continue;
-    const home = vehicle.home_position_ned;
-    if (!home || !Number.isFinite(Number(home.x)) || !Number.isFinite(Number(home.y))) continue;
-    const gps = nedToGps(Number(home.x), Number(home.y), Number(home.z || 0));
-    const lngLat = [gps.lon, gps.lat];
+    const homeLngLat = vehicleHomeLngLat(vehicle);
+    if (!homeLngLat) continue;
     liveNames.add(name);
+    const droneLngLat = vehicleMarkerPosition(vehicle, runtime);
+    const occupied = Boolean(droneLngLat) && haversineMeters(
+      homeLngLat[1], homeLngLat[0], droneLngLat[1], droneLngLat[0]
+    ) < 15;
+    if (occupied) {
+      const marker = vehicleHomeMarkers.get(name);
+      if (marker) {
+        marker.remove();
+        vehicleHomeMarkers.delete(name);
+      }
+      continue;
+    }
     let marker = vehicleHomeMarkers.get(name);
     if (!marker) {
       marker = new maplibregl.Marker({ element: createVehicleHomeElement(name, vehicleRouteColor(name)), anchor: "center" })
-        .setLngLat(lngLat)
+        .setLngLat(homeLngLat)
         .addTo(maplibreMap);
       vehicleHomeMarkers.set(name, marker);
     } else {
-      marker.setLngLat(lngLat);
+      marker.setLngLat(homeLngLat);
     }
   }
   for (const [name, marker] of vehicleHomeMarkers.entries()) {
@@ -4730,8 +4822,18 @@ function updateMapView(state) {
   }
 
   // 更新 home marker（PX4 后端可能有真实 home，AirSim 用模拟原点）
+  // 更新 home marker（PX4 后端可能有真实 home；AirSim 单机时用模拟原点）
+  // 多机模式下每机有自己的 H 标记，中央的旧 homeMarker 会误导坐标对应，直接移除
+  const multiVehicleHomeDisplay =
+    isMultiVehiclePlanning() ||
+    (Array.isArray(state?.tool_runtime?.vehicles) && state.tool_runtime.vehicles.length > 1);
   const homeGps = homeGpsPosition(drone, runtime, state);
-  if (homeGps && homeMarker) {
+  if (multiVehicleHomeDisplay) {
+    if (homeMarker) {
+      homeMarker.remove();
+      homeMarker = null;
+    }
+  } else if (homeGps && homeMarker) {
     homeMarker.setLngLat([homeGps[1], homeGps[0]]);
   }
 

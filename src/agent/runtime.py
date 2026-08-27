@@ -2713,18 +2713,30 @@ class AgentRuntime:
                     return {"ok": False, "error": f"{name or '默认机'} 降落指令失败", "vehicles": results}
 
         # 轮询验证：目标列表里每台都必须确认落地。
-        # 地面 NED z 随地形/出生点变化（3~6m 都有），用该机 home 的 z 作地面基准。
+        # 地面基准用 kinematics 帧标定值（GPS 帧与 kinematics 帧有 ~2m 偏差，
+        # 用错帧会把落地误判为未落地、导致降落超时误报）。
         controller = getattr(self.tools, "controller", None)
         ground_z = {}
-        home_read = getattr(controller, "home_position", None) if controller is not None else None
-        for name in to_land:
-            if callable(home_read):
-                try:
-                    home = home_read(name)
-                except Exception:
-                    home = None
-                if isinstance(home, dict):
-                    ground_z[name] = float(home.get("z", 0.0))
+        kin_ground = getattr(controller, "ground_z_kin", None) if controller is not None else None
+        kin_ground_val = None
+        if callable(kin_ground):
+            try:
+                kin_ground_val = kin_ground()
+            except Exception:
+                kin_ground_val = None
+        if kin_ground_val is not None:
+            for name in to_land:
+                ground_z[name] = float(kin_ground_val)
+        else:
+            home_read = getattr(controller, "home_position", None) if controller is not None else None
+            for name in to_land:
+                if callable(home_read):
+                    try:
+                        home = home_read(name)
+                    except Exception:
+                        home = None
+                    if isinstance(home, dict):
+                        ground_z[name] = float(home.get("z", 0.0))
         pending = set(to_land)
         deadline = time.time() + 120.0
         while pending and time.time() < deadline:
@@ -2766,6 +2778,13 @@ class AgentRuntime:
         return {"ok": ok, "message": message, "vehicles": results}
 
     def _manual_return_home(self, targets: list[str] | None = None) -> dict[str, Any]:
+        """返航：每台目标机都回到各自初始点并降落锁定。
+
+        - 空中：飞回初始点上方 → 降落 → 上锁
+        - 待飞(解锁在地面)：爬升 → 飞回初始点 → 降落 → 上锁
+        - 已锁定但在远处：重新解锁 → 爬升 → 飞回初始点 → 降落 → 上锁
+        - 已锁定且在初始点：无需动作
+        """
         if self.tools.formation_active():
             return {
                 "ok": False,
@@ -2773,91 +2792,109 @@ class AgentRuntime:
             }
         runtime = self.tools.status_snapshot()
         connected = bool(runtime.get("connected")) and not bool(runtime.get("stale_connection"))
-        drone = runtime.get("drone") if isinstance(runtime.get("drone"), dict) else {}
         if not connected:
             return {"ok": False, "error": "flight controller link is offline or stale"}
 
         min_altitude = float(getattr(self.tools.safety.constraints, "min_altitude", 0.5) or 0.5)
         max_altitude = float(getattr(self.tools.safety.constraints, "max_altitude", 50.0) or 50.0)
         controller = getattr(self.tools, "controller", None)
+        gps_to_ned = getattr(controller, "gps_to_ned", None) if controller is not None else None
+        home_read = getattr(controller, "home_position", None) if controller is not None else None
 
         vehicles = [v for v in (runtime.get("vehicles") or []) if isinstance(v, dict) and not v.get("error")]
         target_set = {str(t).strip() for t in (targets or []) if str(t).strip()}
-        # 返航目标：在空中的 + 待飞(解锁但在地面,如任务中碰撞落地)的都纳入;
-        # 已锁定在地面(disarmed)的无需返航
-        flying = [
+        selected = [
             v for v in vehicles
-            if (v.get("flying") or v.get("armed"))
-            and (not target_set or str(v.get("vehicle_name") or "") in target_set)
+            if not target_set or str(v.get("vehicle_name") or "") in target_set
         ]
+        if not selected and isinstance(runtime.get("drone"), dict) and runtime.get("drone"):
+            selected = [runtime.get("drone")]
 
-        if not flying:
-            if not drone or drone.get("error"):
-                return {"ok": False, "error": str(drone.get("error") or "vehicle status unavailable")}
-            armed = bool(drone.get("armed"))
-            pos = drone.get("position_ned") if isinstance(drone.get("position_ned"), dict) else {}
-            altitude = abs(self._ned_value(pos, "z", 0.0) or 0.0)
-            if not armed and altitude < min_altitude:
-                self._append_event("info", "tool", "无人机已在地面，无需返航", {"drone": drone})
-                return {"ok": True, "message": "vehicle already on ground", "drone": drone}
-            return {"ok": False, "error": "vehicle is not airborne; return_home command was not sent", "drone": drone}
-
-        # 每架在空中的机各自返航到自己的初始点位（首次记录的地面位置）。
-        # 多机并发：非阻塞派发，互不等待。
         memory = self.memory.snapshot()
         session = memory.get("session") if isinstance(memory, dict) else {}
         memory_start = session.get("last_task_start_position_ned") if isinstance(session, dict) else None
         speed = max(1.0, min(3.0, float(getattr(self.tools.safety.constraints, "max_velocity", 3.0) or 3.0)))
 
         results: list[dict[str, Any]] = []
-        for vehicle in flying:
+        for vehicle in selected:
             name = str(vehicle.get("vehicle_name") or "")
             label = name or "默认机"
-            pos = vehicle.get("position_ned") if isinstance(vehicle.get("position_ned"), dict) else {}
-            status_flying = bool(vehicle.get("flying"))
-            current_x = self._ned_value(pos, "x", 0.0) or 0.0
-            current_y = self._ned_value(pos, "y", 0.0) or 0.0
-            current_z = self._ned_value(pos, "z", 0.0) or 0.0
-            altitude = abs(current_z)
-            if current_z < -min_altitude:
-                target_z = -min(max(altitude, min_altitude), max_altitude)
-            else:
-                target_z = -min(max(3.0, min_altitude), max_altitude)
-
+            gps = vehicle.get("gps") if isinstance(vehicle.get("gps"), dict) else None
             home = None
-            if controller is not None and hasattr(controller, "home_position"):
+            if callable(home_read):
                 try:
-                    home = controller.home_position(name)
+                    home = home_read(name)
                 except Exception:
                     home = None
 
-            if isinstance(home, dict) and home.get("x") is not None:
-                target = {
-                    "x": round(float(home.get("x", 0.0)), 3),
-                    "y": round(float(home.get("y", 0.0)), 3),
-                    "z": round(float(target_z), 3),
+            # 当前位置：优先 GPS→NED（地面状态下 kinematics 多机读数不可靠）
+            cur = None
+            cur_from_gps = False
+            if gps is not None and callable(gps_to_ned):
+                try:
+                    cur = gps_to_ned(float(gps.get("lat")), float(gps.get("lon")), float(gps.get("alt", 0.0) or 0.0))
+                    cur_from_gps = cur is not None
+                except (TypeError, ValueError):
+                    cur = None
+            if cur is None:
+                pos = vehicle.get("position_ned") if isinstance(vehicle.get("position_ned"), dict) else {}
+                cur = {
+                    "x": self._ned_value(pos, "x", 0.0) or 0.0,
+                    "y": self._ned_value(pos, "y", 0.0) or 0.0,
+                    "z": self._ned_value(pos, "z", 0.0) or 0.0,
                 }
-                target_source = "vehicle_initial_position"
-            elif len(flying) == 1:
-                # 无该机记录时的单机回退：上次任务起点 / 安全 home
-                target_x = self._ned_value(memory_start, "x")
-                target_y = self._ned_value(memory_start, "y")
-                if target_x is None or target_y is None:
-                    home_x, home_y = self.tools.safety.constraints.home_position
-                    target_x, target_y = float(home_x), float(home_y)
-                    target_source = "safety_home_position"
+
+            flying = bool(vehicle.get("flying"))
+            armed = bool(vehicle.get("armed"))
+
+            if not isinstance(home, dict) or home.get("x") is None:
+                # 无该机返航点记录：单机回退 memory/safety home，多机跳过并说明
+                if len(selected) == 1 and not name:
+                    target_x = self._ned_value(memory_start, "x")
+                    target_y = self._ned_value(memory_start, "y")
+                    if target_x is None or target_y is None:
+                        home_x, home_y = self.tools.safety.constraints.home_position
+                        target_x, target_y = float(home_x), float(home_y)
+                    home = {"x": round(float(target_x), 3), "y": round(float(target_y), 3), "z": 0.0}
                 else:
-                    target_source = "last_task_start_position_ned"
-                target = {"x": round(float(target_x), 3), "y": round(float(target_y), 3), "z": round(float(target_z), 3)}
-            else:
+                    results.append({
+                        "vehicle": name, "ok": False,
+                        "message": "no recorded initial position for this vehicle",
+                    })
+                    continue
+
+            dist_home = math.hypot(cur["x"] - float(home["x"]), cur["y"] - float(home["y"]))
+
+            # 已锁定且在初始点：无需动作
+            if (not flying) and (not armed) and dist_home < 1.5:
                 results.append({
-                    "vehicle": name, "ok": False,
-                    "message": "no recorded initial position for this vehicle",
+                    "vehicle": name, "ok": True,
+                    "message": "already at initial point and disarmed",
+                    "dist_home_m": round(dist_home, 2),
                 })
                 continue
 
-            horizontal_error = math.hypot(current_x - target["x"], current_y - target["y"])
-            if horizontal_error < 0.6 and status_flying:
+            # 目标巡航高度：当前离地高度（钳制在安全范围）。
+            # cur 为 kinematics 帧时用 kinematics 地面标定（GPS 帧偏差 ~2m）
+            kin_ground_val = None
+            kin_ground_fn = getattr(controller, "ground_z_kin", None)
+            if not cur_from_gps and callable(kin_ground_fn):
+                try:
+                    kin_ground_val = kin_ground_fn()
+                except Exception:
+                    kin_ground_val = None
+            if kin_ground_val is not None:
+                altitude_agl = max(0.0, float(kin_ground_val) - float(cur.get("z", 0.0)))
+            else:
+                altitude_agl = max(0.0, -(float(cur.get("z", 0.0)) - float(home.get("z", 0.0))))
+            cruise = min(max(altitude_agl, min_altitude, 3.0), max_altitude)
+            target = {
+                "x": round(float(home["x"]), 3),
+                "y": round(float(home["y"]), 3),
+                "z": round(-cruise, 3),
+            }
+
+            if flying and dist_home < 0.6:
                 # 空中且已在初始点上方 → 直接降落并锁定
                 land_result = self.tools.execute(
                     "drone_land", {"vehicle_name": name} if name else {},
@@ -2872,12 +2909,12 @@ class AgentRuntime:
                 ok_near = land_result.ok and (disarm_result is None or disarm_result.ok)
                 results.append({
                     "vehicle": name, "ok": bool(ok_near),
-                    "message": "already at return point; landed and disarmed",
-                    "target_position_ned": target, "target_source": target_source,
+                    "message": "already above initial point; landed and disarmed",
+                    "dist_home_m": round(dist_home, 2),
                 })
                 continue
 
-            # 返航完整语义：飞回初始点 → 到位后自动降落 → 上锁（后台监视线程完成）
+            # 其余所有状态(空中远处/待飞/已锁在远处) → 引导返航+降落锁定
             move_result = self.tools.execute(
                 "drone_dispatch_return_land",
                 {
@@ -2893,7 +2930,7 @@ class AgentRuntime:
                 "ok": bool(move_result.ok),
                 "message": move_result.data.get("message", "return + land dispatched"),
                 "target_position_ned": target,
-                "target_source": target_source,
+                "dist_home_m": round(dist_home, 2),
             })
 
         ok = all(r.get("ok") for r in results) and bool(results)

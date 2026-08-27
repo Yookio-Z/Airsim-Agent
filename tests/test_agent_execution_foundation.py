@@ -234,8 +234,9 @@ def test_local_mission_fallback_takes_off_before_path() -> None:
 
     assert result.ok is True
     assert tools.calls == ["drone_upload_mission", "drone_takeoff", "drone_fly_path"]
-    assert flown_paths[0][0] == {"x": 0.0, "y": 0.0, "z": -3.0}
-    assert 11.0 <= flown_paths[0][1]["x"] <= 11.2
+    # takeoff 项被过滤：不再泄漏为 (0,0) 航点，路径只有真实航点（相对当前位置换算）
+    assert len(flown_paths[0]) == 1
+    assert 11.0 <= flown_paths[0][0]["x"] <= 11.2
 
 
 def test_local_mission_fallback_offsets_global_waypoints_from_current_local_position() -> None:

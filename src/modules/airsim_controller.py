@@ -85,6 +85,11 @@ class AirSimController(FlightController):
     _shared_dispatched_paths: dict[str, dict[str, Any]] = {}
     _home_store_loaded = False
     _ue_ned_ground_z: float | None = None
+    # 地面高度（kinematics 帧）：本机 AirSim 版本中 GPS 反推 z 与
+    # getMultirotorState 的 kinematics z 存在 ~2m 系统偏差，触地判定、
+    # 起飞 AGL 必须用 kinematics 帧的地面标定值。
+    _ground_z_kin: float | None = None
+    _ground_z_kin_samples: list[float] = []
 
     def __init__(self, ip: str = "127.0.0.1", port: int = 41452) -> None:
         self._ip = ip
@@ -619,6 +624,22 @@ class AirSimController(FlightController):
         down = -(float(alt) - alt0)
         return {"x": round(north, 3), "y": round(east, 3), "z": round(down, 3)}
 
+    def ned_to_gps(self, x: float, y: float, z: float = 0.0) -> dict[str, float] | None:
+        """AirSim NED(米) → GPS(度)，gps_to_ned 的逆变换（平面近似）。
+
+        本机 AirSim 版本多机的 getGpsData 原始读数存在重启间不一致（有的
+        会话带出生点偏移、有的会话正确），对外 GPS 由选定的逐机位置反推，
+        保证与地图/航点同帧。
+        """
+        if self._origin_geopoint is None:
+            return None
+        lat0, lon0, alt0 = self._origin_geopoint
+        R = 6371000.0
+        lat = lat0 + math.degrees(float(x) / R)
+        lon = lon0 + math.degrees(float(y) / (R * math.cos(math.radians(lat0))))
+        alt = alt0 - float(z)
+        return {"lat": round(lat, 7), "lon": round(lon, 7), "alt": round(alt, 2)}
+
     def _home_store_path(self) -> Path:
         return Path(__file__).resolve().parents[1] / "data" / "vehicle_homes.json"
 
@@ -656,10 +677,9 @@ class AirSimController(FlightController):
         返航点 = settings.json 出生点(UE) + 标定偏移，与"首次落地位置"彻底脱钩：
         服务重启、飞机悬停在外，出生点都由配置权威决定，不会污染。
         悬停中的飞机绝不参与标定（其 z 不能当地面）。
+        同时用 kinematics z 标定地面高度（触地判定/起飞 AGL 用，见 _ground_z_kin）。
         """
         if landed_raw != 0:
-            return
-        if self._ue_ned_offset is not None and len(self._ue_offset_samples) >= 5:
             return
         gps = status.get("gps")
         if not isinstance(gps, dict):
@@ -673,19 +693,46 @@ class AirSimController(FlightController):
             return
         if ned is None:
             return
-        # 该机停在出生点附近（距理论出生点 < 1m）才参与标定，排除已移动的机；
+        # 该机停在出生点附近（距理论出生点 < 1m）才参与偏移标定，排除已移动的机；
         # 三机样本一致性 ±5mm，位移的机（哪怕整体平移）会被拒绝
         dx = ned["x"] - spawn[0]
         dy = ned["y"] - spawn[1]
         if math.hypot(dx, dy) > 1.0:
+            # kinematics 地面标定独立放宽到 5m：返航降落会偏离 +1.5m，
+            # 过严会导致无人机的 landed_state==0 永远标定不上（地面 z 丢失）
+            self._record_kin_ground_z(status)
             return
-        self._ue_offset_samples.append((dx, dy, ned["z"]))
-        self._ue_ned_offset = (
-            sum(s[0] for s in self._ue_offset_samples) / len(self._ue_offset_samples),
-            sum(s[1] for s in self._ue_offset_samples) / len(self._ue_offset_samples),
+        self._record_kin_ground_z(status)
+        if self._ue_ned_offset is None or len(self._ue_offset_samples) < 5:
+            self._ue_offset_samples.append((dx, dy, ned["z"]))
+            self._ue_ned_offset = (
+                sum(s[0] for s in self._ue_offset_samples) / len(self._ue_offset_samples),
+                sum(s[1] for s in self._ue_offset_samples) / len(self._ue_offset_samples),
+            )
+            # 地面 NED z（该环境原点可能高于地面 3~6m，绝不能假设 z=0 是地面）
+            self._ue_ned_ground_z = sum(s[2] for s in self._ue_offset_samples) / len(self._ue_offset_samples)
+
+    def _record_kin_ground_z(self, status: dict) -> None:
+        """kinematics 帧地面高度采样（与 GPS 帧存在 ~2m 系统偏差，必须单独标定）。"""
+        kin_pos = status.get("position_ned") if isinstance(status.get("position_ned"), dict) else {}
+        kin_z = kin_pos.get("z")
+        if kin_z is None or not math.isfinite(float(kin_z)) or abs(float(kin_z)) > 200.0:
+            return
+        if len(AirSimController._ground_z_kin_samples) < 5:
+            AirSimController._ground_z_kin_samples.append(float(kin_z))
+        AirSimController._ground_z_kin = (
+            sum(AirSimController._ground_z_kin_samples) / len(AirSimController._ground_z_kin_samples)
+            if AirSimController._ground_z_kin_samples
+            else None
         )
-        # 地面 NED z（该环境原点可能高于地面 3~6m，绝不能假设 z=0 是地面）
-        self._ue_ned_ground_z = sum(s[2] for s in self._ue_offset_samples) / len(self._ue_offset_samples)
+
+    def _ground_z_kin_value(self) -> float | None:
+        """地面高度（kinematics 帧），未标定时返回 None。"""
+        return AirSimController._ground_z_kin
+
+    def ground_z_kin(self) -> float | None:
+        """对外暴露：kinematics 帧地面高度（runtime 触地判定/AGL 计算用）。"""
+        return AirSimController._ground_z_kin
 
     def _spawn_home_ned(self, name: str) -> dict[str, float] | None:
         """由出生点 + 标定偏移推导该机返航点（NED）。"""
@@ -758,6 +805,46 @@ class AirSimController(FlightController):
             logger.error(f"disarm failed: {e}")
             return False
 
+    def _takeoff_target_z(self, altitude: float) -> float:
+        """起飞目标 z：相对地面（AGL）而非 NED 原点。
+
+        本环境 NED 原点可能位于地面以下数米，-altitude 会把"起飞 3m"
+        变成实际爬升十几米；有 kinematics 地面标定时按 AGL 换算。
+        目标额外下压 1m 抵消位置控制器的悬停死区（实测到位差 ~1.2m）。
+        """
+        altitude = max(0.5, abs(float(altitude)))
+        ground_z = self._ground_z_kin_value()
+        target_alt = altitude + 1.0
+        if ground_z is not None:
+            return ground_z - target_alt
+        return -target_alt
+
+    def _dispatch_climb(self, name: str, target_z: float, altitude: float, timeout: float = 10.0) -> None:
+        """给单机派发爬升指令。已在空中的机绝不能再发 takeoffAsync——
+        本机版本对飞行中的飞机调 takeoffAsync 会触发异常状态（直接降落地面）；
+        地面机（即使已解锁）必须先 takeoffAsync。"""
+        try:
+            status = self.get_status(name).to_dict()
+        except Exception:
+            status = {}
+        if not status.get("flying"):
+            self._rpc(
+                lambda n=name: self._client.takeoffAsync(timeout_sec=max(30, altitude * 5), vehicle_name=n),
+                timeout=timeout,
+            )
+            # 给 takeoffAsync 留出状态机初始化窗口再派发爬升，避免紧接的
+            # moveToZ 抢占 takeoff 导致起飞只拉起一半就停摆
+            time.sleep(0.3)
+        self._rpc(
+            lambda n=name: self._client.moveToZAsync(
+                target_z,
+                velocity=1.5,
+                timeout_sec=max(25, altitude * 8),
+                vehicle_name=n,
+            ),
+            timeout=timeout,
+        )
+
     def takeoff(self, altitude: float = 3.0, vehicle_name: str = "") -> bool:
         self.last_error = ""
         if not self._ensure_connected():
@@ -767,29 +854,20 @@ class AirSimController(FlightController):
             altitude = max(0.5, abs(float(altitude)))
             self._ensure_control(vehicle_name)
             names = self._resolve_vehicles(vehicle_name)
+            target_z = self._takeoff_target_z(altitude)
             # 多机并行：先把全部起飞/爬升任务发给模拟器（AirSim 并发执行），
             # 再统一等待到位——逐架 join 会把 N 架的起飞时间串行相加
             for name in names:
-                self._rpc(
-                    lambda n=name: self._client.takeoffAsync(
-                        timeout_sec=max(30, altitude * 5), vehicle_name=n
-                    ),
-                    timeout=15.0,
-                )
+                self._dispatch_climb(name, target_z, altitude)
             for name in names:
-                self._rpc(
-                    lambda n=name: self._client.moveToZAsync(
-                        -altitude,
-                        velocity=1.5,
-                        timeout_sec=max(20, altitude * 6),
-                        vehicle_name=n,
-                    ),
-                    timeout=15.0,
-                )
-            for name in names:
-                if not self._wait_until_airborne_at_altitude(name, altitude, timeout=max(30, altitude * 6)):
-                    self.last_error = f"AirSim takeoff command returned but {name} did not reach {altitude:.1f}m"
-                    return False
+                if not self._wait_until_airborne_at_altitude(name, altitude, timeout=max(35, altitude * 10)):
+                    # 指令可能被瞬时 RPC 超时丢弃（多客户端并发时时有发生）：
+                    # 重发一次爬升再等一轮才判定失败
+                    logger.warning(f"takeoff[{name}]: 首轮未到高度, 重发爬升指令")
+                    self._dispatch_climb(name, target_z, altitude)
+                    if not self._wait_until_airborne_at_altitude(name, altitude, timeout=max(35, altitude * 10)):
+                        self.last_error = f"AirSim takeoff command returned but {name} did not reach {altitude:.1f}m"
+                        return False
             return True
         except Exception as e:
             self.last_error = str(e)
@@ -797,6 +875,13 @@ class AirSimController(FlightController):
             return False
 
     def land(self, vehicle_name: str = "") -> bool:
+        """降落并锁定（阻塞直到全部目标机确认触地）。
+
+        本机 AirSim 版本 landAsync 静默无效、landed_state 触地后仍停留在
+        Flying，二者均不可用；改用引导压地：moveToPosition 持续指向地面，
+        触地由 kinematics 高度/速度（或 landed_state==0）判定，随后上锁
+        并复核。多机并发：每机一个监视线程，互不阻塞。
+        """
         self.last_error = ""
         if not self._ensure_connected():
             self.last_error = "AirSim not connected"
@@ -804,103 +889,273 @@ class AirSimController(FlightController):
         if self._uses_external_px4_controller(vehicle_name):
             self.last_error = "AirSim settings use PX4Multirotor; use PX4 MAVLink or PX4 ROS2 mode for landing."
             return False
-        try:
-            names = self._resolve_vehicles(vehicle_name)
-            for name in names:
-                # 与 _ensure_control 相同：enableApiControl 每次重发（幂等），
-                # 防止模拟器侧已丢失 API 控制权而内存集合未同步
-                self._rpc(self._client.enableApiControl, True, name)
-                time.sleep(0.2)
-                self._control_enabled.add(name)
-            # 唤醒：悬停超过看门狗窗口后 SimpleFlight 进入安全悬停态并忽略
-            # 后续指令（"API call was not received"），先发 hover 重置看门狗
-            for name in names:
-                try:
-                    self._rpc(lambda n=name: self._client.hoverAsync(vehicle_name=n), timeout=10.0)
-                except Exception:
-                    pass
-                time.sleep(0.2)
-            # 多机并行降落：先给全部车辆发出 landAsync（AirSim 并发执行），
-            # 再统一轮询落地确认——逐架 join 会把 N 架的降落时间串行相加
-            for name in names:
-                self._rpc(
-                    lambda n=name: self._client.landAsync(
-                        timeout_sec=60, vehicle_name=n
-                    ),
-                    timeout=15.0,
-                )
-            landed: set[str] = set()
-            # 未落地的机自动重试（唤醒 + 重发 landAsync）——安全看门狗可能吞掉首条降落指令
-            for attempt in range(3):
-                stragglers = [n for n in names if n not in landed]
-                if not stragglers:
-                    break
-                if attempt > 0:
-                    logger.warning(f"land retry #{attempt} for: {', '.join(stragglers)}")
-                    for name in stragglers:
-                        try:
-                            self._rpc(self._client.enableApiControl, True, name)
-                            self._rpc(lambda n=name: self._client.hoverAsync(vehicle_name=n), timeout=10.0)
-                        except Exception:
-                            pass
-                        time.sleep(0.2)
-                    for name in stragglers:
-                        self._rpc(
-                            lambda n=name: self._client.landAsync(timeout_sec=60, vehicle_name=n),
-                            timeout=15.0,
-                        )
-                for name in stragglers:
-                    if self._wait_until_landed(name, timeout=45.0 if attempt == 0 else 30.0):
-                        landed.add(name)
-                        self._landed_vehicles.add(name)
-                        try:
-                            self._rpc(self._client.armDisarm, False, name)
-                            self._armed.discard(name)
-                        except Exception:
-                            pass
-            failed = [n for n in names if n not in landed]
-            if failed:
-                self.last_error = f"landing not confirmed for: {', '.join(failed)}"
-                logger.warning(self.last_error)
-                return False
-            return True
-        except Exception as e:
-            logger.error(f"land failed: {e}")
+        names = self._resolve_vehicles(vehicle_name)
+        results: dict[str, bool] = {}
+        threads: list[threading.Thread] = []
+        for name in names:
+            t = threading.Thread(
+                target=self._guided_land_worker,
+                args=(name, results),
+                daemon=True,
+                name=f"guided_land_{name}",
+            )
+            t.start()
+            threads.append(t)
+        for t in threads:
+            t.join()
+        failed = [n for n in names if not results.get(n)]
+        if failed:
+            self.last_error = f"landing not confirmed for: {', '.join(failed)}"
+            logger.warning(self.last_error)
             return False
+        return True
 
-    def _wait_until_landed(self, vehicle_name: str, timeout: float = 20.0) -> bool:
-        deadline = time.time() + timeout
-        last_state = None
-        while time.time() < deadline:
+    def _guided_land_worker(self, name: str, results: dict[str, bool] | None = None, timeout: float = 180.0) -> bool:
+        """单机引导降落：确保 API 控制权 → 压地循环 → 触地 → 上锁并复核。
+
+        上锁必须被模拟器接受且复核不再处于 armed 才判定成功——上锁失败
+        绝不能报"已降落锁定"（SimpleFlight 状态机异常时 armDisarm 会拒绝，
+        无人机仍悬停在空中，系统却已宣告完成）。
+        """
+        ok = False
+        try:
+            # 确保解锁：本版本未 armed 的悬停机虽能响应移动指令，但状态机
+            # 混乱时指令可能被忽略——先 arm 保证下压指令有效驱动
             try:
-                state = self._rpc(self._client.getMultirotorState, vehicle_name)
-                last_state = state
-                if state.landed_state == 0:
-                    return True
-                # Some AirSim releases lag the landed_state enum after a
-                # successful touchdown; being on the ground by altitude is
-                # equally safe. 地面 z 用标定值（原点可能高于地面数米，
-                # 绝不能用 z>0 当落地，否则 3m 悬停会被误判落地并提前上锁）。
-                pos = state.kinematics_estimated.position
-                # 高度捷径仅在完成地面标定后可用（否则原点高度未知，
-                # 悬停 3m 会被误判为落地并提前上锁）
-                if self._ue_ned_ground_z is not None and float(pos.z_val) > (self._ue_ned_ground_z - 0.4):
-                    return True
+                self._rpc(self._client.enableApiControl, True, name)
+                self._control_enabled.add(name)
+                self._rpc(self._client.armDisarm, True, name)
+                self._armed.add(name)
+                self._landed_vehicles.discard(name)
+                time.sleep(0.3)
             except Exception:
                 pass
-            time.sleep(0.4)
-        if last_state is not None:
-            logger.warning(f"wait_until_landed timeout: landed_state={getattr(last_state, 'landed_state', None)}")
+            ok = self._guided_land_loop(name, timeout)
+        except Exception as e:
+            logger.error(f"guided_land[{name}]: 异常: {e}")
+            ok = False
+
+        if ok:
+            ok = self._disarm_verified(name)
+
+        if ok:
+            self._landed_vehicles.add(name)
+            logger.info(f"guided_land[{name}]: 已触地并确认上锁")
+        else:
+            logger.warning(f"guided_land[{name}]: 未完成（触地/上锁未确认）")
+        if results is not None:
+            results[name] = ok
+        return ok
+
+    def _disarm_verified(self, name: str) -> bool:
+        """上锁并做物理复核：armDisarm(False) 被接受后，无人机必须真正落回
+        地面——本版本模拟器可能静默忽略上锁（RPC 不报错但无人机继续悬停），
+        只信内存 armed 标记会把"还在空中"误报成"已降落锁定"。
+        失败时用 enableApiControl 重断言 + hover 复位状态机重试一次。
+        """
+        for attempt in range(2):
+            try:
+                self._rpc(self._client.armDisarm, False, name)
+                self._armed.discard(name)
+            except Exception as e:
+                logger.warning(f"guided_land[{name}]: 上锁失败: {e}")
+            else:
+                # 物理复核：上锁成功的无人机必然落到地面（或已在接近地面处）。
+                # 轮询 ~4s：到地面附近 → 成功；z 持续下降（坠落中）→ 继续等；
+                # 稳定悬停在空中 → 上锁被静默忽略 → 失败。
+                ground_z = self._ground_z_kin_value()
+                stable_alt = None
+                for _ in range(8):
+                    time.sleep(0.5)
+                    try:
+                        status = self.get_status(name).to_dict()
+                    except Exception:
+                        continue
+                    pz = float((status.get("position_ned") or {}).get("z", 0.0) or 0.0)
+                    raw = status.get("landed_state_raw")
+                    on_ground = raw == 0 or (ground_z is not None and pz > ground_z - 0.9)
+                    if on_ground:
+                        return True
+                    if stable_alt is None or abs(pz - stable_alt) > 0.3:
+                        stable_alt = pz
+                # 4s 后仍未落地：若位置稳定（悬停）且远离地面，判定上锁被忽略
+                if ground_z is not None and stable_alt is not None and stable_alt < ground_z - 1.5:
+                    logger.warning(f"guided_land[{name}]: 上锁后仍悬停于 {stable_alt:.2f}m, 判定上锁未生效")
+                else:
+                    logger.warning(f"guided_land[{name}]: 上锁后未确认落地, 重试 #{attempt + 1}")
+            # 复位状态机后重试
+            try:
+                self._rpc(self._client.enableApiControl, True, name)
+                self._rpc(lambda n=name: self._client.hoverAsync(vehicle_name=n), timeout=10.0)
+                time.sleep(1.0)
+            except Exception:
+                pass
+        self.last_error = f"{name or '默认机'} 触地但上锁未确认（模拟器拒绝/忽略 armDisarm）"
         return False
+
+    def _guided_land_loop(self, name: str, timeout: float = 150.0) -> bool:
+        """引导压地循环。触地判定（任一满足，宁可不确认也绝不在空中误判）：
+        1. kinematics 高度接近标定地面且速度低（主判定，需地面标定）；
+        2. 模拟器原始状态报 Landed(0) 且速度低（该状态可能卡 1，但报 0 可信）；
+        3. 无地面标定时：撞击检测——simGetCollisionInfo 的时间戳出现新撞击
+           （无 reset 接口，只能用时间戳区分新旧撞击）。
+        下降速度分级：高中速 ≤0.5 m/s，低空 ≤0.35，贴地 ≤0.25。
+        """
+        deadline = time.time() + timeout
+        last_cmd_ts = 0.0
+        last_progress_log = 0.0
+        # 无标定路径状态：撞击检测基线 + 双阶梯停滞触地确认
+        collision_baseline: float | None = None
+        step_target_pz: float | None = None
+        step_z0: float | None = None
+        step_wait_since: float | None = None
+        stagnation_streak = 0
+        while time.time() < deadline:
+            if self._stop_requested():
+                return False
+            try:
+                status = self.get_status(name).to_dict()
+            except Exception:
+                time.sleep(0.5)
+                continue
+            if status.get("connection_error"):
+                time.sleep(0.5)
+                continue
+            pos = status.get("position_ned") if isinstance(status.get("position_ned"), dict) else {}
+            vel = status.get("velocity_ned") if isinstance(status.get("velocity_ned"), dict) else {}
+            px = float(pos.get("x", 0.0) or 0.0)
+            py = float(pos.get("y", 0.0) or 0.0)
+            pz = float(pos.get("z", 0.0) or 0.0)
+            speed = math.sqrt(
+                float(vel.get("vx", 0.0) or 0.0) ** 2
+                + float(vel.get("vy", 0.0) or 0.0) ** 2
+                + float(vel.get("vz", 0.0) or 0.0) ** 2
+            )
+            ground_z = self._ground_z_kin_value()
+            # AGL = 地面 - 当前位置（NED 向上为负；地面上方 agl>0）
+            agl = (ground_z - pz) if ground_z is not None else None
+            now = time.time()
+            if now - last_progress_log > 10.0:
+                last_progress_log = now
+                agl_text = f"{agl:.2f}m" if agl is not None else "未知(未标定)"
+                logger.info(
+                    f"guided_land[{name}]: 下降中 agl={agl_text} speed={speed:.2f}m/s "
+                    f"raw_landed={status.get('landed_state_raw')}"
+                )
+
+            # 触地判定 1：接近标定地面且低速（命令目标略低于地面以压实）
+            if agl is not None and agl < 0.5 and speed < 0.4:
+                return True
+            # 触地判定 2：模拟器原始状态报告已落地且低速（报 0 时可信等
+            # 同于物理在地面，其 z 是精确地面，顺带回填标定）。
+            # 空中也可能误报 0，叠加高度护栏（有标定时必须在低空才可信）。
+            raw_landed = status.get("landed_state_raw")
+            if raw_landed == 0 and speed < 0.4 and (agl is None or agl < 1.2):
+                self._retro_record_ground_z(name, pz)
+                return True
+            # 触地判定 3（仅无标定）：
+            #   a) 撞击快通道：撞击时间戳出现新撞击 → 触地（本版本慢速触地
+            #      通常不产生碰撞事件，此通道仅覆盖硬触地场景）
+            #   b) 双阶梯停滞确认：下压指令每 1.2s 重发（有效驱动，见
+            #      _ensure_control），连续两个"压 3.5s 高度不动"周期 = 物理
+            #     接触地面（命令在压而压不动，只可能是触地）
+            if ground_z is None:
+                try:
+                    ci = self._rpc(self._client.simGetCollisionInfo, vehicle_name=name, timeout=5.0)
+                    ts = float(getattr(ci, "time_stamp", 0.0) or 0.0)
+                    if collision_baseline is None:
+                        collision_baseline = ts
+                    elif ts > collision_baseline and speed < 0.6:
+                        logger.info(
+                            f"guided_land[{name}]: 撞击检测触地 (碰撞 ts {ts:.0f} > 基线 {collision_baseline:.0f})"
+                        )
+                        self._retro_record_ground_z(name, pz)
+                        return True
+                except Exception:
+                    pass
+                # 阶梯停滞确认
+                if step_target_pz is None or pz >= step_target_pz - 0.3:
+                    # 完成上一阶梯（或初始）：进入下一阶梯
+                    step_target_pz = pz + 1.2
+                    step_z0 = pz
+                    step_wait_since = now
+                    stagnation_streak = 0
+                else:
+                    progress = pz - step_z0
+                    if progress >= 0.15:
+                        # 有进展：重置停滞计时
+                        step_wait_since = now
+                        stagnation_streak = 0
+                    elif step_wait_since is not None and now - step_wait_since > 3.5:
+                        # 命令持续下压但高度不动 → 物理接触
+                        stagnation_streak += 1
+                        logger.info(
+                            f"guided_land[{name}]: 下压停滞 #{stagnation_streak} (z={pz:.2f}), "
+                            f"目标 {step_target_pz:.2f} 未达"
+                        )
+                        if stagnation_streak >= 2:
+                            logger.info(f"guided_land[{name}]: 双停滞判定触地 (z={pz:.2f})")
+                            self._retro_record_ground_z(name, pz)
+                            return True
+                        # 未达标：以当前高度为基准压向更深处
+                        step_target_pz = pz + 1.2
+                        step_z0 = pz
+                        step_wait_since = now
+
+            # 下压指令：每 1.2s 重发（持续压向地面；目标略低于地面）
+            if now - last_cmd_ts >= 1.2:
+                if agl is not None:
+                    # 压点在地面下方 0.2m，抵消位置控制器 ~0.4m 悬停死区
+                    target_z = ground_z + 0.2
+                    # 分级减速：高中速 ≤0.5，低空 ≤0.35，贴地 ≤0.25
+                    if agl < 0.8:
+                        descend_speed = 0.25
+                    elif agl < 1.5:
+                        descend_speed = 0.35
+                    else:
+                        descend_speed = 0.5
+                else:
+                    if step_target_pz is None:
+                        step_target_pz = pz + 1.2
+                        step_z0 = pz
+                        step_wait_since = now
+                    target_z = step_target_pz
+                    descend_speed = 0.4
+                try:
+                    self._rpc(
+                        lambda n=name: self._client.moveToPositionAsync(
+                            px, py, target_z, descend_speed, timeout_sec=10.0, vehicle_name=n
+                        ),
+                        timeout=8.0,
+                    )
+                    last_cmd_ts = now
+                except Exception as e:
+                    logger.warning(f"guided_land[{name}]: 下压指令异常: {e}")
+            time.sleep(0.35)
+        return False
+
+    def _retro_record_ground_z(self, name: str, touchdown_z: float) -> None:
+        """触地后回填 kinematics 地面标定（无标定/标定过期时让后续降落直接可用）。"""
+        samples = AirSimController._ground_z_kin_samples
+        if not math.isfinite(float(touchdown_z)) or abs(float(touchdown_z)) > 200.0:
+            return
+        if len(samples) < 5:
+            samples.append(round(float(touchdown_z), 3))
+        AirSimController._ground_z_kin = sum(samples) / len(samples) if samples else None
 
     def _wait_until_airborne_at_altitude(self, vehicle_name: str, altitude: float, timeout: float = 4.0) -> bool:
         deadline = time.time() + max(0.0, timeout)
         required_altitude = max(0.4, altitude * 0.75)
+        ground_z = self._ground_z_kin_value()
         while time.time() < deadline:
             try:
                 state = self._rpc(self._client.getMultirotorState, vehicle_name)
                 pos = state.kinematics_estimated.position
-                current_altitude = max(0.0, -float(pos.z_val))
+                # AGL：有 kinematics 地面标定时按地面算（原点可能在地面以下）
+                if ground_z is not None:
+                    current_altitude = max(0.0, ground_z - float(pos.z_val))
+                else:
+                    current_altitude = max(0.0, -float(pos.z_val))
                 if state.landed_state == 1 and current_altitude >= required_altitude:
                     return True
             except Exception:
@@ -943,17 +1198,38 @@ class AirSimController(FlightController):
             self._ensure_control(vehicle_name)
             names = self._resolve_vehicles(vehicle_name)
             dist = (x**2 + y**2 + z**2) ** 0.5
-            flight_timeout = max(30, dist / max(velocity, 0.5) + 10.0)
+            # 本机版本有效飞行速度常远低于设定值（任务按 timeout_sec 中途停止），
+            # 超时按保守速度放大；等待用纯遥测轮询（task.join 会提前返回），
+            # 任务停摆未到位时重发指令
+            flight_timeout = max(45, dist / 0.8 + 30.0)
             for name in names:
-                task = self._rpc(
-                    lambda n=name: self._client.moveToPositionAsync(
-                        x, y, z, velocity,
-                        timeout_sec=flight_timeout,
-                        vehicle_name=n,
-                    ),
-                    timeout=15.0,
-                )
-                if not self._wait_async_interruptible(task, name, flight_timeout + 10.0):
+                arrived = False
+                for attempt in range(3):
+                    self._rpc(
+                        lambda n=name: self._client.moveToPositionAsync(
+                            x, y, z, velocity,
+                            timeout_sec=flight_timeout,
+                            vehicle_name=n,
+                        ),
+                        timeout=15.0,
+                    )
+                    if self._wait_move_arrival(name, (x, y, z), tolerance=1.5, timeout=flight_timeout):
+                        arrived = True
+                        break
+                    if self._stop_requested():
+                        return False
+                    logger.warning(
+                        f"move_to_position[{name}]: 任务停摆未到位, 重发 #{attempt + 1}"
+                    )
+                if not arrived:
+                    pos = self.get_status(name).to_dict().get("position_ned") or {}
+                    err = math.sqrt(
+                        (float(pos.get("x", 0.0) or 0.0) - x) ** 2
+                        + (float(pos.get("y", 0.0) or 0.0) - y) ** 2
+                        + (float(pos.get("z", 0.0) or 0.0) - z) ** 2
+                    )
+                    self.last_error = f"{name or '默认机'} 未到达目标位置 (距目标 {err:.1f}m)"
+                    logger.warning(self.last_error)
                     return False
             time.sleep(1.0)
             return True
@@ -970,27 +1246,64 @@ class AirSimController(FlightController):
         try:
             self._ensure_control(vehicle_name)
             names = self._resolve_vehicles(vehicle_name)
-            airsim_path = [
-                airsim.Vector3r(wp.get("x", 0), wp.get("y", 0), wp.get("z", 0))
-                for wp in waypoints
-            ]
             total_dist = sum(
                 ((waypoints[i].get("x",0)-waypoints[i-1].get("x",0))**2 +
                  (waypoints[i].get("y",0)-waypoints[i-1].get("y",0))**2 +
                  (waypoints[i].get("z",0)-waypoints[i-1].get("z",0))**2) ** 0.5
                 for i in range(1, len(waypoints))
             ) if len(waypoints) > 1 else 0
-            flight_timeout = max(30, total_dist / max(velocity, 0.5) + 10.0)
+            # 本机版本有效飞行速度常远低于设定值，任务会按 timeout_sec 中途停止；
+            # 超时按保守速度(0.8m/s)放大；等待用纯遥测轮询（task.join 会提前
+            # 返回），任务停摆未到位时从最近航点起重发剩余段
+            flight_timeout = max(60, total_dist / 0.8 + 30.0)
+            final_wp = waypoints[-1]
+            target = (
+                float(final_wp.get("x", 0.0)),
+                float(final_wp.get("y", 0.0)),
+                float(final_wp.get("z", 0.0)),
+            )
             for name in names:
-                task = self._rpc(
-                    lambda n=name: self._client.moveOnPathAsync(
-                        airsim_path, velocity,
-                        timeout_sec=flight_timeout,
-                        vehicle_name=n,
-                    ),
-                    timeout=15.0,
-                )
-                if not self._wait_async_interruptible(task, name, flight_timeout + 10.0):
+                current_path = [dict(wp) for wp in waypoints]
+                arrived = False
+                for attempt in range(3):
+                    airsim_path = [
+                        airsim.Vector3r(wp.get("x", 0), wp.get("y", 0), wp.get("z", 0))
+                        for wp in current_path
+                    ]
+                    self._rpc(
+                        lambda n=name: self._client.moveOnPathAsync(
+                            airsim_path, velocity,
+                            timeout_sec=flight_timeout,
+                            vehicle_name=n,
+                        ),
+                        timeout=15.0,
+                    )
+                    if self._wait_move_arrival(name, target, tolerance=1.5, timeout=flight_timeout):
+                        arrived = True
+                        break
+                    if self._stop_requested():
+                        return False
+                    # 从距当前位置最近的航点起重发剩余段（避免飞回已过的航点）
+                    pos = self.get_status(name).to_dict().get("position_ned") or {}
+                    px = float(pos.get("x", 0.0) or 0.0)
+                    py = float(pos.get("y", 0.0) or 0.0)
+                    pz = float(pos.get("z", 0.0) or 0.0)
+                    dists = [
+                        math.sqrt(
+                            (float(wp.get("x", 0.0)) - px) ** 2
+                            + (float(wp.get("y", 0.0)) - py) ** 2
+                            + (float(wp.get("z", 0.0)) - pz) ** 2
+                        )
+                        for wp in current_path
+                    ]
+                    k = dists.index(min(dists))
+                    current_path = current_path[k:]
+                    logger.warning(
+                        f"move_on_path[{name}]: 任务停摆未到位, 从第 {k + 1} 点起重发 #{attempt + 1}"
+                    )
+                if not arrived:
+                    self.last_error = f"{name or '默认机'} 未到达航线终点"
+                    logger.warning(self.last_error)
                     return False
             return True
         except Exception as e:
@@ -998,44 +1311,64 @@ class AirSimController(FlightController):
             logger.error(f"move_on_path failed: {e}")
             return False
 
-    def _wait_async_interruptible(self, task, vehicle_name: str, timeout: float) -> bool:
-        """Wait for an AirSim async task, preempting on external stop/cancel.
+    def _wait_move_arrival(
+        self,
+        name: str,
+        target: tuple[float, float, float],
+        tolerance: float = 1.5,
+        timeout: float = 120.0,
+    ) -> bool:
+        """轮询等待移动任务到位（纯遥测判定，不依赖 task.join）。
 
-        The task's ``join()`` must run on the single RPC worker (thread-affine
-        client), so it is submitted there and the caller polls for completion
-        and for the stop provider. On stop, a fire-and-forget hover preempts
-        the running move in the simulator and False is returned immediately;
-        the worker thread exits on its own once the simulator completes the
-        task (bounded by the task's own timeout_sec)."""
-        result_box: dict[str, Any] = {}
-
-        def _wait() -> None:
-            try:
-                task.join()
-                result_box["done"] = True
-            except Exception as exc:
-                result_box["error"] = exc
-
-        self._executor.submit(_wait)
-        deadline = time.time() + max(1.0, float(timeout))
+        msgpackrpc 客户端以 timeout_value=5 创建时，task.join() 会在 ~6s
+        提前返回（客户端超时），绝不能用 join 判断任务完成。
+        到位 → True；任务停摆（低速悬停但未到位，模拟器侧任务已结束）→ False；
+        超时 → False；外部急停/取消 → hover 抢占并 False。
+        """
+        deadline = time.time() + max(5.0, timeout)
+        tx, ty, tz = target
+        slow_since: float | None = None
         while time.time() < deadline:
             if self._stop_requested():
-                # hoverAsync is a send-only call; AirSim preempts the running
-                # move with the hover command. Best-effort: the RPC worker is
-                # busy joining the task, so we cannot route through _rpc.
                 try:
-                    self._client.hoverAsync(vehicle_name=vehicle_name)
-                except Exception as exc:
-                    self.last_error = str(exc)
+                    self._client.hoverAsync(vehicle_name=name)
+                except Exception:
+                    pass
                 self.last_error = "interrupted by emergency stop / cancel"
                 return False
-            if "done" in result_box:
+            try:
+                status = self.get_status(name).to_dict()
+            except Exception:
+                time.sleep(0.5)
+                continue
+            if status.get("connection_error"):
+                time.sleep(0.5)
+                continue
+            pos = status.get("position_ned") if isinstance(status.get("position_ned"), dict) else {}
+            vel = status.get("velocity_ned") if isinstance(status.get("velocity_ned"), dict) else {}
+            px = float(pos.get("x", 0.0) or 0.0)
+            py = float(pos.get("y", 0.0) or 0.0)
+            pz = float(pos.get("z", 0.0) or 0.0)
+            err = math.sqrt((px - tx) ** 2 + (py - ty) ** 2 + (pz - tz) ** 2)
+            if err < tolerance:
+                time.sleep(0.5)
                 return True
-            if result_box.get("error") is not None:
-                raise result_box["error"]
-            time.sleep(0.02)
-        self._reset_rpc_runtime()
-        raise TimeoutError(f"AirSim task timed out after {timeout:.0f}s")
+            speed = math.sqrt(
+                float(vel.get("vx", 0.0) or 0.0) ** 2
+                + float(vel.get("vy", 0.0) or 0.0) ** 2
+                + float(vel.get("vz", 0.0) or 0.0) ** 2
+            )
+            now = time.time()
+            if speed < 0.15:
+                if slow_since is None:
+                    slow_since = now
+                elif now - slow_since > 4.0:
+                    # 低速悬停且未到位：模拟器侧任务已结束
+                    return False
+            else:
+                slow_since = None
+            time.sleep(0.5)
+        return False
 
     def set_stop_provider(self, stop_provider: Callable[[], bool] | None = None) -> None:
         """Wire an external stop/cancel signal into blocking flight commands."""
@@ -1066,23 +1399,10 @@ class AirSimController(FlightController):
         try:
             altitude = max(0.5, abs(float(altitude)))
             names = self._resolve_vehicles(vehicle_name)
+            target_z = self._takeoff_target_z(altitude)
             for name in names:
                 self._ensure_control(name)
-                self._rpc(
-                    lambda n=name: self._client.takeoffAsync(timeout_sec=max(30, altitude * 5), vehicle_name=n),
-                    timeout=10.0,
-                )
-            # 实际爬升到目标高度（fire-and-forget）
-            for name in names:
-                self._rpc(
-                    lambda n=name: self._client.moveToZAsync(
-                        -altitude,
-                        velocity=1.5,
-                        timeout_sec=max(20, altitude * 6),
-                        vehicle_name=n,
-                    ),
-                    timeout=10.0,
-                )
+                self._dispatch_climb(name, target_z, altitude)
             return True
         except Exception as e:
             self.last_error = str(e)
@@ -1090,7 +1410,12 @@ class AirSimController(FlightController):
             return False
 
     def dispatch_move_on_path(self, waypoints: list[dict], velocity: float = 2.0, vehicle_name: str = "") -> bool:
-        """派发航线（不等待完成）。每架机各自执行自己的路径。"""
+        """派发航线（不等待完成）。每架机各自执行自己的路径。
+
+        本机版本任务可能按 timeout_sec 中途停止（有效速度远低于设定值），
+        每机附一个后台监视线程：未到终点时从最近航点起重发剩余段，
+        到位后把 _shared_dispatched_paths 标记为 done。
+        """
         self.last_error = ""
         if not self._ensure_connected():
             self.last_error = "AirSim not connected"
@@ -1101,18 +1426,19 @@ class AirSimController(FlightController):
         try:
             self._ensure_control(vehicle_name)
             names = self._resolve_vehicles(vehicle_name)
-            airsim_path = [
-                airsim.Vector3r(wp.get("x", 0), wp.get("y", 0), wp.get("z", 0))
-                for wp in waypoints
-            ]
             total_dist = sum(
                 ((waypoints[i].get("x",0)-waypoints[i-1].get("x",0))**2 +
                  (waypoints[i].get("y",0)-waypoints[i-1].get("y",0))**2 +
                  (waypoints[i].get("z",0)-waypoints[i-1].get("z",0))**2) ** 0.5
                 for i in range(1, len(waypoints))
             ) if len(waypoints) > 1 else 0
-            flight_timeout = max(30, total_dist / max(velocity, 0.5) + 10.0)
+            # 保守速度 0.8m/s 估算（有效速度可能远低于设定值）
+            flight_timeout = max(60, total_dist / 0.8 + 30.0)
             for name in names:
+                airsim_path = [
+                    airsim.Vector3r(wp.get("x", 0), wp.get("y", 0), wp.get("z", 0))
+                    for wp in waypoints
+                ]
                 self._rpc(
                     lambda n=name: self._client.moveOnPathAsync(
                         airsim_path, velocity,
@@ -1129,41 +1455,123 @@ class AirSimController(FlightController):
                     "done": False,
                     "near_count": 0,
                 }
+                threading.Thread(
+                    target=self._dispatch_path_monitor,
+                    args=(name, [dict(wp) for wp in waypoints], float(velocity), flight_timeout),
+                    daemon=True,
+                    name=f"path_monitor_{name}",
+                ).start()
             return True
         except Exception as e:
             self.last_error = str(e)
             logger.error(f"dispatch_move_on_path failed: {e}")
             return False
 
+    def _dispatch_path_monitor(self, name: str, waypoints: list[dict], velocity: float, flight_timeout: float) -> None:
+        """航线到位监视线程：任务超时停摆时从最近航点起重发剩余段。
+
+        判定到位：距最后航点 <1.5m。总窗口 = flight_timeout × 2 + 120s，
+        超窗放弃（保留未 done 状态，由上层进度跟踪如实上报）。
+        """
+        deadline = time.time() + flight_timeout * 2 + 120.0
+        final_wp = waypoints[-1]
+        current_path = [dict(wp) for wp in waypoints]
+        last_dispatch = time.time()
+        reissued = 0
+        while time.time() < deadline:
+            if self._stop_requested():
+                return
+            info = AirSimController._shared_dispatched_paths.get(name)
+            if info and info.get("done"):
+                return
+            time.sleep(2.0)
+            try:
+                status = self.get_status(name).to_dict()
+            except Exception:
+                continue
+            if status.get("connection_error"):
+                continue
+            pos = status.get("position_ned") if isinstance(status.get("position_ned"), dict) else {}
+            px = float(pos.get("x", 0.0) or 0.0)
+            py = float(pos.get("y", 0.0) or 0.0)
+            pz = float(pos.get("z", 0.0) or 0.0)
+            err = math.sqrt(
+                (px - float(final_wp.get("x", 0.0))) ** 2
+                + (py - float(final_wp.get("y", 0.0))) ** 2
+                + (pz - float(final_wp.get("z", 0.0))) ** 2
+            )
+            if err < 1.5:
+                if info is not None:
+                    info["done"] = True
+                    info["done_at"] = time.time()
+                logger.info(f"path_monitor[{name}]: 航线完成 (距终点 {err:.2f}m)")
+                return
+            # 任务停摆（超时悬停）→ 从最近航点起重发剩余段
+            vel = status.get("velocity_ned") if isinstance(status.get("velocity_ned"), dict) else {}
+            speed = math.sqrt(
+                float(vel.get("vx", 0.0) or 0.0) ** 2
+                + float(vel.get("vy", 0.0) or 0.0) ** 2
+                + float(vel.get("vz", 0.0) or 0.0) ** 2
+            )
+            if speed > 0.5 or time.time() - last_dispatch < 15.0:
+                continue
+            if reissued >= 3:
+                logger.warning(f"path_monitor[{name}]: 重发 {reissued} 次仍未到位，放弃")
+                return
+            dists = [
+                math.sqrt(
+                    (float(wp.get("x", 0.0)) - px) ** 2
+                    + (float(wp.get("y", 0.0)) - py) ** 2
+                    + (float(wp.get("z", 0.0)) - pz) ** 2
+                )
+                for wp in current_path
+            ]
+            k = dists.index(min(dists))
+            remaining = current_path[k:]
+            try:
+                airsim_path = [
+                    airsim.Vector3r(wp.get("x", 0), wp.get("y", 0), wp.get("z", 0))
+                    for wp in remaining
+                ]
+                self._rpc(
+                    lambda n=name: self._client.moveOnPathAsync(
+                        airsim_path, velocity,
+                        timeout_sec=flight_timeout,
+                        vehicle_name=n,
+                    ),
+                    timeout=10.0,
+                )
+                reissued += 1
+                last_dispatch = time.time()
+                logger.warning(
+                    f"path_monitor[{name}]: 停摆未到位 (距终点 {err:.1f}m), 从第 {k + 1} 点起重发 #{reissued}"
+                )
+            except Exception as e:
+                logger.warning(f"path_monitor[{name}]: 重发异常: {e}")
+                last_dispatch = time.time()
+
     def is_flying(self, vehicle_name: str = "") -> bool:
         status = self.get_status(vehicle_name)
         return bool(status.flying)
 
     def dispatch_land(self, vehicle_name: str = "") -> bool:
-        """派发降落（fire-and-forget）。多机同时降落用，完成验证由调用方轮询。"""
+        """派发降落（fire-and-forget）。多机同时降落用，完成验证由调用方轮询。
+
+        引导压地方案（landAsync 在本机版本静默无效），每机一个后台线程。
+        """
         self.last_error = ""
         if not self._ensure_connected():
             self.last_error = "AirSim not connected"
             return False
-        try:
-            names = self._resolve_vehicles(vehicle_name)
-            # 唤醒看门狗（悬停久了安全悬停态会忽略 landAsync）
-            for name in names:
-                try:
-                    self._rpc(lambda n=name: self._client.hoverAsync(vehicle_name=n), timeout=10.0)
-                except Exception:
-                    pass
-                time.sleep(0.2)
-            for name in names:
-                self._rpc(
-                    lambda n=name: self._client.landAsync(timeout_sec=60, vehicle_name=n),
-                    timeout=10.0,
-                )
-            return True
-        except Exception as e:
-            self.last_error = str(e)
-            logger.error(f"dispatch_land failed: {e}")
-            return False
+        names = self._resolve_vehicles(vehicle_name)
+        for name in names:
+            threading.Thread(
+                target=self._guided_land_worker,
+                args=(name, None),
+                daemon=True,
+                name=f"guided_land_{name}",
+            ).start()
+        return True
 
     def dispatch_return_and_land(
         self, x: float, y: float, z: float, velocity: float = 3.0, vehicle_name: str = ""
@@ -1171,10 +1579,9 @@ class AirSimController(FlightController):
         """派发返航：引导循环飞回 (x,y,z)，到位后自动降落并锁定。
 
         返航语义 = 到达初始点 + 降落 + 上锁，全程异步，不阻塞调用方。
-        不用 moveOnPath：任务结束悬停久了 SimpleFlight 安全看门狗会吞掉
-        首条指令（"API call was not received, entering hover mode for safety"），
-        改用引导循环——监视线程每 1.2s 重发一次 moveToPosition(初始点)，
-        持续喂看门狗，飞机必然收敛到家；地面待飞机先爬升。
+        不用 moveOnPath：改用引导循环——监视线程每 1.2s 重发一次
+        moveToPosition(初始点)，飞机必然收敛到家；降落阶段用引导压地
+        （本机版本 landAsync 无效）。
         """
         self.last_error = ""
         if not self._ensure_connected():
@@ -1193,10 +1600,9 @@ class AirSimController(FlightController):
         return True
 
     def _return_land_monitor(self, name: str, x: float, y: float, z: float, velocity: float = 3.0) -> None:
-        """引导式返航：循环重发 moveToPosition(初始点) 喂看门狗，到位后降落锁定。
+        """引导式返航：循环重发 moveToPosition(初始点)，到位后引导压地并上锁。
 
-        每轮重发会取消上一条同目标指令——目标不变，对飞行无害，
-        但保证 SimpleFlight 持续收到指令、绝不进入安全悬停态。
+        每轮重发会取消上一条同目标指令——目标不变，对飞行无害。
         地面待飞机第一轮指令即从地面爬升飞向初始点。单机总超时 180s。
         """
         deadline = time.time() + 180.0
@@ -1212,7 +1618,6 @@ class AirSimController(FlightController):
                 vel = status.get("velocity_ned") or {}
                 px = float(pos.get("x", 0.0) or 0.0)
                 py = float(pos.get("y", 0.0) or 0.0)
-                pz = float(pos.get("z", 0.0) or 0.0)
                 dist_xy = math.hypot(px - x, py - y)
                 speed = math.sqrt(
                     float(vel.get("vx", 0.0) or 0.0) ** 2
@@ -1220,12 +1625,12 @@ class AirSimController(FlightController):
                     + float(vel.get("vz", 0.0) or 0.0) ** 2
                 )
                 # 到位判定用水平距离：飞机先飞到自家初始点正上方（巡航高度），
-                # 再垂直降落在初始点上。0.8m 是"到位"半径，目标始终是各自的初始点。
-                if dist_xy < 0.8 and speed < 0.5:
+                # 再垂直降落在初始点上。1.2m 是"到位"半径，目标始终是各自的初始点。
+                if dist_xy < 1.2 and speed < 0.5:
                     arrived = True
                     logger.info(f"return_land_monitor[{name}]: 到位 (水平 {dist_xy:.2f}m, 速度 {speed:.2f}m/s), 准备降落")
                     break
-                # 引导指令：喂看门狗 + 持续指向初始点
+                # 引导指令：持续指向初始点
                 self._rpc(
                     lambda n=name: self._client.moveToPositionAsync(
                         x, y, z, max(0.5, velocity),
@@ -1252,15 +1657,11 @@ class AirSimController(FlightController):
                 time.sleep(2.5)
             except Exception:
                 pass
-            # 唤醒 + 降落 + 上锁（悬停等待期间看门狗可能再次触发）
-            try:
-                self._rpc(lambda n=name: self._client.hoverAsync(vehicle_name=n), timeout=10.0)
-                time.sleep(0.3)
-            except Exception:
-                pass
-            if self.land(vehicle_name=name):
-                self.disarm(vehicle_name=name)
+            # 引导压地 + 触地上锁（本机版本 landAsync 无效，不能用 landAsync）
+            if self._guided_land_worker(name, timeout=150.0):
                 logger.info(f"return_land_monitor[{name}]: 已返航降落并锁定")
+            else:
+                logger.error(f"return_land_monitor[{name}]: 返航到位但降落未确认")
         except Exception as e:
             logger.error(f"return_land_monitor: {name} 降落/锁定失败: {e}")
 
@@ -1343,40 +1744,6 @@ class AirSimController(FlightController):
             logger.error(f"move_by_velocity failed: {e}")
             return False
 
-    def move_on_path(self, waypoints: list[dict], velocity: float = 2.0, vehicle_name: str = "") -> bool:
-        self.last_error = ""
-        if not self._ensure_connected():
-            self.last_error = "AirSim not connected"
-            return False
-        try:
-            self._ensure_control(vehicle_name)
-            names = self._resolve_vehicles(vehicle_name)
-            airsim_path = [
-                airsim.Vector3r(wp.get("x", 0), wp.get("y", 0), wp.get("z", 0))
-                for wp in waypoints
-            ]
-            total_dist = sum(
-                ((waypoints[i].get("x",0)-waypoints[i-1].get("x",0))**2 +
-                 (waypoints[i].get("y",0)-waypoints[i-1].get("y",0))**2 +
-                 (waypoints[i].get("z",0)-waypoints[i-1].get("z",0))**2) ** 0.5
-                for i in range(1, len(waypoints))
-            ) if len(waypoints) > 1 else 0
-            flight_timeout = max(30, total_dist / max(velocity, 0.5) + 10.0)
-            for name in names:
-                self._rpc_call(
-                    lambda n=name: self._client.moveOnPathAsync(
-                        airsim_path, velocity,
-                        timeout_sec=flight_timeout,
-                        vehicle_name=n,
-                    ).join(),
-                    timeout=flight_timeout + 10.0,
-                )
-            return True
-        except Exception as e:
-            self.last_error = str(e)
-            logger.error(f"move_on_path failed: {e}")
-            return False
-
     # ------------------------------------------------------------------
     # 状态查询
     # ------------------------------------------------------------------
@@ -1409,21 +1776,46 @@ class AirSimController(FlightController):
             except Exception:
                 pass
 
-            # 多机注意：部分 AirSim 版本在地面未解锁状态下 getMultirotorState 的
-            # kinematics_estimated 对所有车返回第一架车的读数（飞行中才恢复按车），
-            # 因此地图定位必须用 getGpsData（全程按车正确，由 OriginGeopoint 换算）。
-            gps_data = None
+            # 逐机位置可信度判定（不依赖任何会话假设）：
+            # 本机 AirSim 版本中，飞过的机 kinematics 逐机正确（悬停也正确），
+            # 从未飞过的地面机 kinematics 是废数（可能共享首机读数或偏离出生点），
+            # 而这时原始 GPS 恰好逐机正确。逐机规则：
+            #   - kinematics 在自家出生点附近 → 用 kinematics（地面/已飞均正确）
+            #   - 否则若原始 GPS 在出生点附近 → 该机从未有效飞行，用原始 GPS
+            #   - 两者都不在出生点 → 用 kinematics（飞行/悬停中，逐机正确）
+            raw_gps = None
             try:
                 gnss = self._rpc(self._client.getGpsData, vehicle_name=name, timeout=4.0).gnss
                 geo = gnss.geo_point
                 if geo and abs(float(geo.latitude)) > 0.001 and abs(float(geo.longitude)) > 0.001:
-                    gps_data = {
+                    raw_gps = {
                         "lat": round(float(geo.latitude), 7),
                         "lon": round(float(geo.longitude), 7),
                         "alt": round(float(geo.altitude), 2),
                     }
             except Exception:
-                gps_data = None
+                raw_gps = None
+            speed = math.sqrt(vel.x_val ** 2 + vel.y_val ** 2 + vel.z_val ** 2)
+            spawn = self._settings_spawns.get(name)
+            raw_ned = None
+            if raw_gps is not None:
+                try:
+                    raw_ned = self.gps_to_ned(
+                        float(raw_gps["lat"]), float(raw_gps["lon"]), float(raw_gps["alt"] or 0.0)
+                    )
+                except (TypeError, ValueError):
+                    raw_ned = None
+            use_raw_gps = False
+            if spawn is not None and raw_ned is not None:
+                kin_ok = math.hypot(pos.x_val - spawn[0], pos.y_val - spawn[1]) < 1.2
+                gps_ok = math.hypot(raw_ned["x"] - spawn[0], raw_ned["y"] - spawn[1]) < 1.2
+                use_raw_gps = (not kin_ok) and gps_ok
+            if use_raw_gps:
+                position = {"x": raw_ned["x"], "y": raw_ned["y"], "z": raw_ned["z"]}
+                gps_data = raw_gps
+            else:
+                derived_gps = self.ned_to_gps(pos.x_val, pos.y_val, pos.z_val)
+                gps_data = derived_gps if derived_gps is not None else raw_gps
 
             _, pitch, yaw = self._quat_to_euler(ori)
             heading_deg = math.degrees(yaw)
@@ -1436,15 +1828,23 @@ class AirSimController(FlightController):
             speed = math.sqrt(vel.x_val ** 2 + vel.y_val ** 2 + vel.z_val ** 2)
             # 悬停时速度≈0 但明显高于地面——只看速度会把悬停误判成落地，
             # 导致返航被 "vehicle is not airborne" 拒绝。速度或相对高度任一满足即算飞行。
-            # 相对高度基于标定地面（该环境 NED 原点可能高于地面 3~6m）。
-            ground_z = self._ue_ned_ground_z if self._ue_ned_ground_z is not None else 0.0
-            airborne_by_altitude = pos.z_val < (ground_z - 0.3)
-            flying = (landed == 1) and not landed_confirmed and (speed > 0.3 or airborne_by_altitude)
+            # 相对高度基于 kinematics 帧标定地面（GPS 帧与 kinematics 帧有 ~2m 偏差）。
+            ground_ref = self._ground_z_kin_value()
+            if ground_ref is None:
+                ground_ref = self._ue_ned_ground_z if self._ue_ned_ground_z is not None else 0.0
+            airborne_by_altitude = pos.z_val < (ground_ref - 0.3)
+            # 飞行判定不依赖 landed 状态机：本版本状态机既会卡 1（落地报
+            # Flying）也会误报 0（空中报 Landed），只有速度/相对高度可信。
+            # 悬停速度≈0 但明显高于地面，靠高度判飞行。
+            flying = (not landed_confirmed) and (speed > 0.3 or airborne_by_altitude)
             if landed_confirmed:
                 position = {"x": float(position.get("x", 0.0) or 0.0), "y": float(position.get("y", 0.0) or 0.0), "z": 0.0}
             extra = {
                 "heading_deg": round(heading_deg, 1),
                 "landed_state": "flying" if flying else "landed",
+                # 原始模拟器落地状态(0=Landed)：本版本触地后可能卡在 1(Flying)，
+                # 但报 0 时可信，供触地判定直接使用
+                "landed_state_raw": int(landed),
                 "has_collided": getattr(state, 'collision', None) and state.collision.has_collided,
                 "api_control_enabled": name in self._control_enabled,
                 "vehicle_types": self._settings_vehicle_types,
