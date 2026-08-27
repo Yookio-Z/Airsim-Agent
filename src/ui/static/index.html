@@ -830,6 +830,16 @@
       integrity="sha256-20nQCchB9co0qIjJZRGuk2/Z9VM+kNiyxNV1lvTlZBo="
       crossorigin=""
     ></script>
-    <script src="/app.js"></script>
+    <!-- app.js 按职责拆分为多个经典脚本，按依赖顺序加载（最后一个 init.js 执行启动序列） -->
+    <script src="/core.js"></script>
+    <script src="/camera.js"></script>
+    <script src="/net.js"></script>
+    <script src="/form.js"></script>
+    <script src="/map.js"></script>
+    <script src="/renders.js"></script>
+    <script src="/chat.js"></script>
+    <script src="/panels.js"></script>
+    <script src="/missions.js"></script>
+    <script src="/init.js"></script>
   </body>
 </html>

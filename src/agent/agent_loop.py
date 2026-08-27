@@ -20,6 +20,18 @@ LoopPauseCheck = Callable[[], bool]
 AgentToolExecutor = Callable[[str, dict[str, Any], bool], ToolCallResult]
 LoopStateCallback = Callable[[LoopState], None]
 
+# 计划中"可验证目标达成"的运动类工具：LLM 声明任务完成前，这些动作
+# 必须在该循环内留下一次成功执行记录（或被状态回读证明目标已达成）。
+_PLANNED_MOTION_TOOLS = {
+    "drone_takeoff",
+    "drone_hover",
+    "drone_move_relative",
+    "drone_fly_to",
+    "drone_fly_path",
+    "drone_land",
+    "drone_rotate_to",
+}
+
 
 class AgentLoop:
     """Small ReAct-style loop that stays close to the existing tool runtime."""
@@ -647,7 +659,24 @@ class AgentLoop:
         if initial_plan is None:
             return {}
         plan_dict = initial_plan.to_dict() if hasattr(initial_plan, "to_dict") else {}
-        return plan_dict.get("goal") or {}
+        goal = dict(plan_dict.get("goal") or {})
+        criteria = list(goal.get("success_criteria") or [])
+        # 自动补完成判据：LLM 经常不提供 success_criteria，导致"声明完成即
+        # 完成"畅行无阻（例如向前移动被安全层拦截后仍被标记 completed）。
+        # 计划中含有运动步骤时，注入"这些动作必须成功执行过"的机器校验判据。
+        if not any(c.get("metric") == "planned_motion_steps_ok" for c in criteria):
+            planned_motion = [s.tool for s in (initial_plan.steps or []) if getattr(s, "tool", "") in _PLANNED_MOTION_TOOLS]
+            if planned_motion:
+                criteria.append({
+                    "metric": "planned_motion_steps_ok",
+                    "tools": list(dict.fromkeys(planned_motion)),
+                    "detail": "计划中的运动步骤必须成功执行：{}".format(
+                        ", ".join(dict.fromkeys(planned_motion))
+                    ),
+                })
+        if criteria:
+            goal["success_criteria"] = criteria
+        return goal
 
     def _verify_completion(self, goal: dict[str, Any], state: LoopState, observation: LoopObservation) -> dict[str, Any]:
         criteria = (goal or {}).get("success_criteria") or []
@@ -674,6 +703,17 @@ class AgentLoop:
             # declares completion without doing anything must not pass the gate.
             base["satisfied"] = bool(state.results) and not failed
             base["detail"] = f"results={len(state.results)} failed={len(failed)}"
+        elif metric == "planned_motion_steps_ok":
+            # 计划中的每个运动步骤必须至少留下一次成功执行记录；被安全层
+            # 拦截/失败的动作用 fresh 状态回读证明目标已达成也无法通过——
+            # 必须真正补做成功（LLM 提示词里已声明此纪律）。
+            tools = list(criterion.get("tools") or [])
+            ok_tools = {str(result.tool) for result in state.results if result.ok}
+            missing = [t for t in tools if t not in ok_tools]
+            base.update(
+                satisfied=not missing,
+                detail=f"missing={','.join(missing)}" if missing else "all planned motion steps succeeded",
+            )
         elif metric == "photo_taken":
             ok = self._has_successful_tool(state, "airsim_take_photo") or any(
                 result.ok and self._result_contains_image(result.data) for result in state.results

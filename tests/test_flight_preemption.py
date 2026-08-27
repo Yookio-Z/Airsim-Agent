@@ -131,54 +131,73 @@ def test_velocity_move_interrupted_leaves_offboard_cleanly() -> None:
 
 
 # ---------------------------------------------------------------------------
-# AirSim interruptible task wait (fake task, no real AirSim connection)
+# AirSim move-arrival wait (telemetry polling; task.join is unreliable with
+# timeout_value=5 — it returns after ~6s regardless of task state)
 # ---------------------------------------------------------------------------
 
 
-class _FakeTask:
-    """Minimal msgpackrpc-Future-like object: join() blocks until released."""
+class _FakeStatus:
+    """Minimal DroneStatus-like object for _wait_move_arrival tests."""
 
-    def __init__(self, block: bool = True) -> None:
-        self._release = threading.Event()
-        self._block = block
+    def __init__(self, pos: dict, vel: dict, raw_landed: int = 1) -> None:
+        self._d = {
+            "position_ned": pos,
+            "velocity_ned": vel,
+            "extra": {"landed_state_raw": raw_landed},
+            "flying": True,
+            "armed": True,
+        }
 
-    def join(self) -> None:
-        if self._block:
-            self._release.wait(timeout=10.0)
+    def to_dict(self) -> dict:
+        return dict(self._d)
 
 
-def test_airsim_wait_interruptible_preempts_on_stop() -> None:
+def test_airsim_wait_move_arrival_preempts_on_stop() -> None:
     from src.modules.airsim_controller import AirSimController
 
     controller = AirSimController()
-    task = _FakeTask(block=True)
     flag = {"stop": False}
     controller.set_stop_provider(lambda: flag["stop"])
     threading.Timer(0.1, lambda: flag.__setitem__("stop", True)).start()
     started = time.time()
-    try:
-        ok = controller._wait_async_interruptible(task, "drone_0", timeout=30.0)
-        assert ok is False
-        assert time.time() - started < 2.0
-        assert "interrupted" in controller.last_error
-    finally:
-        task._release.set()  # let the join worker thread exit
+    ok = controller._wait_move_arrival("drone_0", (10.0, 0.0, -5.0), timeout=30.0)
+    assert ok is False
+    assert time.time() - started < 2.0
+    assert "interrupted" in controller.last_error
 
 
-def test_airsim_wait_interruptible_completes_normally() -> None:
+def test_airsim_wait_move_arrival_completes_on_arrival() -> None:
     from src.modules.airsim_controller import AirSimController
 
     controller = AirSimController()
-    task = _FakeTask(block=False)  # join returns immediately
-    ok = controller._wait_async_interruptible(task, "drone_0", timeout=5.0)
+    controller.get_status = lambda name="drone_0": _FakeStatus(  # type: ignore[method-assign]
+        {"x": 9.9, "y": 0.0, "z": -5.0}, {"vx": 0.1, "vy": 0.0, "vz": 0.0}
+    )
+    ok = controller._wait_move_arrival("drone_0", (10.0, 0.0, -5.0), timeout=5.0)
     assert ok is True
     assert controller.last_error == ""
 
 
-def test_airsim_wait_interruptible_no_provider_no_behavior_change() -> None:
+def test_airsim_wait_move_arrival_detects_stall() -> None:
+    from src.modules.airsim_controller import AirSimController
+
+    controller = AirSimController()
+    # hovering far from the target: simulator-side task ended without arrival
+    controller.get_status = lambda name="drone_0": _FakeStatus(  # type: ignore[method-assign]
+        {"x": 0.0, "y": 0.0, "z": 0.0}, {"vx": 0.0, "vy": 0.0, "vz": 0.0}
+    )
+    started = time.time()
+    ok = controller._wait_move_arrival("drone_0", (10.0, 0.0, -5.0), timeout=30.0)
+    assert ok is False
+    assert time.time() - started < 10.0
+
+
+def test_airsim_wait_move_no_provider_no_behavior_change() -> None:
     from src.modules.airsim_controller import AirSimController
 
     controller = AirSimController()
     assert controller._stop_requested() is False
-    task = _FakeTask(block=False)
-    assert controller._wait_async_interruptible(task, "drone_0", timeout=5.0) is True
+    controller.get_status = lambda name="drone_0": _FakeStatus(  # type: ignore[method-assign]
+        {"x": 10.0, "y": 0.0, "z": -5.0}, {"vx": 0.0, "vy": 0.0, "vz": 0.0}
+    )
+    assert controller._wait_move_arrival("drone_0", (10.0, 0.0, -5.0), timeout=5.0) is True

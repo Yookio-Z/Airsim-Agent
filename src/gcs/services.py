@@ -459,28 +459,37 @@ class ToolMissionManager:
         if not plans:
             return ManagerResult(False, "没有非空的航线任务", {})
 
-        # 2. 阶段 A：对未在空中的机并发派发起飞（fire-and-forget）
+        # 2. 阶段 A：对未在空中的机并发派发起飞（fire-and-forget）。
+        #    无非阻塞派发能力的后端（PX4 MAVLink / 真机）跳过本阶段，
+        #    起飞由阶段 C 的阻塞路径逐机负责。
+        controller = getattr(self._tools, "controller", None)
+        supports_dispatch = bool(
+            controller is not None
+            and callable(getattr(controller, "dispatch_move_on_path", None))
+            and callable(getattr(controller, "dispatch_takeoff", None))
+        )
         vehicles_state = {v.vehicle_id: v for v in state.vehicles}
         dispatched_takeoffs: list[str] = []
-        for plan in plans:
-            vehicle = plan["vehicle"]
-            telemetry = vehicles_state.get(vehicle)
-            if telemetry is not None and telemetry.flying and telemetry.armed:
-                continue
-            result = self._tools.execute(
-                "drone_dispatch_takeoff",
-                {"altitude": plan["takeoff_altitude"], "vehicle_name": vehicle},
-                dry_run=False,
-                blocked_by_supervisor=state.safety.emergency_stop,
-            )
-            if result.ok:
-                dispatched_takeoffs.append(vehicle)
-            else:
-                return ManagerResult(
-                    False,
-                    f"{vehicle or '默认机'} 起飞派发失败: {result.data.get('message', '')}",
-                    {"assignments": plans, "failed_takeoff": vehicle},
+        if supports_dispatch:
+            for plan in plans:
+                vehicle = plan["vehicle"]
+                telemetry = vehicles_state.get(vehicle)
+                if telemetry is not None and telemetry.flying and telemetry.armed:
+                    continue
+                result = self._tools.execute(
+                    "drone_dispatch_takeoff",
+                    {"altitude": plan["takeoff_altitude"], "vehicle_name": vehicle},
+                    dry_run=False,
+                    blocked_by_supervisor=state.safety.emergency_stop,
                 )
+                if result.ok:
+                    dispatched_takeoffs.append(vehicle)
+                else:
+                    return ManagerResult(
+                        False,
+                        f"{vehicle or '默认机'} 起飞派发失败: {result.data.get('message', '')}",
+                        {"assignments": plans, "failed_takeoff": vehicle},
+                    )
 
         # 3. 阶段 B：等待派发了起飞的机进入空中（有上限，不阻塞已空中的机）
         if dispatched_takeoffs:
@@ -493,22 +502,65 @@ class ToolMissionManager:
                 pending -= airborne
             # 超时的机不再等，路径照常派发（AirSim 会在起飞完成后执行路径）
 
-        # 4. 阶段 C：逐机派发各自路径（fire-and-forget，互不阻塞）
+        # 4. 阶段 C：逐机执行各自路径。
+        #    有非阻塞派发能力的后端（AirSim）fire-and-forget 互不阻塞；
+        #    没有的后端（PX4 MAVLink / 真机）走阻塞路径：已起飞的目标机直接
+        #    飞路径，未起飞的先起飞再飞路径（逐机顺序执行，确定性强）。
+        controller = getattr(self._tools, "controller", None)
+        supports_dispatch = bool(
+            controller is not None
+            and callable(getattr(controller, "dispatch_move_on_path", None))
+            and callable(getattr(controller, "dispatch_takeoff", None))
+        )
         results: list[dict[str, Any]] = []
         failed: list[str] = []
         for plan in plans:
-            result = self._tools.execute(
-                "drone_dispatch_path",
-                {
-                    "waypoints_json": json.dumps(plan["waypoints"]),
-                    "velocity": plan["velocity"],
-                    "vehicle_name": plan["vehicle"],
-                },
-                dry_run=False,
-                blocked_by_supervisor=state.safety.emergency_stop,
-            )
+            vehicle = plan["vehicle"]
+            if supports_dispatch:
+                result = self._tools.execute(
+                    "drone_dispatch_path",
+                    {
+                        "waypoints_json": json.dumps(plan["waypoints"]),
+                        "velocity": plan["velocity"],
+                        "vehicle_name": vehicle,
+                    },
+                    dry_run=False,
+                    blocked_by_supervisor=state.safety.emergency_stop,
+                )
+            else:
+                # PX4/真机：先确保目标机在任务高度（未起飞则起飞）
+                taked_off = True
+                telemetry = {v.vehicle_id: v for v in state.vehicles}.get(vehicle)
+                if telemetry is None or not (telemetry.flying and telemetry.armed):
+                    takeoff = self._tools.execute(
+                        "drone_takeoff",
+                        {"altitude": plan["takeoff_altitude"], "vehicle_name": vehicle},
+                        dry_run=False,
+                        blocked_by_supervisor=state.safety.emergency_stop,
+                    )
+                    taked_off = bool(takeoff.ok)
+                if not taked_off:
+                    entry = {
+                        "vehicle": vehicle,
+                        "waypoint_count": len(plan["waypoints"]),
+                        "ok": False,
+                        "message": "takeoff failed before path",
+                    }
+                    results.append(entry)
+                    failed.append(vehicle or "默认机")
+                    continue
+                result = self._tools.execute(
+                    "drone_fly_path",
+                    {
+                        "waypoints_json": json.dumps(plan["waypoints"]),
+                        "velocity": plan["velocity"],
+                        "vehicle_name": vehicle,
+                    },
+                    dry_run=False,
+                    blocked_by_supervisor=state.safety.emergency_stop,
+                )
             entry = {
-                "vehicle": plan["vehicle"],
+                "vehicle": vehicle,
                 "waypoint_count": len(plan["waypoints"]),
                 "velocity": plan["velocity"],
                 "ok": bool(result.ok),
@@ -516,7 +568,7 @@ class ToolMissionManager:
             }
             results.append(entry)
             if not result.ok:
-                failed.append(plan["vehicle"] or "默认机")
+                failed.append(vehicle or "默认机")
 
         ok = not failed
         summary = "、".join(f"{r['vehicle'] or '默认机'}({r['waypoint_count']}点)" for r in results)
@@ -609,10 +661,18 @@ class ToolMissionManager:
     def _draft_to_local_path(self, draft: MissionPlanDraft) -> tuple[list[dict[str, float]], float]:
         waypoints: list[dict[str, float]] = []
         velocities: list[float] = []
-        vehicle_geo = self._current_vehicle_geo_home()
-        vehicle_local = self._current_vehicle_local_position()
+        # global 航点（PX4 帧）转本地 NED 时，偏移基准必须是该计划目标机自己
+        # 的位置——用默认车会把多机任务里其余各机的航点整体偏移
+        vehicle_geo = self._current_vehicle_geo_home(draft.vehicle)
+        vehicle_local = self._current_vehicle_local_position(draft.vehicle)
         home = draft.home or vehicle_geo
         for item in draft.items:
+            # 只转换几何航点：takeoff/land/rtl 是动作指令（分别派发
+            # drone_takeoff/drone_land/drone_rtl），不是坐标——尤其 UI 自
+            # 动插入的 takeoff 项带 x:0,y:0，泄漏进路径会让每架机先飞到原
+            # 点（Drone1 出生点）再执行自己的航线。
+            if item.type not in ("waypoint", ""):
+                continue
             if item.is_global() and vehicle_geo and vehicle_local:
                 relative = item.to_local_ned(vehicle_geo)
                 if relative is None:
@@ -643,10 +703,16 @@ class ToolMissionManager:
             return 3.0
         return None
 
-    def _current_vehicle_geo_home(self) -> GeoPoint | None:
+    def _current_vehicle_geo_home(self, vehicle_id: str = "") -> GeoPoint | None:
+        """目标车（空 = 默认车）的 GPS 位置，global 航点转本地 NED 的基准。"""
         try:
             state = self._telemetry.get_state()
-            gps = state.vehicle.gps if state.vehicle else None
+            target = None
+            if vehicle_id:
+                target = next((v for v in state.vehicles if v.vehicle_id == vehicle_id), None)
+            if target is None:
+                target = state.vehicle
+            gps = target.gps if target else None
             if isinstance(gps, dict) and gps.get("lat") is not None and gps.get("lon") is not None:
                 return GeoPoint(
                     lat=float(gps["lat"]),
@@ -657,10 +723,16 @@ class ToolMissionManager:
             return None
         return None
 
-    def _current_vehicle_local_position(self) -> dict[str, float] | None:
+    def _current_vehicle_local_position(self, vehicle_id: str = "") -> dict[str, float] | None:
+        """目标车（空 = 默认车）的本地 NED 位置，global 航点转本地路径的基准。"""
         try:
             state = self._telemetry.get_state()
-            pos = state.vehicle.position_ned if state.vehicle else None
+            target = None
+            if vehicle_id:
+                target = next((v for v in state.vehicles if v.vehicle_id == vehicle_id), None)
+            if target is None:
+                target = state.vehicle
+            pos = target.position_ned if target else None
             if isinstance(pos, dict):
                 return {
                     "x": float(pos.get("x", 0.0) or 0.0),
