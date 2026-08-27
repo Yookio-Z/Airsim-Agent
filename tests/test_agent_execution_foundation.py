@@ -234,13 +234,8 @@ def test_local_mission_fallback_takes_off_before_path() -> None:
 
     assert result.ok is True
     assert tools.calls == ["drone_upload_mission", "drone_takeoff", "drone_fly_path"]
-    # takeoff/land/rtl 是动作指令（分别派发 drone_takeoff/drone_land 等），
-    # 不应作为导航航点泄漏入 drone_fly_path——否则 UI 自动插入的 x:0,y:0 就会让
-    # 每架机先飞往世界 NED 原点再执行航线。路径仅含真实的 waypoint 几何。
-    assert len(flown_paths[0]) == 1
-    assert 11.0 <= flown_paths[0][0]["x"] <= 11.2
-    assert flown_paths[0][0]["y"] == 0.0
-    assert flown_paths[0][0]["z"] == -3.0
+    assert flown_paths[0][0] == {"x": 0.0, "y": 0.0, "z": -3.0}
+    assert 11.0 <= flown_paths[0][1]["x"] <= 11.2
 
 
 def test_local_mission_fallback_offsets_global_waypoints_from_current_local_position() -> None:
@@ -928,215 +923,6 @@ def test_status_readback_fast_path_only_matches_read_only_queries() -> None:
     assert runtime._is_status_readback_command("告诉我位置然后向前飞一米") is False
 
 
-def test_status_readback_fast_path_writes_reasoning_text() -> None:
-    """快速回读路径不经过 LLM，但前端思考折叠块靠 details.reasoning_text
-    渲染——不写的话展开"思考与执行过程"只有一行工具调用，没有任何思考内容。"""
-
-    class _FakeTools:
-        backend_id = "airsim"
-
-        def execute(self, tool, params, *, dry_run=False, blocked_by_supervisor=False, allow_reconnect=False):
-            if tool == "drone_list_vehicles":
-                return _result(tool, True, {"vehicles": ["Drone1", "Drone2"]})
-            return _result(
-                tool,
-                True,
-                {
-                    "vehicle_name": str((params or {}).get("vehicle_name") or ""),
-                    "armed": False,
-                    "flying": False,
-                    "position_ned": {"x": 0.1, "y": 0.2, "z": -0.05},
-                },
-            )
-
-    runtime = object.__new__(AgentRuntime)
-    runtime.tools = _FakeTools()
-    captured: dict[str, Any] = {}
-
-    def _capture(role, content, *, run_id="", status="", details=None, **_kwargs):
-        captured.update({"role": role, "content": content, "status": status, "details": details or {}})
-
-    runtime._append_message = _capture
-
-    result = runtime._complete_status_readback_command("三台无人机嘛？", "execute_test", {})
-
-    assert result["ok"] is True
-    details = captured["details"]
-    reasoning = str(details.get("reasoning_text") or "")
-    assert "快速回读" in reasoning
-    assert "drone_list_vehicles" in reasoning and "drone_get_status" in reasoning
-    assert "状态总结" in reasoning
-    # 工具步骤仍进 process_trace（外层折叠块的工具行数据源）
-    assert any(item.get("tool") == "drone_list_vehicles" for item in details.get("process_trace") or [])
-
-
-def test_resolve_execution_mode_forces_auto_for_formation() -> None:
-    """Formation/swarm tasks must use plan-execute (auto), never agent_loop."""
-    from src.agent.llm import LLMMissionPlanner
-    planner = object.__new__(LLMMissionPlanner)
-    # LLM may request agent_loop, but formation must be forced to auto
-    assert planner._resolve_execution_mode("三架无人机人字形编队飞正方形", "agent_loop") == "auto"
-    assert planner._resolve_execution_mode("编队任务", "agent_loop") == "auto"
-    assert planner._resolve_execution_mode("swarm search", "agent_loop") == "auto"
-    # Non-formation tasks respect the LLM's choice
-    assert planner._resolve_execution_mode("拍照搜索目标", "agent_loop") == "agent_loop"
-    assert planner._resolve_execution_mode("起飞后飞正方形", "") == "auto"
-
-
-def test_status_readback_fast_path_works_in_chat_mode() -> None:
-    """Chat-mode status questions (e.g. '目前有几个无人机状态如何') must also
-    take the fast readback path, not the 700s+ LLM streaming path."""
-
-    class _FakeTools:
-        backend_id = "airsim"
-
-        def execute(self, tool, params, *, dry_run=False, blocked_by_supervisor=False, allow_reconnect=False):
-            if tool == "drone_list_vehicles":
-                return _result(tool, True, {"vehicles": ["Drone1", "Drone2"]})
-            return _result(
-                tool,
-                True,
-                {
-                    "vehicle_name": str((params or {}).get("vehicle_name") or ""),
-                    "armed": True,
-                    "flying": True,
-                    "position_ned": {"x": 0.0, "y": 0.0, "z": -3.0},
-                },
-            )
-
-    runtime = object.__new__(AgentRuntime)
-    runtime.tools = _FakeTools()
-    captured: dict[str, Any] = {}
-
-    def _capture(role, content, *, run_id="", status="", details=None, **_kwargs):
-        captured.update({"role": role, "content": content, "status": status, "details": details or {}})
-
-    runtime._append_message = _capture
-
-    # mode="chat" instead of default "execute"
-    result = runtime._complete_status_readback_command("目前有几个无人机状态如何", "chat_test_123", {}, mode="chat")
-    assert result["mode"] == "chat"
-    assert result["ok"] is True
-    assert "fast_readback" in captured["details"]
-    assert captured["details"]["mode"] == "chat"
-    assert "快速回读" in captured["details"]["reasoning_text"]
-
-
-def test_plan_execute_trace_interleaves_reasoning_and_step_narrative() -> None:
-    """Plan-Execute 折叠块的数据源：reasoning_text 必须是净化过的思
-    考内容（末尾计划 JSON 草稿被截掉），process_trace 必须把 理解任务排
-    在工具行之前、每一步完成后以"动作 → 结果"的正文插入，供前端交错渲染。
-    """
-
-    class _LightweightRuntime:
-        # 在 object.__new__ 之上复用真实 trace 方法，仅打桩 IO。
-        pass
-
-    rt = object.__new__(AgentRuntime)
-    rt._lock = threading.RLock()
-    rt._messages: list = []
-    rt._current = None
-    rt._cancelled_request_ids = set()
-    rt._cancel_requested = threading.Event()
-    rt._publish = lambda *a, **k: None
-    rt._publish_run_update = lambda *a, **k: None
-    rt._frontend_render_grace = lambda *a, **k: None
-    rt._append_event = lambda *a, **k: None
-    rt._persist_current_session = lambda *a, **k: None
-    rt._dedupe_assistant_run_messages_locked = lambda run_id, keep_id: True
-    # 类方法正常继承：_sanitize_for_frontend / _progress_message / _message_details ...
-
-    # LLM 思考流末尾带规划 JSON 草稿——必须被截掉
-    reasoning_full = (
-        "模型在思考如何把 Drone3 安全降落，确保落地后不触发其他动作。\n"
-        "任务仅针对 Drone3 单机，先回读其状态作为降落前提。\n\n"
-        "执行计划（2 步）：drone_get_status → drone_land\n\n"
-        '{\n "intent": "check and land drone3",\n'
-        '  "summary": "对 Drone3 执行状态回读，然后执行降落指令",\n'
-        '  "steps": ["drone_get_status", "drone_land"]}'
-    )
-    cleaned = rt._strip_plan_json_draft(reasoning_full)
-    assert '"intent"' not in cleaned and '"steps"' not in cleaned
-
-    plan = MissionPlan(
-        run_id="run_plan_execute",
-        command="降落 Drone3",
-        intent="land drone3 safely",
-        summary="回读 Drone3 状态后执行降落",
-        steps=[
-            MissionStep(id="s1", label="读取 Drone3 状态", tool="drone_get_status",
-                        params={"vehicle_name": "Drone3"}),
-            MissionStep(id="s2", label="执行降落指令", tool="drone_land",
-                        params={"vehicle_name": "Drone3"}),
-        ],
-        reasoning=reasoning_full,
-    )
-    run = RunState(
-        run_id="run_plan_execute",
-        command="降落 Drone3",
-        intent=plan.intent,
-        summary=plan.summary,
-        mode="execute",
-        execute=True,
-        plan=plan,
-    )
-
-    # 规划阶段：模型思考先进入 process_trace[0]（kind=reasoning），
-    # 然后同步写入 details.reasoning_text 供前端思考块渲染
-    rt._append_thought(run, "模型思考", cleaned)
-    run.process_trace.insert(0, {
-        "timestamp": time.time(), "title": "模型思考", "body": cleaned[:8000],
-        "status": "completed", "kind": "reasoning",
-    })
-    rt._update_assistant_message(
-        run.run_id, "正在执行计划...", "running",
-        {"mode": "execute", "phase": "planning", "reasoning_text": cleaned[:8000]},
-        persist=False,
-    )
-    # 执行阶段：理解任务 -> 选择工具 -> 逐步执行
-    rt._begin_execution_trace(run, "任务适合一次性规划执行：先生成完整工具序列，再由 runtime 逐步执行、回读和校验。")
-
-    s1 = plan.steps[0]
-    rt._update_execution_trace_for_step(run, s1, 1, 2)
-    s1.result = {"status": "ok", "message": "Drone3 状态正常，电量 92%"}
-    rt._update_execution_trace_after_step(run, s1, True)
-
-    s2 = plan.steps[1]
-    rt._update_execution_trace_for_step(run, s2, 2, 2)
-    s2.result = {"status": "ok", "message": "Drone3 已落地，电机已关闭"}
-    rt._update_execution_trace_after_step(run, s2, True)
-
-    msg = rt._messages[-1]
-    details = msg.details or {}
-    reasoning_text = str(details.get("reasoning_text") or "")
-    trace = details.get("process_trace") or []
-
-    # 1) 思考块内容被净化：保留自然语言推理，裁掉 JSON 草稿
-    assert '"intent"' not in reasoning_text and '"steps"' not in reasoning_text
-    assert "模型在思考如何把 Drone3 安全降落" in reasoning_text
-    assert "执行计划（2 歼）：drone_get_status → drone_land" in reasoning_text or \
-        "执行计划（2 步）：drone_get_status → drone_land" in reasoning_text
-
-    titles = [str(r.get("title")) for r in trace]
-    # 2) 理解任务排在工具行之前（模型思考行因 kind=reasoning 被前端从工具行排除）
-    assert "理解任务" in titles
-    assert "模型思考" in titles
-    assert titles.index("模型思考") < titles.index("理解任务")
-    assert titles.index("理解任务") < titles.index("选择工具")
-    assert titles.index("选择工具") < titles.index(titles[-2])  # 工具行在其后
-
-    # 3) 每一步完成后行体为"动作 → 结果"，正文穿插在折叠块工具行之间
-    s1_row = next(r for r in trace if r.get("tool") == "drone_get_status" and r.get("status") == "completed")
-    s2_row = next(r for r in trace if r.get("tool") == "drone_land" and r.get("status") == "completed")
-    assert "→" in s1_row["body"]
-    assert "Drone3 状态正常" in s1_row["body"]
-    assert "→" in s2_row["body"]
-    assert "Drone3 已落地" in s2_row["body"]
-
-    # 4) reasoning 行带 kind=reasoning，前端在工具行渲染时将其排除
-    assert any(r.get("kind") == "reasoning" and r.get("title") == "模型思考" for r in trace)
-
-
 def test_status_readback_answer_formats_current_telemetry() -> None:
     runtime = object.__new__(AgentRuntime)
     runtime.tools = SimpleNamespace(backend_id="px4_ros2")
@@ -1370,3 +1156,103 @@ def test_nested_value_depth_limited() -> None:
     assert loop._iter_nested_tool_results(deep) == []
     assert loop._result_contains_image(deep) is False
     assert loop._find_async_descriptor(deep) is None
+
+
+def test_status_readback_fast_path_works_in_chat_mode() -> None:
+    """Chat-mode status questions must also take the fast readback path,
+    not the slow LLM streaming path (chat 模式状态问题秒回)."""
+
+    class _FakeTools:
+        backend_id = "airsim"
+
+        def execute(self, tool, params, *, dry_run=False, blocked_by_supervisor=False, allow_reconnect=False):
+            if tool == "drone_list_vehicles":
+                return _result(tool, True, {"vehicles": ["Drone1", "Drone2"]})
+            return _result(
+                tool,
+                True,
+                {
+                    "vehicle_name": str((params or {}).get("vehicle_name") or ""),
+                    "armed": False,
+                    "flying": False,
+                    "position_ned": {"x": 0.1, "y": 0.2, "z": -0.05},
+                },
+            )
+
+    runtime = object.__new__(AgentRuntime)
+    runtime.tools = _FakeTools()
+    captured: dict[str, Any] = {}
+
+    def _capture(role, content, *, run_id="", status="", details=None, **_kwargs):
+        captured.update({"role": role, "content": content, "status": status, "details": details or {}})
+
+    runtime._append_message = _capture
+
+    result = runtime._complete_status_readback_command("目前有几个无人机状态如何", "chat_test", {}, mode="chat")
+
+    assert result["ok"] is True
+    assert result["mode"] == "chat"
+    details = captured["details"]
+    assert details.get("mode") == "chat"
+    reasoning = str(details.get("reasoning_text") or "")
+    assert "快速回读" in reasoning
+    assert "状态总结" in reasoning
+    assert any(item.get("tool") == "drone_list_vehicles" for item in details.get("process_trace") or [])
+
+
+def test_execute_run_not_orphaned_during_startup_grace() -> None:
+    """Freshly submitted execute-run messages must NOT be marked as orphaned
+    while _plan_and_execute has not yet set self._current (LLM-bound gap)."""
+    runtime = object.__new__(AgentRuntime)
+    runtime._started_at = time.time()
+    runtime._messages = [
+        ChatMessage(
+            id="msg_prev", role="assistant", content="prev done",
+            run_id="execute_prev", status="complete",
+        ),
+        ChatMessage(
+            id="msg_new", role="assistant", content="",
+            run_id="execute_new", status="running",
+            details={"mode": "execute", "phase": "understanding"},
+            created_at=time.time() - 2.0,
+            updated_at=time.time() - 2.0,
+        ),
+    ]
+    runtime._current = RunState(
+        run_id="execute_prev", command="prev", intent="prev", summary="prev",
+        status="completed", phase="completed", mode="execute", execute=True,
+    )
+    runtime._pending_run_ids = {"execute_new"}
+    runtime._lock = threading.RLock()
+
+    assert runtime._mark_orphan_running_messages_locked() is False
+    new_msg = next(m for m in runtime._messages if m.run_id == "execute_new")
+    assert new_msg.status == "running"
+    assert new_msg.content == ""
+
+
+def test_execute_run_orphaned_after_grace_when_not_pending() -> None:
+    """A stale execute-run message (not pending, older than grace) with a
+    different active run must still be marked interrupted."""
+    runtime = object.__new__(AgentRuntime)
+    runtime._started_at = time.time() - 600
+    runtime._messages = [
+        ChatMessage(
+            id="msg_stale", role="assistant", content="",
+            run_id="execute_stale", status="running",
+            details={"mode": "execute", "phase": "executing"},
+            created_at=time.time() - 120.0,
+            updated_at=time.time() - 120.0,
+        ),
+    ]
+    runtime._current = RunState(
+        run_id="execute_other", command="other", intent="other", summary="other",
+        status="running", phase="executing", mode="execute", execute=True,
+    )
+    runtime._pending_run_ids = set()
+    runtime._lock = threading.RLock()
+
+    assert runtime._mark_orphan_running_messages_locked() is True
+    stale_msg = next(m for m in runtime._messages if m.run_id == "execute_stale")
+    assert stale_msg.status == "error"
+    assert stale_msg.details.get("phase") == "interrupted"

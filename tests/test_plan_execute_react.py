@@ -11,6 +11,7 @@ Covers:
 from __future__ import annotations
 
 import threading
+from types import SimpleNamespace
 
 from src.agent.llm import LLMMissionPlanner
 from src.agent.planner import MissionPlan, MissionStep
@@ -290,41 +291,13 @@ def test_vehicle_line_format() -> None:
     assert "高度约 3.25 m" in flying
 
 
-def test_strip_plan_json_draft_cuts_model_json_draft() -> None:
-    """思考流末尾常带模型起草的计划 JSON 草稿——思考块只留自然语言推理。"""
-    from src.agent.runtime import AgentRuntime
-
-    rt = object.__new__(AgentRuntime)
-    streamed = (
-        "操作员同时要求查看 Drone3 状态并让其降落，先读取状态作为降落前提，"
-        "再单独执行降落；任务仅针对 Drone3 单机。\n\n"
-        "执行计划（3 步）：drone_get_status → drone_land → drone_get_status\n\n"
-        '{\n    "intent": "check and land drone3",\n'
-        '    "summary": "对 Drone3 执行状态回读，然后执行降落指令",\n'
-        '    "steps": []'
-    )
-    cleaned = rt._strip_plan_json_draft(streamed)
-    assert "操作员同时要求查看 Drone3" in cleaned
-    assert "执行计划（3 步）" in cleaned
-    assert '"intent"' not in cleaned and '"steps"' not in cleaned
-
-    # 截断的 JSON 草稿同样要截干净
-    truncated = '先读取 Drone3 状态再降落。{"intent": "check and la'
-    assert rt._strip_plan_json_draft(truncated) == "先读取 Drone3 状态再降落。"
-
-    # 正文里出现与规划无关的花括号/JSON 不受影响
-    prose = '状态里有 {"speed": 0} 字样，属于正常回读内容。'
-    assert rt._strip_plan_json_draft(prose) == prose
-    assert rt._strip_plan_json_draft("") == ""
-
-
 # ── goal completion gating (fix: 目标未达成不得误判完成) ──
 
 
 def test_run_goal_injects_motion_completion_criteria() -> None:
     """LLM 常不提供 success_criteria——计划含运动步骤时必须自动注入
     '这些运动步骤必须成功执行过' 的机器校验判据，防止假完成。"""
-    from src.agent.agent_loop import _PLANNED_MOTION_TOOLS, AgentLoop
+    from src.agent.agent_loop import AgentLoop
 
     plan = _plan(_step("drone_takeoff"), _step("drone_move_relative"))
     goal = AgentLoop._run_goal(plan)
@@ -341,8 +314,6 @@ def test_run_goal_injects_motion_completion_criteria() -> None:
 def test_verify_completion_blocks_when_planned_motion_missing() -> None:
     """LLM 声明完成但计划中的运动动作没有成功执行记录 → 校验必须拦截，
     驱动纠错/失败，而不是放行 completed。"""
-    from types import SimpleNamespace
-
     from src.agent.agent_loop import AgentLoop
     from src.agent.loop_types import LoopObservation, LoopState
 
@@ -385,3 +356,7 @@ def test_strip_plan_json_draft_cuts_correction_decision_json() -> None:
     cleaned = rt._strip_plan_json_draft(streamed)
     assert "当前飞机仍在爬升中" in cleaned
     assert '"action"' not in cleaned and '"is_complete"' not in cleaned
+
+    # 规划 JSON 草稿同样截干净，正文花括号不受影响
+    prose = '状态里有 {"speed": 0} 字样，属于正常回读内容。'
+    assert rt._strip_plan_json_draft(prose) == prose

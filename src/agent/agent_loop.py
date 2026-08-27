@@ -665,7 +665,10 @@ class AgentLoop:
         # 完成"畅行无阻（例如向前移动被安全层拦截后仍被标记 completed）。
         # 计划中含有运动步骤时，注入"这些动作必须成功执行过"的机器校验判据。
         if not any(c.get("metric") == "planned_motion_steps_ok" for c in criteria):
-            planned_motion = [s.tool for s in (initial_plan.steps or []) if getattr(s, "tool", "") in _PLANNED_MOTION_TOOLS]
+            planned_motion = [
+                s.tool for s in (initial_plan.steps or [])
+                if getattr(s, "tool", "") in _PLANNED_MOTION_TOOLS
+            ]
             if planned_motion:
                 criteria.append({
                     "metric": "planned_motion_steps_ok",
