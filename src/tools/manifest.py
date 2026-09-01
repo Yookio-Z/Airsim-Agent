@@ -306,6 +306,16 @@ TOOL_MANIFEST: dict[str, ToolManifestEntry] = {
         recommended_layer="runtime",
         notes="Handled by AgentRuntime, not by external MCP servers.",
     ),
+    "perception_status": ToolManifestEntry(
+        name="perception_status",
+        group="perception",
+        kind="atomic",
+        surface="perception",
+        recommended_layer="tool",
+        stable=True,
+        notes="Read-only perception axis health/snapshot/events; independent of the flight backend.",
+        future_backend_notes="Works unchanged for sim (local engine) and real vehicles (remote Jetson engine).",
+    ),
 }
 
 

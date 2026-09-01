@@ -205,21 +205,42 @@ class AirSimFrameSource:
     """AirSim RPC frames (Scene camera) as a FrameSource.
 
     Kept thin: image decoding happens here so callers share one contract.
+    open() probes the connection (fast ping) so callers fail quickly when
+    the simulator is not running.
     """
 
-    def __init__(self, client: Any, camera_name: str = "0", image_type: int = 0, timeout_sec: float = 15.0) -> None:
+    def __init__(self, client: Any, camera_name: str = "0", image_type: int = 0, timeout_sec: float = 15.0, host: str = "", port: int = 0) -> None:
         self._client = client
         self.camera_name = camera_name
         self.image_type = image_type
         self.timeout_sec = timeout_sec
+        self._host = host
+        self._port = port
         self._open = False
+        self.last_error = ""
 
     @property
     def is_open(self) -> bool:
         return self._open
 
     def open(self) -> bool:
+        if self._open:
+            return True
+        if self._host and self._port:
+            # Fast TCP probe: fail clearly when the simulator is not running
+            # instead of blocking on AirSim RPC timeouts.
+            try:
+                import socket
+
+                with socket.socket() as s:
+                    s.settimeout(1.0)
+                    s.connect((self._host, self._port))
+            except Exception as exc:
+                self._open = False
+                self.last_error = f"AirSim TCP probe failed: {exc}"
+                return False
         self._open = True
+        self.last_error = ""
         return True
 
     def close(self) -> None:

@@ -273,11 +273,19 @@ def register_core_tools(
         X is north meters, Y is east meters, Z is down meters. Negative Z means
         altitude above the local origin.
         """
-        ok, targets = _run_for_vehicles(vehicle_name, lambda name: controller.move_to_position(x, y, z, velocity, name))
+        fx, fy, fz = finite_float(x), finite_float(y), finite_float(z)
+        if fx is None or fy is None or fz is None:
+            return fmt_result({
+                "status": "error",
+                "backend": controller.backend_name,
+                "message": "invalid parameters: x/y/z must be finite numbers (got null)",
+                "received": {"x": x, "y": y, "z": z},
+            })
+        ok, targets = _run_for_vehicles(vehicle_name, lambda name: controller.move_to_position(fx, fy, fz, velocity, name))
         payload = {
             "status": "ok" if ok else "error",
             "backend": controller.backend_name,
-            "message": f"target reached ({x}, {y}, {z})" if ok else "position command failed",
+            "message": f"target reached ({fx}, {fy}, {fz})" if ok else "position command failed",
             "vehicles": targets,
         }
         payload.update(status_payload())
@@ -634,16 +642,17 @@ def register_core_tools(
         )
 
     @mcp.tool()
-    def drone_set_mode(mode: str) -> str:
+    def drone_set_mode(mode: str, vehicle_name: str = "") -> str:
         """Set the flight mode when supported by the active backend."""
-        ok = controller.set_mode(mode)
-        return fmt_result(
-            {
-                "status": "ok" if ok else "error",
-                "backend": controller.backend_name,
-                "message": f"mode set to {mode}" if ok else f"failed to set mode {mode}",
-            }
-        )
+        ok, targets = _run_for_vehicles(vehicle_name, lambda name: controller.set_mode(mode, vehicle_name=name))
+        payload = {
+            "status": "ok" if ok else "error",
+            "backend": controller.backend_name,
+            "message": f"mode set to {mode}" if ok else f"failed to set mode {mode}",
+            "vehicles": targets,
+        }
+        payload.update(status_payload())
+        return fmt_result(payload)
 
     @mcp.tool()
     def drone_rotate_to(heading_deg: float, vehicle_name: str = "") -> str:

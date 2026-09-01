@@ -2068,6 +2068,27 @@ class LLMMissionPlanner:
 
     def _decision_from_payload(self, payload: dict[str, Any], allowed_tools: set[str]) -> LoopDecision:
         action = str(payload.get("action") or "").strip()
+        if not action:
+            # Models occasionally nest the tool call inside the reason field
+            # (e.g. a fenced ```json block that failed to lift to the top
+            # level). Recover the inner decision so a valid action is not
+            # dropped and the run does not die on step one.
+            try:
+                reason_text = str(payload.get("reason") or "")
+                stripped = reason_text.strip()
+                if stripped.startswith("{") or stripped.startswith("```"):
+                    inner = json.loads(_extract_json(reason_text))
+                    if isinstance(inner, dict):
+                        inner_action = str(inner.get("action") or "").strip()
+                        if inner_action:
+                            merged = dict(inner)
+                            outer_reflection = str(payload.get("reflection") or "").strip()
+                            if outer_reflection:
+                                merged["reflection"] = outer_reflection
+                            payload = merged
+                            action = inner_action
+            except (ValueError, TypeError, json.JSONDecodeError):
+                pass
         is_complete = bool(payload.get("is_complete", False))
         if is_complete:
             action = ""

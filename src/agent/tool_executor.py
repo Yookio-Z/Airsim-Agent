@@ -196,6 +196,7 @@ class ToolRuntime:
         "provider_bridge_health",
         "provider_obstacle_summary",
         "provider_validate_motion",
+        "perception_status",
     }
 
     CONTROL_TOOLS = {
@@ -249,6 +250,7 @@ class ToolRuntime:
         backend_id: str | None = None,
         backend_registry: BackendRegistry | None = None,
         camera_settings_provider: Callable[[], dict[str, Any]] | None = None,
+        perception_axis: Any | None = None,
     ) -> None:
         self.backend_registry = backend_registry or create_builtin_backend_registry()
         self.backend_id = self.backend_registry.resolve_id(backend_id)
@@ -256,6 +258,7 @@ class ToolRuntime:
         self.controller: Any | None = None
         self.collector: ToolCollector | None = None
         self.camera_settings_provider = camera_settings_provider
+        self.perception_axis = perception_axis
         self.camera_controller: Any | None = None
         self.camera_collector: ToolCollector | None = None
         self.camera_key = ""
@@ -326,6 +329,20 @@ class ToolRuntime:
 
                     logging.getLogger(__name__).warning(f"provider tools skipped: {exc}")
 
+            # Perception axis tools: registered when the axis is enabled,
+            # independent of the flight backend's capabilities. The axis reads
+            # its own frame source; AirSim-only perception tools above still
+            # follow the backend capabilities as before.
+            if self.perception_axis is not None and getattr(self.perception_axis, "enabled", False):
+                try:
+                    from src.tools.perception_axis import register_perception_axis_tools
+
+                    register_perception_axis_tools(self.collector, self.perception_axis, fmt)
+                except Exception as exc:
+                    import logging
+
+                    logging.getLogger(__name__).warning(f"perception axis tools skipped: {exc}")
+
             self._ensure_formation_tools()
 
             self.available = True
@@ -354,6 +371,16 @@ class ToolRuntime:
         merged = dict(capabilities or {})
         settings = self._camera_settings()
         source = str(settings.get("source") or "").lower()
+        # The standalone AirSim camera sink is only valid on the airsim flight
+        # backend; elsewhere the perception axis / RTSP owns the image surface.
+        # Only merge capture capabilities here so cards and tool gating stay
+        # consistent (metadata is still surfaced for the UI Links panel).
+        if self.backend_id != "airsim":
+            merged["camera_source"] = source
+            merged["image_capture_via"] = "perception_axis_or_rtsp"
+            merged["image_capture"] = False
+            merged["depth_perception"] = False
+            return merged
         if source == "airsim":
             merged["image_capture"] = True
             merged["depth_perception"] = True
@@ -922,6 +949,30 @@ class ToolRuntime:
         path: no stationary check, no retry/cooldown loop, no base64 JSON.
         Agent visual reasoning still uses governed tools.
         """
+        raw_params = dict(params or {})
+        settings = self._camera_settings()
+        source = str(raw_params.get("source") or settings.get("source") or "airsim").strip().lower()
+        want_detect = str(raw_params.get("detect") or "0").strip().lower() in {"1", "true", "yes", "on"}
+        if want_detect and source == "airsim":
+            axis = getattr(self, "perception_axis", None)
+            if axis is not None and getattr(axis, "is_online", lambda: False)():
+                try:
+                    jpeg, dets, _ts = axis.annotated_frame()
+                    if jpeg:
+                        max_width = 560
+                        quality = 54
+                        body, mime = self._encode_preview_frame(jpeg, max_width=max_width, quality=quality)
+                        return True, body, mime, {
+                            "status": "ok",
+                            "vehicle": "perception-axis",
+                            "camera": settings.get("camera_name", "0"),
+                            "image_type": "scene",
+                            "size_kb": round(len(body) / 1024, 1),
+                            "source": "airsim",
+                            "detections": list(dets),
+                        }
+                except Exception:
+                    pass  # fall through to the direct AirSim path
         self._start_preview_reaper()
         raw_params = dict(params or {})
         controller, error = self._ensure_preview_controller(raw_params)
@@ -936,6 +987,7 @@ class ToolRuntime:
         camera_name = str(raw_params.get("camera_name") or settings.get("camera_name") or "0")
         vehicle_name = str(raw_params.get("vehicle_name") or settings.get("vehicle_name") or "")
         image_type_name = str(raw_params.get("image_type") or settings.get("image_type") or "scene").lower()
+        detect = str(raw_params.get("detect") or "0").strip().lower() in {"1", "true", "yes", "on"}
         try:
             timeout_sec = float(raw_params.get("timeout_sec") or 2.0)
         except (TypeError, ValueError):
@@ -968,7 +1020,16 @@ class ToolRuntime:
                     "surface_normals": airsim.ImageType.SurfaceNormals,
                 }
                 image_type = type_map.get(image_type_name, airsim.ImageType.Scene)
-            names = [vehicle_name] if vehicle_name else list(getattr(controller, "_vehicles", []) or [])
+            # AirSim vehicles are named in the simulator (e.g. "Drone1"); the
+            # settings panel may carry a MAVLink system name ("px4_sys1") that
+            # is not a valid simulator vehicle -> fall back to the default.
+            valid_vehicles = list(getattr(controller, "_vehicles", []) or [])
+            if vehicle_name and vehicle_name in valid_vehicles:
+                names = [vehicle_name]
+            elif valid_vehicles:
+                names = valid_vehicles
+            else:
+                names = [""]
             if not names and source in {"rtsp", "local"}:
                 names = [""]
             if not names:
@@ -989,8 +1050,12 @@ class ToolRuntime:
                     "status": "error",
                     "message": "AirSim returned an empty camera preview frame",
                 }
-            body, mime_type = self._encode_preview_frame(bytes(raw), max_width=max_width, quality=quality)
-            return True, body, mime_type, {
+            detections: list[dict[str, Any]] = []
+            preview_bytes = bytes(raw)
+            if detect and source in {"airsim", "rtsp", "local"}:
+                preview_bytes, detections = self._detect_and_annotate(preview_bytes)
+            body, mime_type = self._encode_preview_frame(preview_bytes, max_width=max_width, quality=quality)
+            meta: dict[str, Any] = {
                 "status": "ok",
                 "vehicle": vehicle,
                 "camera": camera_name,
@@ -998,6 +1063,9 @@ class ToolRuntime:
                 "size_kb": round(len(body) / 1024, 1),
                 "source": source,
             }
+            if detections:
+                meta["detections"] = detections
+            return True, body, mime_type, meta
         except Exception as exc:
             self.camera_error = str(exc)
             return False, b"", "text/plain; charset=utf-8", {
@@ -1047,6 +1115,47 @@ class ToolRuntime:
                         pass
                     controller._last_preview_used = 0.0
 
+    def _detect_and_annotate(self, raw: bytes, threshold: float = 0.20) -> tuple[bytes, list[dict[str, Any]]]:
+        """Run YOLO on one preview frame and overlay detection boxes.
+
+        One-shot path (not a continuous stream): a single AirSim frame is
+        captured, annotated with detection boxes/labels, and returned for the
+        UI. Serialized through the shared model inference lock.
+        """
+        try:
+            import cv2
+            import numpy as np
+
+            from src.modules.yolo_detection import build_search_classes, get_yolo_model, run_yolo_detection
+
+            img = cv2.imdecode(np.frombuffer(raw, dtype=np.uint8), cv2.IMREAD_UNCHANGED)
+            if img is None:
+                return raw, []
+            if img.ndim == 3 and img.shape[2] == 4:
+                img = cv2.cvtColor(img, cv2.COLOR_BGRA2BGR)
+            if img.ndim != 3:
+                return raw, []
+            model = get_yolo_model(build_search_classes("car"))
+            dets = run_yolo_detection(model, img, "car", threshold)
+            labeled: list[dict[str, Any]] = []
+            for det in dets:
+                x1, y1, x2, y2 = [int(v) for v in det["bbox"]]
+                cv2.rectangle(img, (x1, y1), (x2, y2), (0, 200, 255), 2)
+                label = f"{det['class']} {det['confidence']:.2f}"
+                (tw, th), _ = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.7, 2)
+                bx1, by1 = x1, max(0, y1 - th - 8)
+                bx2, by2 = min(img.shape[1], x1 + tw + 8), max(0, y1 - 2)
+                cv2.rectangle(img, (bx1, by1), (bx2, by2), (0, 0, 0), -1)
+                cv2.putText(img, label, (bx1 + 4, by2 - 5), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 255), 2)
+                labeled.append({"class": det["class"], "confidence": det["confidence"], "bbox": det["bbox"]})
+            ok, buf = cv2.imencode(".jpg", img, [int(cv2.IMWRITE_JPEG_QUALITY), 85])
+            if not ok:
+                return raw, labeled
+            return buf.tobytes(), labeled
+        except Exception as exc:
+            self.camera_error = str(exc)
+            return raw, []
+
     @staticmethod
     def _encode_preview_frame(raw: bytes, max_width: int = 640, quality: int = 62) -> tuple[bytes, str]:
         try:
@@ -1081,7 +1190,7 @@ class ToolRuntime:
         specs = []
         for name, fn in sorted(collector.tools.items()):
             specs.append(self._spec_for(name, fn).__dict__)
-        if self._camera_source_enabled():
+        if self._camera_source_enabled() and self.backend_id == "airsim":
             for camera_tool in sorted(self.CAMERA_SOURCE_TOOLS):
                 if camera_tool not in collector.tools:
                     camera_spec = self._camera_tool_spec(camera_tool)
@@ -1340,7 +1449,28 @@ class ToolRuntime:
             )
 
         if name in self.CAMERA_SOURCE_TOOLS and self.backend_id != "airsim":
-            return self._execute_camera_tool(name, params, started)
+            # Camera capture through a direct AirSim client is only valid on the
+            # airsim flight backend. On PX4 links the visuals belong to the
+            # perception axis (perception_status) or an RTSP source -- issuing
+            # simGetImage against a PX4-managed vehicle here has crashed AirSim,
+            # so refuse instead of delegating to the standalone camera sink.
+            return ToolCallResult(
+                name,
+                params,
+                False,
+                {
+                    "status": "error",
+                    "message": (
+                        f"{name} requires the airsim backend. On the current "
+                        f"{self.backend_id} backend use perception_status to query "
+                        "the perception service, or switch to the airsim backend in "
+                        "the Links panel."
+                    ),
+                },
+                started,
+                time.time(),
+                error_code="BLOCKED",
+            )
 
         if blocked_by_supervisor and name not in {"drone_hover", "drone_land", "drone_get_status"}:
             return ToolCallResult(

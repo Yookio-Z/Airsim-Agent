@@ -1018,6 +1018,7 @@ function cameraWindowParts(el) {
     imageEl: el.querySelector("[data-camera-role='image']"),
     placeholderEl: el.querySelector("[data-camera-role='placeholder']"),
     metaEl: el.querySelector("[data-camera-role='meta']"),
+    hudEl: el.querySelector("[data-camera-role='hud']"),
   };
 }
 
@@ -1158,16 +1159,16 @@ function cameraSourceLabel(settings) {
 }
 
 function renderCameraMeta(data = null, win = primaryCameraWindow()) {
-  if (!win?.metaEl) return;
-  const settings = win.settings || cameraSettings;
-  const sourceLabel = cameraSourceLabel(settings);
-  const camera = data?.camera || settings.camera_name || "0";
-  const vehicle = data?.vehicle || settings.vehicle_name || "default";
-  const type = data?.image_type || settings.image_type || "scene";
-  const size = data?.size_kb ? ` · ${data.size_kb} KB` : "";
-  win.metaEl.textContent = `${sourceLabel} · ${vehicle} · camera ${camera} · ${type}${size}`;
+  const hudEl = win?.hudEl || els.cameraHud;
+  if (!hudEl) return;
+  const detections = Array.isArray(data?.detections) ? data.detections : [];
+  if (detections.length) {
+    hudEl.textContent = detections.map((d) => `🎯 ${d.class} ${Number(d.confidence || 0).toFixed(2)}`).join("\n");
+    hudEl.hidden = false;
+  } else {
+    hudEl.hidden = true;
+  }
 }
-
 function setCameraViewerVisible(visible, win = primaryCameraWindow()) {
   if (!win?.el) return;
   win.el.hidden = !visible;
@@ -1325,7 +1326,7 @@ function cameraStreamQuality(source = "airsim") {
     return { interval: 90, maxWidth: 800, quality: 82 };
   }
   // AirSim / RTSP: 适度降频避免对仿真器/网络造成压力
-  if (count <= 1) return { interval: CAMERA_STREAM_INTERVAL_MS, maxWidth: 560, quality: 54 };
+  if (count <= 1) return { interval: 700, maxWidth: 560, quality: 54 };
   if (count === 2) return { interval: 220, maxWidth: 480, quality: 50 };
   return { interval: 420, maxWidth: 400, quality: 46 };
 }
@@ -1366,6 +1367,7 @@ function cameraPreviewUrl(settings) {
     params.set("camera_name", settings.camera_name || "0");
     params.set("vehicle_name", settings.vehicle_name || "");
     params.set("image_type", settings.image_type || "scene");
+    params.set("detect", "1");
   }
   return `/api/camera/preview?${params.toString()}`;
 }
@@ -1554,6 +1556,18 @@ function setupCameraWindowEvents(win) {
   win.eventsBound = true;
   win.el.addEventListener("pointerdown", () => focusCameraWindow(win));
   win.newBtn?.addEventListener("click", () => createAdditionalCameraWindow(win));
+  // Click the image to cycle zoom (1x -> 1.6x -> 2.4x -> reset); the
+  // container scrolls so details can be inspected.
+  win.imageEl?.addEventListener("click", () => {
+    const cur = win.imgScale || 1;
+    const next = cur >= 2.4 ? 1 : cur >= 1.6 ? 2.4 : 1.6;
+    win.imgScale = next;
+    win.imageEl.style.transform = `scale(${next})`;
+    win.imageEl.style.transformOrigin = "center";
+    win.imageEl.style.cursor = next > 1 ? "zoom-out" : "zoom-in";
+    const container = win.imageEl.parentElement;
+    if (container) container.style.overflow = "auto";
+  });
   win.closeBtn?.addEventListener("click", () => stopCameraStream({ hide: true, windowId: win.id }));
   win.sourceSelect?.addEventListener("change", (event) => {
     toggleCameraSourceSpecificFields(win);
@@ -1565,7 +1579,83 @@ function setupCameraWindowEvents(win) {
   setupCameraWindowDrag(win);
 }
 
+function resetCameraViewerSize(win = primaryCameraWindow()) {
+  const viewer = els.cameraViewer;
+  if (!viewer) return;
+  viewer.style.width = "";
+  viewer.style.height = "";
+  viewer.style.left = "";
+  viewer.style.bottom = "";
+}
+
+function bindCameraViewerResize() {
+  if (window.__camResizeBound) return;
+  window.__camResizeBound = true;
+  document.addEventListener("pointerdown", (e) => {
+    const edge = e.target && e.target.closest ? e.target.closest(".cam-resize") : null;
+    if (!edge || e.button !== 0) return;
+    const viewer = edge.closest(".camera-viewer");
+    if (!viewer) return;
+    e.preventDefault();
+    e.stopPropagation();
+    const dir = edge.dataset.cameraResize || "se";
+    const rect = viewer.getBoundingClientRect();
+    const startX = e.clientX;
+    const startY = e.clientY;
+    const startW = rect.width;
+    const startH = rect.height;
+    const leftAbs = rect.left;                 // absolute left (fixed unless w)
+    const rightAbs = rect.right;               // absolute right
+    const topAbs = rect.top;                   // absolute top
+    const bottomAbs = rect.bottom;             // absolute bottom
+    const minW = 300;
+    const minH = 220;
+    viewer.style.transition = "none";
+    viewer.style.width = startW + "px";
+    viewer.style.height = startH + "px";
+    viewer.style.left = leftAbs + "px";
+    viewer.style.bottom = String(window.innerHeight - bottomAbs) + "px";
+    function onMove(ev) {
+      const dx = ev.clientX - startX;
+      const dy = ev.clientY - startY;
+      let left = leftAbs;
+      let top = topAbs;
+      let right = rightAbs;
+      let bottom = bottomAbs;
+      let w = startW;
+      let h = startH;
+      if (dir.includes("e")) {
+        right = Math.max(leftAbs + minW, startX + dx);
+      }
+      if (dir.includes("w")) {
+        left = Math.min(rightAbs - minW, startX + dx);
+      }
+      if (dir.includes("s")) {
+        bottom = Math.max(topAbs + minH, startY + dy);
+      }
+      if (dir.includes("n")) {
+        top = Math.min(bottomAbs - minH, startY + dy);
+      }
+      w = right - left;
+      h = bottom - top;
+      left = Math.max(4, Math.min(left, window.innerWidth - 60));
+      top = Math.max(4, Math.min(top, window.innerHeight - 100));
+      viewer.style.left = String(Math.round(left)) + "px";
+      viewer.style.bottom = String(Math.round(window.innerHeight - Math.max(4, Math.min(top + h, window.innerHeight - 20)))) + "px";
+      viewer.style.width = String(Math.round(w)) + "px";
+      viewer.style.height = String(Math.round(h)) + "px";
+    }
+    function onUp() {
+      window.removeEventListener("pointermove", onMove);
+      window.removeEventListener("pointerup", onUp);
+    }
+    window.addEventListener("pointermove", onMove);
+    window.addEventListener("pointerup", onUp);
+  });
+}
+
 function setupCameraEventListeners() {
+  bindCameraViewerResize();
   const primary = ensurePrimaryCameraWindow();
   if (els.cameraViewBtn) {
     els.cameraViewBtn.addEventListener("click", () => {
@@ -4170,6 +4260,7 @@ async function loadSession(sessionId) {
     if (latestState) {
       latestState.current_session = result.session;
       latestState.messages = messages;
+      forceNextChatScroll = true;
       render(latestState);
     }
     closeSessionsPanel();
@@ -5726,7 +5817,7 @@ function initSplitters() {
           document.documentElement.style.setProperty("--left-pane", `${next}px`);
           saveLayoutPref("left", Math.round(next));
         } else if (kind === "right") {
-          const next = clamp(shellRect.right - moveEvent.clientX - 12, 310, 660);
+          const next = clamp(shellRect.right - moveEvent.clientX - 12, 480, 760);
           document.documentElement.style.setProperty("--right-pane", `${next}px`);
           saveLayoutPref("right", Math.round(next));
         } else if (kind === "timeline") {
@@ -6517,6 +6608,9 @@ function updateAgentTurn(entry, message, run, llm) {
 }
 
 function renderChat(messages, run, llm) {
+  // Initial page open (empty thread) jumps to the newest message instead of
+  // parking on the first line.
+  if (!els.chatThread || !els.chatThread.firstChild) forceNextChatScroll = true;
   const serverMessages = Array.isArray(messages) ? messages : [];
   reconcilePendingMessages(serverMessages);
   const list = [...serverMessages, ...localPendingMessages];

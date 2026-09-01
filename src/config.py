@@ -60,5 +60,20 @@ class DroneConfig(BaseSettings):
     yolo_confidence: float = 0.5
     tracking_max_velocity: float = 1.0
 
+    # Perception axis (orthogonal to the flight backend).
+    # When enabled, the perception service runs and exposes perception_status;
+    # frame_source/deploy determine where detection runs (local module vs a
+    # remote Jetson HTTP service). See docs/perception_axis_design.md.
+    perception_enabled: bool = False
+    perception_profile: str = "sim_local"       # sim_local | jetson_remote | rtsp_local
+    perception_frame_source: str = "airsim"     # airsim | rtsp | usb
+    perception_deploy: str = "local"            # local | remote
+    perception_remote_url: str = ""             # deploy=remote 时: http://<ip>:<port>
+    perception_target_class: str = "car"
+    perception_confidence: float = 0.25
+    perception_update_fps: float = 5.0
+    perception_health_timeout_sec: float = 3.0
+    perception_rtsp_url: str = ""               # frame_source=rtsp 时的流地址
+
 
 config = DroneConfig()

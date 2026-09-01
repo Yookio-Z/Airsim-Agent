@@ -604,7 +604,11 @@ class AgentRuntime:
         self._started_at = time.time()
         self.planner = LLMMissionPlanner()
         self.rule_planner = MissionPlanner()
-        self.tools = ToolRuntime(camera_settings_provider=lambda: _camera_settings())
+        self.perception_axis = self._create_perception_axis()
+        self.tools = ToolRuntime(
+            camera_settings_provider=lambda: _camera_settings(),
+            perception_axis=self.perception_axis,
+        )
         self.memory = AgentMemory()
         self.task_runs = TaskRunStore()
         self.supervisor = ExecutionSupervisor(default_timeout=30.0)
@@ -669,6 +673,46 @@ class AgentRuntime:
             args=(self._backend_generation, self._auto_connect_initial_backend_id),
             daemon=True,
         ).start()
+
+    # ------------------------------------------------------------------
+    # Perception axis lifecycle (docs/perception_axis_design.md)
+    # ------------------------------------------------------------------
+
+    def _create_perception_axis(self) -> Any:
+        """Build and start the perception axis from the runtime config.
+
+        A failed start is non-fatal: the flight backend keeps working and the
+        axis just reports health/start_error through perception_status.
+        """
+        try:
+            from src.modules.perception_axis import PerceptionAxis
+            from src.modules.perception_profile import resolve_profile
+
+            profile = resolve_profile(config)
+            if profile is None:
+                return None
+            axis = PerceptionAxis(profile=profile, rtsp_url=str(getattr(config, "perception_rtsp_url", "") or ""))
+            ok = axis.start()
+            if not ok:
+                import logging
+
+                logging.getLogger("runtime").warning("perception_axis_start_failed", extra={"error": axis.health().get("start_error", "")})
+            return axis
+        except Exception as exc:  # the axis must never break the runtime
+            import logging
+
+            logging.getLogger("runtime").warning("perception_axis_init_failed", extra={"error": str(exc)})
+            return None
+
+    def shutdown_perception(self) -> None:
+        """Stop the perception axis; safe to call multiple times."""
+        if self.perception_axis is not None:
+            try:
+                self.perception_axis.stop()
+            except Exception as exc:
+                import logging
+
+                logging.getLogger("runtime").warning("perception_axis_stop_failed", extra={"error": str(exc)})
 
     def submit_command(
         self,
@@ -1427,6 +1471,18 @@ class AgentRuntime:
                 self._run_log = None
         try:
             tool_runtime = self.tools.status_snapshot()
+            drone_state = tool_runtime.get("drone") or {}
+            drone_pos = drone_state.get("position_ned") or {}
+            drone_z = float(drone_pos.get("z", 0.0) or 0.0)
+            # Simulation health gate: a wildly drifted vehicle position means
+            # the simulator link broke (HIL drop / AirSim↔PX4 baseline loss).
+            # Refuse to execute flight steps against a broken environment
+            # instead of letting the plan run into the drift.
+            if abs(drone_z) > 25.0:
+                raise RuntimeError(
+                    f"仿真环境异常:无人机位置失稳 (z={drone_z:.0f}m)。"
+                    "任务已停止,请重启 AirSim 后再重新下发。"
+                )
             agent_state = agent_state or self._agent_state_context(tool_runtime)
             backend_profile = tool_runtime.get("backend_profile") or {}
             capabilities = backend_profile.get("capabilities") or {}
@@ -1479,6 +1535,14 @@ class AgentRuntime:
             )
             return
         except Exception as e:
+            import logging
+            import traceback
+
+            logging.getLogger("runtime").warning(
+                "plan_execute_route_exception: %s\n%s",
+                str(e),
+                "\n".join(traceback.format_exc().splitlines()[-25:]),
+            )
             failed_run = None
             hover_result = None
             if run_id:
@@ -1890,6 +1954,7 @@ class AgentRuntime:
         return False
 
     @staticmethod
+    @staticmethod
     def _plan_requires_agent_loop(plan: MissionPlan | None) -> bool:
         """Choose Plan-Execute vs ReAct. The planner may declare agent_loop
         explicitly (visual search, tracking, conditional tasks); otherwise a
@@ -1897,7 +1962,25 @@ class AgentRuntime:
         structurally — no natural-language classification involved."""
         if plan is None:
             return False
-        return plan.execution_mode == "agent_loop" or AgentRuntime._plan_has_observation_dependency(plan)
+        if AgentRuntime._plan_has_observation_dependency(plan):
+            return True
+        # A plan that only queries structured perception state
+        # (perception_status) and otherwise uses plain motion/telemetry tools
+        # executes fine as a fixed sequence: the executor reads the perception
+        # snapshot directly, no LLM image analysis is involved. Only honour
+        # the planner's agent_loop declaration when the plan actually contains
+        # LLM-reading tools (photo/VLM/detect/depth).
+        if plan.execution_mode == "agent_loop":
+            steps = list(plan.steps) if plan else []
+            if any(step.tool in OBSERVATION_TOOLS for step in steps):
+                return True
+            # The planner's agent_loop declaration is honoured for motion-only
+            # plans, but a plan whose only "observation" steps are structured
+            # perception_status queries needs no LLM reading -- the executor
+            # consumes the snapshot directly, so run it as one fixed sequence.
+            if not any(step.tool == "perception_status" for step in steps):
+                return True
+        return False
 
     def _correction_command(self, run: RunState) -> str:
         """Structured failure context for the ReAct correction loop: the LLM
@@ -5635,6 +5718,18 @@ class AgentRuntime:
             later_tools = {step.tool for step in steps[index + 1 :]}
             return bool(later_tools & {"drone_fly_to", "drone_move_relative", "drone_upload_mission", "drone_start_mission"})
 
+        def position_before(index: int):
+            """Nearest known position recorded before this step (get_status /
+            fly_to results carry position_ned) — the segment start for
+            move_relative verification in multi-leg missions."""
+            for j in range(index - 1, -1, -1):
+                prior = steps[j]
+                r = prior.result if isinstance(prior.result, dict) else {}
+                p = r.get("position_ned")
+                if isinstance(p, dict):
+                    return p
+            return start_pos
+
         def later_lands(index: int) -> bool:
             return any(step.tool == "drone_land" for step in steps[index + 1 :])
 
@@ -5685,8 +5780,15 @@ class AgentRuntime:
             if step.tool == "drone_move_relative" and isinstance(start_pos, dict) and isinstance(end_pos, dict):
                 if later_has_position_goal(index):
                     continue
+                # Verify the leg displacement (from the nearest position
+                # snapshot before this step to the run end), not the whole
+                # mission displacement — multi-leg missions otherwise fail
+                # because earlier legs inflate the total delta.
+                seg_start = position_before(index) or start_pos
+                seg_dx = self._float(end_pos.get("x")) - self._float(seg_start.get("x"))
+                seg_dy = self._float(end_pos.get("y")) - self._float(seg_start.get("y"))
                 expected_xy = (self._float(step.params.get("forward_m")) ** 2 + self._float(step.params.get("right_m")) ** 2) ** 0.5
-                actual_xy = float(result.get("delta_xy_m", 0.0))
+                actual_xy = (seg_dx * seg_dx + seg_dy * seg_dy) ** 0.5
                 tolerance = max(1.0, expected_xy * 0.45)
                 error = abs(actual_xy - expected_xy)
                 hard_tolerance = max(3.0, expected_xy * 1.5)

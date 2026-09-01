@@ -23,6 +23,11 @@ logger = get_logger(__name__)
 _yolo_model: Any | None = None
 _yolo_model_classes: tuple[str, ...] | None = None
 _yolo_model_lock = threading.Lock()
+# Inference lock: the YOLO model singleton is shared by the perception axis
+# thread, camera tools, and any diagnostics. Torch inference on the same
+# model instance from two threads can deadlock inside the worker pool, so
+# every inference call is serialized through this lock.
+_yolo_infer_lock = threading.Lock()
 
 VEHICLE_CLASSES = {"car", "truck", "bus", "motorcycle", "bicycle", "vehicle"}
 PERSON_CLASSES = {"person", "pedestrian"}
@@ -103,7 +108,8 @@ def build_search_classes(target_class: str) -> list[str]:
 def run_yolo_detection(model: Any, img: Any, target_class: str, confidence: float) -> list[dict[str, Any]]:
     """Run YOLO inference and return detections matching the requested target."""
 
-    results = model(img, verbose=False)
+    with _yolo_infer_lock:
+        results = model(img, verbose=False)
     boxes = results[0].boxes
     aliases = TARGET_ALIASES.get(target_class.lower(), set()) if target_class else set()
 

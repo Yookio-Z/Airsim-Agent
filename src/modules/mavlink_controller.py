@@ -48,13 +48,13 @@ _MASK_VELOCITY_ONLY = (
     | mavutil.mavlink.POSITION_TARGET_TYPEMASK_YAW_IGNORE
     | mavutil.mavlink.POSITION_TARGET_TYPEMASK_YAW_RATE_IGNORE
 )
-_MASK_YAW_RATE_ONLY = (
+# PX4 OFFBOARD rejects pure yaw-rate setpoints (no position AND no velocity
+# fields active) as invalid. In-place yaw turns must carry zero velocity so
+# the vehicle holds position while rotating.
+_MASK_VELOCITY_YAW_RATE = (
     mavutil.mavlink.POSITION_TARGET_TYPEMASK_X_IGNORE
     | mavutil.mavlink.POSITION_TARGET_TYPEMASK_Y_IGNORE
     | mavutil.mavlink.POSITION_TARGET_TYPEMASK_Z_IGNORE
-    | mavutil.mavlink.POSITION_TARGET_TYPEMASK_VX_IGNORE
-    | mavutil.mavlink.POSITION_TARGET_TYPEMASK_VY_IGNORE
-    | mavutil.mavlink.POSITION_TARGET_TYPEMASK_VZ_IGNORE
     | mavutil.mavlink.POSITION_TARGET_TYPEMASK_AX_IGNORE
     | mavutil.mavlink.POSITION_TARGET_TYPEMASK_AY_IGNORE
     | mavutil.mavlink.POSITION_TARGET_TYPEMASK_AZ_IGNORE
@@ -1395,12 +1395,12 @@ class MavlinkController(FlightController):
         ok = True
         for sysid in targets:
             self._set_target(sysid)
-            if not self._move_on_path_one(waypoints, velocity):
+            if not self._move_on_path_one(waypoints, velocity, vehicle_name):
                 ok = False
                 break
         return ok
 
-    def _move_on_path_one(self, waypoints: list[dict], velocity: float = 2.0) -> bool:
+    def _move_on_path_one(self, waypoints: list[dict], velocity: float = 2.0, vehicle_name: str = "") -> bool:
         if not self.is_connected:
             self._last_path_error = {"stage": "move_on_path", "message": "not connected"}
             return False
@@ -2635,6 +2635,10 @@ class MavlinkController(FlightController):
             self.update_telemetry(timeout=0.05)
             gps = self._telemetry.get("GLOBAL_POSITION_INT", {})
             current = float(gps.get("hdg", 0.0) or 0.0)
+            # MAVLink GLOBAL_POSITION_INT.hdg is centi-degrees (0..35999);
+            # normalize to degrees before computing the turn error.
+            if current > 360.0:
+                current = current / 100.0
             error = target - current
             if error > 180:
                 error -= 360
@@ -3287,7 +3291,10 @@ class MavlinkController(FlightController):
     def _send_yaw_rate_setpoint(self, yaw_rate: float) -> None:
         self._send_position_target_local_ned(
             frame=mavutil.mavlink.MAV_FRAME_LOCAL_NED,
-            type_mask=_MASK_YAW_RATE_ONLY,
+            type_mask=_MASK_VELOCITY_YAW_RATE,
+            vx=0.0,
+            vy=0.0,
+            vz=0.0,
             yaw_rate=yaw_rate,
         )
 

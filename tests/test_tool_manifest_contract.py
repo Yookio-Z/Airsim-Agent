@@ -15,6 +15,7 @@ from src.agent.tool_executor import ToolCollector
 from src.tools.core import register_core_tools
 from src.tools.manifest import TOOL_MANIFEST, list_tool_manifest
 from src.tools.perception import register_perception_tools
+from src.tools.perception_axis import register_perception_axis_tools
 from src.tools.providers import register_provider_tools
 from src.tools.vision import register_vision_tools
 
@@ -41,6 +42,22 @@ def _register_all_neutral_tools() -> set[str]:
     collector = ToolCollector()
     register_core_tools(collector, _capability_stub_controller(), lambda data: "{}")
     register_provider_tools(collector, _capability_stub_controller(), lambda data: "{}")
+
+    # Perception axis tools register when the axis is enabled (conditional
+    # registration, same nature as formation_command).
+    class _StubAxis:
+        enabled = True
+
+        def health(self):
+            return {"enabled": True, "online": False}
+
+        def snapshot(self):
+            return {"targets": [], "primary": None}
+
+        def pop_events(self):
+            return []
+
+    register_perception_axis_tools(collector, _StubAxis(), lambda data: "{}")
     return set(collector.tools)
 
 

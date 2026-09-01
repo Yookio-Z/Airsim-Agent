@@ -160,6 +160,10 @@ class MissionPlanDraft:
             warnings.append("mission_has_no_items")
             return warnings
         for item in self.items:
+            # PX4 NAV_TAKEOFF / NAV_LAND execute from the current position:
+            # they carry no waypoint coordinates and need no home reference.
+            if item.type in ("takeoff", "land"):
+                continue
             if not (item.is_global() or item.is_local_ned()):
                 warnings.append(f"{item.id}:missing_position")
             if item.frame.startswith("global") and not self.home:

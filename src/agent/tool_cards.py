@@ -457,6 +457,16 @@ TOOL_CARDS: dict[str, ToolCard] = {
         required_capabilities=[],
         cost="low",
     ),
+    "perception_status": ToolCard(
+        name="perception_status",
+        purpose="Read the perception axis state: health, detected targets, and recent perception events.",
+        when_to_use="When the operator asks about what the system currently sees or detects, or when a detection/tracking task reports no target and the cause needs checking.",
+        inputs={"include_snapshot": "include current detection snapshot (default true)", "include_events": "include recent events (default true)", "limit": "event count limit"},
+        outputs="Perception health {online, fps, error} plus target snapshot and target_found/target_lost events.",
+        required_capabilities=[],
+        cost="low",
+        risk="low",
+    ),
 }
 
 

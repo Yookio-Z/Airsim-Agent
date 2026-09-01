@@ -44,3 +44,10 @@ docs/px4_agent_handoff.md
 htmlcov/
 _cmd*.json
 shots/
+
+# Local environment overrides (may hold credentials)
+.env
+
+# Large local bundles (not source)
+PX4-Autopilot.zip
+*.zip

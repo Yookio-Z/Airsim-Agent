@@ -36,6 +36,12 @@
 | multi_vehicle | ✅ | ❌ | ❌ |
 | ros2_topics | ❌ | ❌ | ✅ |
 | real_vehicle（审批门） | ❌ | 串口强制 ✅ | 视配置 |
+| **perception_status（感知轴）** | ✅（感知轴启用时） | ✅（感知轴启用时） | ✅（感知轴启用时） |
+
+> **感知轴（2026-08-27 新增）**：`perception_status` 等感知轴工具独立于飞行后端——
+> 由 `perception_*` 配置启用（见 `docs/perception_axis_design.md`）。px4_mavlink 后端
+> 启用感知轴后即可消费 AirSim 帧源（local）或 Jetson 感知服务（remote），
+> 工具面与仿真/真机形态一致。
 
 关键设计：**能力差异由 capabilities 自动裁剪工具集**——切到真机后端时，
 AirSim 专属工具（相机/深度/搜索）自动消失，LLM 不会尝试调用不存在的工具

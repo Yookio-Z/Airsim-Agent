@@ -545,7 +545,11 @@ body.resizing .h-resizer::after {
   position: absolute;
   left: 58px;
   bottom: 184px;
-  width: min(390px, calc(100% - 76px));
+  display: flex;
+  flex-direction: column;
+  min-height: 200px;
+  width: min(520px, calc(100% - 76px));
+  height: 380px;
   border: 1px solid rgba(255, 255, 255, 0.12);
   border-radius: 8px;
   background: rgba(16, 18, 24, 0.72);
@@ -556,6 +560,19 @@ body.resizing .h-resizer::after {
   z-index: 8;
 }
 
+.cam-resize {
+  position: absolute;
+  z-index: 4;
+}
+.cam-resize-n { top: 0; left: 0; right: 0; height: 18px; cursor: n-resize; z-index: 6; }
+.cam-resize-s { bottom: 0; left: 0; right: 0; height: 12px; cursor: s-resize; }
+.cam-resize-e { right: 0; top: 14px; bottom: 12px; width: 12px; cursor: e-resize; }
+.cam-resize-w { left: 0; top: 14px; bottom: 12px; width: 12px; cursor: w-resize; }
+.cam-resize-corner { width: 14px; height: 14px; }
+.cam-resize-corner[data-camera-resize="nw"] { top: 0; left: 0; cursor: nw-resize; }
+.cam-resize-corner[data-camera-resize="ne"] { top: 0; right: 0; cursor: ne-resize; }
+.cam-resize-corner[data-camera-resize="sw"] { bottom: 0; left: 0; cursor: sw-resize; }
+.cam-resize-corner[data-camera-resize="se"] { bottom: 0; right: 0; cursor: se-resize; }
 .camera-viewer[hidden] {
   display: none;
 }
@@ -740,7 +757,8 @@ body.resizing .h-resizer::after {
 
 .camera-frame {
   position: relative;
-  aspect-ratio: 16 / 9;
+  flex: 1 1 auto;
+  min-height: 0;
   background: rgba(0, 0, 0, 0.42);
   display: grid;
   place-items: center;
@@ -767,6 +785,20 @@ body.resizing .h-resizer::after {
   text-align: center;
 }
 
+.camera-hud {
+  position: absolute;
+  left: 8px;
+  bottom: 8px;
+  z-index: 3;
+  color: #ffd34d;
+  font: 600 15px/1.7 Consolas, monospace;
+  text-shadow: 0 1px 3px rgba(0, 0, 0, 0.9);
+  pointer-events: none;
+  white-space: pre-wrap;
+  background: rgba(0, 0, 0, 0.55);
+  border-radius: 6px;
+  padding: 4px 8px;
+}
 .camera-meta {
   min-height: 26px;
   padding: 6px 9px;
@@ -1219,6 +1251,21 @@ body[data-profile-collapsed="true"] .mission-profile {
   min-height: 44px;
   padding: 8px 14px;
   border-bottom: 1px solid var(--line-soft);
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 6px;
+}
+.agent-header .current-session-label {
+  min-width: 0;
+  flex: 0 1 auto;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.agent-header .header-actions {
+  flex-shrink: 0;
+  margin-left: auto;
 }
 
 .mission-editor {
@@ -2177,6 +2224,9 @@ body[data-profile-collapsed="true"] .mission-profile {
 .agent-composer {
   padding: 10px 12px 12px;
   border-top: 1px solid var(--line-soft);
+}
+.agent-composer .composer-bottom {
+  flex-wrap: wrap;
 }
 
 .composer-box {

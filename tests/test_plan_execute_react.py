@@ -360,3 +360,16 @@ def test_strip_plan_json_draft_cuts_correction_decision_json() -> None:
     # 规划 JSON 草稿同样截干净，正文花括号不受影响
     prose = '状态里有 {"speed": 0} 字样，属于正常回读内容。'
     assert rt._strip_plan_json_draft(prose) == prose
+
+
+def test_agent_loop_declared_with_perception_status_runs_fixed_sequence() -> None:
+    """Plans whose only observation steps are perception_status queries run
+    as one fixed sequence: the executor reads the snapshot directly, no LLM
+    image analysis is involved."""
+    plan = _plan(_step("drone_takeoff"), _step("perception_status"), _step("drone_fly_to"), execution_mode="agent_loop")
+    assert AgentRuntime._plan_requires_agent_loop(plan) is False
+
+
+def test_agent_loop_declared_with_photo_still_runs_agent_loop() -> None:
+    plan = _plan(_step("drone_takeoff"), _step("airsim_take_photo"), execution_mode="agent_loop")
+    assert AgentRuntime._plan_requires_agent_loop(plan) is True
