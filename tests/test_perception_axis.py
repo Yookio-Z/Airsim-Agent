@@ -289,3 +289,54 @@ def test_preview_uses_axis_cache_first():
     assert body.startswith(b"\xff\xd8")
     assert meta.get("vehicle") == "perception-axis"
     assert meta.get("detections"), "axis detections must flow into preview meta"
+
+
+def test_inspect_current_frame_with_vlm_stub():
+    """inspect_current_frame feeds the cached frame to the vision model."""
+    import numpy as np
+    from src.agent.tool_executor import ToolCollector
+
+    engine = LocalPerceptionEngine(
+        frame_source=StubFrameSource(),
+        detect_fn=_stub_detector([_CAR_DET]),
+        update_fps=50.0,
+        health_timeout_sec=5.0,
+    )
+    assert engine.start() is True
+    axis = PerceptionAxis(profile=None)
+    axis._engine = engine  # noqa: SLF001
+    calls = {"n": 0}
+
+    def fake_vlm(question, image_b64):
+        calls["n"] += 1
+        assert image_b64.startswith("/9j/")  # JPEG base64
+        return {"text": "画面里有一辆蓝色汽车", "confidence": 0.9}
+
+    from src.tools.perception_axis import register_perception_axis_tools
+    from src.agent.tool_executor import ToolCollector as TC
+
+    collector = TC()
+    fmt = lambda data: __import__("json").dumps(data, ensure_ascii=False)  # noqa: E731
+    register_perception_axis_tools(collector, axis, fmt, vlm=fake_vlm)
+    assert "inspect_current_frame" in collector.tools
+    deadline = time.time() + 5.0
+    while time.time() < deadline:
+        jpeg, _d, _t = axis.annotated_frame()
+        if jpeg:
+            break
+        time.sleep(0.05)
+    out = collector.tools["inspect_current_frame"]("画面里有什么？")
+    assert calls["n"] == 1
+    assert "蓝色汽车" in out
+    engine.stop()
+
+
+def test_inspect_current_frame_without_vlm():
+    from src.agent.tool_executor import ToolCollector
+    from src.tools.perception_axis import register_perception_axis_tools
+
+    collector = ToolCollector()
+    fmt = lambda data: __import__("json").dumps(data, ensure_ascii=False)  # noqa: E731
+    register_perception_axis_tools(collector, None, fmt, vlm=None)
+    out = collector.tools["inspect_current_frame"]("画面里有什么？")
+    assert "多模态" in out

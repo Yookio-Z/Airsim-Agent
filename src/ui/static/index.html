@@ -261,6 +261,10 @@
           <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><ellipse cx="12" cy="5" rx="9" ry="3"/><path d="M3 5V19A9 3 0 0 0 21 19V5"/><path d="M3 12A9 3 0 0 0 21 12"/></svg>
           <span>记忆</span>
         </button>
+        <button data-settings-tab="link" title="链路与硬件">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M10 13a5 5 0 007.54.54l3-3a5 5 0 00-7.07-7.07l-1.72 1.71"/><path d="M14 11a5 5 0 00-7.54-.54l-3 3a5 5 0 007.07 7.07l1.71-1.71"/></svg>
+          <span>链路</span>
+        </button>
         <button data-settings-tab="llm" title="模型">
           <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="11" width="18" height="10" rx="2"/><path d="M7 11V7a5 5 0 0110 0v4"/><circle cx="12" cy="16" r="1"/></svg>
           <span>模型</span>
@@ -331,6 +335,38 @@
           </header>
           <p class="settings-help">支持 OpenAI-compatible Chat Completions 与 Anthropic Messages API。默认按模型 ID 自动识别图像输入与上下文窗口，识别不准确时可手动覆盖。</p>
           <div id="modelConfigList" class="model-config-list"></div>
+        </div>
+      </section>
+
+      <section class="settings-panel" data-settings-panel="link" hidden>
+        <div class="settings-card">
+          <header class="settings-head">
+            <strong>链路状态(飞行控制 + 感知)</strong>
+            <button class="icon-button" id="linkRefresh" title="刷新">↻</button>
+          </header>
+          <div id="linkSummary" class="link-summary">加载中...</div>
+          <p class="link-hint" id="linkHint"></p>
+        </div>
+        <div class="settings-card">
+          <header class="settings-head">
+            <strong>真机 / 仿真 切换</strong>
+          </header>
+          <p class="settings-hint">飞行控制:在左侧 <em>连接</em> 面板选 SIM 链接或真机数传;
+          图像:重启 UI 进程后改 <code>.env</code> 里
+          <code>DRONE_PERCEPTION_FRAME_SOURCE</code>(airsim / rtsp / usb)与
+          <code>DRONE_PERCEPTION_RTSP_URL</code>(真机/图传/RTSP 拉流)。</p>
+        </div>
+        <div class="settings-card">
+          <header class="settings-head">
+            <strong>常见连接方式</strong>
+          </header>
+          <ul class="link-recipes">
+            <li><b>AirSim 仿真</b> · 控制 UDP 127.0.0.1:14550 · 帧源 AirSim 相机 0</li>
+            <li><b>PX4 SITL (Jetson)</b> · 控制 UDP Jetson:14550/18570 · 帧源 AirSim 相机 0</li>
+            <li><b>真机 · 数传 USB</b> · 控制 Serial COM 口 115200(在<em>连接</em>面板选 PX4 USB Serial)· 帧源 USB 相机</li>
+            <li><b>真机 · 数传 UDP + 图传 RTSP</b> · 控制 udpin 数传 IP:14550 · 帧源 RTSP rtsp://图传 IP:8554/</li>
+            <li><b>真机 · Jetson 板载</b> · 控制 udpin Jetson:14550 · 帧源 Jetson 转发 RTSP rtsp://Jetson:8554/</li>
+          </ul>
         </div>
       </section>
 

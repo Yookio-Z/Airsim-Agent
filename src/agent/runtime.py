@@ -608,6 +608,9 @@ class AgentRuntime:
         self.tools = ToolRuntime(
             camera_settings_provider=lambda: _camera_settings(),
             perception_axis=self.perception_axis,
+            vlm_provider=lambda question, image_b64: self.planner.analyze_image(
+                question, image_b64, model_id=""
+            ),
         )
         self.memory = AgentMemory()
         self.task_runs = TaskRunStore()
@@ -3192,6 +3195,80 @@ class AgentRuntime:
     def _is_run_cancelled(self, run_id: str) -> bool:
         with self._lock:
             return self._cancel_requested.is_set() or run_id in self._cancelled_request_ids
+
+    def link_summary(self) -> dict[str, Any]:
+        """Single shot of how the Agent is wired to the vehicle.
+
+        Reports the active flight backend, connection mode (MAVLink over
+        UDP/TCP/serial, ROS2 gateway, AirSim), the perception axis profile
+        (frame source type, target class, health) and a one-line hint
+        describing which set of tools the Agent can call given that
+        combination.
+        """
+        summary: dict[str, Any] = {
+            "flight": {},
+            "perception": {},
+            "available": {"flight_control": False, "perception": False, "vlm": False},
+            "hint": "",
+        }
+        try:
+            tr = self.tools.status_snapshot()
+            backend = str(tr.get("backend") or self.tools.backend_id or "")
+            dr = tr.get("drone") or {}
+            summary["flight"] = {
+                "backend": backend,
+                "connected": bool(tr.get("connected") and not tr.get("stale_connection")),
+                "vehicle": dr.get("vehicle_name") or "px4_sys1",
+                "mode": dr.get("mode"),
+                "armed": dr.get("armed"),
+                "flying": dr.get("flying"),
+                "altitude_m": abs(float(dr.get("position_ned", {}).get("z") or 0.0)),
+                "battery_v": dr.get("battery_voltage"),
+                "gps": dr.get("gps"),
+                "heartbeat_age_s": dr.get("heartbeat_age_s"),
+            }
+            summary["available"]["flight_control"] = summary["flight"]["connected"]
+        except Exception as exc:
+            summary["flight"] = {"error": str(exc)}
+        try:
+            axis = self.perception_axis
+            online = bool(getattr(axis, "is_online", lambda: False)()) if axis is not None else False
+            profile_name = getattr(getattr(axis, "_profile", None), "profile", "")
+            source = ""
+            try:
+                if axis is not None and axis._engine is not None:
+                    src_obj = axis._engine._frame_source
+                    source = type(src_obj).__name__
+            except Exception:
+                pass
+            summary["perception"] = {
+                "enabled": getattr(axis, "enabled", False),
+                "online": online,
+                "profile": profile_name,
+                "frame_source": source,
+            }
+            if axis is not None and getattr(axis, "enabled", False):
+                health = axis.health()
+                summary["perception"].update(health)
+            summary["available"]["perception"] = online
+        except Exception as exc:
+            summary["perception"] = {"error": str(exc)}
+        try:
+            llm = self.application_settings().get("agent", {}) or {}
+            summary["available"]["vlm"] = bool(llm.get("auto_select_multimodal_model", True))
+        except Exception:
+            pass
+        # Plain-language hint based on what is actually live
+        if summary["flight"].get("connected") and summary["perception"].get("online"):
+            hint = "链路就绪:飞行控制可用,感知在线,Agent 可调用飞行与视觉工具。"
+        elif summary["flight"].get("connected") and not summary["perception"].get("online"):
+            hint = "飞行控制可用,感知离线(无法获取画面)。先检查感知配置(.env 或设置 → 连接)。"
+        elif not summary["flight"].get("connected"):
+            hint = "飞行控制未连接:选择正确的连接(仿真 UDP/真机数传/ROS2 网关)后重新激活。"
+        else:
+            hint = "链路状态未知,请检查服务与配置。"
+        summary["hint"] = hint
+        return summary
 
     def connection_settings(self) -> dict[str, Any]:
         """Return current connection settings (QGC Links style)."""

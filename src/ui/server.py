@@ -139,6 +139,12 @@ class AgentRequestHandler(BaseHTTPRequestHandler):
                 "current": RUNTIME.tools.backend_id,
             })
             return
+        if path == "/api/link":
+            # Single end-point describing how the Agent is wired to the
+            # vehicle: flight control link + perception axis link + telemetry
+            # source. Surfaces connection strings, source type, health.
+            self._send_json({"ok": True, **RUNTIME.link_summary()})
+            return
 
         if path == "/api/settings/connections":
             self._send_json({"ok": True, **RUNTIME.connection_settings()})

@@ -251,6 +251,7 @@ class ToolRuntime:
         backend_registry: BackendRegistry | None = None,
         camera_settings_provider: Callable[[], dict[str, Any]] | None = None,
         perception_axis: Any | None = None,
+        vlm_provider: Callable[[str, str], dict[str, Any]] | None = None,
     ) -> None:
         self.backend_registry = backend_registry or create_builtin_backend_registry()
         self.backend_id = self.backend_registry.resolve_id(backend_id)
@@ -259,6 +260,7 @@ class ToolRuntime:
         self.collector: ToolCollector | None = None
         self.camera_settings_provider = camera_settings_provider
         self.perception_axis = perception_axis
+        self.vlm_provider = vlm_provider
         self.camera_controller: Any | None = None
         self.camera_collector: ToolCollector | None = None
         self.camera_key = ""
@@ -329,15 +331,55 @@ class ToolRuntime:
 
                     logging.getLogger(__name__).warning(f"provider tools skipped: {exc}")
 
-            # Perception axis tools: registered when the axis is enabled,
-            # independent of the flight backend's capabilities. The axis reads
-            # its own frame source; AirSim-only perception tools above still
-            # follow the backend capabilities as before.
+            # Perception axis tools: always register when configured. inspect_current_frame
+            # is useful even when the axis has no frames yet (its fallback
+            # pulls one frame directly from the camera), so we do not gate on
+            # axis.is_online -- the tool itself reports an explanatory error.
             if self.perception_axis is not None and getattr(self.perception_axis, "enabled", False):
                 try:
                     from src.tools.perception_axis import register_perception_axis_tools
 
-                    register_perception_axis_tools(self.collector, self.perception_axis, fmt)
+                    register_perception_axis_tools(
+                        self.collector,
+                        self.perception_axis,
+                        fmt,
+                        vlm=self.vlm_provider,
+                        fallback_capture=self._capture_current_frame_jpeg,
+                    )
+                except Exception as exc:
+                    import logging
+
+                    logging.getLogger(__name__).warning(f"perception axis tools skipped: {exc}")
+            elif getattr(self, "vlm_provider", None) is not None:
+                # Axis not configured but the active model can see images.
+                # Still expose inspect_current_frame for the UI camera panel
+                # fallback path.
+                try:
+                    from src.tools.perception_axis import register_perception_axis_tools
+                    from src.tools.vision import register_vision_aliases
+
+                    register_perception_axis_tools(
+                        self.collector,
+                        self.perception_axis,
+                        fmt,
+                        vlm=self.vlm_provider,
+                        fallback_capture=self._capture_current_frame_jpeg,
+                    )
+                    # Forward the legacy airsim_vlm_* aliases to inspect so
+                    # any plan the LLM produces with the old names still
+                    # reaches a working vision-model call.
+                    def _inspect_shim(question: str) -> str:
+                        try:
+                            return self.execute(
+                                "inspect_current_frame",
+                                {"question": question},
+                                dry_run=False,
+                                blocked_by_supervisor=False,
+                            ).data.get("answer", "")
+                        except Exception as exc:
+                            return f"vision unavailable: {exc}"
+
+                    register_vision_aliases(self.collector, None, fmt, _inspect_shim)
                 except Exception as exc:
                     import logging
 
@@ -1114,6 +1156,28 @@ class ToolRuntime:
                     except Exception:
                         pass
                     controller._last_preview_used = 0.0
+
+    def _capture_current_frame_jpeg(self) -> bytes | None:
+        """Grab one AirSim scene frame directly and return it as JPEG bytes."""
+        try:
+            import cv2
+            import numpy as np
+
+            controller, error = self._ensure_preview_controller({"source": "airsim"})
+            if controller is None:
+                return None
+            raw = controller.capture_image(camera_name="0", image_type=0, vehicle_name="", timeout=3.0)
+            if not raw:
+                return None
+            img = cv2.imdecode(np.frombuffer(bytes(raw), dtype=np.uint8), cv2.IMREAD_UNCHANGED)
+            if img is None:
+                return None
+            if img.ndim == 3 and img.shape[2] == 4:
+                img = cv2.cvtColor(img, cv2.COLOR_BGRA2BGR)
+            ok, buf = cv2.imencode(".jpg", img, [int(cv2.IMWRITE_JPEG_QUALITY), 82])
+            return buf.tobytes() if ok else None
+        except Exception:
+            return None
 
     def _detect_and_annotate(self, raw: bytes, threshold: float = 0.20) -> tuple[bytes, list[dict[str, Any]]]:
         """Run YOLO on one preview frame and overlay detection boxes.

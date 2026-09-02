@@ -47,6 +47,10 @@ _VISION_MODEL_HINTS = (
     "claude-opus-4",
     "llava",
     "mimo-v2.5",
+    "minimax-m3",
+    "minimax-m2",
+    "minimax-m1",
+    "qwen2.5-vl",
 )
 
 _CONTEXT_WINDOW_HINTS = (
@@ -2036,7 +2040,7 @@ class LLMMissionPlanner:
             "If the operator's command is a knowledge question, explanation request, or non-UAV task that does not require vehicle tools or backend state, mark is_complete=true in the first turn and put a concise Chinese natural-language answer in reason. Do not force a drone tool call for questions unrelated to UAV operation. "
             "If flight_sequence guidance is present and the request is a short ordered workflow such as status -> takeoff -> move -> photo/VLM -> return -> land, use that Markdown to choose the next native tool and keep the sequence concise. "
             "For vague scan/move wording such as '一点距离' or '简单扫描', keep horizontal movement to 1-2 meters, use velocity around 1.0-1.5 m/s, and take off to at least 3 m before horizontal movement. "
-            "For open-ended 'what is in the photo' requests, use airsim_vlm_analyze_image; use airsim_vlm_confirm_target only for a named target. "
+            "For open-ended 'what is in the photo' requests, use inspect_current_frame (vision-model analysis of the current perception frame). Use it whenever the user asks what the drone sees, the color/type/size of an object, or any '看看画面里.../描述当前画面' question. "
             "For return-to-start, use the first observed position when available instead of guessing home coordinates. "
             "For square/rectangle/orbit/circle/grid path tasks, prefer one drone_fly_path action with explicit local NED waypoints over many rotate-to-heading plus drone_move_relative turns. Use rotate_to only when camera orientation matters. "
             "For multi-step goals, call one available tool per turn, then use the next observation to decide the following tool. "

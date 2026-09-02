@@ -329,8 +329,8 @@ TOOL_CARDS: dict[str, ToolCard] = {
     ),
     "airsim_vlm_analyze_image": ToolCard(
         name="airsim_vlm_analyze_image",
-        purpose="Use the selected multimodal model to describe the latest captured image.",
-        when_to_use="After airsim_take_photo when the operator asks what the drone can see or asks for open-ended image understanding.",
+        purpose="[ALIAS for inspect_current_frame] Use the multimodal model to describe the current frame.",
+        when_to_use="[DEPRECATED alias] When you would call this tool, prefer inspect_current_frame which has the same effect. If only this alias is available, the runtime will forward to inspect_current_frame.",
         inputs={
             "question": "operator question about the image",
             "source": "last_image or explicit image_base64",
@@ -456,6 +456,16 @@ TOOL_CARDS: dict[str, ToolCard] = {
         outputs="Memory write acknowledgement.",
         required_capabilities=[],
         cost="low",
+    ),
+    "inspect_current_frame": ToolCard(
+        name="inspect_current_frame",
+        purpose="Use the multimodal model to visually analyze the drone's current camera frame and answer a free-form question about it.",
+        when_to_use="MANDATORY for any question about the current view (what the drone sees, colors, object type, scene description). The YOLO-only perception_status tool returns class+confidence labels only and cannot answer open visual questions. Call this tool whenever the user asks for visual understanding of the current frame.",
+        inputs={"question": "natural language question about the current frame"},
+        outputs="Model answer text plus the YOLO detections on that frame.",
+        required_capabilities=[],
+        cost="medium",
+        risk="low",
     ),
     "perception_status": ToolCard(
         name="perception_status",

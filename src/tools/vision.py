@@ -139,3 +139,33 @@ def register_vision_tools(mcp, controller: FlightController, _fmt_result):
 
         except Exception as e:
             return _fmt_result({"status": "error", "message": f"深度感知失败: {e}"})
+
+
+
+# ---------------------------------------------------------------------
+# Legacy aliases -- forward to the perception axis's inspect_current_frame.
+# These existed as cards for the LLM to pick, but had no real implementations
+# in this module. Forwarding keeps old plans working and lets the LLM land on
+# the same actual analysis path regardless of which name it picked.
+# ---------------------------------------------------------------------
+
+def register_vision_aliases(mcp, controller: Any, fmt_result: Callable[[dict], str], inspect_runner: Callable[[str], str]) -> None:
+    """Wire legacy airsim_vlm_* tools as thin shims over inspect_current_frame."""
+
+    @mcp.tool()
+    def airsim_vlm_analyze_image(
+        question: str = "请描述画面里看到了什么,目标是什么颜色",
+        source: str = "last_image",
+        image_base64: str = "",
+    ) -> str:
+        """[DEPRECATED alias] Forward to inspect_current_frame (multimodal)."""
+        return inspect_runner(question)
+
+    @mcp.tool()
+    def airsim_vlm_confirm_target(
+        target_description: str,
+        source: str = "last_image",
+        image_base64: str = "",
+    ) -> str:
+        """[DEPRECATED alias] Forward to inspect_current_frame (multimodal)."""
+        return inspect_runner(f"请在画面中确认目标: {target_description}")

@@ -10,8 +10,19 @@ from __future__ import annotations
 from typing import Any, Callable
 
 
-def register_perception_axis_tools(mcp, axis: Any, fmt: Callable[[dict], str]) -> None:
-    """Register axis tools against a ToolCollector (mcp.tool decorator)."""
+def register_perception_axis_tools(
+    mcp,
+    axis: Any,
+    fmt: Callable[[dict], str],
+    vlm: Callable[[str, str], dict] | None = None,
+    fallback_capture: Callable[[], bytes | None] | None = None,
+) -> None:
+    """Register axis tools against a ToolCollector (mcp.tool decorator).
+
+    ``vlm`` (optional) is a callable (question, image_base64) -> dict that runs
+    a multimodal model over the current perception frame; injected by the
+    runtime with the planner when a vision-capable model is configured.
+    """
 
     @mcp.tool()
     def perception_status(include_snapshot: bool = True, include_events: bool = True, limit: int = 5) -> str:
@@ -38,4 +49,45 @@ def register_perception_axis_tools(mcp, axis: Any, fmt: Callable[[dict], str]) -
         if include_events:
             events = axis.pop_events()
             payload["events"] = events[-max(1, int(limit)) :]
+        return fmt(payload)
+
+    @mcp.tool()
+    def inspect_current_frame(question: str) -> str:
+        """用多模态模型分析感知轴当前画面并回答问题。
+
+        读取感知轴的最近一帧(标注后的画面)交给视觉模型理解,返回模型对
+        画面的描述/判断。适合"画面里有什么""目标是什么颜色"等开放问题;
+        若当前没有可用画面(感知离线/未取帧)或模型不支持视觉则返回错误。
+
+        Args:
+            question: 针对当前画面的问题(中文即可),例如"画面里有什么目标"
+        """
+        if vlm is None:
+            return fmt({"status": "error", "message": "当前模型不支持图像分析(多模态未启用或未配置视觉模型)"})
+        if axis is None:
+            return fmt({"status": "error", "message": "perception axis unavailable"})
+        try:
+            jpeg, dets, _ts = axis.annotated_frame()
+        except Exception as exc:
+            return fmt({"status": "error", "message": f"画面读取失败: {exc}"})
+        if not jpeg and fallback_capture is not None:
+            # The perception axis may not have frames yet in some runtimes
+            # (UI-process RPC hang); grab one frame directly from the
+            # simulator so the visual question still works.
+            try:
+                jpeg = fallback_capture()
+            except Exception as exc:
+                return fmt({"status": "error", "message": f"直连取帧失败: {exc}"})
+        if not jpeg:
+            return fmt({"status": "error", "message": "当前无感知画面(感知轴离线或尚未取到帧)"})
+        import base64
+
+        image_b64 = base64.b64encode(jpeg).decode("ascii")
+        try:
+            answer = vlm(question, image_b64)
+        except Exception as exc:
+            return fmt({"status": "error", "message": f"视觉模型调用失败: {exc}"})
+        payload: dict[str, Any] = {"status": "ok", "question": question, "answer": answer}
+        if dets:
+            payload["detections"] = dets
         return fmt(payload)

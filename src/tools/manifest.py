@@ -306,6 +306,16 @@ TOOL_MANIFEST: dict[str, ToolManifestEntry] = {
         recommended_layer="runtime",
         notes="Handled by AgentRuntime, not by external MCP servers.",
     ),
+    "inspect_current_frame": ToolManifestEntry(
+        name="inspect_current_frame",
+        group="perception",
+        kind="atomic",
+        surface="perception",
+        recommended_layer="tool",
+        stable=True,
+        notes="Multimodal analysis of the latest perception axis frame (requires a vision-capable model).",
+        future_backend_notes="Works for sim and real frames via the perception axis cache.",
+    ),
     "perception_status": ToolManifestEntry(
         name="perception_status",
         group="perception",
