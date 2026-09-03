@@ -166,6 +166,52 @@ def _default_connection_settings() -> dict[str, Any]:
                     "workspace": config.ros_workspace_path,
                 },
             },
+            # 真机常用数传(UDPin:地面端开监听,等真机数传主动推过来,无需预知 IP)
+            {
+                "id": "default_px4_telem_udp",
+                "name": "PX4 数传 UDP (UDPin)",
+                "type": "udp",
+                "params": {
+                    "host": "0.0.0.0",
+                    "portNumber": "14550",
+                    "remotePort": "",
+                    "realVehicle": True,
+                },
+            },
+            # 真机数传直接出 TCP(部分 USB 数传盒带以太网)
+            {
+                "id": "default_px4_telem_tcp",
+                "name": "PX4 数传 TCP",
+                "type": "tcp",
+                "params": {
+                    "host": "",
+                    "portNumber": "5760",
+                    "realVehicle": True,
+                },
+            },
+            # Jetson 机载 + mavlink-router 已转发 MAVLink 到 UDP
+            {
+                "id": "default_jetson_mavlink_udp",
+                "name": "Jetson MAVLink 桥 (UDP)",
+                "type": "udp",
+                "params": {
+                    "host": "127.0.0.1",
+                    "portNumber": "14550",
+                    "remotePort": "18570",
+                    "realVehicle": True,
+                },
+            },
+            # 真机数传串口(高波特率,飞行数据更丰富)
+            {
+                "id": "default_px4_usb_921600",
+                "name": "PX4 USB Serial (921600)",
+                "type": "serial",
+                "params": {
+                    "port": "",
+                    "baud": "921600",
+                    "realVehicle": True,
+                },
+            },
         ],
     }
 
