@@ -162,7 +162,10 @@ def test_serial_baud_port_mixup_is_normalized():
     assert params["real_vehicle"] is True
 
 
-def test_px4_backend_prefers_auto_link_over_stale_ros_active_id():
+def test_px4_backend_falls_back_to_first_real_vehicle_preset():
+    """With AirSim + USB Serial + ROS2 as the only defaults, a stale ROS2
+    active id is replaced by the first non-AirSim entry (USB Serial) which is
+    the most plausible real-vehicle link."""
     settings = {
         "backend": "px4_mavlink",
         "connections": {
@@ -172,7 +175,7 @@ def test_px4_backend_prefers_auto_link_over_stale_ros_active_id():
 
     merged = _connection_settings(settings)
 
-    assert merged["active_connection_id"] == "default_px4_auto"
+    assert merged["active_connection_id"] == "default_px4_usb"
 
 
 def test_auto_link_builds_serial_first_with_udp_fallback(monkeypatch):

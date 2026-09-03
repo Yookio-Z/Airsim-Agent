@@ -126,35 +126,13 @@ def _default_connection_settings() -> dict[str, Any]:
                 "params": {"host": "127.0.0.1", "portNumber": "41452"},
             },
             {
-                "id": "default_px4_auto",
-                "name": "PX4 Auto",
-                "type": "auto",
-                "params": {
-                    "host": "127.0.0.1",
-                    "portNumber": "14550",
-                    "remotePort": "18570",
-                    "realVehicle": False,
-                },
-            },
-            {
                 "id": "default_px4_usb",
-                "name": "PX4 USB Serial",
+                "name": "PX4 USB Serial (典型真机数传)",
                 "type": "serial",
                 "params": {
                     "port": "",
                     "baud": "115200",
                     "realVehicle": True,
-                },
-            },
-            {
-                "id": "default_px4",
-                "name": "PX4 SITL UDP",
-                "type": "udp",
-                "params": {
-                    "host": "127.0.0.1",
-                    "portNumber": "14550",
-                    "remotePort": "18570",
-                    "realVehicle": False,
                 },
             },
             {
