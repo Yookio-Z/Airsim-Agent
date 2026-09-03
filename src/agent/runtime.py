@@ -144,6 +144,22 @@ def _default_connection_settings() -> dict[str, Any]:
                     "workspace": config.ros_workspace_path,
                 },
             },
+            {
+                # 厂商遥控器(Siyi / Herelink / DJI OcuSync 等自带数传图传)
+                # → 遥控器开 WiFi,飞机/吊舱接遥控器,地面站电脑连同一 WiFi
+                # → 控制/遥测走遥控器内置 MAVLink(常见 14550/14560 等)
+                # → 图传走 RTSP(常见 8554/554)
+                # 用户只需填"遥控器 IP"和 RTSP URL 两项
+                "id": "default_rc_mavlink_udp",
+                "name": "厂商遥控器 (MAVLink UDP)",
+                "type": "udp",
+                "params": {
+                    "host": "192.168.144.50",
+                    "portNumber": "14550",
+                    "remotePort": "",
+                    "realVehicle": True,
+                },
+            },
         ],
     }
 
