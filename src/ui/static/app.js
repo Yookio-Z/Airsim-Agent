@@ -381,51 +381,6 @@ function mergeApplicationSettings(raw) {
   );
 }
 
-function renderLinkSummary(data) {
-  const el = document.getElementById("linkSummary");
-  const hintEl = document.getElementById("linkHint");
-  if (!el) return;
-  if (!data) {
-    el.textContent = "无法读取链路状态";
-    return;
-  }
-  const f = data.flight || {};
-  const p = data.perception || {};
-  const av = data.available || {};
-  const rows = [
-    ["飞行控制", f.backend || "-"],
-    ["连接", f.connected ? "✓ 在线" : "✗ 离线"],
-    ["飞行模式", f.mode || "-"],
-    ["解锁 / 飞行", (f.armed ? "已解锁" : "未解锁") + " / " + (f.flying ? "在飞" : "未飞")],
-    ["姿态高度", (f.altitude_m != null ? f.altitude_m.toFixed(1) + " m" : "-")],
-    ["电量", f.battery_v != null ? f.battery_v.toFixed(1) + " V" : "-"],
-    ["GPS", f.gps ? f.gps.lat?.toFixed(4) + ", " + f.gps.lon?.toFixed(4) + " (" + f.gps.fix_type + ")" : "-"],
-    ["心跳", f.heartbeat_age_s != null ? f.heartbeat_age_s.toFixed(2) + " s" : "-"],
-    ["感知轴", p.enabled ? (p.online ? "✓ 在线" : "⚠ 已配但无帧") : "未配置"],
-    ["感知帧源", p.frame_source || "-"],
-    ["YOLO FPS", p.fps != null ? p.fps.toFixed(1) : "-"],
-    ["感知错误", p.error || "-"],
-    ["可用 · 飞行", av.flight_control ? "✓" : "✗"],
-    ["可用 · 感知", av.perception ? "✓" : "✗"],
-    ["可用 · 视觉模型", av.vlm ? "✓" : "✗"],
-  ];
-  el.innerHTML = rows.map(([k, v]) =>
-    `<div class="link-row"><span class="link-key">${k}</span><span class="link-val">${String(v)}</span></div>`
-  ).join("");
-  if (hintEl) hintEl.textContent = data.hint || "";
-}
-
-async function loadLinkSummary() {
-  const el = document.getElementById("linkSummary");
-  if (el) el.textContent = "加载中...";
-  try {
-    const data = await api("/api/link");
-    renderLinkSummary(data);
-  } catch (error) {
-    if (el) el.textContent = "加载失败: " + (error.message || "");
-  }
-}
-
 
 async function loadApplicationSettings(force = false) {
   if (applicationSettingsLoaded && !force) return applicationSettings;
@@ -1701,10 +1656,6 @@ function bindCameraViewerResize() {
 }
 
 
-document.getElementById("linkRefresh")?.addEventListener("click", loadLinkSummary);
-document.querySelectorAll('[data-settings-tab="link"]').forEach((tab) => {
-  tab.addEventListener("click", () => loadLinkSummary());
-});
 
 
 function setupCameraEventListeners() {

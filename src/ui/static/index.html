@@ -451,31 +451,7 @@
             </section>
 
             <section class="system-settings-panel active" data-system-panel="links">
-              <div class="settings-card" style="margin-bottom:12px">
-                <header class="settings-head">
-                  <strong>链路状态(飞行控制 + 感知)</strong>
-                  <button class="icon-button" id="linkRefresh" type="button" title="刷新">↻</button>
-                </header>
-                <div id="linkSummary" class="link-summary">加载中...</div>
-                <p class="link-hint" id="linkHint"></p>
-              </div>
-              <div class="settings-card" style="margin-bottom:12px">
-                <header class="settings-head"><strong>真机 / 仿真 切换</strong></header>
-                <p class="settings-hint">飞行控制:在右侧 <em>连接预设</em> 选 SIM 链接或真机数传。
-                图像:重启 UI 进程后改 <code>.env</code> 里
-                <code>DRONE_PERCEPTION_FRAME_SOURCE</code>(airsim / rtsp / usb)与
-                <code>DRONE_PERCEPTION_RTSP_URL</code>(真机图传/RTSP 拉流)。</p>
-              </div>
-              <div class="settings-card" style="margin-bottom:12px">
-                <header class="settings-head"><strong>常见连接方式</strong></header>
-                <ul class="link-recipes">
-                  <li><b>AirSim 仿真</b> · 控制 UDP 127.0.0.1:14550 · 帧源 AirSim 相机 0</li>
-                  <li><b>PX4 SITL (Jetson)</b> · 控制 UDP Jetson:14550/18570 · 帧源 AirSim 相机 0</li>
-                  <li><b>真机 · 数传 USB</b> · 控制 Serial COM 口 115200(选 PX4 USB Serial)· 帧源 USB 相机</li>
-                  <li><b>真机 · 数传 UDP + 图传 RTSP</b> · 控制 udpin 数传 IP:14550 · 帧源 RTSP rtsp://图传 IP:8554/</li>
-                  <li><b>真机 · Jetson 板载</b> · 控制 udpin Jetson:14550 · 帧源 Jetson 转发 RTSP rtsp://Jetson:8554/</li>
-                </ul>
-              </div>
+
               <div class="link-settings-layout">
                 <aside class="links-list-column">
                   <div class="settings-section-head">
