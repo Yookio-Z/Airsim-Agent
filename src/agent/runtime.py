@@ -126,13 +126,16 @@ def _default_connection_settings() -> dict[str, Any]:
                 "params": {"host": "127.0.0.1", "portNumber": "41452"},
             },
             {
-                "id": "default_px4_usb",
-                "name": "PX4 USB Serial (典型真机数传)",
-                "type": "serial",
+                # PX4 SITL over UDP (local SITL or Jetson-shared MAVLink bridge).
+                # User can add serial/TCP/auto presets manually when needed.
+                "id": "default_px4_sitl_udp",
+                "name": "PX4 SITL UDP",
+                "type": "udp",
                 "params": {
-                    "port": "",
-                    "baud": "115200",
-                    "realVehicle": True,
+                    "host": "127.0.0.1",
+                    "portNumber": "14550",
+                    "remotePort": "18570",
+                    "realVehicle": False,
                 },
             },
             {
@@ -142,22 +145,6 @@ def _default_connection_settings() -> dict[str, Any]:
                 "params": {
                     "url": config.ros_bridge_url,
                     "workspace": config.ros_workspace_path,
-                },
-            },
-            {
-                # 厂商遥控器(Siyi / Herelink / DJI OcuSync 等自带数传图传)
-                # → 遥控器开 WiFi,飞机/吊舱接遥控器,地面站电脑连同一 WiFi
-                # → 控制/遥测走遥控器内置 MAVLink(常见 14550/14560 等)
-                # → 图传走 RTSP(常见 8554/554)
-                # 用户只需填"遥控器 IP"和 RTSP URL 两项
-                "id": "default_rc_mavlink_udp",
-                "name": "厂商遥控器 (MAVLink UDP)",
-                "type": "udp",
-                "params": {
-                    "host": "192.168.144.50",
-                    "portNumber": "14550",
-                    "remotePort": "",
-                    "realVehicle": True,
                 },
             },
         ],
