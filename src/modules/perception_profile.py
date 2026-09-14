@@ -26,6 +26,8 @@ class PerceptionProfile:
     confidence: float = 0.25
     update_fps: float = 5.0
     health_timeout_sec: float = 3.0
+    # 检测模型选择：auto（COCO 类别用固定类模型）| world（YOLO-World 开放词表）| coco
+    model: str = "auto"
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -37,6 +39,7 @@ class PerceptionProfile:
             "confidence": self.confidence,
             "update_fps": self.update_fps,
             "health_timeout_sec": self.health_timeout_sec,
+            "model": self.model,
         }
 
     @classmethod
@@ -62,6 +65,8 @@ class PerceptionProfile:
             merged["update_fps"] = float(cfg.perception_update_fps)
         if getattr(cfg, "perception_health_timeout_sec", None) is not None:
             merged["health_timeout_sec"] = float(cfg.perception_health_timeout_sec)
+        if getattr(cfg, "perception_model", ""):
+            merged["model"] = str(cfg.perception_model)
         merged["profile"] = str(getattr(cfg, "perception_profile", "sim_local"))
         return PerceptionProfile(**merged)
 

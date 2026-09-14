@@ -1,3 +1,4 @@
+import copy
 import math
 import time
 import struct
@@ -5,6 +6,7 @@ from types import SimpleNamespace
 
 from pymavlink import mavutil
 
+from src.agent import runtime as runtime_module
 from src.agent.runtime import _build_connect_params, _connection_settings
 from src.agent.tool_executor import ToolCollector, ToolRuntime
 from src.modules.flight_controller import DroneStatus
@@ -547,3 +549,253 @@ def test_set_vehicle_parameter_sends_param_set_and_updates_cache():
     assert link.sent["param_value"] == 2.0
     assert result["parameter"]["value"] == 2
     assert controller.get_parameter_status()["received_count"] == 1
+
+
+# ---------------------------------------------------------------------------
+# 连接如实上报：监听模式（udpin:0.0.0.0）会接收任意来源的心跳，
+# "已连接"不等于"连上了配置里那台设备"。
+# ---------------------------------------------------------------------------
+
+
+def _listening_controller(**details_overrides):
+    controller = MavlinkController()
+    details = {
+        "url": "udpin:0.0.0.0:14550",
+        "local_listen_url": "udpin:0.0.0.0:14550",
+        "px4_remote_host": "192.168.137.217",
+        "px4_remote_port": 18570,
+        "px4_remote_endpoint": "192.168.137.217:18570",
+    }
+    details.update(details_overrides)
+    controller._active_connection_details = details
+    return controller
+
+
+def test_listening_link_reports_real_heartbeat_source_not_configured_target():
+    """配置的是 192.168.137.217，实际收到本机 WSL 的心跳时不能谎报配置地址。"""
+    controller = _listening_controller()
+    controller._mavlink = SimpleNamespace(
+        udp_server=True,
+        clients_last_alive={("192.168.137.1", 14550): time.time()},
+    )
+    controller._note_rx_peer()
+
+    info = controller.get_connection_info()
+
+    assert info["actual_peer_endpoint"] == "192.168.137.1:14550"
+    assert info["peer_source_verified"] is True
+    assert info["configured_peer_endpoint"] == "192.168.137.217:18570"
+    assert info["peer_mismatch"] is True
+    assert "192.168.137.217:18570" in info["peer_mismatch_note"]
+    assert "192.168.137.1:14550" in info["peer_mismatch_note"]
+
+
+def test_matching_source_is_not_flagged_as_mismatch():
+    controller = _listening_controller()
+    controller._peer_observations = {("192.168.137.217", 18570): time.time()}
+
+    info = controller.get_connection_info()
+
+    assert info["peer_mismatch"] is False
+    assert info["peer_mismatch_note"] == ""
+    assert info["actual_peer_endpoint"] == "192.168.137.217:18570"
+
+
+def test_observed_source_on_same_host_but_other_port_is_a_mismatch():
+    controller = _listening_controller()
+    controller._peer_observations = {("192.168.137.217", 14550): time.time()}
+
+    info = controller.get_connection_info()
+
+    assert info["peer_mismatch"] is True
+
+
+def test_unverified_send_target_is_not_reported_as_mismatch():
+    """udpout 拿不到来源时，退回发送目标只是推断，不能据此报警。"""
+    controller = _listening_controller()
+    controller._mavlink = SimpleNamespace(
+        udp_server=False,
+        destination_addr=("10.0.0.5", 14550),
+    )
+    controller._note_rx_peer()
+
+    info = controller.get_connection_info()
+
+    assert info["actual_peer_endpoint"] == "10.0.0.5:14550"
+    assert info["peer_source_verified"] is False
+    assert info["peer_mismatch"] is False
+
+
+def test_note_rx_peer_keeps_latest_udp_server_client():
+    controller = MavlinkController()
+    controller._mavlink = SimpleNamespace(
+        udp_server=True,
+        clients_last_alive={
+            ("10.0.0.9", 18570): 100.0,
+            ("192.168.137.1", 14550): 200.0,
+        },
+    )
+
+    controller._note_rx_peer()
+
+    assert controller._rx_peer == ("192.168.137.1", 14550)
+    assert controller._peer_observations[("192.168.137.1", 14550)] == controller._rx_peer_ts
+
+
+def test_configured_host_with_embedded_url_and_port_still_matches():
+    controller = _listening_controller(
+        px4_remote_host="udp:192.168.137.217:14550",
+        px4_remote_port=0,
+        px4_remote_endpoint="",
+    )
+    controller._peer_observations = {("192.168.137.217", 14550): time.time()}
+
+    info = controller.get_connection_info()
+
+    assert info["peer_mismatch"] is False
+
+
+def test_disconnect_clears_observed_peer():
+    controller = _listening_controller()
+    controller._peer_observations = {("192.168.137.1", 14550): time.time()}
+    controller._rx_peer = ("192.168.137.1", 14550)
+    controller._rx_peer_ts = time.time()
+
+    controller.disconnect()
+
+    assert controller._peer_observations == {}
+    assert controller._rx_peer is None
+    assert controller.get_connection_info().get("actual_peer_endpoint") is None
+
+
+# ---------------------------------------------------------------------------
+# 断开链路：面板按真实端点识别出的活动链路未必等于 settings 里记的
+# active_connection_id，所以断开需要一条不依赖该 id 的显式路径。
+# ---------------------------------------------------------------------------
+
+_WSL_LINK = {
+    "id": "px4_wsl",
+    "name": "PX4 WSL",
+    "type": "udp",
+    "params": {"host": "127.0.0.1", "portNumber": "14550", "remotePort": "18570"},
+}
+
+
+def _runtime_with_stored_settings(monkeypatch, stored):
+    monkeypatch.setattr(runtime_module, "_load_settings", lambda: copy.deepcopy(stored))
+    monkeypatch.setattr(
+        runtime_module,
+        "_save_settings",
+        lambda data: stored.clear() or stored.update(copy.deepcopy(data)),
+    )
+
+    class _Tools:
+        def __init__(self):
+            self.calls = []
+
+        def execute(self, name, params, **_kwargs):
+            self.calls.append(name)
+            return SimpleNamespace(ok=True, to_dict=lambda: {"status": "ok", "tool": name})
+
+    runtime = object.__new__(runtime_module.AgentRuntime)
+    runtime.tools = _Tools()
+    monkeypatch.setattr(runtime, "_append_event", lambda *args, **kwargs: None)
+    return runtime
+
+
+def test_deactivate_connection_disconnects_and_clears_active_id(monkeypatch):
+    stored = {
+        "backend": "px4_mavlink",
+        "connections": {"active_connection_id": "px4_jetson", "connections": [_WSL_LINK]},
+    }
+    runtime = _runtime_with_stored_settings(monkeypatch, stored)
+
+    result = runtime.deactivate_connection()
+
+    assert result["ok"] is True
+    assert result["action"] == "disconnect"
+    assert runtime.tools.calls == ["drone_disconnect"]
+    assert stored["connections"]["active_connection_id"] == ""
+
+
+def test_activate_connection_disconnects_when_it_is_the_remembered_link(monkeypatch):
+    stored = {
+        "backend": "px4_mavlink",
+        "connections": {"active_connection_id": "px4_wsl", "connections": [_WSL_LINK]},
+    }
+    runtime = _runtime_with_stored_settings(monkeypatch, stored)
+    runtime.tools.status_snapshot = lambda: {"backend": "px4_mavlink", "connected": True, "stale_connection": False}
+
+    result = runtime.activate_connection("px4_wsl")
+
+    assert result["action"] == "disconnect"
+    assert runtime.tools.calls == ["drone_disconnect"]
+
+
+_JETSON_LINK = {
+    "id": "px4_jetson",
+    "name": "PX4 JETSON",
+    "type": "udp",
+    "params": {"host": "192.168.137.217", "portNumber": "14550", "remotePort": "18570"},
+}
+
+
+def test_activate_connection_switches_when_another_link_is_remembered(monkeypatch):
+    stored = {
+        "backend": "px4_mavlink",
+        "connections": {
+            "active_connection_id": "px4_jetson",
+            "connections": [_JETSON_LINK, _WSL_LINK],
+        },
+    }
+    runtime = _runtime_with_stored_settings(monkeypatch, stored)
+    runtime.tools.status_snapshot = lambda: {"backend": "px4_mavlink", "connected": True, "stale_connection": False}
+    switched = {}
+    monkeypatch.setattr(
+        runtime,
+        "set_backend",
+        lambda backend, connect_params=None, connection_id="": switched.update(
+            {"backend": backend, "params": connect_params, "connection_id": connection_id}
+        )
+        or {"ok": True},
+    )
+
+    result = runtime.activate_connection("px4_wsl")
+
+    assert result == {"ok": True}
+    assert runtime.tools.calls == []
+    assert switched["connection_id"] == "px4_wsl"
+    assert switched["params"]["url"] == "udp:127.0.0.1:14550"
+    assert stored["connections"]["active_connection_id"] == "px4_wsl"
+
+
+# ---------------------------------------------------------------------------
+# 监听口收不到心跳时要说清"端口被别的进程占了"：老实例没退出会悄悄收走
+# 全部心跳，报出来却只是"no MAVLink heartbeat received"，看起来像 PX4 没起来。
+# ---------------------------------------------------------------------------
+
+
+def test_local_port_conflict_hint_detects_squatter():
+    import socket
+
+    squatter = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    squatter.bind(("127.0.0.1", 0))
+    port = squatter.getsockname()[1]
+    controller = MavlinkController()
+    try:
+        hint = controller._local_port_conflict_hint(f"udpin:0.0.0.0:{port}")
+    finally:
+        squatter.close()
+
+    assert "已被其他进程占用" in hint
+    assert str(port) in hint
+    # 释放后不应再报占用
+    assert controller._local_port_conflict_hint(f"udpin:0.0.0.0:{port}") == ""
+
+
+def test_local_port_conflict_hint_ignores_non_listen_candidates():
+    controller = MavlinkController()
+
+    assert controller._local_port_conflict_hint("udpout:127.0.0.1:14550") == ""
+    assert controller._local_port_conflict_hint("serial:COM3:115200") == ""
+    assert controller._local_port_conflict_hint("udpin:0.0.0.0:not-a-port") == ""

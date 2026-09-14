@@ -133,7 +133,10 @@ TOOL_CARDS: dict[str, ToolCard] = {
     "drone_takeoff": ToolCard(
         name="drone_takeoff",
         purpose="Take off to a target relative altitude.",
-        when_to_use="When a mission requires the vehicle to become airborne.",
+        when_to_use=(
+            "任务需要飞机离地时使用。目标识别/搜索/追踪类任务定高 2~3m"
+            "（机载相机前视 15°，2~3m 才能平视目标），不要飞 5m 以上。"
+        ),
         inputs={"altitude": "Positive altitude in meters.", "vehicle_name": "目标载具：空=默认机，all=全部，或具体载具名"},
         outputs="Takeoff command result.",
         required_capabilities=["flight_control"],
@@ -175,12 +178,30 @@ TOOL_CARDS: dict[str, ToolCard] = {
     "drone_move_relative": ToolCard(
         name="drone_move_relative",
         purpose="Move relative to current vehicle heading.",
-        when_to_use="For operator commands like forward, backward, left, right, up, or down.",
+        when_to_use=(
+            "操作员要求前/后/左/右/上/下移动时使用；也用于目标确认不清晰时抵近观察"
+            "（例如向前 3m 拉近距离后再检测/确认），定高 2~3m、不要贴脸（<2m）。"
+        ),
         inputs={"forward_m": "meters forward", "right_m": "meters right", "up_m": "meters upward", "velocity": "m/s", "vehicle_name": "目标载具：空=默认机，all=全部，或具体载具名"},
         outputs="Relative movement result and target NED position.",
         required_capabilities=["flight_control", "telemetry"],
         preconditions=["connected", "current position and heading available"],
         not_for="Geometric paths such as square/rectangle/orbit/circle/grid. Use drone_fly_path with explicit local NED waypoints instead.",
+        risk="medium",
+    ),
+    "drone_approach_target": ToolCard(
+        name="drone_approach_target",
+        purpose="Make one bounded forward step toward the currently centered/locked visual target.",
+        when_to_use=(
+            "确认目标且目标已在画面中央、需要缩短距离时使用（视觉伺服式抵近）。"
+            "单步有界 1~3m，只看机体前方；目标未居中或感知无目标会拒绝执行。"
+            "每次抵近后必须重新检测/确认，再决定是否继续靠近或转入持续跟踪。"
+        ),
+        inputs={"step_m": "本次前向推进距离（米），限制 1~3m，默认 2"},
+        outputs="Approach step result with target track_id, pixel offset ex, and new NED position.",
+        required_capabilities=["flight_control", "object_detection"],
+        preconditions=["connected", "target detected and horizontally centered"],
+        not_for="Blind movement when no target is locked, or approaching without re-checking afterwards.",
         risk="medium",
     ),
     "drone_fly_velocity": ToolCard(
@@ -274,12 +295,16 @@ TOOL_CARDS: dict[str, ToolCard] = {
     ),
     "airsim_take_photo": ToolCard(
         name="airsim_take_photo",
-        purpose="Capture an AirSim camera image and optionally verify a target class.",
-        when_to_use="When the operator asks for a photo or a visual confirmation is required.",
+        purpose="Capture a camera image (saves to disk and returns image data).",
+        when_to_use=(
+            "只用于保存证据帧或操作员明确要求拍照。若要判断画面里有什么/目标是否存在或颜色，"
+            "请改用 airsim_detect_objects（结构化检测，首选）或 inspect_current_frame（视觉模型读图）；"
+            "纯文本推理循环无法直接阅读图像数据，反复拍照不会得到结论。"
+        ),
         inputs={"camera_name": "Camera id", "image_type": "scene/depth/segmentation/infrared", "verify_target_class": "optional class"},
         outputs="Image path/base64 and optional visual verification result.",
         required_capabilities=["image_capture"],
-        preconditions=["AirSim backend connected"],
+        preconditions=["A camera source is configured and connected"],
         cost="medium",
         risk="low",
     ),
@@ -303,18 +328,26 @@ TOOL_CARDS: dict[str, ToolCard] = {
     ),
     "airsim_detect_objects": ToolCard(
         name="airsim_detect_objects",
-        purpose="Run single-frame object detection.",
-        when_to_use="When the vehicle already has a useful camera view and needs target detection.",
+        purpose="Run single-frame object detection and return structured results (class/confidence/bbox).",
+        when_to_use=(
+            "首选的目标确认方式：判断画面里有没有某类目标（car/person/truck 等）时直接调用，"
+            "返回结构化结果无需读图。检测到目标后：若任务不需要颜色/型号等语义属性，直接进入追踪；"
+            "若需要语义属性，再用视觉模型确认一次。"
+        ),
         inputs={"target_class": "optional class such as car/person/truck", "confidence": "minimum confidence"},
-        outputs="Detected objects and confidence scores.",
+        outputs="Detected objects with class names and confidence scores.",
         required_capabilities=["object_detection"],
-        preconditions=["AirSim backend connected", "image stream/camera available"],
-        cost="medium",
+        preconditions=["A camera source / perception stream is available"],
+        cost="low",
     ),
     "airsim_vlm_confirm_target": ToolCard(
         name="airsim_vlm_confirm_target",
-        purpose="Use the selected multimodal model to confirm whether the latest captured image contains a requested target.",
-        when_to_use="After airsim_take_photo, airsim_detect_objects, or a visual sweep returns an image that needs semantic confirmation.",
+        purpose="Use the configured multimodal model to confirm whether the current image contains a requested target and report the evidence.",
+        when_to_use=(
+            "目标已经由检测提示可能存在、需要二次确认时调用一次。每次抵近/换角度后最多调用一次；"
+            "若确认结果不确定（目标太远、细节不足），下一步应是抵近观察再确认，而不是原地重复调用。"
+            "确认成功后进入追踪阶段，跟踪复检优先用 airsim_detect_objects。"
+        ),
         inputs={
             "target_description": "natural language target description such as red car/person/truck",
             "source": "last_image or explicit image_base64",
@@ -322,8 +355,8 @@ TOOL_CARDS: dict[str, ToolCard] = {
         },
         outputs="Structured VLM confirmation: target_found, confidence, evidence, relative direction, and next-action hint.",
         required_capabilities=["image_capture"],
-        preconditions=["A multimodal model is selected", "An image is available from capture/search or image_base64 is provided"],
-        cost="medium",
+        preconditions=["A multimodal model is selected", "An image is available from the perception stream or last capture"],
+        cost="high",
         risk="low",
         notes=["This tool does not move the vehicle; it only analyzes imagery."],
     ),
@@ -459,20 +492,49 @@ TOOL_CARDS: dict[str, ToolCard] = {
     ),
     "inspect_current_frame": ToolCard(
         name="inspect_current_frame",
-        purpose="Use the multimodal model to visually analyze the drone's current camera frame and answer a free-form question about it.",
-        when_to_use="MANDATORY for any question about the current view (what the drone sees, colors, object type, scene description). The YOLO-only perception_status tool returns class+confidence labels only and cannot answer open visual questions. Call this tool whenever the user asks for visual understanding of the current frame.",
+        purpose="Use the configured multimodal model to visually analyze the drone's current camera frame and answer a free-form question about it.",
+        when_to_use=(
+            "涉及当前画面的语义判断时使用（画面里有什么、目标是什么颜色/类型、场景描述）。"
+            "这是昂贵的视觉模型调用：同一位置只调用一次；若回答因目标太远/太小而不确定，"
+            "不要重复调用，应当先抵近（drone_move_relative 向前或 drone_fly_to 靠近）再重新检测；"
+            "简单的是否存在某类目标优先用 airsim_detect_objects（结构化、低成本）。"
+        ),
         inputs={"question": "natural language question about the current frame"},
         outputs="Model answer text plus the YOLO detections on that frame.",
         required_capabilities=[],
-        cost="medium",
+        cost="high",
         risk="low",
     ),
     "perception_status": ToolCard(
         name="perception_status",
         purpose="Read the perception axis state: health, detected targets, and recent perception events.",
-        when_to_use="When the operator asks about what the system currently sees or detects, or when a detection/tracking task reports no target and the cause needs checking.",
+        when_to_use=(
+            "只读：查看感知服务是否在线、当前锁定/检测到哪些目标、最近的目标出现/丢失事件。"
+            "注意它**不做检测动作**——要主动识别画面里的目标必须调用 airsim_detect_objects，"
+            "perception_status 只读取后台持续检测的快照，不能替代检测。"
+        ),
         inputs={"include_snapshot": "include current detection snapshot (default true)", "include_events": "include recent events (default true)", "limit": "event count limit"},
         outputs="Perception health {online, fps, error} plus target snapshot and target_found/target_lost events.",
+        required_capabilities=[],
+        cost="low",
+        risk="low",
+    ),
+    "perception_start": ToolCard(
+        name="perception_start",
+        purpose="Start (or ensure) the background target-detection service and optionally set the target class.",
+        when_to_use="需要目标检测/跟踪但感知服务未在线时调用（后台持续检测 + 跟踪保持，Agent 只读结果）。也可用于切换检测类别。",
+        inputs={"target_class": "optional class such as car/person/truck"},
+        outputs="Service health plus started/online flags.",
+        required_capabilities=[],
+        cost="low",
+        risk="low",
+    ),
+    "perception_stop": ToolCard(
+        name="perception_stop",
+        purpose="Stop the background target-detection service.",
+        when_to_use="操作员要求停止检测/释放算力时调用。",
+        inputs={},
+        outputs="Confirmation that detection stopped.",
         required_capabilities=[],
         cost="low",
         risk="low",

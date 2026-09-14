@@ -47,6 +47,10 @@ class LoopDecision:
     needs_replan: bool = False
     reflection: str = ""
     parallel_actions: list[dict[str, Any]] = field(default_factory=list)
+    # 决策来源："llm" = 模型本轮真实思考后的选择；"plan" = 按 LLM 已给出的
+    # 计划顺序执行（没有新的模型思考）；"guard" = 安全/前置守卫生成。
+    # 前端据此区分"模型思考"与"执行计划步骤"，不要都当成思考展示。
+    source: str = "llm"
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -57,6 +61,7 @@ class LoopDecision:
             "needs_replan": self.needs_replan,
             "reflection": self.reflection,
             "parallel_actions": [dict(item) for item in self.parallel_actions],
+            "source": self.source,
         }
 
 

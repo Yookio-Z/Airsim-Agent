@@ -19,9 +19,23 @@ const els = {
   modelSelectorBtn: $("modelSelectorBtn"),
   modelSelectorLabel: $("modelSelectorLabel"),
   modelSelectorMenu: $("modelSelectorMenu"),
+  modelDropdown: $("modelDropdown"),
+  reasoningBtn: $("reasoningBtn"),
+  reasoningLabel: $("reasoningLabel"),
+  reasoningMenu: $("reasoningMenu"),
+  reasoningDropdown: $("reasoningDropdown"),
   contextUsage: $("contextUsage"),
+  contextPopover: $("contextPopover"),
+  contextDropdown: $("contextDropdown"),
   newSessionBtn: $("newSessionBtn"),
-  sessionNavBtn: $("sessionNavBtn"),
+  sessionSwitcher: $("sessionSwitcher"),
+  sessionSwitcherBtn: $("sessionSwitcherBtn"),
+  sessionMenu: $("sessionMenu"),
+  chatArea: $("chatArea"),
+  chatRail: $("chatRail"),
+  railTip: $("railTip"),
+  sessionsSearch: $("sessionsSearch"),
+  sessionsNewBtn: $("sessionsNewBtn"),
   sessionsPanel: $("sessionsPanel"),
   sessionsList: $("sessionsList"),
   currentSessionLabel: $("currentSessionLabel"),
@@ -132,8 +146,6 @@ const els = {
   cameraAutoSave: $("cameraAutoSave"),
   cameraSaveSettingsBtn: $("cameraSaveSettingsBtn"),
   cameraCaptureFromSettingsBtn: $("cameraCaptureFromSettingsBtn"),
-  appLanguage: $("appLanguage"),
-  appTheme: $("appTheme"),
   appDensity: $("appDensity"),
   appMapLayer: $("appMapLayer"),
   appTelemetryRefresh: $("appTelemetryRefresh"),
@@ -141,8 +153,10 @@ const els = {
   appHistorySeconds: $("appHistorySeconds"),
   appFollowVehicle: $("appFollowVehicle"),
   appShowTrack: $("appShowTrack"),
-  appRequireGps: $("appRequireGps"),
-  appConfirmRealVehicle: $("appConfirmRealVehicle"),
+  appMissionAltitude: $("appMissionAltitude"),
+  appMissionSpeed: $("appMissionSpeed"),
+  appMissionHold: $("appMissionHold"),
+  appMissionAccept: $("appMissionAccept"),
   appRequireMissionGps: $("appRequireMissionGps"),
   appShowContext: $("appShowContext"),
   appAutoMultimodal: $("appAutoMultimodal"),
@@ -153,24 +167,18 @@ const els = {
   modelModalClose: $("modelModalClose"),
   modelModalCancel: $("modelModalCancel"),
   modelForm: $("modelForm"),
-  skillModal: $("skillModal"),
-  skillModalTitle: $("skillModalTitle"),
-  skillModalSubtitle: $("skillModalSubtitle"),
-  skillModalClose: $("skillModalClose"),
-  skillForm: $("skillForm"),
-  addSkillBtn: $("addSkillBtn"),
   importSkillBtn: $("importSkillBtn"),
   skillImportInput: $("skillImportInput"),
   modelEditId: $("modelEditId"),
   modelName: $("modelName"),
-  modelProvider: $("modelProvider"),
   modelModelId: $("modelModelId"),
   modelApiType: $("modelApiType"),
   modelBaseUrl: $("modelBaseUrl"),
+  fetchModelListBtn: $("fetchModelListBtn"),
+  providerModelOptions: $("providerModelOptions"),
+  providerModelHint: $("providerModelHint"),
   modelApiKey: $("modelApiKey"),
   modelRevealKey: $("modelRevealKey"),
-  modelReasoningEffort: $("modelReasoningEffort"),
-  modelThinkingMode: $("modelThinkingMode"),
 };
 
 let latestState = null;
@@ -201,6 +209,23 @@ let rosTelemetryReconnectTimer = null;
 let rosTelemetryConnected = false;
 let forceNextChatScroll = false;
 let chatRenderRafId = 0;
+// 自动跟随最新输出：只要用户仍停在底部就继续跟随。用"更新 DOM 之前"的
+// 位置判断，避免一次新增很多内容后距离超过阈值而停止跟随（表现为必须手动
+// 往下滑才能看到最新输出）。
+let chatAutoFollow = true;
+let chatFollowBound = false;
+let chatContentObserver = null;
+// 记录"程序触发的贴底滚动"时间戳：滚动事件无法区分用户滚动和我们自己设置
+// scrollTop，若不加区分，加载/流式过程中我们自己的滚动会被误判成"用户往上
+// 滚了"，从而关闭自动跟随（表现为之后必须手动下滑）。
+let chatProgrammaticScrollAt = 0;
+
+function pinChatToBottom() {
+  if (!els.chatThread) return;
+  chatProgrammaticScrollAt = Date.now();
+  els.chatThread.scrollTop = els.chatThread.scrollHeight;
+  chatAutoFollow = true;
+}
 let pendingImages = [];
 let localPendingMessages = [];
 let pendingMessageCounter = 0;
@@ -247,6 +272,20 @@ let lastMissionProgress = null;
 let currentLayerKey = "satellite";
 let wpDragging = false;
 let fenceDrawingMode = false;
+// 高度剖面图交互：最近一次绘制的几何用于命中测试，拖拽时冻结 Y 轴范围避免抖动
+let missionProfileView = null;
+let missionProfileDrag = null;
+let missionProfileHover = null;
+let profileRedrawScheduled = false;
+const PROFILE_ALT_MAX_M = 200;
+const PROFILE_HIT_RADIUS_PX = 16;
+// 航点类型配色（地图 sprite 与剖面图共用）
+const WAYPOINT_TYPE_COLORS = {
+  waypoint: "#55dff4",
+  takeoff: "#4ee6a4",
+  land: "#f0b84a",
+  rtl: "#ff5b6e",
+};
 
 // 地图图层源：走本地瓦片代理 /tile/{layer}/{z}/{x}/{y}（参考 QGC 磁盘缓存）
 // 代理首次从 Esri/OSM 拉取并写本地缓存，后续秒开；前端 URL 顺序统一 z/x/y
@@ -279,8 +318,9 @@ let skillsCache = [];
 let skillsLoaded = false;
 const DEFAULT_APPLICATION_SETTINGS = {
   appearance: { language: "zh-CN", theme: "dark", density: "comfortable" },
-  map: { default_layer: "satellite", follow_vehicle: true, show_vehicle_track: false, require_reliable_gps: true },
+  map: { default_layer: "satellite", follow_vehicle: true, show_vehicle_track: false },
   telemetry: { refresh_ms: 250, setup_refresh_ms: 100, history_seconds: 60, chart_sample_hz: 20 },
+  mission: { default_altitude_m: 3, default_speed_mps: 2, default_hold_s: 0, default_acceptance_radius_m: 2 },
   safety: { confirm_real_vehicle_actions: true, require_gps_for_global_mission: true, max_display_jump_m: 120 },
   agent: { show_context_usage: true, auto_select_multimodal_model: true, persist_full_session_history: true },
 };
@@ -401,8 +441,6 @@ async function loadApplicationSettings(force = false) {
 
 function fillApplicationSettingsForm() {
   const settings = applicationSettings;
-  if (els.appLanguage) els.appLanguage.value = settings.appearance.language;
-  if (els.appTheme) els.appTheme.value = settings.appearance.theme;
   if (els.appDensity) els.appDensity.value = settings.appearance.density;
   if (els.appMapLayer) els.appMapLayer.value = settings.map.default_layer;
   if (els.appTelemetryRefresh) els.appTelemetryRefresh.value = String(settings.telemetry.refresh_ms);
@@ -410,8 +448,10 @@ function fillApplicationSettingsForm() {
   if (els.appHistorySeconds) els.appHistorySeconds.value = String(settings.telemetry.history_seconds);
   if (els.appFollowVehicle) els.appFollowVehicle.checked = Boolean(settings.map.follow_vehicle);
   if (els.appShowTrack) els.appShowTrack.checked = Boolean(settings.map.show_vehicle_track);
-  if (els.appRequireGps) els.appRequireGps.checked = Boolean(settings.map.require_reliable_gps);
-  if (els.appConfirmRealVehicle) els.appConfirmRealVehicle.checked = Boolean(settings.safety.confirm_real_vehicle_actions);
+  if (els.appMissionAltitude) els.appMissionAltitude.value = String(settings.mission.default_altitude_m);
+  if (els.appMissionSpeed) els.appMissionSpeed.value = String(settings.mission.default_speed_mps);
+  if (els.appMissionHold) els.appMissionHold.value = String(settings.mission.default_hold_s);
+  if (els.appMissionAccept) els.appMissionAccept.value = String(settings.mission.default_acceptance_radius_m);
   if (els.appRequireMissionGps) els.appRequireMissionGps.checked = Boolean(settings.safety.require_gps_for_global_mission);
   if (els.appShowContext) els.appShowContext.checked = Boolean(settings.agent.show_context_usage);
   if (els.appAutoMultimodal) els.appAutoMultimodal.checked = Boolean(settings.agent.auto_select_multimodal_model);
@@ -419,34 +459,44 @@ function fillApplicationSettingsForm() {
   document.body.dataset.density = settings.appearance.density || "comfortable";
 }
 
+// 注意：通用/地图/任务默认值/安全 面板已移除，对应输入框不再存在。
+// 这里的兜底值必须沿用"已加载的设置"，绝不能用写死的默认值——否则一旦
+// 有人调用它，就会把用户已保存的地图/任务默认值悄悄冲掉。
 function applicationSettingsFromForm() {
   return mergeApplicationSettings({
     appearance: {
-      language: els.appLanguage?.value || "zh-CN",
-      theme: els.appTheme?.value || "dark",
-      density: els.appDensity?.value || "comfortable",
+      // 语言/主题无可切换实现，保持已加载值，不写死以免覆盖
+      language: applicationSettings.appearance.language,
+      theme: applicationSettings.appearance.theme,
+      density: els.appDensity?.value || applicationSettings.appearance.density,
     },
     map: {
-      default_layer: els.appMapLayer?.value || "satellite",
-      follow_vehicle: Boolean(els.appFollowVehicle?.checked),
-      show_vehicle_track: Boolean(els.appShowTrack?.checked),
-      require_reliable_gps: Boolean(els.appRequireGps?.checked),
+      default_layer: els.appMapLayer?.value || applicationSettings.map.default_layer,
+      follow_vehicle: els.appFollowVehicle ? Boolean(els.appFollowVehicle.checked) : applicationSettings.map.follow_vehicle,
+      show_vehicle_track: els.appShowTrack ? Boolean(els.appShowTrack.checked) : applicationSettings.map.show_vehicle_track,
     },
     telemetry: {
-      refresh_ms: Number(els.appTelemetryRefresh?.value || 250),
-      setup_refresh_ms: Number(els.appSetupRefresh?.value || 100),
-      history_seconds: Number(els.appHistorySeconds?.value || 60),
+      refresh_ms: Number(els.appTelemetryRefresh?.value || applicationSettings.telemetry.refresh_ms),
+      setup_refresh_ms: Number(els.appSetupRefresh?.value || applicationSettings.telemetry.setup_refresh_ms),
+      history_seconds: Number(els.appHistorySeconds?.value || applicationSettings.telemetry.history_seconds),
       chart_sample_hz: applicationSettings.telemetry.chart_sample_hz,
     },
+    mission: {
+      default_altitude_m: Number(els.appMissionAltitude?.value || applicationSettings.mission.default_altitude_m),
+      default_speed_mps: Number(els.appMissionSpeed?.value || applicationSettings.mission.default_speed_mps),
+      default_hold_s: Number(els.appMissionHold?.value || applicationSettings.mission.default_hold_s),
+      default_acceptance_radius_m: Number(els.appMissionAccept?.value || applicationSettings.mission.default_acceptance_radius_m),
+    },
     safety: {
-      confirm_real_vehicle_actions: Boolean(els.appConfirmRealVehicle?.checked),
-      require_gps_for_global_mission: Boolean(els.appRequireMissionGps?.checked),
-      max_display_jump_m: Number(els.appMaxMapJump?.value || 120),
+      // 真实飞控确认由后端能力强制开启，无 UI 开关，保持已加载值
+      confirm_real_vehicle_actions: applicationSettings.safety.confirm_real_vehicle_actions,
+      require_gps_for_global_mission: els.appRequireMissionGps ? Boolean(els.appRequireMissionGps.checked) : applicationSettings.safety.require_gps_for_global_mission,
+      max_display_jump_m: Number(els.appMaxMapJump?.value || applicationSettings.safety.max_display_jump_m),
     },
     agent: {
-      show_context_usage: Boolean(els.appShowContext?.checked),
-      auto_select_multimodal_model: Boolean(els.appAutoMultimodal?.checked),
-      persist_full_session_history: true,
+      show_context_usage: els.appShowContext ? Boolean(els.appShowContext.checked) : applicationSettings.agent.show_context_usage,
+      auto_select_multimodal_model: els.appAutoMultimodal ? Boolean(els.appAutoMultimodal.checked) : applicationSettings.agent.auto_select_multimodal_model,
+      persist_full_session_history: applicationSettings.agent.persist_full_session_history,
     },
   });
 }
@@ -798,7 +848,143 @@ function isConnectionActive(connId) {
   const toolRuntime = latestState?.tool_runtime || {};
   const connected = Boolean(toolRuntime.connected) && !toolRuntime.stale_connection;
   if (!connected) return false;
-  return connId === activeConnectionId;
+  // 唯一判据：实际链路识别出来的那条连接（识别不出来就是没有，不再硬指一条）。
+  return connId === refreshLiveConnectionId(currentActualLink(), connected);
+}
+
+// ── 从实际链路反推"当前连的是用户加的那条连接" ─────────────────────────
+// 监听模式（udpin:0.0.0.0:PORT）会把配置里的 host 丢掉：JETSON(192.168.137.217)
+// 和 WSL(127.0.0.1) 都用 14550 时，展开出来是同一个监听口，光看 URL 分不出是
+// 哪条。所以要用真实心跳来源（actual_peer_endpoint）配合本地端口来认领，
+// 而不是按"列表里第一条同后端的预设"硬指一条。
+function normalizeHost(value) {
+  return String(value || "").trim().toLowerCase().replace(/^\[|\]$/g, "");
+}
+
+function isLoopbackHost(host) {
+  return ["localhost", "127.0.0.1", "::1", "0.0.0.0"].includes(normalizeHost(host));
+}
+
+function isPrivateHost(host) {
+  const value = normalizeHost(host);
+  if (isLoopbackHost(value)) return true;
+  if (/^10\./.test(value) || /^192\.168\./.test(value) || /^169\.254\./.test(value)) return true;
+  return /^172\.(1[6-9]|2\d|3[01])\./.test(value);
+}
+
+function hostMatches(left, right) {
+  const a = normalizeHost(left);
+  const b = normalizeHost(right);
+  if (!a || !b) return false;
+  if (a === b) return true;
+  const loopbacks = new Set(["localhost", "127.0.0.1", "::1"]);
+  return loopbacks.has(a) && loopbacks.has(b);
+}
+
+function peerEndpointParts(link = currentActualLink()) {
+  const endpoint = String(link.actual_peer_endpoint || "");
+  const index = endpoint.lastIndexOf(":");
+  if (index <= 0) return { host: "", port: 0 };
+  const port = Number(endpoint.slice(index + 1));
+  return { host: normalizeHost(endpoint.slice(0, index)), port: Number.isFinite(port) ? port : 0 };
+}
+
+// 0 = 这条连接和当前链路无关
+function connectionLinkScore(conn, link = currentActualLink()) {
+  const params = conn?.params || {};
+  const url = String(link?.url || "");
+  if (!url) return 0;
+  if (/^https?:\/\//i.test(url)) {
+    // ROS2 网关 / AirSim RPC：按完整 URL 或 host:port 比
+    const configuredUrl = String(params.url || "").trim().replace(/\/+$/, "");
+    if (configuredUrl && configuredUrl === url.replace(/\/+$/, "")) return 8;
+    let parsedHost = "";
+    let parsedPort = 0;
+    try {
+      const parsed = new URL(url);
+      parsedHost = parsed.hostname;
+      parsedPort = Number(parsed.port || (parsed.protocol === "https:" ? 443 : 80));
+    } catch (error) {
+      return 0;
+    }
+    const configuredPort = Number(String(params.port ?? params.portNumber ?? "").trim());
+    if (configuredPort && configuredPort !== parsedPort) return 0;
+    return hostMatches(parsedHost, params.host || params.ip) ? 6 : 0;
+  }
+  if (url.startsWith("serial:")) {
+    const device = String(url.split(":")[1] || "");
+    const configured = String(params.port || "").trim();
+    if (!configured || normalizeHost(device) !== normalizeHost(configured)) return 0;
+    const baud = String(url.split(":")[2] || "").trim();
+    return 4 + (baud && String(params.baud || "").trim() === baud ? 2 : 0);
+  }
+  const urlHost = String(url.split(":")[1] || "");
+  const urlPort = Number(String(url.split(":").pop() || "").trim());
+  if (url.startsWith("tcp:")) {
+    if (!hostMatches(urlHost, params.address)) return 0;
+    return 4 + (!params.portNumber || Number(params.portNumber) === urlPort ? 2 : 0);
+  }
+  const configuredPort = Number(String(params.portNumber || "").trim());
+  if (!configuredPort || configuredPort !== urlPort) return 0;
+  let score = 2;
+  if (url.startsWith("udpout:") || url.startsWith("udp:")) {
+    // 直接发往配置的 host:port，地址说了算
+    return hostMatches(urlHost, params.host) ? score + 4 : 0;
+  }
+  // 监听口：host 被 0.0.0.0 取代，用真实心跳来源认领
+  const peer = peerEndpointParts(link);
+  const configuredHost = String(params.host || "").trim();
+  if (peer.host && hostMatches(peer.host, configuredHost)) {
+    score += 4;
+  } else if (peer.host && isLoopbackHost(configuredHost) && isPrivateHost(peer.host)) {
+    // 本机 / WSL 的 SITL 就是走这个监听口的，属于 127.0.0.1 那条
+    score += 3;
+  } else if (peer.port && Number(params.remotePort) === peer.port) {
+    score += 2;
+  }
+  return score;
+}
+
+let liveConnectionCache = { key: "", id: "" };
+
+function refreshLiveConnectionId(link = currentActualLink(), connectedOverride = null) {
+  const runtime = latestState?.tool_runtime || {};
+  const connected = connectedOverride == null
+    ? Boolean(runtime.connected) && !runtime.stale_connection
+    : Boolean(connectedOverride);
+  if (!connected) {
+    liveConnectionCache = { key: "offline", id: "" };
+    return "";
+  }
+  const connections = Array.isArray(connectionsCache) ? connectionsCache : [];
+  const key = [
+    String(link.url || ""),
+    String(link.actual_peer_endpoint || ""),
+    String(activeConnectionId || ""),
+    connections.length,
+  ].join("|");
+  if (key === liveConnectionCache.key) return liveConnectionCache.id;
+  const ranked = connections
+    .map((conn) => {
+      let score = connectionLinkScore(conn, link);
+      // 同分时优先用户刚点过的那条，避免两条都像的时候来回跳
+      if (score > 0 && String(conn.id || "") === String(activeConnectionId || "")) score += 1;
+      return { id: String(conn.id || ""), score };
+    })
+    .filter((entry) => entry.id && entry.score > 0)
+    .sort((left, right) => right.score - left.score);
+  let identified = ranked.length ? ranked[0].id : "";
+  if (!identified) {
+    // 认不出来时是否沿用上次激活的连接：链路没有端点信息（AirSim 后端不回报
+    // url）才允许，否则必须能被这条连接解释。以前按"列表里第一条同后端的预设"
+    // 硬指一条，于是用户新加的 127.0.0.1 链路会被显示成连在老的 JETSON 预设上。
+    const persisted = connections.find((conn) => String(conn.id || "") === String(activeConnectionId || ""));
+    if (persisted && (!link.url || connectionLinkScore(persisted, link) > 0)) {
+      identified = String(persisted.id || "");
+    }
+  }
+  liveConnectionCache = { key, id: identified };
+  return identified;
 }
 
 
@@ -1241,12 +1427,12 @@ function clampCameraViewerPosition(win = null) {
 }
 
 function setupCameraWindowDrag(win) {
-  const handle = win?.handle;
+  const handle = win?.el?.querySelector("header") || win?.handle;
   if (!handle || !win.el) return;
   let drag = null;
 
   handle.addEventListener("pointerdown", (event) => {
-    if (event.button !== 0 || event.target.closest("button, select, input")) return;
+    if (event.button !== 0 || event.target.closest("button, select, input, .cam-resize")) return;
     const stage = win.el.offsetParent;
     if (!stage) return;
     const viewerRect = win.el.getBoundingClientRect();
@@ -1435,8 +1621,8 @@ async function captureCameraFrame({ notify = true, openViewer = true, windowId =
       if (previousUrl) setTimeout(() => URL.revokeObjectURL(previousUrl), 250);
     }
     win.errorCount = 0;
-    const timestamp = new Date().toLocaleTimeString("zh-CN", { hour12: false });
-    setCameraViewerState(win, "ready", win.streamActive ? `视频流 · ${timestamp}` : (data.message || "画面已更新"));
+    // 视频流正常时不显示时间戳, 保持头部紧凑; 仅在非流式(单帧)时给出提示
+    setCameraViewerState(win, "ready", win.streamActive ? "" : (data.message || "画面已更新"));
     renderCameraMeta(data, win);
     win.lastSuccessSource = win.settings.source;
     if (notify) showNotice(data.message || "摄像头画面已更新", "success");
@@ -1557,17 +1743,38 @@ function setupCameraWindowEvents(win) {
   win.eventsBound = true;
   win.el.addEventListener("pointerdown", () => focusCameraWindow(win));
   win.newBtn?.addEventListener("click", () => createAdditionalCameraWindow(win));
-  // Click the image to cycle zoom (1x -> 1.6x -> 2.4x -> reset); the
-  // container scrolls so details can be inspected.
-  win.imageEl?.addEventListener("click", () => {
+  // Click the image to cycle zoom (1x -> 1.6x -> 2.4x -> reset); 以鼠标位置为锚点放大，
+  // 容器滚动以便查看细节，且光标下的画面内容在缩放前后保持不动。
+  win.imageEl?.addEventListener("click", (event) => {
+    const container = win.imageEl.parentElement;
+    if (!container) return;
     const cur = win.imgScale || 1;
     const next = cur >= 2.4 ? 1 : cur >= 1.6 ? 2.4 : 1.6;
     win.imgScale = next;
+    if (next <= 1) {
+      // 复位：清空缩放，恢复裁剪（面板缩放时图片始终自适应铺满）
+      win.imageEl.style.transform = "";
+      win.imageEl.style.transformOrigin = "";
+      win.imageEl.style.cursor = "zoom-in";
+      container.style.overflow = "hidden";
+      container.scrollTop = 0;
+      container.scrollLeft = 0;
+      return;
+    }
+    const rect = container.getBoundingClientRect();
+    const cx = event.clientX - rect.left;
+    const cy = event.clientY - rect.top;
+    // 光标当前对应的图像内容坐标（未缩放布局像素）
+    const contentX = (container.scrollLeft + cx) / cur;
+    const contentY = (container.scrollTop + cy) / cur;
+    win.imageEl.style.transformOrigin = "0 0";
     win.imageEl.style.transform = `scale(${next})`;
-    win.imageEl.style.transformOrigin = "center";
-    win.imageEl.style.cursor = next > 1 ? "zoom-out" : "zoom-in";
-    const container = win.imageEl.parentElement;
-    if (container) container.style.overflow = "auto";
+    win.imageEl.style.cursor = "zoom-out";
+    container.style.overflow = "auto";
+    // 触发一次布局让可滚动范围更新，再把同一内容点滚回光标下
+    void container.scrollWidth;
+    container.scrollLeft = contentX * next - cx;
+    container.scrollTop = contentY * next - cy;
   });
   win.closeBtn?.addEventListener("click", () => stopCameraStream({ hide: true, windowId: win.id }));
   win.sourceSelect?.addEventListener("change", (event) => {
@@ -1581,12 +1788,14 @@ function setupCameraWindowEvents(win) {
 }
 
 function resetCameraViewerSize(win = primaryCameraWindow()) {
-  const viewer = els.cameraViewer;
+  const viewer = win?.el || els.cameraViewer;
   if (!viewer) return;
-  viewer.style.width = "";
-  viewer.style.height = "";
-  viewer.style.left = "";
-  viewer.style.bottom = "";
+  viewer.style.removeProperty("width");
+  viewer.style.removeProperty("height");
+  viewer.style.removeProperty("left");
+  viewer.style.removeProperty("top");
+  viewer.style.removeProperty("right");
+  viewer.style.removeProperty("bottom");
 }
 
 function bindCameraViewerResize() {
@@ -1597,61 +1806,67 @@ function bindCameraViewerResize() {
     if (!edge || e.button !== 0) return;
     const viewer = edge.closest(".camera-viewer");
     if (!viewer) return;
+    const stage = viewer.offsetParent;
+    if (!stage) return;
     e.preventDefault();
     e.stopPropagation();
     const dir = edge.dataset.cameraResize || "se";
-    const rect = viewer.getBoundingClientRect();
+    const viewerRect = viewer.getBoundingClientRect();
+    const stageRect = stage.getBoundingClientRect();
+    // 全部换算到 offsetParent(舞台) 局部坐标, 与拖拽保持一致
+    const startLeft = viewerRect.left - stageRect.left;
+    const startTop = viewerRect.top - stageRect.top;
+    const startW = viewerRect.width;
+    const startH = viewerRect.height;
     const startX = e.clientX;
     const startY = e.clientY;
-    const startW = rect.width;
-    const startH = rect.height;
-    const leftAbs = rect.left;                 // absolute left (fixed unless w)
-    const rightAbs = rect.right;               // absolute right
-    const topAbs = rect.top;                   // absolute top
-    const bottomAbs = rect.bottom;             // absolute bottom
     const minW = 300;
     const minH = 220;
     viewer.style.transition = "none";
-    viewer.style.width = startW + "px";
-    viewer.style.height = startH + "px";
-    viewer.style.left = leftAbs + "px";
-    viewer.style.bottom = String(window.innerHeight - bottomAbs) + "px";
+    viewer.style.right = "auto";
+    viewer.style.bottom = "auto";
+    viewer.style.left = `${Math.round(startLeft)}px`;
+    viewer.style.top = `${Math.round(startTop)}px`;
+    viewer.style.width = `${Math.round(startW)}px`;
+    viewer.style.height = `${Math.round(startH)}px`;
+    viewer.classList.add("resizing");
     function onMove(ev) {
       const dx = ev.clientX - startX;
       const dy = ev.clientY - startY;
-      let left = leftAbs;
-      let top = topAbs;
-      let right = rightAbs;
-      let bottom = bottomAbs;
+      const right = startLeft + startW;
+      const bottom = startTop + startH;
+      let left = startLeft;
+      let top = startTop;
       let w = startW;
       let h = startH;
-      if (dir.includes("e")) {
-        right = Math.max(leftAbs + minW, startX + dx);
-      }
+      if (dir.includes("e")) w = Math.max(minW, startW + dx);
+      if (dir.includes("s")) h = Math.max(minH, startH + dy);
       if (dir.includes("w")) {
-        left = Math.min(rightAbs - minW, startX + dx);
-      }
-      if (dir.includes("s")) {
-        bottom = Math.max(topAbs + minH, startY + dy);
+        left = Math.min(right - minW, startLeft + dx);
+        left = Math.max(0, left);
+        w = right - left;
       }
       if (dir.includes("n")) {
-        top = Math.min(bottomAbs - minH, startY + dy);
+        top = Math.min(bottom - minH, startTop + dy);
+        top = Math.max(0, top);
+        h = bottom - top;
       }
-      w = right - left;
-      h = bottom - top;
-      left = Math.max(4, Math.min(left, window.innerWidth - 60));
-      top = Math.max(4, Math.min(top, window.innerHeight - 100));
-      viewer.style.left = String(Math.round(left)) + "px";
-      viewer.style.bottom = String(Math.round(window.innerHeight - Math.max(4, Math.min(top + h, window.innerHeight - 20)))) + "px";
-      viewer.style.width = String(Math.round(w)) + "px";
-      viewer.style.height = String(Math.round(h)) + "px";
+      w = Math.min(w, stageRect.width - left);
+      h = Math.min(h, stageRect.height - top);
+      viewer.style.left = `${Math.round(left)}px`;
+      viewer.style.top = `${Math.round(top)}px`;
+      viewer.style.width = `${Math.round(w)}px`;
+      viewer.style.height = `${Math.round(h)}px`;
     }
     function onUp() {
       window.removeEventListener("pointermove", onMove);
       window.removeEventListener("pointerup", onUp);
+      window.removeEventListener("pointercancel", onUp);
+      viewer.classList.remove("resizing");
     }
     window.addEventListener("pointermove", onMove);
     window.addEventListener("pointerup", onUp);
+    window.addEventListener("pointercancel", onUp);
   });
 }
 
@@ -1815,52 +2030,216 @@ function renderModelSelector() {
 
   const selected = models.find((m) => m.id === selector.value) || models[0];
   if (selected && els.modelSelectorLabel) {
-    const effortLabel = reasoningEffortLabel(selected);
-    els.modelSelectorLabel.textContent = effortLabel ? `${selected.name} · ${effortLabel}` : selected.name;
+    els.modelSelectorLabel.textContent = selected.name;
+    els.modelSelectorBtn.title = `当前模型：${selected.name}${selected.multimodal ? "（支持图像输入）" : ""}`;
   }
   renderModelMenu();
+  renderReasoningChip();
+}
+
+function selectedModel() {
+  return loadModels().find((m) => m.id === getSelectedModelId()) || loadModels()[0] || null;
+}
+
+// ── 思考力度：档位来自模型能力（后端按厂商目录 / 模型族给出），不硬套四档 ──
+const REASONING_LEVEL_META = {
+  low: { label: "低", bars: 1 },
+  medium: { label: "中", bars: 2 },
+  high: { label: "高", bars: 3 },
+  max: { label: "最大", bars: 4 },
+};
+
+function reasoningCapability(model) {
+  const profile = model?.reasoning || {};
+  const levels = Array.isArray(profile.levels)
+    ? profile.levels.filter((level) => REASONING_LEVEL_META[level])
+    : [];
+  return {
+    supports: Boolean(profile.supports_thinking) || levels.length > 0,
+    levels,
+    default: REASONING_LEVEL_META[profile.default] ? profile.default : "",
+    mandatory: Boolean(profile.mandatory),
+  };
+}
+
+function reasoningLevelOf(model) {
+  if (String(model?.thinking_mode || "").toLowerCase() === "disabled") return "off";
+  const effort = String(model?.reasoning_effort || "");
+  return REASONING_LEVEL_META[effort] ? effort : "";
 }
 
 function reasoningEffortLabel(model) {
-  const mode = model?.thinking_mode || "";
-  const effort = model?.reasoning_effort || "";
-  if (mode === "disabled") return "无思考";
-  if (mode === "enabled" && !effort) return "思考";
-  const names = { low: "低思考", medium: "中思考", high: "高思考", max: "最大思考" };
-  return names[effort] || "";
+  const level = reasoningLevelOf(model);
+  if (level === "off") return "无思考";
+  return REASONING_LEVEL_META[level]?.label || "默认";
+}
+
+function reasoningBars(level) {
+  if (level === "off") return 0;
+  return REASONING_LEVEL_META[level]?.bars || 0;
+}
+
+function renderReasoningChip() {
+  const model = selectedModel();
+  const capability = reasoningCapability(model);
+  const level = model ? reasoningLevelOf(model) : "";
+  const meter = els.reasoningLabel;
+  if (meter) {
+    meter.dataset.level = level === "off" ? "off" : String(reasoningBars(level));
+    meter.classList.toggle("is-off", level === "off");
+  }
+  if (els.reasoningBtn) {
+    const unsupported = Boolean(model) && !capability.supports;
+    els.reasoningBtn.classList.toggle("is-unsupported", unsupported);
+    els.reasoningBtn.disabled = unsupported;
+    els.reasoningBtn.title = !model
+      ? "思考力度"
+      : unsupported
+        ? `${model.name}：未识别到可调档位（保持模型默认）`
+        : `${model.name} · 思考力度：${reasoningEffortLabel(model)}`;
+  }
+  renderReasoningMenu();
+}
+
+function renderReasoningMenu() {
+  if (!els.reasoningMenu) return;
+  const model = selectedModel();
+  const capability = reasoningCapability(model);
+  const level = model ? reasoningLevelOf(model) : "";
+  const levelRow = (value, label) => `
+    <button class="composer-menu-item ${level === value ? "active" : ""}" data-reasoning-value="${escapeHtml(value)}" type="button" role="menuitemradio" aria-checked="${level === value}" title="${escapeHtml(label)}">
+      <span class="level-meter" data-level="${reasoningBars(value)}" aria-hidden="true"><i></i><i></i><i></i><i></i></span>
+      <span class="composer-menu-main">${escapeHtml(label)}</span>
+      <span class="check">✓</span>
+    </button>
+  `;
+  const rows = [
+    levelRow("", "模型默认"),
+    ...capability.levels.map((value) => levelRow(value, REASONING_LEVEL_META[value].label)),
+  ].join("");
+  const offRow = capability.mandatory
+    ? ""
+    : `
+    <div class="composer-menu-sep"></div>
+    <button class="composer-menu-item ${level === "off" ? "active" : ""}" data-reasoning-toggle="off" type="button" role="menuitemcheckbox" aria-checked="${level === "off"}" title="不发送思考参数">
+      <span class="level-meter" data-level="off" aria-hidden="true"><i></i><i></i><i></i><i></i></span>
+      <span class="composer-menu-main">关闭思考</span>
+      <span class="check">✓</span>
+    </button>`;
+  els.reasoningMenu.innerHTML = `
+    <div class="composer-menu-head">思考力度${model ? ` · ${escapeHtml(model.name)}` : ""}</div>
+    ${capability.supports ? rows : `<div class="composer-menu-empty">未识别到可调档位，保持模型默认</div>`}
+    ${offRow}
+  `;
+}
+
+async function applyReasoningSetting(updates, message) {
+  const model = selectedModel();
+  if (!model?.id) return;
+  try {
+    const data = await post(`/api/models/${encodeURIComponent(model.id)}`, { ...updates, name: model.name });
+    const updated = data?.model;
+    if (updated) {
+      const index = modelsCache.findIndex((m) => m.id === updated.id);
+      if (index >= 0) modelsCache[index] = { ...modelsCache[index], ...updated };
+      else modelsCache.push(updated);
+    }
+    renderModelSelector();
+    if (message) showNotice(message, "success");
+  } catch (error) {
+    showNotice(`思考力度保存失败: ${error.message || "未知错误"}`, "error");
+  }
 }
 
 function renderModelMenu() {
   if (!els.modelSelectorMenu) return;
   const models = loadModels();
   const selectedId = getSelectedModelId();
-  const items = models.map((m) => `
-    <button class="model-option ${m.id === selectedId ? "active" : ""}" data-model-id="${escapeHtml(m.id)}" type="button">
-      <span>${escapeHtml(m.name)}${m.multimodal ? " · 视觉" : ""}</span>
-      <span class="check">✓</span>
-    </button>
+  const groups = new Map();
+  models.forEach((m) => {
+    const key = String(m.provider || "其他");
+    if (!groups.has(key)) groups.set(key, []);
+    groups.get(key).push(m);
+  });
+  const modelRows = [...groups.entries()].map(([provider, items]) => `
+    <div class="composer-menu-group">${escapeHtml(provider)}</div>
+    ${items.map((m) => {
+      const badges = [
+        m.multimodal ? "视觉" : "文本",
+        reasoningEffortLabel(m) || "",
+      ].filter(Boolean);
+      return `
+        <button class="composer-menu-item model-option ${m.id === selectedId ? "active" : ""}" data-model-id="${escapeHtml(m.id)}" type="button" role="option" aria-selected="${m.id === selectedId}">
+          <span class="composer-menu-main">${escapeHtml(m.name)}</span>
+          <span class="composer-menu-badges">${badges.map((b) => `<span class="composer-badge">${escapeHtml(b)}</span>`).join("")}</span>
+          <span class="check">✓</span>
+        </button>
+      `;
+    }).join("")}
   `).join("");
-  const addButton = `
-    <button class="model-option model-option-add" data-model-action="add" type="button">
-      <span>＋ 添加模型</span>
+  els.modelSelectorMenu.innerHTML = `
+    <div class="composer-menu-head">选择模型</div>
+    <div class="model-menu-list">${modelRows || '<div class="composer-menu-empty">还没有可用模型</div>'}</div>
+    <div class="composer-menu-sep"></div>
+    <button class="composer-menu-item model-option model-option-add" data-model-action="add" type="button">
+      <span class="composer-menu-main">＋ 添加模型</span>
     </button>
   `;
-  els.modelSelectorMenu.innerHTML = items + addButton;
 }
 
-function toggleModelMenu() {
-  if (!els.modelSelectorMenu) return;
-  const hidden = els.modelSelectorMenu.hidden;
-  closeAllDropdowns();
-  els.modelSelectorMenu.hidden = !hidden;
-  els.modelSelectorMenu.closest(".model-dropdown")?.classList.toggle("open", !hidden);
+function closeComposerMenus(except = null) {
+  [
+    [els.modelSelectorMenu, els.modelDropdown, els.modelSelectorBtn],
+    [els.reasoningMenu, els.reasoningDropdown, els.reasoningBtn],
+    [els.contextPopover, els.contextDropdown, els.contextUsage],
+  ].forEach(([menu, dropdown, button]) => {
+    if (!menu || menu === except) return;
+    menu.hidden = true;
+    dropdown?.classList.remove("open");
+    button?.setAttribute("aria-expanded", "false");
+  });
 }
 
 function closeAllDropdowns() {
-  if (els.modelSelectorMenu) {
-    els.modelSelectorMenu.hidden = true;
-    els.modelSelectorMenu.closest(".model-dropdown")?.classList.remove("open");
+  closeComposerMenus();
+  if (els.sessionMenu) {
+    els.sessionMenu.hidden = true;
+    els.sessionSwitcher?.classList.remove("open");
+    els.sessionSwitcherBtn?.setAttribute("aria-expanded", "false");
   }
+}
+
+function toggleComposerMenu(menu, dropdown, button, render) {
+  if (!menu) return;
+  const willOpen = menu.hidden;
+  closeComposerMenus(willOpen ? menu : null);
+  if (willOpen && typeof render === "function") render();
+  menu.hidden = !willOpen;
+  dropdown?.classList.toggle("open", willOpen);
+  button?.setAttribute("aria-expanded", String(willOpen));
+}
+
+function toggleSessionMenu() {
+  if (!els.sessionMenu) return;
+  const willOpen = els.sessionMenu.hidden;
+  closeSessionsPanel();
+  closeComposerMenus();
+  if (willOpen) renderSessionMenu();
+  els.sessionMenu.hidden = !willOpen;
+  els.sessionSwitcher?.classList.toggle("open", willOpen);
+  els.sessionSwitcherBtn?.setAttribute("aria-expanded", String(willOpen));
+}
+
+function toggleModelMenu() {
+  toggleComposerMenu(els.modelSelectorMenu, els.modelDropdown, els.modelSelectorBtn, renderModelMenu);
+}
+
+function toggleReasoningMenu() {
+  toggleComposerMenu(els.reasoningMenu, els.reasoningDropdown, els.reasoningBtn, renderReasoningMenu);
+}
+
+function toggleContextPopover() {
+  toggleComposerMenu(els.contextPopover, els.contextDropdown, els.contextUsage, renderContextPopover);
 }
 
 function onModelChange(id) {
@@ -1868,7 +2247,7 @@ function onModelChange(id) {
   // Switching now also updates the backend default, so the selected model is
   // used consistently by planning, attachments, and subsequent turns.
   setDefaultModel(id).catch(() => {});
-  closeAllDropdowns();
+  closeComposerMenus();
 }
 
 async function saveModelToBackend(payload) {
@@ -1924,6 +2303,18 @@ if (els.modelSelectorBtn) {
     toggleModelMenu();
   });
 }
+if (els.reasoningBtn) {
+  els.reasoningBtn.addEventListener("click", (event) => {
+    event.stopPropagation();
+    toggleReasoningMenu();
+  });
+}
+if (els.contextUsage) {
+  els.contextUsage.addEventListener("click", (event) => {
+    event.stopPropagation();
+    toggleContextPopover();
+  });
+}
 
 document.addEventListener("click", (event) => {
   const option = event.target.closest(".model-option");
@@ -1931,6 +2322,7 @@ document.addEventListener("click", (event) => {
     const action = option.dataset.modelAction;
     if (action === "add") {
       event.stopPropagation();
+      closeComposerMenus();
       openModelModal();
       return;
     }
@@ -1938,9 +2330,32 @@ document.addEventListener("click", (event) => {
     if (id) onModelChange(id);
     return;
   }
-  if (!event.target.closest(".model-dropdown") && !event.target.closest("#modelModal")) {
-    closeAllDropdowns();
+  const reasoningOption = event.target.closest("[data-reasoning-value], [data-reasoning-toggle]");
+  if (reasoningOption) {
+    event.stopPropagation();
+    if (reasoningOption.dataset.reasoningToggle === "off") {
+      closeComposerMenus();
+      applyReasoningSetting({ thinking_mode: "disabled" }, "已关闭思考");
+    } else {
+      const value = reasoningOption.dataset.reasoningValue || "";
+      closeComposerMenus();
+      applyReasoningSetting(
+        { thinking_mode: value ? "enabled" : "", reasoning_effort: value },
+        value ? `思考力度已设为「${REASONING_LEVEL_META[value]?.label || value}」` : "思考力度已恢复模型默认"
+      );
+    }
+    return;
   }
+  const railTick = event.target.closest("[data-rail-message]");
+  if (railTick) {
+    event.stopPropagation();
+    jumpToChatMessage(railTick.dataset.railMessage || "");
+    return;
+  }
+  const insideOverlay = event.target.closest(
+    ".composer-dropdown, #sessionSwitcher, #sessionMenu, #modelModal"
+  );
+  if (!insideOverlay) closeAllDropdowns();
 });
 
 document.addEventListener("click", async (event) => {
@@ -1955,6 +2370,16 @@ document.addEventListener("click", async (event) => {
 
   if (action === "load") {
     await loadSession(sessionId);
+    return;
+  }
+
+  if (action === "rename") {
+    startSessionRowRename(sessionAction.closest(".session-item"));
+    return;
+  }
+
+  if (action === "load" && event.detail >= 2) {
+    startSessionRowRename(sessionAction.closest(".session-item"));
     return;
   }
 
@@ -1977,7 +2402,9 @@ async function api(path, options = {}) {
   });
   const data = await response.json();
   if (!response.ok) {
-    throw new Error(extractApiError(data, response.statusText));
+    const failure = new Error(extractApiError(data, response.statusText));
+    failure.data = data;
+    throw failure;
   }
   if (data && data.ok === false) {
     throw new Error(extractApiError(data, "request failed"));
@@ -2015,8 +2442,16 @@ function extractApiError(data, fallback = "request failed") {
 function setCommandMode(mode) {
   commandMode = mode === "execute" ? "execute" : "chat";
   localStorage.setItem("airsim-agent-command-mode", commandMode);
-  if (els.chatModeBtn) els.chatModeBtn.classList.toggle("active", commandMode === "chat");
-  if (els.executeModeBtn) els.executeModeBtn.classList.toggle("active", commandMode === "execute");
+  [
+    [els.chatModeBtn, "chat"],
+    [els.executeModeBtn, "execute"],
+  ].forEach(([button, value]) => {
+    if (!button) return;
+    const active = commandMode === value;
+    button.classList.toggle("active", active);
+    button.setAttribute("aria-checked", String(active));
+  });
+  els.commandForm?.classList.toggle("mode-execute", commandMode === "execute");
   if (els.commandInput) {
     els.commandInput.placeholder = commandMode === "execute"
       ? "Execute a flight command..."
@@ -2026,6 +2461,7 @@ function setCommandMode(mode) {
   if (submitButton) {
     submitButton.classList.toggle("execute", commandMode === "execute");
     submitButton.title = commandMode === "execute" ? "执行任务 (Enter)" : "发送聊天 (Enter)";
+    submitButton.setAttribute("aria-label", commandMode === "execute" ? "执行任务" : "发送");
   }
   syncCommandSubmitState();
 }
@@ -2166,7 +2602,6 @@ function syncCommandSubmitState() {
   submitButton.classList.toggle("execute", commandMode === "execute" && !active);
   submitButton.classList.toggle("busy", active);
   submitButton.disabled = false;
-  submitButton.textContent = active ? "" : "↑";
   submitButton.title = active
     ? "任务执行中，发送将中断当前任务"
     : (commandMode === "execute" ? "执行任务 (Enter)" : "发送聊天 (Enter)");
@@ -2422,9 +2857,11 @@ if (els.profileToggle) {
     const collapsed = els.profileToggle.dataset.collapsed !== "true";
     els.profileToggle.dataset.collapsed = String(collapsed);
     document.body.dataset.profileCollapsed = String(collapsed);
+    if (collapsed) missionProfileDrag = null;
     if (maplibreMap) maplibreMap.resize();
   });
 }
+setupMissionProfileInteraction();
 if (els.agentSettingsClose) {
   els.agentSettingsClose.addEventListener("click", () => closeAgentSettings());
 }
@@ -2599,14 +3036,65 @@ if (els.settingsBackdrop) {
   });
 }
 els.newSessionBtn.addEventListener("click", () => createSession());
-if (els.sessionNavBtn) {
-  els.sessionNavBtn.addEventListener("click", () => {
-    if (els.sessionsPanel.classList.contains("is-open")) closeSessionsPanel();
-    else openSessionsPanel();
+if (els.sessionsNewBtn) els.sessionsNewBtn.addEventListener("click", () => createSession());
+if (els.sessionSwitcherBtn) {
+  els.sessionSwitcherBtn.addEventListener("click", (event) => {
+    event.stopPropagation();
+    if (renamingSession) return;
+    toggleSessionMenu();
   });
 }
+if (els.chatRail) {
+  // 悬浮即时显示记录预览（自绘卡片，不受原生 title 的 ~1s 延迟影响）
+  els.chatRail.addEventListener("mouseover", (event) => {
+    const tick = event.target.closest(".rail-tick");
+    if (tick) showRailTip(tick);
+  });
+  els.chatRail.addEventListener("mouseleave", () => hideRailTip());
+  els.chatRail.addEventListener("focusin", (event) => {
+    const tick = event.target.closest(".rail-tick");
+    if (tick) showRailTip(tick);
+  });
+  els.chatRail.addEventListener("focusout", () => hideRailTip());
+  els.chatRail.addEventListener("scroll", () => hideRailTip(), { passive: true });
+}
 if (els.currentSessionLabel) {
-  els.currentSessionLabel.addEventListener("dblclick", startHeaderSessionRename);
+  els.currentSessionLabel.addEventListener("dblclick", (event) => {
+    event.preventDefault();
+    event.stopPropagation();
+    startHeaderSessionRename();
+  });
+}
+if (els.sessionMenu) {
+  els.sessionMenu.addEventListener("input", (event) => {
+    if (event.target.id !== "sessionMenuSearch") return;
+    setSessionFilter(event.target.value);
+    // 重新渲染会重建搜索框，把光标放回末尾，避免连续输入掉字
+    const search = document.getElementById("sessionMenuSearch");
+    if (search) {
+      search.focus();
+      if (typeof search.setSelectionRange === "function") {
+        const end = search.value.length;
+        search.setSelectionRange(end, end);
+      }
+    }
+  });
+  els.sessionMenu.addEventListener("click", (event) => {
+    const action = event.target.closest("[data-session-menu]")?.dataset.sessionMenu;
+    if (!action) return;
+    event.stopPropagation();
+    if (action === "new") {
+      createSession();
+      return;
+    }
+    if (action === "all") {
+      closeAllDropdowns();
+      openSessionsPanel();
+    }
+  });
+}
+if (els.sessionsSearch) {
+  els.sessionsSearch.addEventListener("input", () => setSessionFilter(els.sessionsSearch.value));
 }
 els.addModelBtn.addEventListener("click", () => openModelModal());
 if (els.modelModalClose) els.modelModalClose.addEventListener("click", closeModelModal);
@@ -2631,6 +3119,52 @@ if (els.modelRevealKey) {
     }
   });
 }
+// 向厂商要"当前实际有哪些模型"：模型命名会随版本变（DeepSeek 就把
+// deepseek-chat/reasoner 换成了 deepseek-v4-*），所以以官方目录为准。
+async function fetchProviderModelList() {
+  const btn = els.fetchModelListBtn;
+  const hint = els.providerModelHint;
+  const baseUrl = els.modelBaseUrl.value.trim();
+  const apiKey = els.modelApiKey.value.trim();
+  if (!baseUrl) {
+    showNotice("先填 Base URL，再拉取厂商模型列表", "error");
+    return;
+  }
+  if (btn) { btn.disabled = true; btn.textContent = "拉取中..."; }
+  if (hint) hint.textContent = "正在读取厂商模型目录...";
+  try {
+    const data = await post("/api/models/catalog", {
+      base_url: baseUrl,
+      api_type: els.modelApiType.value,
+      api_key: apiKey,
+    });
+    const models = Array.isArray(data.models) ? data.models : [];
+    if (els.providerModelOptions) {
+      els.providerModelOptions.innerHTML = models
+        .map((m) => `<option value="${escapeHtml(m.id)}">${escapeHtml([m.id, m.context_length ? `${Math.round(m.context_length / 1000)}k` : "", (m.reasoning_levels || []).length ? `思考 ${m.reasoning_levels.join("/")}` : ""].filter(Boolean).join(" · "))}</option>`)
+        .join("");
+    }
+    if (hint) {
+      hint.textContent = models.length
+        ? `已从厂商目录读到 ${models.length} 个模型，输入框下拉可直接选（如 ${models.slice(0, 3).map((m) => m.id).join("、")}${models.length > 3 ? " …" : ""}）`
+        : "厂商目录里没有模型，请检查 Base URL 与 API Key。";
+    }
+    if (models.length && !els.modelModelId.value.trim()) {
+      els.modelModelId.value = models[0].id;
+      if (!els.modelName.value.trim()) els.modelName.value = els.modelName.placeholder ? models[0].id : els.modelName.value;
+    }
+    showNotice(models.length ? `读到 ${models.length} 个可用模型` : "厂商目录为空", models.length ? "success" : "error");
+  } catch (error) {
+    const detail = String(error?.data?.message || error?.message || "").trim();
+    if (hint) hint.textContent = detail || "读取厂商目录失败，可手动填写模型 ID";
+    showNotice(detail || "读取厂商目录失败", "error");
+  } finally {
+    if (btn) { btn.disabled = false; btn.textContent = "拉取模型列表"; }
+  }
+}
+
+if (els.fetchModelListBtn) els.fetchModelListBtn.addEventListener("click", () => fetchProviderModelList());
+
 if (els.modelForm) {
   els.modelForm.addEventListener("submit", async (event) => {
     event.preventDefault();
@@ -2638,21 +3172,37 @@ if (els.modelForm) {
   });
 }
 
+if (els.eventList) {
+  els.eventList.addEventListener("click", (event) => {
+    const filter = event.target.closest("[data-event-level]");
+    if (filter) {
+      eventLevelFilter = filter.dataset.eventLevel || "all";
+      renderEvents(latestState?.events || []);
+      return;
+    }
+    const item = event.target.closest("[data-event-details]");
+    const details = item?.querySelector(".event-data");
+    if (details) details.hidden = !details.hidden;
+  });
+}
+
 if (els.skillList) {
+  els.skillList.addEventListener("input", (event) => {
+    if (event.target.id === "skillSearchInput") setSkillFilter(event.target.value);
+  });
   els.skillList.addEventListener("click", (event) => {
-    const item = event.target.closest("[data-skill-id]");
-    if (!item) return;
-    openSkillModal(item.dataset.skillId);
+    const actionEl = event.target.closest("[data-skill-action]");
+    if (!actionEl) return;
+    const item = actionEl.closest("[data-skill-id]");
+    const skill = item ? skillsCache.find((s) => (s.id || s.name) === item.dataset.skillId) : null;
+    const action = actionEl.dataset.skillAction;
+    if (!skill) return;
+    event.stopPropagation();
+    if (action === "toggle") toggleSkillEnabled(skill);
+    else if (action === "duplicate") duplicateSkill(skill);
+    else if (action === "delete") deleteSkill(skill);
   });
 }
-if (els.skillModalClose) els.skillModalClose.addEventListener("click", closeSkillModal);
-if (els.skillForm) {
-  els.skillForm.addEventListener("submit", async (event) => {
-    event.preventDefault();
-    await submitSkillForm();
-  });
-}
-if (els.addSkillBtn) els.addSkillBtn.addEventListener("click", openNewSkillModal);
 if (els.importSkillBtn && els.skillImportInput) {
   els.importSkillBtn.addEventListener("click", () => els.skillImportInput.click());
   els.skillImportInput.addEventListener("change", async () => {
@@ -3132,12 +3682,7 @@ function applyMapLayer(key) {
 // 注册航点序号 sprite 1-50（canvas 2D 绘制圆+数字，ImageData 同步注册，无 CORS/字体依赖）
 // 分帧生成：先立即生成前 20 个，避免阻塞首帧/首次点击。
 function registerWaypointSprites(map, immediateLimit = 20, total = 50) {
-  const TYPE_COLORS = {
-    waypoint: "#55dff4",
-    takeoff: "#4ee6a4",
-    land: "#f0b84a",
-    rtl: "#ff5b6e",
-  };
+  const TYPE_COLORS = WAYPOINT_TYPE_COLORS;
   const SIZE = 32;
   const draw = (n, color, selected) => {
     const canvas = document.createElement("canvas");
@@ -3560,6 +4105,7 @@ function addWaypointFromMap(latlng) {
     return;
   }
   const index = missionWaypoints.length;
+  const defaults = missionDefaults();
   const alt = currentDefaultAltitude();
   const item = {
     id: `wp_${String(index + 1).padStart(3, "0")}`,
@@ -3568,9 +4114,9 @@ function addWaypointFromMap(latlng) {
     lat: round6(latlng.lat),
     lon: round6(latlng.lng),
     alt_m: alt,
-    speed_mps: 2,
-    hold_s: 0,
-    acceptance_radius_m: 2,
+    speed_mps: defaults.speed,
+    hold_s: defaults.hold,
+    acceptance_radius_m: defaults.acceptance,
     actions: [],
     metadata: { source: "ui_map_click" },
   };
@@ -3587,11 +4133,22 @@ function addWaypointFromMap(latlng) {
   drawMissionPath();
 }
 
+// 任务默认值（设置 → 任务默认值），对新建航点与自动起飞统一生效
+function missionDefaults() {
+  const m = applicationSettings?.mission || {};
+  return {
+    altitude: Math.max(0.5, Number(m.default_altitude_m) || 3),
+    speed: Math.max(0.2, Number(m.default_speed_mps) || 2),
+    hold: Math.max(0, Number(m.default_hold_s) || 0),
+    acceptance: Math.max(0.5, Number(m.default_acceptance_radius_m) || 2),
+  };
+}
+
 function currentDefaultAltitude() {
   const drone = latestState?.tool_runtime?.drone || {};
   const z = Number(drone.position_ned?.z || 0);
   if (z < -0.8) return Math.abs(z);
-  return 3;
+  return missionDefaults().altitude;
 }
 
 function activeFlightRuntime() {
@@ -3693,7 +4250,8 @@ function resetActiveTargetProgress() {
 
 function buildLocalMissionItems(route = missionWaypoints) {
   const items = [];
-  const firstAltitude = Math.max(0.5, Number(route[0]?.alt_m || 3));
+  const defaults = missionDefaults();
+  const firstAltitude = Math.max(0.5, Number(route[0]?.alt_m || defaults.altitude));
   const drone = latestState?.tool_runtime?.drone || {};
   const droneHome = currentDroneGeo(drone);
   const hasTakeoff = route.some((wp) => wp.type === "takeoff");
@@ -3710,9 +4268,9 @@ function buildLocalMissionItems(route = missionWaypoints) {
       y: 0,
       z: -firstAltitude,
       alt_m: firstAltitude,
-      speed_mps: Number(route[0]?.speed_mps || 2),
+      speed_mps: Number(route[0]?.speed_mps || defaults.speed),
       hold_s: 0,
-      acceptance_radius_m: 2,
+      acceptance_radius_m: defaults.acceptance,
       actions: [],
       metadata: { source: "ui_auto_takeoff" },
     });
@@ -3725,13 +4283,13 @@ function buildLocalMissionItems(route = missionWaypoints) {
       frame: wp.frame || (isPx4MavlinkBackend() ? "global_relative_alt" : "local_ned"),
       lat: wp.lat,
       lon: wp.lon,
-      alt_m: Math.max(0.5, Number(wp.alt_m || 3)),
+      alt_m: Math.max(0.5, Number(wp.alt_m ?? defaults.altitude)),
       x: wp.x,
       y: wp.y,
       z: wp.z,
-      speed_mps: Number(wp.speed_mps || 2),
-      hold_s: Number(wp.hold_s || 0),
-      acceptance_radius_m: Number(wp.acceptance_radius_m || 2),
+      speed_mps: Number(wp.speed_mps ?? defaults.speed),
+      hold_s: Number(wp.hold_s ?? defaults.hold),
+      acceptance_radius_m: Number(wp.acceptance_radius_m ?? defaults.acceptance),
       actions: Array.isArray(wp.actions) ? wp.actions : [],
       metadata: wp.metadata || { source: "ui_waypoint_panel" },
     });
@@ -3996,6 +4554,7 @@ function render(state) {
   renderTopbar(run, toolRuntime, supervisor, llm);
   renderOperationContract(toolRuntime);
   renderContextUsage(state.memory || {});
+  syncComposerDensity();
   renderTelemetry(drone, toolRuntime);
   renderPlan(run);
   renderTaskRuns(state.task_runs || state.memory?.task_runs || {});
@@ -4040,21 +4599,87 @@ function renderOperationContract(toolRuntime) {
   });
 }
 
-function renderContextUsage(memory) {
-  if (!els.contextUsage) return;
+function contextUsageData(memory) {
   const usage = memory?.conversation || {};
-  const percent = Number(usage.context_percent);
+  const percentRaw = Number(usage.context_percent);
   const used = Number(usage.estimated_context_tokens);
   const total = Number(usage.context_window);
+  const hasNumbers = Number.isFinite(used) && Number.isFinite(total) && total > 0;
+  return {
+    usage,
+    percent: Number.isFinite(percentRaw) ? percentRaw : null,
+    used: hasNumbers ? used : null,
+    total: hasNumbers ? total : null,
+    remaining: hasNumbers ? Math.max(0, total - used) : null,
+    modelId: String(usage.model_id || ""),
+    messagesSent: Number(usage.messages_sent_to_model),
+    messagesSaved: Number(usage.messages_saved),
+  };
+}
+
+function formatTokens(value) {
+  if (!Number.isFinite(value)) return "--";
+  if (value >= 1_000_000) return `${(value / 1_000_000).toFixed(2)}M`;
+  if (value >= 10_000) return `${(value / 1000).toFixed(1)}k`;
+  return value.toLocaleString();
+}
+
+function renderContextPopover() {
+  if (!els.contextPopover) return;
+  const data = contextUsageData(latestState?.memory);
+  const pctText = data.percent == null ? "--" : `${data.percent.toFixed(data.percent >= 10 ? 0 : 1)}%`;
+  const rows = [
+    ["已用上下文", data.used == null ? "--" : `${formatTokens(data.used)} tokens`],
+    ["模型窗口", data.total == null ? "--" : `${formatTokens(data.total)} tokens`],
+    ["剩余空间", data.remaining == null ? "--" : `${formatTokens(data.remaining)} tokens`],
+    ["发送给模型", Number.isFinite(data.messagesSent) ? `${data.messagesSent} 条消息` : "--"],
+    ["会话已保存", Number.isFinite(data.messagesSaved) ? `${data.messagesSaved} 条消息` : "--"],
+    ["计量模型", data.modelId || "--"],
+  ];
+  const level = data.percent == null ? "" : data.percent >= 90 ? "danger" : data.percent >= 70 ? "warn" : "ok";
+  const barWidth = data.percent == null ? 0 : Math.max(1, Math.min(100, data.percent));
+  els.contextPopover.innerHTML = `
+    <div class="composer-menu-head">上下文用量</div>
+    <div class="context-meter ${level}">
+      <div class="context-meter-bar"><span style="width:${barWidth}%"></span></div>
+      <div class="context-meter-value">${escapeHtml(pctText)}</div>
+    </div>
+    <div class="context-rows">
+      ${rows.map(([label, value]) => `<div class="context-row"><span>${escapeHtml(label)}</span><b>${escapeHtml(String(value))}</b></div>`).join("")}
+    </div>
+    <div class="composer-menu-foot">${
+      data.percent == null
+        ? "等待模型上下文统计。"
+        : data.percent >= 90
+          ? "接近上限：Agent 会压缩较早的历史，完整会话仍会保存。"
+          : "超出窗口后 Agent 会压缩较早的历史，完整会话仍会保存在会话文件里。"
+    }</div>
+  `;
+}
+
+function renderContextUsage(memory) {
+  if (!els.contextUsage) return;
+  const data = contextUsageData(memory ?? latestState?.memory);
   const visible = applicationSettings.agent.show_context_usage !== false;
   els.contextUsage.hidden = !visible;
   if (!visible) return;
-  els.contextUsage.textContent = Number.isFinite(percent) ? `CTX ${percent.toFixed(percent >= 10 ? 0 : 1)}%` : "CTX --";
-  els.contextUsage.title = Number.isFinite(used) && Number.isFinite(total)
-    ? `本次模型上下文估算 ${used.toLocaleString()} / ${total.toLocaleString()} tokens；完整会话仍会保存`
-    : "等待模型上下文统计";
-  els.contextUsage.classList.toggle("warn", percent >= 70 && percent < 90);
-  els.contextUsage.classList.toggle("danger", percent >= 90);
+  const pctText = data.percent == null ? "--" : `${data.percent.toFixed(data.percent >= 10 ? 0 : 1)}%`;
+  els.contextUsage.textContent = "◔";
+  els.contextUsage.title = data.used == null
+    ? "等待模型上下文统计"
+    : `上下文 ${data.used.toLocaleString()} / ${data.total.toLocaleString()} tokens（${pctText}）· 点击查看明细`;
+  els.contextUsage.classList.toggle("warn", data.percent >= 70 && data.percent < 90);
+  els.contextUsage.classList.toggle("danger", data.percent >= 90);
+  if (els.contextPopover && !els.contextPopover.hidden) renderContextPopover();
+}
+
+// 窄面板压缩：不换行，改为收缩/隐藏文字（按面板宽度切换 compact/tight）
+function syncComposerDensity() {
+  const panel = document.getElementById("agentColumn");
+  if (!panel) return;
+  const w = panel.getBoundingClientRect().width;
+  panel.classList.toggle("compact", w < 460);
+  panel.classList.toggle("tight", w < 380);
 }
 
 function renderApprovalDialog(run, pendingApprovals) {
@@ -4127,36 +4752,88 @@ async function rejectRun(runId) {
   }
 }
 
-function renderSessions(sessions, currentSession) {
-  if (!els.sessionsList) return;
-  const currentId = currentSession?.id || "";
-  if (!sessions.length) {
-    els.sessionsList.innerHTML = `<div class="empty">暂无会话</div>`;
-    return;
-  }
-  els.sessionsList.innerHTML = sessions.map((s) => {
-    const isActive = s.id === currentId;
-    const timeText = formatSessionTime(s.updated_at || s.created_at);
-    return `
-      <div class="session-item ${isActive ? "active" : ""}" data-session-id="${escapeHtml(s.id)}" data-session-action="load">
-        <div class="session-name">${escapeHtml(s.name || "未命名对话")}</div>
-        <div class="session-meta">
-          <span>${timeText}</span>
-          <span>${s.message_count || 0} 条消息</span>
-        </div>
-        <div class="session-actions" data-stop-propagation>
-          <button data-session-id="${escapeHtml(s.id)}" data-session-action="export" data-session-format="markdown" title="导出完整会话">↓</button>
-          <button class="delete-session" data-session-id="${escapeHtml(s.id)}" data-session-action="delete" title="删除">×</button>
-        </div>
+let sessionFilter = "";
+let renamingSession = false;
+
+function filteredSessions(sessions) {
+  const term = sessionFilter.trim().toLowerCase();
+  if (!term) return sessions;
+  return sessions.filter((s) => String(s.name || "").toLowerCase().includes(term));
+}
+
+function setSessionFilter(value) {
+  sessionFilter = String(value ?? "");
+  renderSessions(latestState?.sessions || [], latestState?.current_session);
+}
+
+function sessionRowHtml(session, currentId) {
+  const isActive = session.id === currentId;
+  const timeText = formatSessionTime(session.updated_at || session.created_at);
+  const count = Number(session.message_count || 0);
+  const inputs = Number(session.input_count ?? 0);
+  const counts = inputs
+    ? `${inputs} 条输入 · ${count} 条消息`
+    : `${count} 条消息`;
+  return `
+    <div class="session-item ${isActive ? "active" : ""}" data-session-id="${escapeHtml(session.id)}" data-session-action="load" role="button" tabindex="0" title="${escapeHtml(session.name || "未命名对话")}（双击改名）">
+      <div class="session-name">${escapeHtml(session.name || "未命名对话")}</div>
+      <div class="session-meta">
+        <span>${timeText}</span>
+        <span>${counts}</span>
       </div>
-    `;
-  }).join("");
+      <div class="session-actions" data-stop-propagation>
+        <button data-session-id="${escapeHtml(session.id)}" data-session-action="rename" title="重命名" aria-label="重命名会话">✎</button>
+        <button data-session-id="${escapeHtml(session.id)}" data-session-action="export" data-session-format="markdown" title="导出完整会话" aria-label="导出会话">
+          <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 3v12"/><path d="M7 10l5 5 5-5"/><path d="M4 21h16"/></svg>
+        </button>
+        <button class="delete-session" data-session-id="${escapeHtml(session.id)}" data-session-action="delete" title="删除会话" aria-label="删除会话">
+          <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><polyline points="3 6 5 6 21 6"/><path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"/></svg>
+        </button>
+      </div>
+    </div>
+  `;
+}
+
+function renderSessions(sessions, currentSession) {
+  const currentId = currentSession?.id || "";
+  const list = Array.isArray(sessions) ? sessions : [];
+  if (els.sessionsList) {
+    const visible = filteredSessions(list);
+    els.sessionsList.innerHTML = visible.length
+      ? visible.map((s) => sessionRowHtml(s, currentId)).join("")
+      : `<div class="empty">${list.length ? "没有匹配的会话" : "暂无会话"}</div>`;
+  }
+  renderSessionMenu(list, currentId);
+}
+
+// Agent 面板顶部的会话下拉：直接切换 / 删除 / 新建，不必先返回会话列表
+function renderSessionMenu(sessions, currentId) {
+  if (!els.sessionMenu) return;
+  const list = Array.isArray(sessions) ? sessions : (latestState?.sessions || []);
+  const activeId = currentId ?? (latestState?.current_session?.id || "");
+  const visible = filteredSessions(list);
+  const rows = visible.length
+    ? visible.map((s) => sessionRowHtml(s, activeId)).join("")
+    : `<div class="composer-menu-empty">${list.length ? "没有匹配的会话" : "还没有会话"}</div>`;
+  els.sessionMenu.innerHTML = `
+    <label class="session-menu-search">
+      <input id="sessionMenuSearch" type="search" placeholder="搜索会话" autocomplete="off" value="${escapeHtml(sessionFilter)}">
+    </label>
+    <div class="session-menu-list">${rows}</div>
+    <div class="composer-menu-sep"></div>
+    <button class="composer-menu-item" data-session-menu="new" type="button">
+      <span class="composer-menu-main">＋ 新建会话</span>
+    </button>
+    <button class="composer-menu-item" data-session-menu="all" type="button">
+      <span class="composer-menu-main">全部会话</span>
+    </button>
+  `;
 }
 
 function renderCurrentSessionLabel(currentSession) {
   if (!els.currentSessionLabel) return;
-  els.currentSessionLabel.textContent = currentSession?.name || "";
-  els.currentSessionLabel.title = currentSession?.name || "";
+  els.currentSessionLabel.textContent = currentSession?.name || "未命名对话";
+  els.currentSessionLabel.title = `${currentSession?.name || "未命名对话"}（双击重命名，点击切换会话）`;
 }
 
 function startHeaderSessionRename() {
@@ -4165,17 +4842,21 @@ function startHeaderSessionRename() {
   const sessionId = currentSession.id;
   const span = els.currentSessionLabel;
   const currentName = span.textContent;
+  closeSessionsOverlays();
+  renamingSession = true;
   span.hidden = true;
 
   const input = document.createElement("input");
   input.type = "text";
   input.className = "current-session-input";
   input.value = currentName;
-  span.parentNode.insertBefore(input, span.nextSibling);
+  // 放进 header-left 而不是按钮内部：输入框嵌在 button 里会把点击都变成"切换会话"
+  (els.sessionSwitcher?.parentNode || span.parentNode).insertBefore(input, els.sessionSwitcher || span);
   input.focus();
   input.select();
 
   const cleanup = () => {
+    renamingSession = false;
     input.remove();
     span.hidden = false;
   };
@@ -4187,6 +4868,7 @@ function startHeaderSessionRename() {
       span.title = newName;
       cleanup();
       await renameSession(sessionId, newName);
+      await refresh().catch(() => {});
     } else {
       span.textContent = currentName;
       span.title = currentName;
@@ -4216,23 +4898,19 @@ function formatSessionTime(ts) {
 
 function syncHeader() {
   const listOpen = els.sessionsPanel?.classList.contains("is-open") ?? false;
-  if (els.sessionNavBtn) {
-    if (listOpen) {
-      els.sessionNavBtn.hidden = true;
-    } else {
-      els.sessionNavBtn.hidden = false;
-      els.sessionNavBtn.textContent = "←";
-      els.sessionNavBtn.title = "返回会话列表";
-    }
+  if (els.sessionSwitcher) els.sessionSwitcher.hidden = listOpen;
+  if (els.chatRail) {
+    els.chatRail.hidden = listOpen || Number(els.chatRail.dataset?.count || 0) < 2;
   }
-  if (els.currentSessionLabel) els.currentSessionLabel.hidden = listOpen;
 }
 
 function openSessionsPanel() {
   if (!els.sessionsPanel) return;
+  closeSessionsOverlays();
   els.sessionsPanel.classList.add("is-open");
   els.sessionsPanel.hidden = false;
   els.agentColumn?.classList.add("sessions-open");
+  if (els.sessionsSearch) els.sessionsSearch.value = sessionFilter;
   syncHeader();
 }
 
@@ -4244,6 +4922,136 @@ function closeSessionsPanel() {
   syncHeader();
 }
 
+// 收起会话面板、会话下拉与各类浮层：切换/新建/删除会话后统一走这里
+function closeSessionsOverlays() {
+  closeSessionsPanel();
+  closeAllDropdowns();
+  hideRailTip();
+}
+
+// ── 输入记录导航条：贴在对话区左侧，一横杆 = 一条用户输入，点击跳转 ──
+function railEntries(messages) {
+  return (messages || [])
+    .filter((message) => message?.role === "user" && message.id)
+    .map((message, index) => ({
+      id: message.id,
+      index: index + 1,
+      text: String(message.content || ""),
+      time: formatSessionTime(message.created_at),
+    }));
+}
+
+function renderChatRail(messages) {
+  const rail = els.chatRail;
+  if (!rail) return;
+  const entries = railEntries(messages);
+  // 可见性判据只在这里维护，syncHeader 读 dataset.count，避免两处规则不一致
+  rail.dataset.count = String(entries.length);
+  hideRailTip();
+  if (entries.length < 2) {
+    rail.hidden = true;
+    rail.innerHTML = "";
+    return;
+  }
+  rail.innerHTML = entries.map((entry) => {
+    // 预览文字放进 dataset 交给自绘悬浮卡片，避免原生 title 约 1s 的延迟
+    const preview = entry.text.length > 320 ? `${entry.text.slice(0, 320)}…` : entry.text;
+    return `<button type="button" class="rail-tick" data-rail-message="${escapeHtml(entry.id)}" data-rail-index="${entry.index}" data-rail-time="${escapeHtml(entry.time)}" data-rail-text="${escapeHtml(preview || "(空输入)")}" aria-label="${escapeHtml(`跳到第 ${entry.index} 条输入`)}"></button>`;
+  }).join("");
+  rail.hidden = false;
+  syncChatRailActive();
+}
+
+function showRailTip(tick) {
+  const tip = els.railTip;
+  if (!tip || !tick) return;
+  const area = els.chatArea;
+  const rail = els.chatRail;
+  if (!area || !rail) return;
+  const timeText = String(tick.dataset.railTime || "");
+  const total = Number(els.chatRail?.dataset?.count || 0);
+  const totalText = total ? ` / 共 ${total} 条` : "";
+  tip.innerHTML = `
+    <span class="rail-tip-index">第 ${escapeHtml(tick.dataset.railIndex || "?")} 条输入${totalText}${timeText ? ` · ${escapeHtml(timeText)}` : ""}</span>
+    <span class="rail-tip-text">${escapeHtml(tick.dataset.railText || "")}</span>
+  `;
+  tip.hidden = false;
+  const areaBox = area.getBoundingClientRect();
+  const railBox = rail.getBoundingClientRect();
+  const tickBox = tick.getBoundingClientRect();
+  const top = Math.min(
+    Math.max(tickBox.top + tickBox.height / 2 - tip.offsetHeight / 2 - areaBox.top, 4),
+    Math.max(4, areaBox.height - tip.offsetHeight - 4)
+  );
+  tip.style.left = `${railBox.right - areaBox.left + 6}px`;
+  tip.style.top = `${top}px`;
+}
+
+function hideRailTip() {
+  if (els.railTip) els.railTip.hidden = true;
+}
+
+let railSyncRaf = 0;
+function syncChatRailActive() {
+  const rail = els.chatRail;
+  if (!rail || rail.hidden || railSyncRaf) return;
+  railSyncRaf = window.requestAnimationFrame(() => {
+    railSyncRaf = 0;
+    const thread = els.chatThread;
+    if (!thread) return;
+    const box = thread.getBoundingClientRect();
+    const center = box.top + box.height / 2;
+    let bestId = "";
+    let bestDistance = Infinity;
+    thread.querySelectorAll("[data-message-id]").forEach((node) => {
+      const id = node.getAttribute("data-message-id") || "";
+      if (!rail.querySelector(`[data-rail-message="${cssEscape(id)}"]`)) return;
+      const rect = node.getBoundingClientRect();
+      const distance = Math.abs((rect.top + rect.height / 2) - center);
+      if (distance < bestDistance) {
+        bestDistance = distance;
+        bestId = id;
+      }
+    });
+    rail.querySelectorAll(".rail-tick").forEach((tick) => {
+      tick.classList.toggle("active", tick.dataset.railMessage === bestId);
+    });
+    // 全部记录都在导航条里，把当前条滚进可视区域；鼠标停在导航条上时不抢滚动位置
+    const activeTick = rail.querySelector(".rail-tick.active");
+    if (activeTick && !(rail.matches && rail.matches(":hover"))) {
+      const target = activeTick.offsetTop - rail.clientHeight / 2 + activeTick.offsetHeight / 2;
+      rail.scrollTop = Math.max(0, target);
+    }
+  });
+}
+
+function cssEscape(value) {
+  if (window.CSS?.escape) return window.CSS.escape(String(value));
+  return String(value).replace(/["\\]/g, "\\$&");
+}
+
+async function jumpToChatMessage(messageId) {
+  if (!messageId || !els.chatThread) return;
+  const found = () => [...els.chatThread.querySelectorAll("[data-message-id]")]
+    .some((item) => item.getAttribute("data-message-id") === messageId);
+  if (!found()) {
+    // 该会话可能只渲染了最近消息：先把完整历史拉回来再定位
+    await loadCurrentSessionHistory(true).catch(() => {});
+  }
+  scrollMessageIntoView(messageId);
+  requestAnimationFrame(() => {
+    const target = [...els.chatThread.querySelectorAll("[data-message-id]")]
+      .find((item) => item.getAttribute("data-message-id") === messageId);
+    if (!target) return;
+    target.classList.remove("chat-jump-highlight");
+    // 强制重排以便连续点击同一项时动画能重放
+    void target.offsetWidth;
+    target.classList.add("chat-jump-highlight");
+    window.setTimeout(() => target.classList.remove("chat-jump-highlight"), 1600);
+    syncChatRailActive();
+  });
+}
+
 function backendDisplayName(toolRuntime = {}) {
   const profile = toolRuntime.backend_profile || {};
   return profile.name || profile.id || toolRuntime.backend || "Vehicle backend";
@@ -4252,14 +5060,17 @@ function backendDisplayName(toolRuntime = {}) {
 async function createSession() {
   try {
     await post("/api/sessions", { name: "新对话" });
-    closeSessionsPanel();
+    closeSessionsOverlays();
     showNotice("新会话已创建", "success");
+    await refresh().catch(() => {});
   } catch (error) {
     showNotice(error.message || "创建会话失败", "error");
   }
 }
 
 async function loadSession(sessionId) {
+  // 立刻给反馈：大会话渲染要花时间，先把对话区压暗，避免看起来"点了没反应"
+  setChatSwitching(true);
   try {
     const result = await post(`/api/sessions/${encodeURIComponent(sessionId)}/load`, {});
     const messages = Array.isArray(result?.session?.messages) ? result.session.messages : [];
@@ -4270,11 +5081,25 @@ async function loadSession(sessionId) {
       forceNextChatScroll = true;
       render(latestState);
     }
-    closeSessionsPanel();
+    closeSessionsOverlays();
     showNotice("会话已切换", "info");
   } catch (error) {
     showNotice(error.message || "切换会话失败", "error");
+  } finally {
+    setChatSwitching(false);
   }
+}
+
+function setChatSwitching(switching) {
+  const thread = els.chatThread;
+  if (!thread) return;
+  if (switching) {
+    thread.classList.add("is-switching");
+    return;
+  }
+  thread.classList.remove("is-switching");
+  thread.classList.add("just-switched");
+  window.setTimeout(() => thread.classList.remove("just-switched"), 260);
 }
 
 function mergeSessionMessages(completeMessages, recentMessages) {
@@ -4320,6 +5145,42 @@ async function loadCurrentSessionHistory(force = false) {
   }
 }
 
+// 行内改名：把名字换成输入框，回车保存、Esc 取消（列表/下拉共用）
+function startSessionRowRename(row) {
+  if (!row || row.querySelector(".session-edit")) return;
+  const sessionId = row.dataset.sessionId || "";
+  const nameEl = row.querySelector(".session-name");
+  if (!sessionId || !nameEl) return;
+  const currentName = nameEl.textContent;
+  const input = document.createElement("input");
+  input.type = "text";
+  input.className = "session-edit";
+  input.value = currentName;
+  nameEl.hidden = true;
+  nameEl.parentNode.insertBefore(input, nameEl);
+  input.focus();
+  input.select();
+  let done = false;
+  const finish = async (save) => {
+    if (done) return;
+    done = true;
+    const next = input.value.trim();
+    input.remove();
+    nameEl.hidden = false;
+    if (!save || !next || next === currentName) return;
+    nameEl.textContent = next;
+    await renameSession(sessionId, next);
+    await refresh().catch(() => {});
+  };
+  input.addEventListener("click", (event) => event.stopPropagation());
+  input.addEventListener("blur", () => finish(true));
+  input.addEventListener("keydown", (event) => {
+    event.stopPropagation();
+    if (event.key === "Enter") input.blur();
+    else if (event.key === "Escape") finish(false);
+  });
+}
+
 async function renameSession(sessionId, name) {
   try {
     await post(`/api/sessions/${encodeURIComponent(sessionId)}/rename`, { name });
@@ -4329,9 +5190,24 @@ async function renameSession(sessionId, name) {
 }
 
 async function deleteSession(sessionId) {
+  const session = (latestState?.sessions || []).find((s) => s.id === sessionId);
+  const name = session?.name || "该会话";
+  const confirmed = await confirmDialog({
+    title: `删除会话「${name}」`,
+    message: "会话消息将从磁盘移除，无法恢复。",
+    confirmLabel: "删除",
+    danger: true,
+  });
+  if (!confirmed) return;
   try {
-    await post(`/api/sessions/${encodeURIComponent(sessionId)}/delete`, {});
+    const result = await post(`/api/sessions/${encodeURIComponent(sessionId)}/delete`, {});
     showNotice("会话已删除", "info");
+    if (result?.session) {
+      // 删的是当前会话：后端会切到另一个会话，按最新状态重画
+      const messages = Array.isArray(result.session.messages) ? result.session.messages : [];
+      fullSessionMessageCache.set(result.session.id, messages);
+    }
+    await refresh().catch(() => {});
   } catch (error) {
     showNotice(error.message || "删除会话失败", "error");
   }
@@ -4685,67 +5561,145 @@ function humanRunStatus(status) {
     responding: "汇总中",
     awaiting_approval: "待确认",
     paused: "暂停",
+    interrupted: "已中断",
   };
-  return labels[status] || status || "未知";
+  return labels[String(status || "").toLowerCase()] || status || "未知";
+}
+
+// 审计日志：说清"什么时候该看它"，并按级别过滤 + 人话标签
+const EVENT_LEVEL_LABELS = { error: "错误", warning: "警告", info: "信息" };
+const EVENT_SOURCE_LABELS = {
+  tool: "工具",
+  llm: "模型",
+  system: "系统",
+  agent: "Agent",
+  planner: "规划",
+  safety: "安全",
+  runtime: "运行时",
+  ui: "界面",
+};
+let eventLevelFilter = "all";
+
+function eventSourceLabel(source) {
+  const key = String(source || "").toLowerCase();
+  return EVENT_SOURCE_LABELS[key] || String(source || "系统");
+}
+
+function renderEvents(events) {
+  if (!els.eventList) return;
+  const all = [...(events || [])].slice(-120).reverse();
+  if (!all.length) {
+    els.eventList.innerHTML = `
+      <div class="panel-intro">
+        <p>这里记录运行过程中的关键动作与异常：路由怎么选的、调了哪些工具、审批与校验结果、报错原因。</p>
+        <p><strong>什么时候看它：</strong>任务没按预期执行、或想知道 Agent 到底做了什么的时候，从上往下找第一条<em>错误</em>或<em>警告</em>。</p>
+      </div>
+      <div class="empty small">任务开始后这里会出现事件流水。</div>`;
+    return;
+  }
+  const counts = { all: all.length, error: 0, warning: 0, info: 0 };
+  all.forEach((event) => {
+    const level = String(event.level || "info");
+    counts[level] = (counts[level] || 0) + 1;
+  });
+  const visible = eventLevelFilter === "all" ? all : all.filter((e) => String(e.level || "info") === eventLevelFilter);
+
+  // 连续重复的事件折叠计数，避免"同一句刷屏"淹没真正的问题
+  const collapsed = [];
+  visible.forEach((event) => {
+    const key = `${event.level}|${event.source}|${event.message}`;
+    const last = collapsed[collapsed.length - 1];
+    if (last && last.key === key) {
+      last.count += 1;
+      return;
+    }
+    collapsed.push({ key, event, count: 1 });
+  });
+
+  els.eventList.innerHTML = `
+    <div class="event-filters">
+      ${[["all", "全部"], ["error", "错误"], ["warning", "警告"], ["info", "信息"]]
+        .map(([value, label]) => `<button type="button" class="event-filter ${eventLevelFilter === value ? "active" : ""}" data-event-level="${value}">${label} <b>${counts[value] || 0}</b></button>`)
+        .join("")}
+    </div>
+    <div class="event-rows">
+      ${collapsed.length ? collapsed.map(({ event, count }) => {
+        const level = String(event.level || "info");
+        const time = new Date((event.timestamp || 0) * 1000).toLocaleTimeString();
+        const hasData = event.data && Object.keys(event.data).length;
+        return `
+        <article class="event-item ${escapeHtml(level)}" ${hasData ? 'data-event-details role="button" tabindex="0"' : ""}>
+          <div class="event-line">
+            <span class="event-level">${escapeHtml(EVENT_LEVEL_LABELS[level] || level)}</span>
+            <strong>${escapeHtml(eventSourceLabel(event.source))}</strong>
+            <span class="event-time">${time}</span>
+            ${count > 1 ? `<span class="event-repeat">×${count}</span>` : ""}
+          </div>
+          <p class="event-message">${escapeHtml(humanizeEventMessage(event.message || "", event.data))}</p>
+          ${hasData ? `<pre class="event-data" hidden>${escapeHtml(JSON.stringify(event.data, null, 2))}</pre>` : ""}
+        </article>`;
+      }).join("") : `<div class="empty small">没有这个级别的事件</div>`}
+    </div>`;
+}
+
+// 事件文案里常带英文 tool/字段名，翻译成人话；数字与参数保留原文
+function humanizeEventMessage(message, data) {
+  const text = String(message || "").trim();
+  if (!text) return "";
+  const toolName = String(data?.tool || data?.name || "");
+  if (toolName) return `${humanToolLabel(toolName)}：${text}`;
+  return text;
+}
+
+function runDurationText(run) {
+  const start = Number(run?.started_at || 0);
+  const end = Number(run?.finished_at || 0);
+  if (!start) return "";
+  const seconds = end ? Math.max(0, end - start) : Math.max(0, Date.now() / 1000 - start);
+  if (seconds < 60) return `${seconds.toFixed(0)} 秒`;
+  return `${Math.floor(seconds / 60)} 分 ${Math.round(seconds % 60)} 秒`;
 }
 
 function renderTaskRuns(taskRuns) {
   if (!els.taskRunList) return;
   const runs = Array.isArray(taskRuns?.recent) ? taskRuns.recent : [];
   if (!runs.length) {
-    els.taskRunList.innerHTML = `<div class="empty">暂无可复盘任务</div>`;
+    els.taskRunList.innerHTML = `
+      <div class="panel-intro">
+        <p>每执行一次任务，这里就留一条复盘记录：目标是什么、走到哪一步、成功还是失败、失败卡在哪。</p>
+        <p><strong>什么时候看它：</strong>想确认"上一次那个任务到底做完没有"、或者对比两次同类任务时。</p>
+      </div>
+      <div class="empty small">还没有任务记录——在输入框切到 Execute 发一条指令就会产生。</div>`;
     return;
   }
   els.taskRunList.innerHTML = runs.slice(0, 8).map((run) => {
     const counters = run.counters || {};
-    const title = run.summary || run.command || run.intent || "任务记录";
-    const status = humanRunStatus(run.status);
-    const time = run.started_at ? new Date(run.started_at * 1000).toLocaleString() : "";
+    const title = run.command || run.summary || run.intent || "任务记录";
+    const statusKey = String(run.status || "").toLowerCase();
+    const statusText = humanRunStatus(run.status);
+    const stepsTotal = Number(counters.steps_total || 0);
+    const stepsOk = Number(counters.steps_ok || 0);
+    const duration = runDurationText(run);
     const meta = [
-      status,
-      run.route_strategy || run.task_level || "",
-      `${counters.steps_ok || 0}/${counters.steps_total || 0} 步`,
-      `${counters.events || 0} 事件`,
+      stepsTotal ? `${stepsOk}/${stepsTotal} 步完成` : "",
+      duration,
+      run.route_strategy ? `路由 ${run.route_strategy}` : "",
     ].filter(Boolean).join(" · ");
-    const fail = run.failure_reason ? `<p class="task-run-failure">${escapeHtml(run.failure_reason)}</p>` : "";
+    const reason = run.failure_reason
+      ? `<p class="task-run-failure">卡在这里：${escapeHtml(run.failure_reason)}</p>`
+      : "";
     return `
-      <article class="compact-item task-run-item ${escapeHtml(run.status || "")}" title="${escapeHtml(run.run_id || "")}">
+      <article class="compact-item task-run-item ${escapeHtml(statusKey)}" title="${escapeHtml(run.run_id || "")}">
         <div class="memory-item-head">
-          <strong>${escapeHtml(title)}</strong>
-          <small>${escapeHtml(status)}</small>
+          <strong>${escapeHtml(String(title).slice(0, 80))}</strong>
+          <small class="task-run-status ${escapeHtml(statusKey)}">${escapeHtml(statusText)}</small>
         </div>
-        <p>${escapeHtml(meta)}</p>
-        ${time ? `<span class="task-run-time">${escapeHtml(time)}</span>` : ""}
-        ${fail}
+        ${meta ? `<p>${escapeHtml(meta)}</p>` : ""}
+        ${reason}
       </article>
     `;
   }).join("");
 }
-
-function renderEvents(events) {
-  const ordered = [...events].slice(-30).reverse();
-  if (!ordered.length) {
-    els.eventList.innerHTML = `<div class="empty">暂无事件</div>`;
-    return;
-  }
-  els.eventList.innerHTML = ordered.map((event) => {
-    const time = new Date((event.timestamp || 0) * 1000).toLocaleTimeString();
-    return `
-      <article class="event-item ${event.level}">
-        <div class="event-line">
-          <strong>${escapeHtml(event.source || "system")}</strong>
-          <span>${time}</span>
-        </div>
-        <p class="event-message">${escapeHtml(event.message || "")}</p>
-      </article>
-    `;
-  }).join("");
-}
-
-
-
-
-
 
 
 const WAYPOINT_TYPE_LABELS = {
@@ -4820,20 +5774,22 @@ function showWaypointProperties(index) {
   selectedWaypointIndex = index;
   els.waypointProperties.classList.remove("hidden");
   if (els.wpPropType) els.wpPropType.value = wp.type || "waypoint";
-  if (els.wpPropAlt) els.wpPropAlt.value = wp.alt_m ?? 3;
-  if (els.wpPropSpeed) els.wpPropSpeed.value = wp.speed_mps ?? 2;
-  if (els.wpPropHold) els.wpPropHold.value = wp.hold_s ?? 0;
-  if (els.wpPropAccept) els.wpPropAccept.value = wp.acceptance_radius_m ?? 2;
+  const defaults = missionDefaults();
+  if (els.wpPropAlt) els.wpPropAlt.value = wp.alt_m ?? defaults.altitude;
+  if (els.wpPropSpeed) els.wpPropSpeed.value = wp.speed_mps ?? defaults.speed;
+  if (els.wpPropHold) els.wpPropHold.value = wp.hold_s ?? defaults.hold;
+  if (els.wpPropAccept) els.wpPropAccept.value = wp.acceptance_radius_m ?? defaults.acceptance;
 }
 
 function applyWaypointProperties() {
   if (selectedWaypointIndex < 0 || selectedWaypointIndex >= missionWaypoints.length) return;
   const wp = missionWaypoints[selectedWaypointIndex];
+  const defaults = missionDefaults();
   wp.type = els.wpPropType ? els.wpPropType.value : wp.type;
-  wp.alt_m = Math.max(0, parseFloat(els.wpPropAlt?.value) || 0);
-  wp.speed_mps = Math.max(0.1, parseFloat(els.wpPropSpeed?.value) || 2);
+  wp.alt_m = Math.max(0.5, parseFloat(els.wpPropAlt?.value) || defaults.altitude);
+  wp.speed_mps = Math.max(0.2, parseFloat(els.wpPropSpeed?.value) || defaults.speed);
   wp.hold_s = Math.max(0, parseFloat(els.wpPropHold?.value) || 0);
-  wp.acceptance_radius_m = Math.max(0.5, parseFloat(els.wpPropAccept?.value) || 2);
+  wp.acceptance_radius_m = Math.max(0.5, parseFloat(els.wpPropAccept?.value) || defaults.acceptance);
   markMissionEdited();
   renderWaypoints();
   drawMissionPath();
@@ -4843,11 +5799,15 @@ function buildWaypointCommand() {
   const route = missionWaypoints
     .map((wp, index) => `${index + 1}. lat ${wp.lat}, lon ${wp.lon}, alt ${wp.alt_m}m`)
     .join("；");
-  return `按以下航点规划并执行飞行，速度2m/s，完成后悬停并报告状态：${route}`;
+  const speed = missionDefaults().speed;
+  return `按以下航点规划并执行飞行，速度${speed}m/s，完成后悬停并报告状态：${route}`;
 }
 
 function updateMapView(state) {
   if (!maplibreMap) return;
+
+  // 遥测/状态更新时刷新剖面（合并到下一帧，避免高频重绘）
+  scheduleProfileRedraw();
 
   const runtime = state.tool_runtime || {};
   const drone = runtime.drone || {};
@@ -5436,8 +6396,11 @@ function drawMissionProfile() {
   const ctx = canvas.getContext("2d");
   const dpr = window.devicePixelRatio || 1;
   const rect = canvas.getBoundingClientRect();
-  canvas.width = Math.max(1, Math.floor(rect.width * dpr));
-  canvas.height = Math.max(1, Math.floor(rect.height * dpr));
+  // 仅在尺寸变化时重置画布缓冲，遥测高频重绘时避免无谓的重新分配
+  const bufferW = Math.max(1, Math.floor(rect.width * dpr));
+  const bufferH = Math.max(1, Math.floor(rect.height * dpr));
+  if (canvas.width !== bufferW) canvas.width = bufferW;
+  if (canvas.height !== bufferH) canvas.height = bufferH;
   ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
   const width = rect.width;
   const height = rect.height;
@@ -5445,35 +6408,72 @@ function drawMissionProfile() {
   ctx.clearRect(0, 0, width, height);
 
   // 折叠或高度不足时只清空，不重绘
-  if (height < 60) return;
+  if (height < 60) {
+    missionProfileView = null;
+    return;
+  }
 
-  const padding = { top: 16, right: 16, bottom: 38, left: 50 };
+  const padding = { top: 16, right: 42, bottom: 38, left: 50 };
   const chartW = width - padding.left - padding.right;
   const chartH = height - padding.top - padding.bottom;
 
   // 动态 X 轴范围：使用当前地图可视宽度，让剖面图随卫星图缩放变化
   const visibleDist = getVisibleMapDistanceMeters();
 
-  // 计算航点累计距离
+  // 计算航点累计距离/时间，并带出类型、速度、悬停信息
   const points = [];
   let cumulative = 0;
+  let cumulativeTime = 0;
   if (missionWaypoints.length >= 2) {
-    points.push({ dist: 0, alt: missionWaypoints[0].alt_m || 0, seq: 1 });
+    const first = missionWaypoints[0];
+    points.push({
+      dist: 0,
+      alt: Number(first.alt_m || 0),
+      seq: 1,
+      type: first.type || "waypoint",
+      speed: Math.max(0.1, Number(first.speed_mps || 2)),
+      hold: Math.max(0, Number(first.hold_s || 0)),
+      time: 0,
+    });
     for (let i = 1; i < missionWaypoints.length; i++) {
       const a = missionWaypoints[i - 1];
       const b = missionWaypoints[i];
       const segment = haversineMeters(a.lat, a.lon, b.lat, b.lon);
       cumulative += segment;
-      points.push({ dist: cumulative, alt: b.alt_m || 0, seq: i + 1 });
+      const speed = Math.max(0.1, Number(b.speed_mps || 2));
+      const hold = Math.max(0, Number(b.hold_s || 0));
+      cumulativeTime += segment / speed + hold;
+      points.push({
+        dist: cumulative,
+        alt: Number(b.alt_m || 0),
+        seq: i + 1,
+        type: b.type || "waypoint",
+        speed,
+        hold,
+        time: cumulativeTime,
+      });
     }
   }
 
   const maxDist = Math.max(visibleDist, cumulative || 1);
+  const maxSpeed = points.length ? Math.max(0.1, ...points.map((p) => p.speed)) : 1;
+  const speedScaleMax = Math.max(0.5, maxSpeed * 1.2);
+
+  // 实时无人机：投影到航线求里程，取当前高度
+  const droneMarker = computeProfileDroneMarker(points);
+  const droneAlt = droneMarker ? droneMarker.alt : null;
 
   const alts = points.length ? points.map((p) => p.alt) : [0, 10];
+  if (droneAlt != null) alts.push(droneAlt);
   let minAlt = Math.min(...alts);
   let maxAlt = Math.max(...alts);
-  if (maxAlt - minAlt < 5) {
+  if (missionProfileDrag) {
+    // 拖拽中用固定比例换算高度(见 updateProfileDragAltitude)，此处仅保证被拖点留在图内
+    const dragAlt = Number(missionWaypoints[missionProfileDrag.index]?.alt_m ?? minAlt);
+    const span = Math.max(1, missionProfileDrag.altRange);
+    minAlt = Math.max(0, Math.min(missionProfileDrag.minAlt, dragAlt - span * 0.2));
+    maxAlt = Math.max(missionProfileDrag.minAlt + span, dragAlt + span * 0.2);
+  } else if (maxAlt - minAlt < 5) {
     const mid = (minAlt + maxAlt) / 2;
     minAlt = mid - 2.5;
     maxAlt = mid + 2.5;
@@ -5482,6 +6482,18 @@ function drawMissionProfile() {
 
   const xFor = (d) => padding.left + (d / maxDist) * chartW;
   const yFor = (a) => padding.top + chartH - ((a - minAlt) / altRange) * chartH;
+  const yForSpeed = (s) => padding.top + chartH - (Math.max(0, s) / speedScaleMax) * chartH;
+
+  // 记录几何供指针命中测试；单点/空状态时不提供可拖拽点
+  missionProfileView = {
+    paddingTop: padding.top,
+    chartH,
+    minAlt,
+    altRange,
+    points: points.length >= 2
+      ? points.map((p) => ({ index: p.seq - 1, x: xFor(p.dist), y: yFor(p.alt) }))
+      : [],
+  };
 
   // Y 轴水平网格线
   ctx.strokeStyle = "rgba(255,255,255,0.06)";
@@ -5533,23 +6545,112 @@ function drawMissionProfile() {
     ctx.lineWidth = 2;
     ctx.stroke();
 
-    // 航点标记
+    // 速度剖面：右侧独立刻度，紫虚线叠加（配合 tooltip 读取数值）
+    ctx.save();
+    ctx.beginPath();
+    ctx.moveTo(xFor(points[0].dist), yForSpeed(points[0].speed));
+    for (let i = 1; i < points.length; i++) ctx.lineTo(xFor(points[i].dist), yForSpeed(points[i].speed));
+    ctx.strokeStyle = "rgba(167, 139, 250, 0.9)";
+    ctx.lineWidth = 1.5;
+    ctx.setLineDash([5, 4]);
+    ctx.stroke();
+    ctx.restore();
+
+    // 航点标记：按类型配色，选中时加琥珀色粗描边
     points.forEach((p) => {
       const x = xFor(p.dist);
       const y = yFor(p.alt);
+      const selected = selectedWaypointIndex + 1 === p.seq;
+      const markerColor = WAYPOINT_TYPE_COLORS[p.type] || WAYPOINT_TYPE_COLORS.waypoint;
       ctx.beginPath();
-      ctx.arc(x, y, 4, 0, Math.PI * 2);
-      ctx.fillStyle = selectedWaypointIndex + 1 === p.seq ? "#f0b84a" : "#55dff4";
+      ctx.arc(x, y, selected ? 5 : 4, 0, Math.PI * 2);
+      ctx.fillStyle = markerColor;
       ctx.fill();
-      ctx.strokeStyle = "#06121a";
-      ctx.lineWidth = 1.5;
+      ctx.strokeStyle = selected ? "#f0b84a" : "#06121a";
+      ctx.lineWidth = selected ? 2.5 : 1.5;
       ctx.stroke();
 
       ctx.fillStyle = "rgba(237, 244, 255, 0.8)";
       ctx.font = "10px system-ui, sans-serif";
       ctx.textAlign = "center";
+      ctx.textBaseline = "alphabetic";
       ctx.fillText(String(p.seq), x, y - 8);
     });
+
+    // 实时无人机：竖直参考线 + 紫色三角（与地图无人机标记同色）
+    if (droneMarker) {
+      const x = xFor(Math.min(droneMarker.dist, maxDist));
+      const y = yFor(droneMarker.alt);
+      ctx.save();
+      ctx.strokeStyle = "rgba(167, 139, 250, 0.45)";
+      ctx.lineWidth = 1;
+      ctx.setLineDash([2, 3]);
+      ctx.beginPath();
+      ctx.moveTo(x, padding.top);
+      ctx.lineTo(x, padding.top + chartH);
+      ctx.stroke();
+      ctx.setLineDash([]);
+      ctx.beginPath();
+      ctx.moveTo(x, y - 7);
+      ctx.lineTo(x - 5, y + 3);
+      ctx.lineTo(x + 5, y + 3);
+      ctx.closePath();
+      ctx.fillStyle = "#a78bfa";
+      ctx.fill();
+      ctx.strokeStyle = "#0b0f18";
+      ctx.lineWidth = 1.5;
+      ctx.stroke();
+      ctx.restore();
+    }
+
+    // 拖拽中的航点：竖直参考线 + 高度气泡
+    if (missionProfileDrag) {
+      const dp = points.find((p) => p.seq - 1 === missionProfileDrag.index);
+      if (dp) {
+        const x = xFor(dp.dist);
+        const y = yFor(dp.alt);
+        ctx.save();
+        ctx.strokeStyle = "rgba(240, 184, 74, 0.85)";
+        ctx.lineWidth = 1;
+        ctx.setLineDash([3, 3]);
+        ctx.beginPath();
+        ctx.moveTo(x, padding.top);
+        ctx.lineTo(x, padding.top + chartH);
+        ctx.stroke();
+        ctx.setLineDash([]);
+
+        ctx.beginPath();
+        ctx.arc(x, y, 6, 0, Math.PI * 2);
+        ctx.fillStyle = "#f0b84a";
+        ctx.fill();
+        ctx.strokeStyle = "#06121a";
+        ctx.lineWidth = 2;
+        ctx.stroke();
+
+        const label = `${dp.alt.toFixed(1)} m`;
+        ctx.font = "bold 11px system-ui, sans-serif";
+        const boxW = ctx.measureText(label).width + 12;
+        let boxX = x - boxW / 2;
+        boxX = Math.max(padding.left, Math.min(boxX, padding.left + chartW - boxW));
+        const boxY = Math.max(padding.top, y - 28);
+        ctx.fillStyle = "rgba(7, 9, 15, 0.9)";
+        ctx.fillRect(boxX, boxY, boxW, 18);
+        ctx.strokeStyle = "rgba(240, 184, 74, 0.7)";
+        ctx.lineWidth = 1;
+        ctx.strokeRect(boxX, boxY, boxW, 18);
+        ctx.fillStyle = "#f0b84a";
+        ctx.textAlign = "center";
+        ctx.textBaseline = "middle";
+        ctx.fillText(label, boxX + boxW / 2, boxY + 9);
+        ctx.restore();
+      }
+    }
+
+    // 悬停详情：类型/高度/速度/悬停/里程/预计到达
+    if (missionProfileHover != null && !missionProfileDrag) {
+      const hp = points.find((p) => p.seq - 1 === missionProfileHover);
+      if (hp) drawProfileTooltip(ctx, hp, xFor(hp.dist), yFor(hp.alt), padding, chartW, chartH);
+    }
   } else {
     // 空状态：轻量网格背景 + 提示
     ctx.strokeStyle = "rgba(255,255,255,0.05)";
@@ -5619,6 +6720,15 @@ function drawMissionProfile() {
     const y = padding.top + chartH - (chartH * i) / 4;
     ctx.fillText(`${Math.round(alt)}m`, padding.left - 6, y);
   }
+
+  // 速度右轴：仅上限与 0 两个刻度，避免与高度刻度混淆
+  if (points.length >= 2) {
+    ctx.fillStyle = "rgba(167, 139, 250, 0.85)";
+    ctx.textAlign = "left";
+    ctx.fillText(`${speedScaleMax.toFixed(1)}`, padding.left + chartW + 6, padding.top);
+    ctx.fillText("0", padding.left + chartW + 6, padding.top + chartH);
+  }
+
   ctx.textAlign = "center";
   ctx.textBaseline = "top";
   for (let d = 0; d <= maxDist + 0.001; d += xStep) {
@@ -5639,6 +6749,202 @@ function drawMissionProfile() {
   ctx.textBaseline = "bottom";
   ctx.fillStyle = "rgba(141, 152, 173, 0.7)";
   ctx.fillText("距离", padding.left + chartW / 2, height - 6);
+}
+
+// 悬停详情气泡：类型/高度/速度/悬停/里程/预计到达
+function drawProfileTooltip(ctx, point, x, y, padding, chartW, chartH) {
+  const typeLabel = WAYPOINT_TYPE_LABELS[point.type] || "航点";
+  const typeColor = WAYPOINT_TYPE_COLORS[point.type] || WAYPOINT_TYPE_COLORS.waypoint;
+  const lines = [
+    { text: `${point.seq} · ${typeLabel}`, color: typeColor, bold: true },
+    { text: `高度 ${point.alt.toFixed(1)} m`, color: "rgba(237, 244, 255, 0.88)" },
+    { text: `速度 ${point.speed.toFixed(1)} m/s`, color: "rgba(167, 139, 250, 0.95)" },
+    { text: `悬停 ${fmt(point.hold)} s`, color: "rgba(237, 244, 255, 0.72)" },
+    { text: `里程 ${formatDistance(point.dist)}`, color: "rgba(237, 244, 255, 0.72)" },
+    { text: point.time > 0 ? `预计 ${formatDuration(point.time)}` : "起点", color: "rgba(78, 230, 164, 0.95)" },
+  ];
+  const lineH = 13;
+  const padX = 8;
+  const padY = 6;
+  ctx.save();
+  let maxTextW = 0;
+  lines.forEach((line) => {
+    ctx.font = line.bold ? "bold 10px system-ui, sans-serif" : "10px system-ui, sans-serif";
+    maxTextW = Math.max(maxTextW, ctx.measureText(line.text).width);
+  });
+  const boxW = Math.min(chartW, maxTextW + padX * 2);
+  const boxH = lines.length * lineH + padY * 2;
+  let bx = x + 12;
+  if (bx + boxW > padding.left + chartW) bx = x - 12 - boxW;
+  bx = Math.max(padding.left, Math.min(bx, padding.left + chartW - boxW));
+  let by = y - boxH - 10;
+  if (by < padding.top) by = y + 12;
+  by = Math.max(padding.top, Math.min(by, padding.top + chartH - boxH));
+
+  ctx.fillStyle = "rgba(7, 9, 15, 0.94)";
+  ctx.fillRect(bx, by, boxW, boxH);
+  ctx.strokeStyle = "rgba(85, 223, 244, 0.45)";
+  ctx.lineWidth = 1;
+  ctx.strokeRect(bx, by, boxW, boxH);
+
+  ctx.textAlign = "left";
+  ctx.textBaseline = "middle";
+  lines.forEach((line, i) => {
+    ctx.font = line.bold ? "bold 10px system-ui, sans-serif" : "10px system-ui, sans-serif";
+    ctx.fillStyle = line.color;
+    ctx.fillText(line.text, bx + padX, by + padY + lineH * i + lineH / 2);
+  });
+  ctx.restore();
+}
+
+// 带符号米制差值，用于把 GPS 点投影到航段上
+function signedMeters(lat1, lon1, lat2, lon2) {
+  const d = haversineMeters(lat1, lon1, lat2, lon2);
+  const ref = lat2 !== lat1 ? lat2 - lat1 : lon2 - lon1;
+  return ref < 0 ? -d : d;
+}
+
+// 把无人机投影到航线，得到沿线里程与当前高度；离航线过远则不显示
+function computeProfileDroneMarker(points) {
+  if (!points || points.length < 2) return null;
+  const drone = latestState?.tool_runtime?.drone;
+  if (!drone) return null;
+  const geo = getDroneLatLon(drone);
+  if (!geo || geo.lat == null || geo.lon == null) return null;
+  let best = null;
+  for (let i = 1; i < missionWaypoints.length; i++) {
+    const a = missionWaypoints[i - 1];
+    const b = missionWaypoints[i];
+    const bx = signedMeters(a.lat, a.lon, a.lat, b.lon);
+    const by = signedMeters(a.lat, a.lon, b.lat, a.lon);
+    const px = signedMeters(a.lat, a.lon, a.lat, geo.lon);
+    const py = signedMeters(a.lat, a.lon, geo.lat, a.lon);
+    const segLen2 = bx * bx + by * by;
+    let t = segLen2 > 0 ? (px * bx + py * by) / segLen2 : 0;
+    t = Math.max(0, Math.min(1, t));
+    const d = Math.hypot(px - t * bx, py - t * by);
+    if (!best || d < best.d) {
+      best = { d, dist: points[i - 1].dist + t * Math.sqrt(segLen2) };
+    }
+  }
+  if (!best || best.d > 500) return null;
+  return {
+    dist: best.dist,
+    alt: Math.max(0, Math.abs(Number(drone.position_ned?.z || 0))),
+  };
+}
+
+// 遥测高频更新时合并重绘，避免一帧内多次画剖面
+function scheduleProfileRedraw() {
+  if (profileRedrawScheduled) return;
+  profileRedrawScheduled = true;
+  requestAnimationFrame(() => {
+    profileRedrawScheduled = false;
+    drawMissionProfile();
+  });
+}
+
+// 命中测试：找离指针最近的航点（含高度），超出阈值返回 null
+function profileHitTest(clientX, clientY) {
+  const canvas = els.profileCanvas;
+  const view = missionProfileView;
+  if (!canvas || !view || !view.points.length) return null;
+  const rect = canvas.getBoundingClientRect();
+  const mx = clientX - rect.left;
+  const my = clientY - rect.top;
+  let best = null;
+  let bestDist = Infinity;
+  for (const p of view.points) {
+    const d = Math.hypot(p.x - mx, p.y - my);
+    if (d < bestDist) {
+      bestDist = d;
+      best = p;
+    }
+  }
+  return bestDist <= PROFILE_HIT_RADIUS_PX ? best : null;
+}
+
+// 按指针纵向位移换算高度：使用按下时冻结的米/像素比，避免坐标轴自适应导致跳变
+function updateProfileDragAltitude(clientY) {
+  const drag = missionProfileDrag;
+  if (!drag) return;
+  const wp = missionWaypoints[drag.index];
+  if (!wp) return;
+  const metersPerPx = drag.altRange / Math.max(1, drag.chartH);
+  const alt = drag.startAlt - (clientY - drag.startY) * metersPerPx;
+  wp.alt_m = Math.round(Math.max(0, Math.min(PROFILE_ALT_MAX_M, alt)) * 10) / 10;
+  if (!isPx4MavlinkBackend()) {
+    const ned = gpsToNed(wp.lat, wp.lon, -wp.alt_m);
+    wp.x = round1(ned.x);
+    wp.y = round1(ned.y);
+    wp.z = round1(ned.z);
+  }
+  if (els.wpPropAlt) els.wpPropAlt.value = wp.alt_m;
+  drawMissionProfile();
+}
+
+function setupMissionProfileInteraction() {
+  const canvas = els.profileCanvas;
+  if (!canvas || canvas.dataset.profileDragBound === "true") return;
+  canvas.dataset.profileDragBound = "true";
+  canvas.style.touchAction = "none";
+
+  canvas.addEventListener("pointerdown", (event) => {
+    if (event.button !== 0) return;
+    const hit = profileHitTest(event.clientX, event.clientY);
+    const view = missionProfileView;
+    if (!hit || !view) return;
+    event.preventDefault();
+    selectedWaypointIndex = hit.index;
+    missionProfileHover = null;
+    missionProfileDrag = {
+      pointerId: event.pointerId,
+      index: hit.index,
+      startY: event.clientY,
+      startAlt: Number(missionWaypoints[hit.index]?.alt_m || 0),
+      minAlt: view.minAlt,
+      altRange: view.altRange,
+      chartH: view.chartH,
+    };
+    try { canvas.setPointerCapture(event.pointerId); } catch (_) {}
+    canvas.style.cursor = "ns-resize";
+    updateProfileDragAltitude(event.clientY);
+  });
+
+  canvas.addEventListener("pointermove", (event) => {
+    if (missionProfileDrag && missionProfileDrag.pointerId === event.pointerId) {
+      updateProfileDragAltitude(event.clientY);
+      return;
+    }
+    const hit = profileHitTest(event.clientX, event.clientY);
+    canvas.style.cursor = hit ? "ns-resize" : "default";
+    const nextHover = hit ? hit.index : null;
+    if (nextHover !== missionProfileHover) {
+      missionProfileHover = nextHover;
+      drawMissionProfile();
+    }
+  });
+
+  canvas.addEventListener("pointerleave", () => {
+    if (missionProfileDrag || missionProfileHover == null) return;
+    missionProfileHover = null;
+    canvas.style.cursor = "default";
+    drawMissionProfile();
+  });
+
+  const finishDrag = (event) => {
+    if (!missionProfileDrag || missionProfileDrag.pointerId !== event.pointerId) return;
+    const index = missionProfileDrag.index;
+    missionProfileDrag = null;
+    try { canvas.releasePointerCapture(event.pointerId); } catch (_) {}
+    canvas.style.cursor = "default";
+    markMissionEdited();
+    renderWaypoints();
+    drawMissionPath();
+    showWaypointProperties(index);
+  };
+  canvas.addEventListener("pointerup", finishDrag);
+  canvas.addEventListener("pointercancel", finishDrag);
 }
 
 function getVisibleMapDistanceMeters() {
@@ -5808,6 +7114,8 @@ function saveLayoutPref(key, value) {
 }
 
 function initSplitters() {
+  // 初始 / 窗口尺寸变化时同步输入区密度（窄面板收缩文字而非换行）
+  window.addEventListener("resize", () => syncComposerDensity());
   document.querySelectorAll("[data-splitter]").forEach((splitter) => {
     splitter.addEventListener("pointerdown", (event) => {
       event.preventDefault();
@@ -5824,9 +7132,11 @@ function initSplitters() {
           document.documentElement.style.setProperty("--left-pane", `${next}px`);
           saveLayoutPref("left", Math.round(next));
         } else if (kind === "right") {
-          const next = clamp(shellRect.right - moveEvent.clientX - 12, 480, 760);
+          // 下限放宽到 320px（窄面板也保留最小可读宽度），上限 760px
+          const next = clamp(shellRect.right - moveEvent.clientX - 12, 320, 760);
           document.documentElement.style.setProperty("--right-pane", `${next}px`);
           saveLayoutPref("right", Math.round(next));
+          syncComposerDensity();
         } else if (kind === "timeline") {
           const next = clamp(mapRect.bottom - moveEvent.clientY, 130, 380);
           document.documentElement.style.setProperty("--timeline-height", `${next}px`);
@@ -5918,11 +7228,9 @@ async function openSystemSettings() {
     loadVehicleInfo(false),
   ]);
   updateVehicleSettingsAvailability();
-  if (vehicleSettingsAvailable()) await loadVehicleSetup(false);
   selectedConnectionId = activeConnectionId || connectionsCache[0]?.id || "";
   renderConnectionsList();
   renderConnectionDetail(selectedConnectionId);
-  renderVehicleSettingsPanel();
   setSystemSettingsSection(activeSystemSettingsSection || "links");
   renderSystemConnection();
   loadAirSimSettingsTemplates();
@@ -6169,12 +7477,13 @@ function setSettingsTab(tab, drawer = document) {
   });
 }
 
+// 设置面板只保留「通信链路 / 摄像头」：其余分区（通用、地图遥测、任务默认值、
+// 安全、以及整组 Vehicle Settings）已移除，Vehicle Settings 交给 QGC。
+const SYSTEM_SETTINGS_SECTIONS = ["links", "camera"];
+
 function setSystemSettingsSection(section) {
-  if (isVehicleSetupSection(section) && !vehicleSettingsAvailable()) {
-    showNotice("Vehicle Settings 需要已连接的 PX4 数据源", "error");
-    section = "links";
-  }
-  activeSystemSettingsSection = section || "links";
+  if (!SYSTEM_SETTINGS_SECTIONS.includes(section)) section = "links";
+  activeSystemSettingsSection = section;
   const modal = els.systemSettingsModal || document;
   modal.querySelectorAll("[data-system-section]").forEach((button) => {
     button.classList.toggle("active", button.dataset.systemSection === activeSystemSettingsSection);
@@ -6182,20 +7491,7 @@ function setSystemSettingsSection(section) {
   modal.querySelectorAll("[data-system-panel]").forEach((panel) => {
     panel.classList.toggle("active", panel.dataset.systemPanel === activeSystemSettingsSection);
   });
-  if (isVehicleSetupSection(activeSystemSettingsSection)) {
-    renderActiveVehicleSetupPanel("section");
-    startVehicleSetupPolling();
-  } else {
-    stopVehicleSetupPolling();
-  }
-  if (activeSystemSettingsSection === "vehicle") {
-    renderVehicleSettingsPanel();
-    loadVehicleInfo(false).catch(() => {});
-  }
-  if (activeSystemSettingsSection === "parameters") {
-    renderVehicleParametersPanel();
-    loadVehicleParameters(false).catch(() => {});
-  }
+  stopVehicleSetupPolling();
   if (activeSystemSettingsSection === "links") {
     renderConnectionsList();
     renderConnectionDetail(selectedConnectionId);
@@ -6403,9 +7699,27 @@ function buildAgentTurn(message) {
 
   const toolLines = document.createElement("div");
   toolLines.className = "tool-lines";
+
+  // 时间线：按发生顺序交错排列「模型思考 → 工具/技能调用 → 下一轮思考」，
+  // plan-execute 与 ReAct 用同一套结构（ReAct 里思考块会多次出现）。
+  const timeline = document.createElement("div");
+  timeline.className = "proc-timeline";
+
+  // 计划摘要块：任务理解 + 步骤序列（与"模型思考"分开显示）
+  const planBlock = document.createElement("div");
+  planBlock.className = "plan-block";
+  planBlock.style.display = "none";
+  const planHead = document.createElement("div");
+  planHead.className = "plan-head";
+  planHead.textContent = "📋 执行计划";
+  const planBody = document.createElement("pre");
+  planBody.className = "plan-body";
+  planBlock.appendChild(planHead);
+  planBlock.appendChild(planBody);
+
   procFold.appendChild(procSummary);
-  procFold.appendChild(thinkFold2);
-  procFold.appendChild(toolLines);
+  procFold.appendChild(timeline);   // 计划块在时间线内按位置插入
+  procFold.appendChild(toolLines);  // 兼容旧引用，实际渲染走 timeline
 
   const answerBody = document.createElement("div");
   answerBody.className = "answer-body";
@@ -6421,7 +7735,11 @@ function buildAgentTurn(message) {
     thinkState,
     thinkLatest,
     thinkFull,
+    planBlock,
+    planBody,
     toolLines,
+    timeline,
+    renderedTimeline: 0,
     answerBody,
     renderedTrace: 0,
     userToggled: false,
@@ -6468,21 +7786,185 @@ function firstThinkLine(text) {
   return (n === -1 ? t : t.slice(0, n)).slice(0, 90);
 }
 
-function toolLineNode(item) {
+// 条目分类：技能调用(skill:*) / 工具 / 校验 / 记忆 / 系统说明 / 模型思考
+function nodeCategory(item) {
+  const tool = String(item?.tool || "");
+  if (tool.startsWith("skill:")) return "skill";
+  const kind = normalizeProcessKind(item);
+  if (kind === "plan_step" || kind === "tool") return "tool";
+  if (kind === "verify") return "verify";
+  if (kind === "memory") return "memory";
+  if (kind === "system" || kind === "plan") return "system";
+  return "reasoning";
+}
+
+function categoryLabel(cat) {
+  if (cat === "tool") return "工具";
+  if (cat === "skill") return "Skill";
+  if (cat === "verify") return "校验";
+  if (cat === "memory") return "记忆";
+  if (cat === "system") return "系统";
+  return "模型思考";
+}
+
+function systemNode(item) {
   const row = document.createElement("div");
-  row.className = `tool-line ${item.status || "completed"} kind-${item.kind || "tool"}`;
-  const badge = document.createElement("em");
-  badge.className = "tool-badge";
-  badge.textContent = processKindLabel(item.kind || "tool");
-  const title = document.createElement("strong");
-  title.textContent = item.tool ? humanToolLabel(item.tool, item.title) : humanThoughtTitle(item.title || "");
-  const body = document.createElement("span");
-  body.className = "tool-line-body";
-  body.textContent = humanThoughtBody(item.body || "", item.tool || "");
-  row.appendChild(badge);
-  row.appendChild(title);
-  if (body.textContent) row.appendChild(body);
+  row.className = "tl-note";
+  row.textContent = `${humanThoughtTitle(item.title || "说明")}：${humanThoughtBody(item.body || "", "")}`;
   return row;
+}
+
+// 统一节点外壳：图标 + 标题（模型思考 / 工具调用 / 技能调用 / 校验），
+// 让思考块与工具块处于同一层级、同一左对齐线。
+function nodeShell(cat, extraClass = "") {
+  const node = document.createElement("div");
+  node.className = `tl-node tl-${cat}${extraClass ? " " + extraClass : ""}`;
+  const head = document.createElement("div");
+  head.className = "tl-node-head";
+  const icon = document.createElement("i");
+  icon.className = "tl-node-icon";
+  icon.textContent = cat === "reasoning" ? "🧠"
+    : cat === "skill" ? "🧩"
+    : cat === "verify" ? "📋"
+    : "🛠";
+  const label = document.createElement("span");
+  label.className = "tl-node-label";
+  label.textContent = cat === "reasoning" ? "模型思考"
+    : cat === "skill" ? "技能调用"
+    : cat === "verify" ? "校验"
+    : "工具调用";
+  head.appendChild(icon);
+  head.appendChild(label);
+  node.appendChild(head);
+  return node;
+}
+
+// 长文本折叠块：默认一行摘要，点击展开完整内容（块级，不挤压同一行）
+function collapsibleText(text, className = "") {
+  const body = document.createElement("div");
+  body.className = `tl-collapse ${className}`.trim();
+  const plain = String(text || "");
+  if (plain.length <= 90 && !plain.includes("\n")) {
+    const p = document.createElement("div");
+    p.className = "tl-line";
+    p.textContent = plain;
+    body.appendChild(p);
+    return body;
+  }
+  const d = document.createElement("details");
+  const s = document.createElement("summary");
+  s.textContent = plain.replace(/\s+/g, " ").slice(0, 70) + " …（点击展开全文）";
+  const pre = document.createElement("pre");
+  pre.className = "tl-collapse-full";
+  pre.textContent = plain;
+  d.appendChild(s);
+  d.appendChild(pre);
+  body.appendChild(d);
+  return body;
+}
+
+// 工具/技能/校验：默认压缩成一行（超出省略），点击展开完整参数与返回
+function toolLineNode(item) {
+  const status = item.status || "completed";
+  const cat = nodeCategory(item);
+  const rawTool = String(item.tool || "");
+  const label = rawTool ? humanToolLabel(rawTool, item.title) : humanThoughtTitle(item.title || "");
+  const nameText = cat === "skill" && rawTool ? rawTool.replace(/^skill:/, "") : (rawTool || label);
+  const paramsText = item.params && Object.keys(item.params).length ? compactJson(item.params, 400) : "";
+  const resultText = humanThoughtBody(item.body || "", item.tool || "");
+
+  // 一行摘要：图标 + 标题 + 工具名 + 结果（优先）/参数（次要）
+  const row = document.createElement("div");
+  row.className = `tl-one-line ${status} cat-${cat}`;
+  const icon = document.createElement("i");
+  icon.className = "tl-node-icon";
+  icon.textContent = cat === "skill" ? "🧩" : cat === "verify" ? "📋" : "🛠";
+  row.appendChild(icon);
+  const kindLabel = document.createElement("span");
+  kindLabel.className = "tl-node-label";
+  kindLabel.textContent = cat === "skill" ? "技能调用" : cat === "verify" ? "校验" : "工具调用";
+  row.appendChild(kindLabel);
+  const name = document.createElement("code");
+  name.className = "tool-name";
+  name.textContent = nameText;
+  row.appendChild(name);
+  if (status === "running") {
+    const spin = document.createElement("i");
+    spin.className = "tl-spin";
+    row.appendChild(spin);
+    const t = document.createElement("span");
+    t.className = "tl-line-note";
+    t.textContent = "执行中…";
+    row.appendChild(t);
+    return row;
+  }
+  const brief = document.createElement("span");
+  brief.className = "tl-line-brief";
+  brief.textContent = resultText || paramsText || "";
+  row.appendChild(brief);
+
+  const needsExpand = paramsText.length > 60 || resultText.length > 60
+    || paramsText.includes("\n") || resultText.includes("\n");
+  if (!needsExpand) return row;
+
+  const d = document.createElement("details");
+  d.className = "tl-one";
+  const s = document.createElement("summary");
+  s.appendChild(row);
+  d.appendChild(s);
+  const box = document.createElement("div");
+  box.className = "tl-one-body";
+  if (paramsText) {
+    const ph = document.createElement("div");
+    ph.className = "tl-one-section";
+    ph.textContent = "请求参数";
+    const pp = document.createElement("pre");
+    pp.className = "tl-collapse-full";
+    pp.textContent = paramsText;
+    box.appendChild(ph);
+    box.appendChild(pp);
+  }
+  if (resultText) {
+    const rh = document.createElement("div");
+    rh.className = "tl-one-section";
+    rh.textContent = "返回内容";
+    const rp = document.createElement("pre");
+    rp.className = "tl-collapse-full";
+    rp.textContent = resultText;
+    box.appendChild(rh);
+    box.appendChild(rp);
+  }
+  d.appendChild(box);
+  return d;
+}
+
+// 思考节点：统一外壳 + 思考正文（长文折叠）
+function reasoningNode(item, isLive) {
+  const node = nodeShell("reasoning", isLive ? "running" : "");
+  const title = document.createElement("span");
+  title.className = "tl-node-title";
+  title.textContent = item.title && item.title !== "模型思考" ? ` · ${item.title}` : "";
+  node.querySelector(".tl-node-head").appendChild(title);
+  const text = String(item.body || "");
+  if (isLive) {
+    const pre = document.createElement("pre");
+    pre.className = "tl-think-body";
+    pre.textContent = text || "思考中…";
+    node.appendChild(pre);
+  } else {
+    node.appendChild(collapsibleText(text || "（无内容）", "tl-think-result"));
+  }
+  return node;
+}
+
+
+function compactJson(value, limit = 90) {
+  try {
+    const text = JSON.stringify(value, (k, v) => (k === "image_base64" ? "<image>" : v));
+    return text.length > limit ? text.slice(0, limit) + "…" : text;
+  } catch (e) {
+    return String(value).slice(0, limit);
+  }
 }
 
 function updateAgentTurn(entry, message, run, llm) {
@@ -6497,31 +7979,97 @@ function updateAgentTurn(entry, message, run, llm) {
   const reasoning = String(details.reasoning_text || "");
   const running = ["running", "responding", "queued"].includes(message.status);
   const isError = message.status === "error";
-  // 声明必须先于下方 scroll 块使用（TDZ：const 在函数内声明前引用会抛
-  // ReferenceError，pending/running 消息首轮渲染必然触发，导致发送提交
-  // 在 fetch 前整体崩溃——用户消息上屏后无任何响应）
-  const hasProcess = Boolean(reasoning) || entry.renderedTrace > 0;
 
   // 错误徽标
   entry.errorPill.style.display = isError ? "" : "none";
 
-  // 工具/校验步骤：先增量追加（跳过推理类条目——已在思考块里），
-  // 再判定过程折叠块可见性——顺序不能反，否则首轮判定时步骤数为 0
-  // 会把折叠块误隐藏，之后又被快速路径跳过永不恢复
+  // 过程条目：从 run（运行中）或消息 details（结束后）取，按时间线渲染
   const linkedRun = run && message.run_id && run.run_id === message.run_id ? run : null;
   const processTrace = Array.isArray(linkedRun?.process_trace) && linkedRun.process_trace.length
     ? linkedRun.process_trace
     : (Array.isArray(details.process_trace) ? details.process_trace : []);
-  const visible = processTrace.filter((item) => {
-    if ((item.kind || "") === "reasoning") return false;
+  // 时间线按发生顺序渲染：模型思考 / 工具 / 技能 / 校验 交错出现。
+  // plan-execute 呈现为「思考→计划→步骤序列」，ReAct 自然呈现为
+  // 「思考→工具→结果→思考→工具…」——同一套结构，无需分模式。
+  const timelineItems = processTrace.filter((item) => {
     if (item.tool === "memory_store") return false;
-    const title = humanThoughtTitle(item.title || "");
-    return Boolean(title) && !/模型思考|模型推理/.test(item.title || "");
+    // kind=plan 的工具清单与上方"执行计划"块重复，不再重复展示
+    if (normalizeProcessKind(item) === "plan") return false;
+    const cat = nodeCategory(item);
+    if (cat === "reasoning" || cat === "system") {
+      return Boolean(String(item.body || "").trim());
+    }
+    return Boolean(item.tool || humanThoughtTitle(item.title || ""));
   });
-  while (entry.renderedTrace < visible.length) {
-    entry.toolLines.appendChild(toolLineNode(visible[entry.renderedTrace]));
-    entry.renderedTrace += 1;
+  const planSummaryText = String(details.plan_summary || "").trim();
+  const hasProcess = Boolean(reasoning) || timelineItems.length > 0 || Boolean(planSummaryText);
+  // 计划文本必须在时间线重建之前写入：重建时按它决定是否插入计划块，
+  // 且插入位置在"思考之后、第一个工具之前"（先有思考才有计划）。
+  if (planSummaryText && entry.planBody.textContent !== planSummaryText) {
+    entry.planBody.textContent = planSummaryText;
+    entry.planBlock.classList.remove("flash-in");
+    void entry.planBlock.offsetWidth; // 重放进入动画
+    entry.planBlock.classList.add("flash-in");
   }
+  if (planSummaryText) entry.planBlock.style.display = "";
+  // 运行中：以流式 reasoning_text 更新最后一条思考块（打字机效果）
+  if (running && reasoning && timelineItems.length) {
+    const last = timelineItems[timelineItems.length - 1];
+    if (nodeCategory(last) === "reasoning") {
+      last.body = reasoning;
+      last.tool = "";
+    }
+  }
+  // 内容签名变化就重建时间线：条目状态会从 running → completed/failed，
+  // 只做增量追加会让已渲染的行永远停在"转圈"。
+  // 注意：不计入"正在流式的那个思考块的正文"，否则每个 token 都会重建、
+  // 打字机动画被反复打断；流式正文在重建之外就地更新。
+  const liveIdx = running
+    ? timelineItems.findIndex((i) => nodeCategory(i) === "reasoning" && i.status === "running")
+    : -1;
+  let sig = "";
+  try {
+    sig = JSON.stringify(
+      timelineItems.map((i, idx) => [
+        i.tool,
+        i.status,
+        i.params,
+        i.title,
+        idx === liveIdx ? String(i.body || "").length > 0 : String(i.body || ""),
+      ])
+    );
+  } catch (e) {
+    sig = String(timelineItems.length) + "|" + (running ? "1" : "0");
+  }
+  if (sig !== entry.timelineSig) {
+    entry.timelineSig = sig;
+    entry.timeline.textContent = "";
+    // 计划块插到"思考之后、第一个工具之前"——先有 LLM 思考才有计划，
+    // 不能顶在最上面。
+    let planInserted = false;
+    timelineItems.forEach((item, idx) => {
+      const cat = nodeCategory(item);
+      const toolLike = cat === "tool" || cat === "skill" || cat === "verify";
+      if (!planInserted && toolLike && entry.planBody.textContent) {
+        entry.timeline.appendChild(entry.planBlock);
+        planInserted = true;
+      }
+      if (cat === "reasoning") entry.timeline.appendChild(reasoningNode(item, idx === liveIdx));
+      else if (cat === "system") entry.timeline.appendChild(systemNode(item));
+      else entry.timeline.appendChild(toolLineNode(item));
+    });
+    if (!planInserted && entry.planBody.textContent) entry.timeline.appendChild(entry.planBlock);
+  } else if (liveIdx >= 0) {
+    // 结构未变：只把流式文本就地写进正在运行的那个思考块（打字机效果）
+    const liveNode = entry.timeline.querySelector(".tl-node.tl-reasoning.running");
+    if (liveNode) {
+      const target = liveNode.querySelector(".tl-think-body, .tl-think-result .tl-line");
+      const text = String(timelineItems[liveIdx].body || "");
+      if (target && target.textContent !== text) target.textContent = text;
+    }
+  }
+  entry.renderedTrace = timelineItems.length;
+  entry.renderedTimeline = timelineItems.length;
 
   // 外层过程折叠块：思考 + 工具/校验步骤全部收在里面。
   // 运行中自动展开（内层思考块同步展开、标题滚动最新思考句）；
@@ -6544,61 +8092,13 @@ function updateAgentTurn(entry, message, run, llm) {
       }
     }
 
-    // 内层思考折叠块：推理全文；运行中"伪流式"按段平滑释放——模型往往整块
-    // 一次性吐出推理（思考期间不流 token），前端逐段显示避免"思考结束才
-    // 出现"的突兀感；token 真正流式到达时平滑会自动追平。
-    if (reasoning) {
-      entry.thinkFold2.style.display = "";
-      const thinkId = `think_${message.id || message.run_id || entry.root.dataset.messageId}`;
-      if (reasoning !== entry.lastReasoning) {
-        entry.lastReasoning = reasoning;
-        smoothStream.targets.set(thinkId, reasoning);
-        if (!smoothStream.shown.has(thinkId)) smoothStream.shown.set(thinkId, 0);
-        smoothStartLoop();
-      }
-      let revealed = "";
-      if (running) {
-        const target = smoothStream.targets.get(thinkId) || "";
-        const shown = smoothStream.shown.get(thinkId) || 0;
-        revealed = target.slice(0, shown);
-      } else {
-        // 完成/失败时直接展示全文并清掉平滑状态
-        revealed = reasoning;
-        smoothStream.targets.delete(thinkId);
-        smoothStream.shown.delete(thinkId);
-      }
-      if (revealed !== entry.lastRevealedThink) {
-        entry.lastRevealedThink = revealed;
-        entry.thinkFull.textContent = revealed || "思考中…";
-      }
-      entry.thinkLatest.textContent = running ? latestThinkLine(revealed || reasoning) : firstThinkLine(reasoning);
-      entry.thinkLatest.scrollLeft = running ? entry.thinkLatest.scrollWidth : 0;
-      if (running && !entry.thinkFold2.open && !entry.thinkUserToggled) {
-        entry._programmaticThink = true;
-        entry.thinkFold2.open = true;
-      }
-      if (!running && entry.thinkFold2.open && !entry.thinkUserToggled) {
-        entry._programmaticThink = true;
-        entry.thinkFold2.open = false; // 完成后思考也收起（外层已折叠全部过程）
-      }
-    } else {
-      entry.thinkFold2.style.display = "none";
-    }
+    // 思考内容已在时间线里逐块渲染（运行中的最后一块就地打字机更新），
+    // 这里只维护外层标题行的"最新一句"滚动提示。
+    entry.procLatest.textContent = running ? latestThinkLine(reasoning) : "";
+    entry.procLatest.scrollLeft = running ? entry.procLatest.scrollWidth : 0;
   } else {
     entry.procFold.style.display = "none";
-    entry.thinkFold2.style.display = "none";
-  }
-
-  // 内层思考块的 toggle 归属（用户手动 vs 程序设置）
-  if (!entry._thinkToggleWired && entry.thinkFold2) {
-    entry._thinkToggleWired = true;
-    entry.thinkFold2.addEventListener("toggle", () => {
-      if (entry._programmaticThink) {
-        entry._programmaticThink = false;
-        return;
-      }
-      entry.thinkUserToggled = true;
-    });
+    entry.planBlock.style.display = "none";
   }
 
   // 正文：平滑分批释放（smoothShownContent）；运行中推理不占正文，
@@ -6618,6 +8118,30 @@ function renderChat(messages, run, llm) {
   // Initial page open (empty thread) jumps to the newest message instead of
   // parking on the first line.
   if (!els.chatThread || !els.chatThread.firstChild) forceNextChatScroll = true;
+  if (els.chatThread && !chatFollowBound) {
+    chatFollowBound = true;
+    els.chatThread.addEventListener("scroll", () => {
+      syncChatRailActive();
+      // 忽略我们自己发起的贴底滚动，只在用户真正滚动时更新跟随意图。
+      if (Date.now() - chatProgrammaticScrollAt < 250) return;
+      chatAutoFollow = shouldStickToChatBottom();
+    }, { passive: true });
+    // 内容增长（思考块展开、逐条过程行、图片加载后的高度变化）不会触发
+    // 我们自己的滚动调用，这里用 MutationObserver 在 DOM 变化后重新贴底，
+    // 保证输出始终跟着走，而不是要用户手动下滑。
+    if (typeof MutationObserver !== "undefined") {
+      chatContentObserver = new MutationObserver(() => {
+        if (!chatAutoFollow) return;
+        pinChatToBottom();
+        window.requestAnimationFrame(() => {
+          if (chatAutoFollow) pinChatToBottom();
+        });
+      });
+      chatContentObserver.observe(els.chatThread, { childList: true, subtree: true, characterData: true });
+    }
+  }
+  // 关键：在更新 DOM 之前记录是否停在底部，否则新增内容本身就会把距离拉大。
+  const stickBefore = forceNextChatScroll || chatAutoFollow;
   const serverMessages = Array.isArray(messages) ? messages : [];
   reconcilePendingMessages(serverMessages);
   const list = [...serverMessages, ...localPendingMessages];
@@ -6632,6 +8156,7 @@ function renderChat(messages, run, llm) {
   }
 
   const liveIds = new Set();
+  const orderedRoots = [];
   for (const message of list) {
     const id = message.id || `idx_${message.role}_${list.indexOf(message)}`;
     liveIds.add(id);
@@ -6642,6 +8167,7 @@ function renderChat(messages, run, llm) {
       turnNodes.set(id, entry);
       els.chatThread.appendChild(entry.root);
     }
+    orderedRoots.push(entry.root);
     if (entry.kind === "agent") updateAgentTurn(entry, message, run, llm);
     else updateUserTurn(entry, message);
   }
@@ -6651,11 +8177,16 @@ function renderChat(messages, run, llm) {
       turnNodes.delete(id);
     }
   }
+  reconcileChatOrder(orderedRoots);
 
+  renderChatRail(list);
   const scrollTargetId = pendingScrollTargetId;
-  const shouldScroll = !scrollTargetId && (forceNextChatScroll || shouldStickToChatBottom());
+  const shouldScroll = !scrollTargetId && stickBefore;
   if (scrollTargetId) scrollMessageIntoView(scrollTargetId);
-  else if (shouldScroll) scrollChatToEnd();
+  else if (shouldScroll) {
+    chatAutoFollow = true;
+    scrollChatToEnd();
+  }
   forceNextChatScroll = false;
 }
 
@@ -6685,6 +8216,25 @@ function reconcilePendingMessages(serverMessages = []) {
     }
     return true;
   });
+}
+
+// DOM 顺序必须跟消息数组顺序一致。
+// 这些 turn 节点是增量复用的：只在"新建"时 appendChild，之后就不再动位置。
+// 于是只要中途顺序发生变化（合并完整历史、服务端修正顺序、切会话后回填），
+// 旧消息就会停在原来的 DOM 位置——表现就是"最新那条输入却显示在最前面/最后面"。
+// 这里按目标顺序核对一遍，只在错位时搬动节点，顺序正确时不触碰 DOM。
+function reconcileChatOrder(orderedRoots) {
+  const thread = els.chatThread;
+  if (!thread) return;
+  let cursor = thread.firstElementChild;
+  for (const want of orderedRoots) {
+    if (!want || want.parentNode !== thread) continue;
+    if (cursor === want) {
+      cursor = cursor.nextElementSibling;
+      continue;
+    }
+    thread.insertBefore(want, cursor);
+  }
 }
 
 function serverConfirmsPendingUser(message, pending) {
@@ -6747,7 +8297,11 @@ function renderChatMessage(message, run, llm) {
   const text = smoothShownContent(message).trim();
   const phase = linkedRun?.phase || message.details?.phase || "";
   const mode = linkedRun?.mode || message.details?.mode || "";
-  const showThinkingPill = active && mode === "chat" && !thoughts;
+  // 只要还在处理中且尚无任何可见内容（思考块/正文），就显示一个轻量的
+  // "思考中"指示行，而不是先渲染一个空气泡等着内容填进来。
+  const showThinkingPill = active && !text && !thoughts;
+  // 非活动、且完全没有内容的助手消息不渲染，避免留下孤立空气泡。
+  if (!active && !text && !thoughts && !details && !isError) return "";
   return `
     <article class="chat-bubble agent${isError ? " error" : ""}" data-message-id="${escapeHtml(message.id || "")}">
       ${isError ? `<div class="error-pill">任务执行失败，详见对话内容</div>` : ""}
@@ -6882,7 +8436,9 @@ function renderAgentThoughts(message, run, active) {
 
 function normalizeProcessKind(item) {
   const explicit = String(item?.kind || "").trim().toLowerCase();
-  if (["reasoning", "tool", "verify", "memory", "system"].includes(explicit)) return explicit;
+  if (["reasoning", "tool", "verify", "memory", "system", "plan", "plan_step"].includes(explicit)) {
+    return explicit;
+  }
   const title = String(item?.title || "").toLowerCase();
   if (item?.tool) return "tool";
   if (/校验|verify|回读/.test(title)) return "verify";
@@ -6891,10 +8447,11 @@ function normalizeProcessKind(item) {
 
 function processKindLabel(kind) {
   if (kind === "tool") return "工具";
+  if (kind === "plan_step") return "执行计划";
   if (kind === "verify") return "校验";
   if (kind === "memory") return "记忆";
   if (kind === "system") return "系统";
-  return "模型";
+  return "模型思考";
 }
 
 function hasProcessTrace(message, run) {
@@ -7125,7 +8682,6 @@ function openModelModal(modelId) {
   els.modelEditId.value = model ? model.id : "";
   els.modelModalTitle.textContent = model ? "编辑模型" : "添加模型";
   els.modelName.value = model ? model.name || "" : "";
-  els.modelProvider.value = model ? model.provider || "" : "";
   els.modelModelId.value = model ? model.model || "" : "";
   els.modelApiType.value = model ? model.api_type || "openai" : "openai";
   els.modelBaseUrl.value = model ? model.base_url || "" : "";
@@ -7134,8 +8690,10 @@ function openModelModal(modelId) {
   els.modelApiKey.placeholder = model?.key_hint
     ? `已保存 ${model.key_hint}，留空保持不变`
     : "输入 API Key";
-  if (els.modelReasoningEffort) els.modelReasoningEffort.value = model?.reasoning_effort || "";
-  if (els.modelThinkingMode) els.modelThinkingMode.value = model?.thinking_mode || "";
+  if (els.providerModelOptions) els.providerModelOptions.innerHTML = "";
+  if (els.providerModelHint) {
+    els.providerModelHint.textContent = "厂商会更新模型命名，这里以厂商当前实际提供的清单为准。";
+  }
   if (els.modelRevealKey) {
     els.modelRevealKey.hidden = !model?.enabled;
     els.modelRevealKey.textContent = "显示";
@@ -7153,34 +8711,90 @@ function closeModelModal() {
   if (els.modelForm) els.modelForm.reset();
 }
 
+function capabilitySourceLabel(source) {
+  if (source === "manual") return "手动指定";
+  if (source === "provider_catalog") return "厂商目录";
+  return "按模型 ID 推断";
+}
+
+// "检测能力"失败时给出可操作的说明：厂商目录里到底有哪些模型 ID，
+// 以及当前能力是从哪来的——避免只丢一句英文错误让人无从下手。
+function detectFailureMessage(modelId, error) {
+  const model = modelsCache.find((m) => m.id === modelId);
+  const name = model?.name || modelId;
+  const detail = String(error?.data?.message || error?.message || "").trim();
+  const available = Array.isArray(error?.data?.available_models) ? error.data.available_models : [];
+  const total = Number(error?.data?.available_total || available.length);
+  const current = model ? capabilityDisplay(model) : "";
+  const parts = [detail || `无法从厂商目录识别「${name}」的能力`];
+  if (available.length) {
+    const shown = available.slice(0, 6).join("、");
+    parts.push(`该目录里有 ${total} 个模型，例如：${shown}${total > available.length ? " …" : ""}。请核对模型 ID 是否与厂商一致。`);
+  } else {
+    parts.push("该厂商目录没有列出这个模型，或目录需要有效的 API Key 才能读取。");
+  }
+  if (current) parts.push(`当前能力仍按已有信息识别为：${current}，不影响使用。`);
+  return parts.join(" ");
+}
+
+function capabilityDisplay(model) {
+  const modes = (model?.input_modes || []).join(" + ") || "文本";
+  const context = Number(model?.context_window);
+  const contextText = Number.isFinite(context) && context > 0 ? ` · 上下文 ${Math.round(context / 1000)}k` : "";
+  return `${modes}（${capabilitySourceLabel(model?.capability_source)}）${contextText}`;
+}
+
+// 思考档位是自动识别的，列表里直接给结论，不需要用户配置
+function reasoningSummary(model) {
+  const reasoning = model?.reasoning || {};
+  if (Array.isArray(reasoning.levels) && reasoning.levels.length) {
+    return reasoning.levels.map((lv) => REASONING_LEVEL_META[lv]?.label || lv).join(" / ");
+  }
+  if (reasoning.supports_thinking) return "仅支持开关思考";
+  // 没查到任何依据 ≠ 模型不支持，别让用户误判
+  return reasoning.recognized === false ? "未能识别（按模型默认）" : "不支持";
+}
+
+function capabilityNotice(model) {
+  if (!model) return "";
+  const parts = [capabilityDisplay(model)];
+  const reasoning = model.reasoning || {};
+  if (Array.isArray(reasoning.levels) && reasoning.levels.length) {
+    parts.push(`思考档位 ${reasoning.levels.map((lv) => REASONING_LEVEL_META[lv]?.label || lv).join("/")}`);
+  } else if (reasoning.supports_thinking) {
+    parts.push("支持开关思考");
+  }
+  if (model.context_window) parts.push(`上下文 ${Math.round(Number(model.context_window) / 1000)}k`);
+  return `，已识别：${parts.join(" · ")}`;
+}
+
 async function submitModelForm() {
   const isEdit = Boolean(els.modelEditId.value.trim());
+  // 用户只提供名称 / API 类型 / Base URL / 模型 ID / Key，
+  // provider 与输入能力、思考档位都由服务端探测后自动写入。
   const payload = {
     id: els.modelEditId.value.trim(),
     name: els.modelName.value.trim(),
-    provider: els.modelProvider.value.trim(),
     model: els.modelModelId.value.trim(),
     api_type: els.modelApiType.value,
     base_url: els.modelBaseUrl.value.trim(),
   };
-  if (els.modelReasoningEffort) payload.reasoning_effort = els.modelReasoningEffort.value || "";
-  if (els.modelThinkingMode) payload.thinking_mode = els.modelThinkingMode.value || "";
   const apiKey = els.modelApiKey.value.trim();
   if (apiKey || !isEdit) {
     payload.api_key = apiKey;
   }
-  if (!payload.name || !payload.provider || !payload.model) {
-    showNotice("请填写模型名称、Provider 和模型 ID", "error");
+  if (!payload.name || !payload.model) {
+    showNotice("请填写名称和模型 ID", "error");
     return;
   }
   try {
-    await saveModelToBackend(payload);
+    const saved = await saveModelToBackend(payload);
     await fetchModels();
     closeModelModal();
     if (els.agentSettingsDrawer && !els.agentSettingsDrawer.hidden) {
       renderModelConfig();
     }
-    showNotice(isEdit ? "模型已更新" : "模型已添加", "success");
+    showNotice(`${isEdit ? "模型已更新" : "模型已添加"}${capabilityNotice(saved)}`, "success");
   } catch (error) {
     showNotice(error.message || "保存模型失败", "error");
   }
@@ -7220,8 +8834,17 @@ function renderModelConfig() {
         <label>状态</label>
         <span class="config-value ${m.enabled ? "enabled" : "disabled"}">${m.enabled ? `已配置 ${escapeHtml(m.key_hint || "Key")}` : "未配置 Key"}</span>
       </div>
+      <div class="config-row">
+        <label>自动识别</label>
+        <span class="config-value">${escapeHtml(capabilityDisplay(m))}</span>
+      </div>
+      <div class="config-row">
+        <label>思考档位</label>
+        <span class="config-value">${escapeHtml(reasoningSummary(m))}</span>
+      </div>
       <div class="config-actions">
         <button class="edit-model" data-action="edit" data-model-id="${escapeHtml(m.id)}">编辑</button>
+        <button class="detect-model" data-action="detect" data-model-id="${escapeHtml(m.id)}">检测能力</button>
         <button class="delete-model" data-action="delete" data-model-id="${escapeHtml(m.id)}">删除</button>
       </div>
     </div>
@@ -7233,6 +8856,24 @@ function renderModelConfig() {
       openAgentSettings();
       setSettingsTab("llm", els.agentSettingsDrawer);
       openModelModal(modelId);
+    });
+  });
+
+  list.querySelectorAll("[data-action='detect']").forEach((btn) => {
+    btn.addEventListener("click", async (event) => {
+      const modelId = event.target.closest("[data-model-id]").dataset.modelId;
+      if (!modelId) return;
+      try {
+        const data = await post(`/api/models/${encodeURIComponent(modelId)}/detect`, {});
+        await fetchModels();
+        renderModelConfig();
+        const note = data.catalog_metadata === false
+          ? "厂商目录只给了模型 ID，其余能力按模型 ID 推断"
+          : "已按厂商目录更新";
+        showNotice(`检测完成：${capabilityDisplay(data.model)} · ${note}`, "success");
+      } catch (error) {
+        showNotice(detectFailureMessage(modelId, error), "error");
+      }
     });
   });
 
@@ -7256,8 +8897,11 @@ function renderModelConfig() {
 }
 
 function scrollChatToEnd() {
+  // 立即贴底一次，再在下一帧补一次：后台标签/被节流的渲染环境里
+  // requestAnimationFrame 可能长时间不执行，只靠 rAF 会表现为"不跟随"。
+  pinChatToBottom();
   requestAnimationFrame(() => {
-    els.chatThread.scrollTop = els.chatThread.scrollHeight;
+    pinChatToBottom();
   });
 }
 
@@ -7395,9 +9039,7 @@ function smoothStartLoop() {
       if (pos > shown) {
         smoothStream.shown.set(id, pos);
         scheduleChatRender();
-        if (shouldStickToChatBottom() && els.chatThread) {
-          els.chatThread.scrollTop = els.chatThread.scrollHeight;
-        }
+        if (chatAutoFollow) pinChatToBottom();
       }
     }
     if (!active) {
@@ -7643,7 +9285,7 @@ function normalizeAgentSettingsCopy() {
     ],
     llm: [
       "模型配置",
-      "支持 OpenAI-compatible 与 Anthropic API。输入能力和上下文窗口默认按模型 ID 自动识别，也可手动覆盖。",
+      "支持 OpenAI-compatible 与 Anthropic API。输入能力和上下文窗口保存时从厂商模型目录自动识别，离线时按模型 ID 推断，也可手动覆盖。",
     ],
     skills: [
       "技能库",
@@ -7920,137 +9562,177 @@ function readableRunStatus(status) {
   }[value] || value || "unknown";
 }
 
+function normalizeSkillTitle(skill) {
+  const display = String(skill?.display_name || skill?.id || skill?.name || "");
+  return display.startsWith("skill:") ? display.slice("skill:".length) : display;
+}
+
+// 只做"已安装了什么"的清单：不在这里编辑内容，要改就去改文件
 function renderSkills() {
   normalizeAgentSettingsCopy();
   if (!els.skillList) return;
   const skills = Array.isArray(skillsCache) ? skillsCache : [];
-  const active = skills.filter((s) => s.enabled !== false).length;
-  const total = skills.length;
-  els.skillCount.textContent = `${active} / ${total}`;
+  const active = skills.filter(skillEnabled).length;
+  els.skillCount.textContent = `${active} / ${skills.length}`;
 
   if (!skills.length) {
-    els.skillList.innerHTML = `<div class="empty">尚未添加领域 Skill。</div>`;
+    els.skillList.innerHTML = `
+      <div class="skill-empty">
+        <strong>还没有安装 Skill</strong>
+        <p>Skill 是写给 Agent 的操作规程，装好后它遇到对应任务会自动照着做，你不需要手动指定。</p>
+        <p>把 SKILL.md 放到 <code>skills/&lt;名字&gt;/SKILL.md</code>，或点右上角「导入」。</p>
+      </div>`;
     return;
   }
 
-  // Trae/Codex 风格：只展示名称与描述，由模型按 description 决定是否使用
-  els.skillList.innerHTML = skills.map((s) => {
-    const id = s.id || s.name || "";
-    const title = normalizeSkillTitle(s);
-    const desc = s.purpose || s.description || "";
-    const enabled = s.enabled !== false;
-    return `
-      <article class="skill-item ${enabled ? "" : "disabled"}" data-skill-id="${escapeHtml(id)}" role="button" tabindex="0" title="编辑 ${escapeHtml(title)}">
-        <header>
-          <strong>${escapeHtml(title)}</strong>
-          <span class="skill-status">${enabled ? "启用" : "已停用"}</span>
-        </header>
-        <p>${escapeHtml(desc || "定义 Agent 在特定无人机任务中的操作流程与安全边界。")}</p>
-      </article>
-    `;
-  }).join("");
+  const visible = filteredSkills();
+  els.skillList.innerHTML = `
+    <label class="skill-search">
+      <input id="skillSearchInput" type="search" placeholder="搜索 Skill" value="${escapeHtml(skillFilter)}" autocomplete="off">
+    </label>
+    <div class="skill-rows">
+      ${visible.length ? visible.map((skill) => {
+        const id = skill.id || skill.name || "";
+        const title = normalizeSkillTitle(skill);
+        const enabled = skillEnabled(skill);
+        const desc = String(skill.purpose || skill.description || "").replace(/\s+/g, " ").trim();
+        const location = String(skill.doc_path_rel || "").trim();
+        return `
+        <article class="skill-row ${enabled ? "" : "disabled"}" data-skill-id="${escapeHtml(id)}">
+          <div class="skill-row-main">
+            <div class="skill-row-head">
+              <strong>${escapeHtml(title)}</strong>
+              <span class="skill-status ${enabled ? "on" : "off"}">${enabled ? "已安装" : "已停用"}</span>
+            </div>
+            ${desc ? `<p>${escapeHtml(desc)}</p>` : ""}
+            <div class="skill-row-path">${location ? `<code>${escapeHtml(location)}</code>` : "<code>内置（runtime）</code>"}</div>
+          </div>
+          <div class="skill-row-actions">
+            <button type="button" data-skill-action="toggle" title="${enabled ? "停用后 Agent 不再使用它" : "重新启用"}">${enabled ? "停用" : "启用"}</button>
+            <button type="button" class="danger-text" data-skill-action="delete" title="删除这个 Skill 文件">删除</button>
+          </div>
+        </article>`;
+      }).join("") : `<div class="empty small">没有匹配的 Skill</div>`}
+    </div>
+    <p class="skill-foot">要新增或修改内容，直接编辑上面的文件（或点「导入」替换），改动会自动加载。</p>`;
 }
 
-function normalizeSkillTitle(skill) {
-  const display = String(skill.display_name || skill.id || skill.name || "");
-  return display.startsWith("skill:") ? display.slice("skill:".length) : display;
+let skillFilter = "";
+
+function skillDocStatus(skill) {
+  return String(skill?.doc_status || "").toLowerCase();
 }
 
-function openNewSkillModal() {
-  openSkillModal("", { create: true });
+function skillEnabled(skill) {
+  return skill?.enabled !== false && !["disabled", "archived"].includes(skillDocStatus(skill));
 }
 
-function openSkillModal(skillId, options = {}) {
-  const skill = skillsCache.find((s) => (s.id || s.name) === skillId);
-  const creating = Boolean(options.create);
-  if ((!skill && !creating) || !els.skillModal || !els.skillForm) return;
-  const title = skill ? normalizeSkillTitle(skill) : "";
-  els.skillModalTitle.textContent = creating ? "新建 Skill" : "编辑 Skill";
-  els.skillModalSubtitle.textContent = creating ? "创建可复用的领域操作规程（SKILL.md）" : skillId;
-  if (els.skillModalClose) {
-    els.skillModalClose.textContent = "×";
-    els.skillModalClose.title = "关闭";
+function skillCostRiskLabel(skill) {
+  const cost = String(skill?.cost || "").trim();
+  const risk = String(skill?.risk || "").trim();
+  const money = { low: "$", medium: "$$", high: "$$$" }[cost] || "";
+  const riskText = { low: "低风险", medium: "中风险", high: "高风险" }[risk] || "";
+  return [money && `成本 ${money}`, riskText].filter(Boolean).join(" · ");
+}
+
+function skillChips(skill) {
+  const chips = [];
+  const caps = Array.isArray(skill?.required_capabilities) ? skill.required_capabilities : [];
+  const tools = Array.isArray(skill?.subtools) ? skill.subtools : [];
+  if (!caps.length && !tools.length) chips.push("无特殊依赖");
+  caps.forEach((cap) => chips.push(String(cap)));
+  if (tools.length) chips.push(`${tools.length} 个工具`);
+  return chips;
+}
+
+function filteredSkills() {
+  const skills = Array.isArray(skillsCache) ? skillsCache : [];
+  const term = skillFilter.trim().toLowerCase();
+  if (!term) return skills;
+  return skills.filter((s) => [s.id, s.name, s.display_name, s.description, s.purpose]
+    .some((value) => String(value || "").toLowerCase().includes(term)));
+}
+
+function setSkillFilter(value) {
+  skillFilter = String(value ?? "");
+  renderSkills();
+}
+
+
+// SKILL.md 的 frontmatter <-> 表单字段互转：用户填字段，也能随时切回原文
+
+
+
+
+// 展开"原文"时把表单内容同步进去，避免用户以为两种编辑各存一份
+
+
+
+
+
+// 停用/启用：改写 frontmatter 的 status（registry 据此把该 Skill 排除在
+// 模型可见的指导之外），type 保持原值不动。
+function setSkillDocStatus(markdown, enabled) {
+  const lines = String(markdown || "").split("\n");
+  if (lines[0]?.trim() !== "---") return null;
+  const end = lines.findIndex((line, index) => index > 0 && line.trim() === "---");
+  if (end < 0) return null;
+  let statusIndex = -1;
+  let typeValue = "";
+  for (let i = 1; i < end; i += 1) {
+    const status = /^\s*status\s*:\s*(.*)$/.exec(lines[i]);
+    if (status) {
+      statusIndex = i;
+      const current = status[1].trim();
+      if (current && !["disabled", "archived"].includes(current)) typeValue = current;
+    }
+    const type = /^\s*type\s*:\s*(.*)$/.exec(lines[i]);
+    if (type && type[1].trim()) typeValue = typeValue || type[1].trim();
   }
-  const initialMarkdown = creating
-    ? defaultSkillMarkdown("", title)
-    : String(skill?.markdown || "");
-  // Trae/Codex 风格：直接编辑 SKILL.md，frontmatter 决定 name/description 等元数据
-  els.skillForm.innerHTML = `
-    <input type="hidden" id="skillEditId" value="${escapeHtml(skillId)}">
-    <input type="hidden" id="skillEditCreating" value="${creating ? "1" : "0"}">
-    <div class="form-row">
-      <label for="skillEditSlug">标识</label>
-      <input id="skillEditSlug" value="${escapeHtml(skillId.replace(/^skill:/, ""))}" placeholder="inspection_workflow" ${creating ? "" : "disabled"}>
-    </div>
-    <div class="form-row">
-      <label for="skillEditMarkdown">SKILL.md（frontmatter 的 name/description 决定模型何时使用）</label>
-      <textarea id="skillEditMarkdown" class="skill-markdown-editor" spellcheck="false" rows="16">${escapeHtml(initialMarkdown)}</textarea>
-    </div>
-    <div class="modal-actions">
-      <button type="button" id="skillModalCancelInline" class="secondary">取消</button>
-      <button type="submit" class="primary">${creating ? "创建" : "保存"}</button>
-    </div>
-  `;
-  const cancel = document.getElementById("skillModalCancelInline");
-  if (cancel) cancel.addEventListener("click", closeSkillModal, { once: true });
-  els.skillModal.hidden = false;
+  const next = enabled ? (typeValue || "guidance") : "disabled";
+  if (statusIndex >= 0) lines[statusIndex] = `status: ${next}`;
+  else lines.splice(1, 0, `status: ${next}`);
+  return lines.join("\n");
 }
 
-function defaultSkillMarkdown(skillId, title) {
-  const name = skillId.replace(/^skill:/, "") || title || "new_skill";
-  return `---
-name: ${name}
-description: Describe when and how the Agent should use this skill.
-
----
-
-# ${name}
-
-## Purpose
-
-Describe the workflow this skill handles.
-
-## When to Use
-
-Describe the situation in which the Agent should apply this skill.
-
-## Operating Rules
-
-- Read current vehicle state before issuing commands.
-- Use only tools exposed by the active backend.
-`;
-}
-
-function closeSkillModal() {
-  if (els.skillModal) els.skillModal.hidden = true;
-  if (els.skillForm) els.skillForm.reset();
-}
-
-async function submitSkillForm() {
-  const idInput = document.getElementById("skillEditId");
-  const creating = document.getElementById("skillEditCreating")?.value === "1";
-  const slug = String(document.getElementById("skillEditSlug")?.value || "").trim().toLowerCase();
-  const markdown = String(document.getElementById("skillEditMarkdown")?.value || "").trim();
-  const skillId = creating ? `skill:${slug}` : String(idInput?.value || "").trim();
-  if (!skillId || (creating && !slug)) {
-    showNotice("请填写 Skill 标识", "error");
-    return;
-  }
-  if (!markdown) {
-    showNotice("SKILL.md 内容不能为空", "error");
+async function toggleSkillEnabled(skill) {
+  const id = skill?.id || skill?.name || "";
+  const next = !skillEnabled(skill);
+  const markdown = setSkillDocStatus(skill?.markdown || "", next);
+  if (!id || !markdown) {
+    showNotice("这个 Skill 没有可编辑的 SKILL.md 文档", "error");
     return;
   }
   try {
-    const result = creating
-      ? await post("/api/skills", { action: "create", id: slug, markdown })
-      : await post("/api/skills", { id: skillId, markdown });
-    if (!result.ok) throw new Error(result.error || "Save failed");
+    const result = await post("/api/skills", { id, markdown });
+    if (!result.ok) throw new Error(result.error || "切换失败");
     await loadSkills(true);
-    closeSkillModal();
     renderSkills();
-    showNotice(creating ? "Skill 已创建并加载" : "Skill 已保存并重新加载", "success");
+    showNotice(next ? `已启用「${normalizeSkillTitle(skill)}」` : `已停用「${normalizeSkillTitle(skill)}」`, "info");
   } catch (error) {
-    showNotice(error.message || "Skill 保存失败", "error");
+    showNotice(error.message || "切换 Skill 状态失败", "error");
+  }
+}
+
+
+async function deleteSkill(skill) {
+  const id = skill?.id || skill?.name || "";
+  if (!id) return;
+  const confirmed = await confirmDialog({
+    title: `删除 Skill「${normalizeSkillTitle(skill)}」`,
+    message: "会删除工作区里的 SKILL.md 文件，无法恢复。",
+    confirmLabel: "删除",
+    danger: true,
+  });
+  if (!confirmed) return;
+  try {
+    const result = await post("/api/skills", { action: "delete", id });
+    if (!result.ok) throw new Error(result.error || "删除失败");
+    await loadSkills(true);
+    renderSkills();
+    showNotice("Skill 已删除", "info");
+  } catch (error) {
+    showNotice(error.message || "删除 Skill 失败", "error");
   }
 }
 
@@ -8177,6 +9859,15 @@ function mavlinkRemoteTargetSummary(link = currentActualLink()) {
   return "";
 }
 
+// 「实际心跳来源」= 后端真收到 MAVLink 数据报的地址。监听模式（udpin:0.0.0.0）
+// 下 socket 绑全部网卡，所以它才是"当前到底连着哪条链路"的判据；配置里的
+// PX4 目标只是用户填的期望值，两者可能不是同一台设备。
+function actualHeartbeatSourceText(link = currentActualLink()) {
+  const peer = String(link.actual_peer_endpoint || "");
+  if (!peer) return "尚未收到心跳";
+  return link.peer_source_verified === false ? `${peer}（按发送目标推断，未核实）` : peer;
+}
+
 function firmwareVersionText(firmware = currentFirmwareInfo()) {
   const version = firmware.flight_version || {};
   if (version.text) return version.type_name ? `${version.text} ${version.type_name}` : version.text;
@@ -8224,10 +9915,12 @@ function renderActualLinkCard() {
   const remoteTarget = mavlinkRemoteTargetSummary(link);
   if (String(link.url || "").startsWith("udpin:")) {
     rows.push(["本地监听", link.local_listen_url || link.url]);
-    if (remoteTarget) rows.push(["PX4 目标", remoteTarget]);
+    rows.push(["实际心跳来源", actualHeartbeatSourceText(link)]);
+    if (remoteTarget) rows.push(["PX4 目标（配置）", remoteTarget]);
   } else {
     rows.push(["实际端点", actualLinkSummary(link)]);
-    if (remoteTarget) rows.push(["PX4 目标", remoteTarget]);
+    if (link.actual_peer_endpoint) rows.push(["实际心跳来源", actualHeartbeatSourceText(link)]);
+    if (remoteTarget) rows.push(["PX4 目标（配置）", remoteTarget]);
   }
   rows.push(
     ["链路类型", link.real_vehicle ? "真实 USB 飞控" : "仿真/网络链路"],
@@ -9796,7 +11489,7 @@ function renderConnectionDetail(connectionId) {
 
 function updateConnectionDetailStatus(connected) {
   if (!els.connectionDetailStatus) return;
-  els.connectionDetailStatus.classList.toggle("connected", connected);
+  els.connectionDetailStatus.classList.toggle("connected", Boolean(connected));
   const text = els.connectionDetailStatus.querySelector(".status-text");
   if (text) text.textContent = connected ? "已连接" : "未连接";
 }
@@ -9963,11 +11656,16 @@ async function activateSelectedConnection() {
   showNotice(actuallyActive ? "Disconnecting..." : `Connecting ${conn.name}...`, "info");
 
   try {
-    const resp = await fetch("/api/settings/connections/activate", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ connection_id: conn.id }),
-    });
+    // 面板认定的活动链路是按真实端点识别出来的，未必等于 settings 里记的
+    // active_connection_id；断开必须走显式接口，否则会被当成"重连这条"。
+    const resp = await fetch(
+      actuallyActive ? "/api/settings/connections/deactivate" : "/api/settings/connections/activate",
+      {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(actuallyActive ? {} : { connection_id: conn.id }),
+      }
+    );
     const result = await resp.json();
     const toolData = result?.result?.data || {};
     const backend = result?.backend || toolData.backend || "";
@@ -9998,27 +11696,17 @@ async function activateSelectedConnection() {
   await refresh();
 }
 
-function connectionMatchesBackend(connection, backend) {
-  const type = String(connection?.type || "").toLowerCase();
-  const normalized = String(backend || "").toLowerCase();
-  if (normalized === "airsim") return type === "airsim";
-  if (normalized === "px4_ros2") return ["px4_ros2", "ros2", "ros", "px4_ros"].includes(type);
-  if (normalized === "px4_mavlink") return ["auto", "udp", "tcp", "serial", "mavlink", "px4"].includes(type);
-  return false;
-}
-
 function renderSystemConnection(drone = {}, toolRuntime = {}) {
   const connected = Boolean(toolRuntime.connected) && !toolRuntime.stale_connection;
   let activeChanged = false;
 
   if (connected && connectionsCache.length) {
-    const backend = toolRuntime.backend || toolRuntime.backend_profile?.id || "airsim";
-    const current = connectionsCache.find((connection) => connection.id === activeConnectionId);
-    const expected = current && connectionMatchesBackend(current, backend)
-      ? current
-      : connectionsCache.find((connection) => connectionMatchesBackend(connection, backend));
-    if (expected && expected.id !== activeConnectionId) {
-      activeConnectionId = expected.id;
+    // 谁在连着由实际链路决定：按监听口 + 真实心跳来源认领对应的连接。
+    // 以前这里退化成"列表里第一条同后端的预设"，于是用户新加的 127.0.0.1
+    // 链路会被显示成连在那条老的 JETSON 预设上。
+    const identified = refreshLiveConnectionId(currentActualLink(), connected);
+    if (identified && identified !== activeConnectionId) {
+      activeConnectionId = identified;
       activeChanged = true;
     }
   } else if (activeConnectionId) {
@@ -10035,7 +11723,6 @@ function renderSystemConnection(drone = {}, toolRuntime = {}) {
     updateConnectionDetailStatus(actuallyActive);
   }
   renderActualLinkCard();
-  renderActiveVehicleSetupPanel("runtime");
   if (activeSystemSettingsSection === "parameters") {
     renderVehicleParametersPanel();
   }

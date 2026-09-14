@@ -201,6 +201,96 @@ class CameraFrameSource:
                 return None
 
 
+class LazyControllerFrameSource:
+    """FrameSource backed by the flight controller's capture path.
+
+    The ground-station process hosts several msgpack-rpc sessions; a
+    hand-rolled MultirotorClient here has proven to hang on simGetImages
+    (Session.call waits with no timeout), while the flight controller's
+    capture_image (worker thread + hard timeout + runtime reset) keeps
+    working. The controller is resolved lazily per frame so the axis never
+    pins a stale backend instance.
+    """
+
+    def __init__(self, controller_provider: Any, camera_name: str = "0", image_type: int = 0, timeout_sec: float = 8.0) -> None:
+        self._controller_provider = controller_provider
+        self.camera_name = camera_name
+        self.image_type = image_type
+        self.timeout_sec = timeout_sec
+        self._open = False
+        self.last_error = ""
+        # 失败退避：AirSim RPC 卡死时，capture_image 每次要等几十秒才超时；
+        # 连续失败后暂停取帧一段时间，避免感知线程一直卡在超时里、也避免
+        # 反复触发 RPC 重置。
+        self._consecutive_failures = 0
+        self._backoff_until = 0.0
+
+    @property
+    def is_open(self) -> bool:
+        return self._open
+
+    def open(self) -> bool:
+        self._open = True
+        self.last_error = ""
+        return True
+
+    def close(self) -> None:
+        self._open = False
+
+    def _warn_rate_limited(self, message: str, every_s: float = 5.0) -> None:
+        """限流告警：取帧持续失败时便于定位原因，但不要刷屏。"""
+        now = time.time()
+        if now - getattr(self, "_last_warn_ts", 0.0) >= every_s:
+            self._last_warn_ts = now
+            logger.warning("perception_frame_unavailable", error=message)
+
+    def _note_failure(self) -> None:
+        """连续失败后退避：避免感知线程反复卡在 RPC 超时里。"""
+        self._consecutive_failures += 1
+        if self._consecutive_failures >= 3:
+            self._backoff_until = time.time() + 10.0
+            self.last_error = (
+                "AirSim RPC 无响应（模拟器未运行或服务已卡死）。"
+                "请在 UE 中重新 Play / 重启 AirSim 后恢复。"
+            )
+
+    def get_frame(self) -> np.ndarray | None:
+        if not self._open:
+            return None
+        if time.time() < self._backoff_until:
+            return None
+        controller = self._controller_provider() if callable(self._controller_provider) else None
+        if controller is None:
+            self.last_error = "flight controller unavailable"
+            self._warn_rate_limited("controller unavailable")
+            return None
+        try:
+            raw = controller.capture_image(self.camera_name, self.image_type, timeout=self.timeout_sec)
+            self._consecutive_failures = 0
+        except Exception as exc:
+            self.last_error = f"capture failed: {exc}"
+            self._warn_rate_limited(self.last_error)
+            self._note_failure()
+            return None
+        if not raw:
+            self.last_error = "capture returned empty frame"
+            self._note_failure()
+            self._warn_rate_limited(self.last_error)
+            return None
+        try:
+            import cv2
+
+            frame = cv2.imdecode(np.frombuffer(bytes(raw), dtype=np.uint8), cv2.IMREAD_UNCHANGED)
+            if frame is None:
+                return None
+            if frame.ndim == 3 and frame.shape[2] == 4:
+                frame = cv2.cvtColor(frame, cv2.COLOR_BGRA2BGR)
+            return frame
+        except Exception as exc:
+            self.last_error = f"decode failed: {exc}"
+            return None
+
+
 class AirSimFrameSource:
     """AirSim RPC frames (Scene camera) as a FrameSource.
 
@@ -218,6 +308,18 @@ class AirSimFrameSource:
         self._port = port
         self._open = False
         self.last_error = ""
+        # 取帧调用必须带硬超时：msgpack-rpc 的 future.get() 没有超时，
+        # 一次半开连接（模拟器重启/网络抖动）就会把调用线程永久卡死，
+        # 表现为感知轴 online=false、0 帧。超时后重建客户端恢复。
+        self._call_lock = threading.Lock()
+        # 重建限流：AirSim 的 msgpack 服务是单线程的，每次失败就重连会留下
+        # 大量半开连接（服务端 CloseWait 堆积）直到把 RPC 服务彻底堵死。
+        # 因此只在连续失败达阈值、且距上次重建有冷却时间时才重建；重建前
+        # 尽力关闭旧客户端，避免泄漏套接字。
+        self._consecutive_failures = 0
+        self._last_rebuild_ts = 0.0
+        self._rebuild_cooldown_s = 5.0
+        self._rebuild_after_failures = 3
 
     @property
     def is_open(self) -> bool:
@@ -246,9 +348,60 @@ class AirSimFrameSource:
     def close(self) -> None:
         self._open = False
 
-    def get_frame(self) -> np.ndarray | None:
-        if not self._open:
+    def _rebuild_client(self) -> None:
+        """Replace the RPC client: a stuck session can never recover in place."""
+        # 尽力关闭旧客户端，避免在 AirSim 服务端留下半开连接（CloseWait 堆积
+        # 会把单线程 RPC 服务堵死）。不同 airsim 版本的关闭入口不一致，逐个尝试。
+        old = self._client
+        self._client = None
+        if old is not None:
+            for attr in ("close", "shutdown"):
+                fn = getattr(old, attr, None)
+                if callable(fn):
+                    try:
+                        fn()
+                    except Exception:
+                        pass
+                    break
+            inner = getattr(old, "client", None)
+            for attr in ("close", "shutdown"):
+                fn = getattr(inner, attr, None)
+                if callable(fn):
+                    try:
+                        fn()
+                    except Exception:
+                        pass
+                    break
+        try:
+            import airsim
+
+            self._client = airsim.MultirotorClient(ip=self._host, port=self._port)
+            self._last_rebuild_ts = time.time()
+        except Exception as exc:
+            self.last_error = f"client rebuild failed: {exc}"
+
+    def _fetch_with_timeout(self) -> np.ndarray | None:
+        import queue as _queue
+
+        result_q: "queue.Queue[np.ndarray | None]" = _queue.Queue(maxsize=1)
+
+        def _call():
+            try:
+                result_q.put(self._fetch_once())
+            except Exception:
+                result_q.put(None)
+
+        worker = threading.Thread(target=_call, daemon=True, name="airsim-frame-fetch")
+        worker.start()
+        try:
+            return result_q.get(timeout=self.timeout_sec)
+        except Exception:
+            # 超时：worker 卡在 msgpack future.get()（半开会话）——丢弃该
+            # 客户端会话，下一次取帧用全新连接。卡死的 worker 线程无法
+            # 回收，但只在连接故障时发生一次。
             return None
+
+    def _fetch_once(self) -> np.ndarray | None:
         try:
             import airsim
 
@@ -273,3 +426,34 @@ class AirSimFrameSource:
         except Exception as exc:
             logger.warning("airsim_frame_failed", error=str(exc))
             return None
+
+    def get_frame(self) -> np.ndarray | None:
+        if not self._open:
+            return None
+        # 连续失败后进入退避：不再高频发起 RPC，给卡死的 AirSim 服务留出恢复
+        # 窗口，也避免我们自己把它的连接队列挤爆。
+        if self._consecutive_failures >= 6 and (time.time() - self._last_rebuild_ts) < 10.0:
+            return None
+        with self._call_lock:
+            frame = self._fetch_with_timeout()
+        if frame is not None:
+            self._consecutive_failures = 0
+            return frame
+        # 取帧失败：不要每帧都重连（会把 AirSim 单线程 RPC 服务用半开连接堵死）。
+        # 连续失败达阈值且过了冷却时间才重建一次客户端，并且重建前关闭旧连接。
+        self._consecutive_failures += 1
+        now = time.time()
+        if (
+            self._consecutive_failures >= self._rebuild_after_failures
+            and now - self._last_rebuild_ts >= self._rebuild_cooldown_s
+        ):
+            self._rebuild_client()
+        if self._consecutive_failures == self._rebuild_after_failures:
+            # 第一次达到阈值时给出明确原因，让前端显示"模拟器未就绪"而不是
+            # 一直停在"正在连接视频流"。
+            self.last_error = (
+                "AirSim RPC 无响应（模拟器未运行或服务已卡死）。"
+                "请在 UE 中重新 Play / 重启 AirSim 后恢复。"
+            )
+            logger.warning("airsim_frame_unavailable", consecutive_failures=self._consecutive_failures)
+        return None

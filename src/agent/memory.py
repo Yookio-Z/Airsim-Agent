@@ -26,6 +26,18 @@ class AgentMemory:
         self._lock = threading.RLock()
         self._data = self._load()
 
+    def rebind(self, data_dir: Path) -> None:
+        """把记忆切换到另一个会话目录（原地切换，不替换对象）。
+
+        AgentLoop / 子代理持有本对象引用，替换 self.memory 会让它们继续用旧
+        会话的记忆；因此这里只换存储路径并重新加载。
+        """
+        with self._lock:
+            self.data_dir = Path(data_dir)
+            self.data_dir.mkdir(parents=True, exist_ok=True)
+            self.path = self.data_dir / "memory.json"
+            self._data = self._load()
+
     def _load(self) -> dict[str, Any]:
         if not self.path.exists():
             return {
@@ -415,6 +427,26 @@ class AgentMemory:
             if term and term not in deduped:
                 deduped.append(term)
         return deduped[:8]
+
+    def clear(self) -> dict[str, Any]:
+        """清空长期记忆（任务记录/经验/风险/事实）。
+
+        长期记忆是**跨会话共享**的（只有对话是 per-session），所以新开会话仍会
+        看到历史任务记录。需要"干净重来"时调用本方法。
+        """
+        with self._lock:
+            data = self._load()
+            removed = {
+                "missions": len(data.get("missions") or []),
+                "lessons": len(data.get("lessons") or []),
+                "risks": len(data.get("risks") or []),
+                "facts": len(data.get("facts") or {}),
+            }
+            for key in ("missions", "lessons", "risks"):
+                data[key] = []
+            data["facts"] = {}
+            self._save(data)
+        return removed
 
     def snapshot(self) -> dict[str, Any]:
         working_state = dict(self._data.get("session", {}))

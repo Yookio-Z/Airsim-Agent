@@ -73,6 +73,7 @@ class DroneConfig(BaseSettings):
     perception_confidence: float = 0.25
     perception_update_fps: float = 5.0
     perception_health_timeout_sec: float = 3.0
+    perception_model: str = "auto"              # auto | world(YOLO-World) | coco
     perception_rtsp_url: str = ""               # frame_source=rtsp 时的流地址
 
 

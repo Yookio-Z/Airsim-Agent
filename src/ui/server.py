@@ -21,7 +21,7 @@ from pathlib import Path
 from urllib.parse import parse_qs, unquote, urlparse
 
 from src.agent import AgentRuntime
-from src.agent.llm import ModelRegistry
+from src.agent.llm import ModelRegistry, derive_provider, list_provider_models, probe_model_capabilities
 from src.agent.planner import _bounded_copy
 from src.agent.skill_docs import parse_skill_doc
 
@@ -391,6 +391,12 @@ class AgentRequestHandler(BaseHTTPRequestHandler):
             self._send_json(RUNTIME.activate_connection(connection_id))
             return
 
+        # 显式断开：面板按真实端点识别出来的活动链路未必等于 settings 里记的
+        # active_connection_id，那种情况下 activate 的切换逻辑会变成"重连"。
+        if path == "/api/settings/connections/deactivate":
+            self._send_json(RUNTIME.deactivate_connection())
+            return
+
         # P6: GCS MissionManager facade endpoints (UI and Agent unified path)
         if path == "/api/gcs/mission":
             draft_data = payload.get("draft") if isinstance(payload.get("draft"), dict) else payload
@@ -467,6 +473,16 @@ class AgentRequestHandler(BaseHTTPRequestHandler):
             self._handle_model_post(payload)
             return
 
+        # 拉取厂商当前实际提供的模型清单（厂商会改模型命名，不能靠写死的名字猜）
+        if path == "/api/models/catalog":
+            result = list_provider_models(
+                str(payload.get("base_url", "")),
+                str(payload.get("api_type", "openai")),
+                str(payload.get("api_key", "")),
+            )
+            self._send_json(result, HTTPStatus.OK if result.get("ok") else HTTPStatus.BAD_REQUEST)
+            return
+
         if path.startswith("/api/models/"):
             self._handle_model_action(path, payload)
             return
@@ -478,12 +494,24 @@ class AgentRequestHandler(BaseHTTPRequestHandler):
             if not isinstance(params, dict):
                 self._send_json({"ok": False, "error": "params must be an object"}, HTTPStatus.BAD_REQUEST)
                 return
-            self._send_json(RUNTIME.execute_tool(
-                tool,
-                params=params,
-                dry_run=dry_run,
-                expected_backend=str(payload.get("expected_backend", "")),
-            ))
+            try:
+                self._send_json(RUNTIME.execute_tool(
+                    tool,
+                    params=params,
+                    dry_run=dry_run,
+                    expected_backend=str(payload.get("expected_backend", "")),
+                ))
+            except Exception as e:
+                # 工具异常必须带 traceback 落日志，否则前端只看到一个干巴巴的
+                # 错误字符串，无法定位（例如编码/模型返回格式问题）。
+                import logging
+                import traceback
+
+                logging.getLogger("ui").warning(
+                    "tool_exception tool=%s: %s\n%s",
+                    tool, e, "\n".join(traceback.format_exc().splitlines()[-25:]),
+                )
+                self._send_json({"ok": False, "error": str(e)}, HTTPStatus.INTERNAL_SERVER_ERROR)
             return
 
         self._send_json({"ok": False, "error": "not found"}, HTTPStatus.NOT_FOUND)
@@ -660,13 +688,21 @@ class AgentRequestHandler(BaseHTTPRequestHandler):
         model = {
             "id": str(payload.get("id", "")).strip() or f"model_{int(time.time() * 1000)}",
             "name": str(payload.get("name", "")).strip() or "未命名模型",
-            "provider": str(payload.get("provider", "")).strip() or "openai",
             "model": str(payload.get("model", "")).strip(),
             "base_url": str(payload.get("base_url", "")).strip().rstrip("/"),
             "api_key": str(payload.get("api_key", "")),
             "api_type": str(payload.get("api_type", "openai")).strip() or "openai",
             "timeout_sec": float(payload["timeout_sec"]) if payload.get("timeout_sec") not in (None, "") else 25.0,
+            # 能力一律自动识别，用户不需要手填
+            "capability_mode": "auto",
         }
+        # provider 只用于界面分组：用户没填就从 Base URL 推断
+        model["provider"] = str(payload.get("provider", "")).strip() or derive_provider(
+            model["base_url"], model["api_type"], model["model"]
+        )
+        probed = probe_model_capabilities(model["model"], model["api_type"], model["base_url"], model["api_key"])
+        if probed.get("ok"):
+            model["capabilities"] = {**probed["capabilities"], "fetched_at": _utc_now_iso()}
         try:
             MODEL_REGISTRY.add(model)
             RUNTIME.planner.reload_config()
@@ -698,8 +734,48 @@ class AgentRequestHandler(BaseHTTPRequestHandler):
             self._send_json({"ok": True, "api_key": str(model.get("api_key") or "")})
             return
 
+        if sub_action == "detect":
+            model = MODEL_REGISTRY.get(model_id)
+            if not model:
+                self._send_json({"ok": False, "error": "model not found"}, HTTPStatus.NOT_FOUND)
+                return
+            probed = probe_model_capabilities(
+                str(model.get("model") or ""),
+                str(model.get("api_type") or "openai"),
+                str(model.get("base_url") or ""),
+                str(model.get("api_key") or ""),
+            )
+            if not probed.get("ok"):
+                self._send_json({
+                    "ok": False,
+                    "error": probed.get("error", "probe failed"),
+                    "message": probed.get("message", ""),
+                    "available_models": probed.get("available_models") or [],
+                    "available_total": probed.get("available_total") or 0,
+                }, HTTPStatus.BAD_REQUEST)
+                return
+            if probed.get("capabilities"):
+                MODEL_REGISTRY.set_capabilities(model_id, {**probed["capabilities"], "fetched_at": _utc_now_iso()})
+            RUNTIME.planner.reload_config()
+            self._send_json({
+                "ok": True,
+                "model": self._public_model(model_id),
+                "catalog_metadata": bool(probed.get("catalog_metadata")),
+                "message": probed.get("message", ""),
+            })
+            return
+
         updates = {}
-        for key in ["name", "provider", "model", "base_url", "api_key", "api_type", "timeout_sec"]:
+        for key in [
+            "name",
+            "model",
+            "base_url",
+            "api_key",
+            "api_type",
+            "timeout_sec",
+            "thinking_mode",
+            "reasoning_effort",
+        ]:
             if key in payload:
                 if key == "timeout_sec":
                     updates[key] = float(payload[key])
@@ -707,11 +783,30 @@ class AgentRequestHandler(BaseHTTPRequestHandler):
                     updates[key] = str(payload[key]).strip().rstrip("/")
                 else:
                     updates[key] = str(payload[key]).strip()
-        # 清除旧的参数化字段，避免残留配置影响模型能力
-        for stale in ("max_tokens", "temperature", "capability_mode", "generation_mode", "context_window"):
+        updates["capability_mode"] = "auto"
+        # 清除旧的参数化字段，避免残留配置影响模型能力；capability_mode 是
+        # 用户的手动覆盖项，探测会重新执行，因此不在清除之列。
+        for stale in ("max_tokens", "temperature", "generation_mode", "context_window"):
             updates[stale] = None
+        # Base URL / 模型 ID 变了就重推 provider，保持分组标签跟着走
+        if "base_url" in updates or "model" in updates:
+            merged_for_provider = {**(MODEL_REGISTRY.get(model_id) or {}), **{k: v for k, v in updates.items() if v is not None}}
+            updates["provider"] = derive_provider(
+                str(merged_for_provider.get("base_url") or ""),
+                str(merged_for_provider.get("api_type") or "openai"),
+                str(merged_for_provider.get("model") or ""),
+            )
         try:
             MODEL_REGISTRY.update(model_id, updates)
+            merged = MODEL_REGISTRY.get(model_id) or {}
+            probed = probe_model_capabilities(
+                str(merged.get("model") or ""),
+                str(merged.get("api_type") or "openai"),
+                str(merged.get("base_url") or ""),
+                str(merged.get("api_key") or ""),
+            )
+            if probed.get("ok"):
+                MODEL_REGISTRY.set_capabilities(model_id, {**probed["capabilities"], "fetched_at": _utc_now_iso()})
             RUNTIME.planner.reload_config()
             self._send_json({"ok": True, "model": self._public_model(model_id)})
         except Exception as e:
@@ -757,7 +852,13 @@ class AgentRequestHandler(BaseHTTPRequestHandler):
                 markdown = ""
         executable = bool(executable_card)
         doc_status = str(card.get("doc_status") or (doc_card or {}).get("doc_status") or "")
+        # 界面只展示"装在哪"：给出相对仓库根的路径，用户可以直接去改文件
+        try:
+            doc_path_rel = str(Path(doc_path).resolve().relative_to(REPO_ROOT).as_posix()) if doc_path else ""
+        except Exception:
+            doc_path_rel = ""
         return {
+            "doc_path_rel": doc_path_rel,
             "id": action_name,
             "name": action_name,
             "display_name": card.get("display_name") or action_name,
@@ -788,6 +889,13 @@ class AgentRequestHandler(BaseHTTPRequestHandler):
             except Exception as exc:
                 self._send_json({"ok": False, "error": str(exc)}, HTTPStatus.BAD_REQUEST)
             return
+        if action == "delete":
+            try:
+                self._delete_skill_document(str(payload.get("id", "")))
+                self._send_json({"ok": True})
+            except Exception as exc:
+                self._send_json({"ok": False, "error": str(exc)}, HTTPStatus.BAD_REQUEST)
+            return
         action_name = str(payload.get("id", "")).strip()
         updates = payload.get("updates") or {}
         markdown = payload.get("markdown")
@@ -810,6 +918,29 @@ class AgentRequestHandler(BaseHTTPRequestHandler):
             self._send_json({"ok": False, "error": str(e)}, HTTPStatus.NOT_FOUND)
         except Exception as e:
             self._send_json({"ok": False, "error": str(e)}, HTTPStatus.BAD_REQUEST)
+
+    def _delete_skill_document(self, action_name: str) -> None:
+        """删除工作区里的 SKILL.md（只允许删 skills/ 目录下的文档）。"""
+        name = str(action_name or "").strip()
+        if not name:
+            raise ValueError("id required")
+        cards = {
+            str(item.get("name")): item
+            for item in RUNTIME.agent_loop.skills.doc_cards()
+            if isinstance(item, dict) and item.get("name")
+        }
+        card = cards.get(name)
+        if not card:
+            raise KeyError(f"unknown skill: {name}")
+        doc_path = str(card.get("doc_path") or "")
+        if not doc_path:
+            raise ValueError("skill has no SKILL.md document")
+        resolved = Path(doc_path).resolve()
+        skills_root = (REPO_ROOT / "skills").resolve()
+        if skills_root not in resolved.parents:
+            raise ValueError("only workspace skills can be deleted")
+        resolved.unlink()
+        RUNTIME.agent_loop.skills.reload_docs()
 
     def _save_skill_markdown(self, action_name: str, markdown: str) -> None:
         cards = {
@@ -978,6 +1109,10 @@ class AgentRequestHandler(BaseHTTPRequestHandler):
             pass
 
         self._send_bytes(data, content_type, cache=True)
+
+
+def _utc_now_iso() -> str:
+    return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
 
 
 def _load_saved_backend() -> str:

@@ -224,18 +224,12 @@ def register_perception_tools(mcp, controller: FlightController, _fmt_result):
                 import cv2
                 import numpy as np
                 # 延迟导入避免循环依赖
-                from src.modules.yolo_detection import (
-                    build_search_classes,
-                    get_yolo_model,
-                    run_yolo_detection,
-                )
+                from src.modules.yolo_detection import detect_objects_stateless
 
                 nparr = np.frombuffer(response, np.uint8)
                 img = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
                 if img is not None:
-                    search_classes = build_search_classes(verify_target_class)
-                    model = get_yolo_model(search_classes)
-                    detections = run_yolo_detection(model, img, verify_target_class, verify_min_confidence)
+                    detections = detect_objects_stateless(img, verify_target_class, verify_min_confidence)
 
                     if not detections:
                         # 画面中没有目标，返回错误

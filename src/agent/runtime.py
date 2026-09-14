@@ -41,7 +41,124 @@ from src.config import config
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 SESSIONS_DIR = REPO_ROOT / "src" / "data" / "sessions"
+# 记忆按"会话"隔离：一个 session 一份记忆（任务记录/经验/风险/事实），
+# 新开会话不再继承上一个会话的记忆。
+SESSION_MEMORY_DIR = REPO_ROOT / ".airsim_agent" / "session_memory"
 SESSIONS_DIR.mkdir(parents=True, exist_ok=True)
+
+# 会话文件里最占体积、又没人真的需要落盘的两类字段：
+#   loop_state.observations —— 每次工具观测的原文，单条消息就能到 500KB；
+#   details.agent_state    —— 每步完整状态快照，约 25KB/条。
+# 前端不渲染它们（timeline 用 process_trace / decisions / results），
+# 运行时需要的仍在内存里，只是落盘和发给前端时剥掉。
+_SESSION_DROP_DETAIL_KEYS = ("agent_state", "observations")
+# 发给前端时 loop_state 里只保留界面真正会读的键（界面读 decisions / results）
+_UI_KEEP_LOOP_STATE_KEYS = (
+    "decisions", "results", "command", "summary", "status", "run_id",
+    "started_at", "finished_at", "verification_status", "max_steps",
+)
+# 工具返回里界面只读 message（决策行正文）与 status
+_UI_KEEP_RESULT_KEYS = ("message", "status")
+
+
+def _slim_result_data(value: Any) -> Any:
+    if not isinstance(value, dict):
+        return value
+    return {key: value[key] for key in _UI_KEEP_RESULT_KEYS if key in value}
+
+
+def _trim_session_message(message: Any, for_payload: bool = False) -> Any:
+    """剥掉消息 details 里的大字段，返回副本（不改内存里的原对象）。
+
+    ``for_payload=True`` 时进一步瘦身：界面只读 results[].data.message 与
+    plan.steps[].result.message/status，工具原始返回对渲染没用。
+    """
+    if not isinstance(message, dict):
+        return message
+    details = message.get("details")
+    if not isinstance(details, dict):
+        return message
+    slim = {key: value for key, value in details.items() if key not in _SESSION_DROP_DETAIL_KEYS}
+    loop_state = slim.get("loop_state")
+    if isinstance(loop_state, dict):
+        loop_state = {key: value for key, value in loop_state.items() if key != "observations"}
+        loop_state["observations_omitted"] = True
+        if for_payload:
+            loop_state = {
+                key: value for key, value in loop_state.items()
+                if key in _UI_KEEP_LOOP_STATE_KEYS or key == "observations_omitted"
+            }
+            results = loop_state.get("results")
+            if isinstance(results, list):
+                loop_state["results"] = [
+                    {**item, "data": _slim_result_data(item.get("data"))} if isinstance(item, dict) else item
+                    for item in results
+                ]
+        slim["loop_state"] = loop_state
+    if for_payload:
+        plan = slim.get("plan")
+        if isinstance(plan, dict) and isinstance(plan.get("steps"), list):
+            slim["plan"] = {
+                **plan,
+                "steps": [
+                    {**step, "result": _slim_result_data(step.get("result"))}
+                    if isinstance(step, dict) and "result" in step else step
+                    for step in plan["steps"]
+                ],
+            }
+    trimmed = dict(message)
+    trimmed["details"] = slim
+    return trimmed
+
+
+
+def trim_loop_state_payload(payload: Any) -> Any:
+    """run 顶层 loop_state 的瘦身：丢掉 observations 与界面不读的大块。
+
+    run.to_dict() 里 loop_state.observations 是工具观测原文（可到数百 KB），
+    界面只用 decisions / results 画时间线。
+    """
+    if not isinstance(payload, dict):
+        return payload
+    loop_state = payload.get("loop_state")
+    if not isinstance(loop_state, dict):
+        return payload
+    slim = {
+        key: value for key, value in loop_state.items()
+        if key in _UI_KEEP_LOOP_STATE_KEYS or key == "observations_omitted"
+    }
+    if "observations" in loop_state:
+        slim["observations_omitted"] = True
+    results = slim.get("results")
+    if isinstance(results, list):
+        slim["results"] = [
+            {**item, "data": _slim_result_data(item.get("data"))} if isinstance(item, dict) else item
+            for item in results
+        ]
+    return {**payload, "loop_state": slim}
+
+
+def read_session_file(path: Path) -> dict[str, Any] | None:
+    """容错读取会话文件。
+
+    历史文件可能被并发/中断的写入拼成"两份 JSON"，标准 json.loads 会以
+    "Extra data" 直接失败，会话就会从列表里凭空消失。这里退回解析第一份，
+    至少让该会话还能打开（原始文件不修改）。
+    """
+    try:
+        text = path.read_text(encoding="utf-8")
+    except OSError:
+        return None
+    if not text.strip():
+        return None
+    try:
+        data = json.loads(text)
+    except json.JSONDecodeError:
+        try:
+            data, _ = json.JSONDecoder().raw_decode(text.lstrip())
+        except Exception:
+            return None
+    return data if isinstance(data, dict) else None
 SETTINGS_PATH = REPO_ROOT / "src" / "data" / "settings.json"
 SKILLS_OVERRIDES_PATH = REPO_ROOT / "src" / "data" / "skills.json"
 ATTACHMENTS_DIR = REPO_ROOT / "src" / "data" / "attachments"
@@ -73,20 +190,46 @@ AIRSIM_SETTINGS_TEMPLATES: dict[str, dict[str, str]] = {
 }
 
 # Plan-Execute ⇄ ReAct collaboration:
-# - OBSERVATION_TOOLS: steps whose outcome must be seen before the next step
-#   can be chosen (photo/VLM/detect/depth).
+# - OBSERVATION_TOOLS: steps whose outcome必须由 LLM 读图/深度后才能决策
+#   (photo/VLM/depth) —— 固定序列无法表达,必须转 ReAct。
+# - STRUCTURED_PERCEPTION_TOOLS: 返回结构化 JSON 的感知读取。executor 可
+#   直接消费结果,不需要每步一次 LLM 决策;把它们塞进 ReAct 会让普通搜索
+#   任务多出 5~10 次模型往返(每次 15~30s),是任务耗时过长的主因。
 # - MOTION_TOOLS: steps that change vehicle state.
-# A fixed sequence with observation -> motion is structurally dependent on
-# mid-execution observations, so it routes to the ReAct loop before executing.
 CORRECTION_ATTEMPTS_MAX = 2
 OBSERVATION_TOOLS = {
     "airsim_take_photo",
-    "airsim_detect_objects",
     "airsim_vlm_analyze_image",
     "airsim_vlm_confirm_target",
     "airsim_get_depth_map",
-    "airsim_get_sensors",
 }
+STRUCTURED_PERCEPTION_TOOLS = {
+    "airsim_detect_objects",
+    "airsim_get_sensors",
+    "perception_status",
+}
+
+
+def reasoning_delta(new_text: str, seen: list[str]) -> str:
+    """返回本轮推理相对已展示内容的"新增部分"。
+
+    推理模型常把整段推理（含之前几轮）一起重新吐出来；直接累加会让每一轮
+    思考块都把以前的思考再显示一遍。这里从已展示片段里找"最长前缀"并裁掉，
+    只保留本轮新增的文字；没有新增则返回空串（调用方跳过该轮显示）。
+    """
+    delta = str(new_text or "").strip()
+    if not delta:
+        return ""
+    best = 0
+    for prior in seen:
+        prior_text = str(prior or "").strip()
+        if prior_text and delta.startswith(prior_text) and len(prior_text) > best:
+            best = len(prior_text)
+    if best:
+        delta = delta[best:].strip()
+    return delta
+
+
 MOTION_TOOLS = {
     "drone_arm",
     "drone_takeoff",
@@ -177,13 +320,18 @@ def _default_application_settings() -> dict[str, Any]:
             "default_layer": "satellite",
             "follow_vehicle": True,
             "show_vehicle_track": False,
-            "require_reliable_gps": True,
         },
         "telemetry": {
             "refresh_ms": 250,
             "setup_refresh_ms": 100,
             "history_seconds": 60,
             "chart_sample_hz": 20,
+        },
+        "mission": {
+            "default_altitude_m": 3.0,
+            "default_speed_mps": 2.0,
+            "default_hold_s": 0.0,
+            "default_acceptance_radius_m": 2.0,
         },
         "safety": {
             "confirm_real_vehicle_actions": True,
@@ -207,9 +355,11 @@ def _application_settings(settings: dict[str, Any] | None = None) -> dict[str, A
     merged: dict[str, Any] = {}
     for group, values in defaults.items():
         incoming = section.get(group)
+        incoming = dict(incoming) if isinstance(incoming, dict) else {}
+        # 只保留当前 schema 已知的键，历史遗留/已废弃配置不再透传
         merged[group] = {
             **values,
-            **(dict(incoming) if isinstance(incoming, dict) else {}),
+            **{key: value for key, value in incoming.items() if key in values},
         }
     try:
         merged["telemetry"]["refresh_ms"] = max(100, min(2000, int(merged["telemetry"]["refresh_ms"])))
@@ -219,6 +369,19 @@ def _application_settings(settings: dict[str, Any] | None = None) -> dict[str, A
         )
         merged["telemetry"]["history_seconds"] = max(10, min(600, int(merged["telemetry"]["history_seconds"])))
         merged["telemetry"]["chart_sample_hz"] = max(5, min(100, int(merged["telemetry"]["chart_sample_hz"])))
+        merged["mission"]["default_altitude_m"] = max(
+            0.5,
+            min(500.0, float(merged["mission"]["default_altitude_m"])),
+        )
+        merged["mission"]["default_speed_mps"] = max(
+            0.2,
+            min(20.0, float(merged["mission"]["default_speed_mps"])),
+        )
+        merged["mission"]["default_hold_s"] = max(0.0, min(600.0, float(merged["mission"]["default_hold_s"])))
+        merged["mission"]["default_acceptance_radius_m"] = max(
+            0.5,
+            min(50.0, float(merged["mission"]["default_acceptance_radius_m"])),
+        )
         merged["safety"]["max_display_jump_m"] = max(10.0, min(5000.0, float(merged["safety"]["max_display_jump_m"])))
     except (TypeError, ValueError):
         return defaults
@@ -589,6 +752,8 @@ class AgentRuntime:
         self.tools = ToolRuntime(
             camera_settings_provider=lambda: _camera_settings(),
             perception_axis=self.perception_axis,
+            # VLM 图像分析固定走多模态模型（dots-studio），与默认规划模型
+            # 解耦：默认模型可能是纯文本（如 deepseek），规划低延迟但看不了图。
             vlm_provider=lambda question, image_b64: self.planner.analyze_image(
                 question, image_b64, model_id=""
             ),
@@ -634,6 +799,16 @@ class AgentRuntime:
         self._pending_run_ids: set[str] = set()
         self._thread: threading.Thread | None = None
         self._current_session_id: str = ""
+        # 追踪辅助：算法负责把锁定目标保持在画面中央（不经 LLM、不暴露工具）
+        self._tracking_assist: threading.Thread | None = None
+        self._tracking_assist_stop = threading.Event()
+        self._tracking_assist_run_id: str = ""
+        # 飞行包线看门狗：近距离识别/追踪任务里，如果飞机报出异常高度或水平
+        # 位移（真实失控或 EKF 位置估计发散都会如此），立即中止并降落，而不是
+        # 让它在无人干预的情况下飞出几公里、飞好几分钟。
+        self._envelope_stop = threading.Event()
+        self._envelope_thread: threading.Thread | None = None
+        self._envelope_run_id: str = ""
         self._backend_generation = 0
         self._auto_connect_initial_backend_id = self.tools.backend_id
         self._last_visual_frame: dict[str, Any] = {}
@@ -675,7 +850,15 @@ class AgentRuntime:
             profile = resolve_profile(config)
             if profile is None:
                 return None
-            axis = PerceptionAxis(profile=profile, rtsp_url=str(getattr(config, "perception_rtsp_url", "") or ""))
+            # frame_provider: 感知轴走独立的 AirSim 相机通道（与飞控后端类型
+            # 解耦）——px4_mavlink 后端的控制器没有拍图能力，飞行链路切后端
+            # 不应影响感知画面。独立 AirSimController 带 _rpc 超时+运行时重置，
+            # 而本进程内手搓 MultirotorClient 的 simGetImages 会无超时卡死。
+            axis = PerceptionAxis(
+                profile=profile,
+                rtsp_url=str(getattr(config, "perception_rtsp_url", "") or ""),
+                frame_provider=self._perception_camera_controller,
+            )
             ok = axis.start()
             if not ok:
                 import logging
@@ -697,6 +880,42 @@ class AgentRuntime:
                 import logging
 
                 logging.getLogger("runtime").warning("perception_axis_stop_failed", extra={"error": str(exc)})
+
+    def _perception_camera_controller(self) -> Any | None:
+        """独立 AirSim 相机通道：感知轴的取帧源，与飞控后端类型解耦。
+
+        px4_mavlink / px4_ros2 后端的控制器没有拍图能力，而感知画面（仿真
+        相机/吊舱流）与飞行链路是两条独立通道。这里惰性创建并保活一个
+        AirSimController（带 _rpc 超时+运行时重置），连接失败返回 None，
+        感知轴自然报告离线，下一次取帧再尝试重建。
+        """
+        controller = getattr(self, "_perception_camera_ctrl", None)
+        if controller is not None and bool(getattr(controller, "is_connected", False)):
+            return controller
+        if controller is None:
+            try:
+                from src.config import config as _cfg
+                from src.modules.airsim_controller import AirSimController
+
+                controller = AirSimController(ip=str(_cfg.airsim_ip), port=int(_cfg.airsim_port))
+            except Exception as exc:
+                import logging
+
+                logging.getLogger("runtime").warning("perception_camera_init_failed", extra={"error": str(exc)})
+                return None
+        try:
+            info = controller.connect(ip=controller._ip, port=controller._port)
+        except Exception as exc:  # noqa: BLE001 — the camera channel must never crash the runtime
+            import logging
+
+            logging.getLogger("runtime").warning("perception_camera_connect_failed", extra={"error": str(exc)})
+            self._perception_camera_ctrl = controller
+            return None
+        if not bool(getattr(info, "connected", False)):
+            self._perception_camera_ctrl = controller
+            return None
+        self._perception_camera_ctrl = controller
+        return controller
 
     def submit_command(
         self,
@@ -1417,6 +1636,74 @@ class AgentRuntime:
             compact["error"] = drone.get("error")
         return compact
 
+    def _preflight_link_check(
+        self,
+        command: str,
+        execute: bool,
+        tool_runtime: dict[str, Any],
+    ) -> dict[str, Any]:
+        """执行前链路自检：不凭记忆假设链路/目标状态。
+
+        未连接或链路陈旧时先尝试一次重连；重连后仍不可用就直接中止并上报，
+        避免任务在"假状态"里空转（例如以为飞机已起飞、以为目标就在前方）。
+        只对需要飞控的执行任务生效，只读/规划模式不受影响。
+        """
+        if not execute:
+            return tool_runtime
+        capabilities = (tool_runtime.get("backend_profile") or {}).get("capabilities") or {}
+        if not capabilities.get("flight_control"):
+            return tool_runtime
+        connected = bool(tool_runtime.get("connected")) and not bool(tool_runtime.get("stale_connection"))
+        if connected:
+            self._warn_px4_health(tool_runtime)
+            return tool_runtime
+        self._append_event(
+            "warning", "system", "任务前链路自检：飞控未连接，尝试自动重连",
+            {"command": (command or "")[:60]},
+        )
+        # 链路抖动（UDP 丢包、飞控重启后的心跳间隙）很常见：先重连 + 轮询几次，
+        # 只有持续不可用才中止任务，避免一次瞬时抖动把任务误判为"链路不可用"。
+        refreshed = tool_runtime
+        for attempt in range(3):
+            try:
+                result = self.tools.reconnect()
+                self._append_event("info", "tool", f"Reconnect (preflight {attempt + 1}/3)", result.to_dict())
+            except Exception as exc:
+                self._append_event("warning", "system", f"任务前链路自检重连异常：{exc}", {})
+            time.sleep(2.0)
+            refreshed = self.tools.status_snapshot()
+            if bool(refreshed.get("connected")) and not bool(refreshed.get("stale_connection")):
+                self._warn_px4_health(refreshed)
+                return refreshed
+        raise RuntimeError(
+            "任务前链路自检未通过：飞控链路持续不可用（已重连 3 次），任务已停止。"
+            "请确认 PX4 SITL / 仿真仍在运行，并在设置里重新连接后再下发指令。"
+        )
+
+    def _warn_px4_health(self, tool_runtime: dict[str, Any]) -> None:
+        """把 PX4 自身的健康告警（如罗盘未校准）显式抛到前端。
+
+        这类告警以前只在 PX4 控制台可见，表现为"任务能飞但降落/悬停不稳"却
+        查不到原因。这里在任务开始前提示根因，避免用户反复重启仿真排查。
+        """
+        drone = tool_runtime.get("drone") if isinstance(tool_runtime.get("drone"), dict) else {}
+        text = str((drone or {}).get("status_text") or "").strip()
+        if not text:
+            return
+        lowered = text.lower()
+        if not any(key in lowered for key in ("compass", "calibrat", "magnetometer", "mag ")):
+            return
+        signature = text[:120]
+        if getattr(self, "_px4_health_warned", "") == signature:
+            return
+        self._px4_health_warned = signature
+        self._append_event(
+            "warning", "system",
+            f"PX4 健康告警：{text}（可能导致偏航/定位不稳、降落震荡；"
+            "建议先在 PX4 校准罗盘，或确认磁力计配置与仿真一致）",
+            {"status_text": text},
+        )
+
     def _plan_and_execute(
         self,
         command: str,
@@ -1455,6 +1742,7 @@ class AgentRuntime:
                 self._run_log = None
         try:
             tool_runtime = self.tools.status_snapshot()
+            tool_runtime = self._preflight_link_check(command, execute, tool_runtime)
             drone_state = tool_runtime.get("drone") or {}
             drone_pos = drone_state.get("position_ned") or {}
             drone_z = float(drone_pos.get("z", 0.0) or 0.0)
@@ -2107,17 +2395,19 @@ class AgentRuntime:
             self._current = run
             self._pending_run_ids.discard(run_id)
         self._start_task_run(run)
+        # 飞行包线看门狗必须在两条执行路径上都启动：之前只挂在 Agent Loop
+        # 状态回调里，走一次性计划路径时完全没有保护（实测飞机爬到 30m 才被
+        # 人工急停）。
+        self._maybe_start_envelope_guard(run)
         self._append_event(
             "info",
             "planner",
             "Plan-Execute route selected",
             {"run_id": run.run_id, "execute": execute, "planner_source": plan.planner_source, **route},
         )
-        # 思考块内容组合（保证展开必有内容）：
-        #   1. LLM 规划理由 plan.reasoning（中文）；模型省略时用任务理解兜底
-        #   2. 执行计划概览（步骤序列）
-        #   3. 思考词元流（reasoning_content，模型开启思考时才有）
-        reasoning_parts: list[str] = []
+        # 思考块内容组合：
+        #   模型真实流式推理 reasoning_text（思考块主内容，打字机展示）
+        #   计划摘要 plan_summary（任务理解 + 步骤列表，前端单独一块）
         plan_reasoning = str(getattr(plan, "reasoning", "") or "").strip()
         if not plan_reasoning:
             plan_reasoning = f"任务理解：{plan.summary}"
@@ -2143,26 +2433,36 @@ class AgentRuntime:
                     )
             if extracted:
                 plan_reasoning = extracted
-        reasoning_parts.append(plan_reasoning)
-        step_tools = [step.tool for step in (plan.steps or []) if step.tool and step.tool != "memory_store"]
-        if step_tools:
-            reasoning_parts.append("执行计划（" + str(len(step_tools)) + " 步）：" + " → ".join(step_tools))
-        if reasoning_full:
-            # 思考流末尾常带模型起草的计划 JSON 草稿，截掉只留自然语言推理
-            reasoning_parts.append(self._strip_plan_json_draft(reasoning_full))
-        reasoning_full = "\n\n".join(reasoning_parts)
-        if reasoning_full:
+        # 模型真实思考（流式 token + 计划里的 reasoning 字段，二者都是模型输出）
+        # 与"计划步骤列表"分开：
+        #   reasoning_text = 模型思考全文（前端思考块打字机展示的主内容）
+        #   plan_summary   = 执行计划步骤列表（单独一块，不占思考）
+        streamed_reasoning = self._strip_plan_json_draft(reasoning_full) if reasoning_full else ""
+        thinking_parts = [p for p in (streamed_reasoning, plan_reasoning) if p]
+        model_thinking = "\n\n".join(dict.fromkeys(thinking_parts)).strip()
+        plan_step_tools = [step.tool for step in (plan.steps or []) if step.tool and step.tool != "memory_store"]
+        plan_summary = ""
+        if plan_step_tools:
+            plan_summary = "执行计划（" + str(len(plan_step_tools)) + " 步）：" + " → ".join(plan_step_tools)
+        reasoning_full = model_thinking
+        if model_thinking or plan_summary:
+            # 思考全文/计划摘要同时存到 run.agent_state：details 每次重建都会
+            # 从 run 取，避免任务结束时的覆写把思考内容冲掉。
+            with self._lock:
+                if not isinstance(run.agent_state, dict):
+                    run.agent_state = {}
+                run.agent_state["_reasoning_text"] = (model_thinking or plan_reasoning)[:12000]
+                run.agent_state["_plan_summary"] = plan_summary[:4000]
             # 规划推理全文归档到 run 上（此前写在消息 details 里会被
             # _begin_execution_trace 的 process_trace 覆盖而丢失）：
-            # thought_trace 存全文供回看，process_trace 首条进时间线折叠块；
-            # 并同步进消息 details.reasoning_text（前端思考块数据源）
-            self._append_thought(run, "模型思考", reasoning_full)
+            # thought_trace 存全文供回看，process_trace 首条进时间线折叠块。
+            self._append_thought(run, "模型思考", model_thinking or plan_reasoning)
             run.process_trace.insert(
                 0,
                 {
                     "timestamp": time.time(),
                     "title": "模型思考",
-                    "body": reasoning_full[:8000],
+                    "body": (model_thinking or plan_reasoning)[:8000],
                     "status": "completed",
                     "kind": "reasoning",
                 },
@@ -2171,15 +2471,46 @@ class AgentRuntime:
                 run.run_id,
                 "正在执行计划...",
                 "running",
-                {"mode": "execute", "phase": "planning", "reasoning_text": reasoning_full[:8000]},
+                {
+                    "mode": "execute",
+                    "phase": "planning",
+                    # 思考块放模型思考全文；计划步骤列表单独给前端
+                    "reasoning_text": (model_thinking or plan_reasoning)[:8000],
+                    "plan_summary": plan_summary[:4000],
+                },
                 persist=False,
             )
         if execute:
-            self._begin_execution_trace(run, "任务适合一次性规划执行：先生成完整工具序列，再由 runtime 逐步执行、回读和校验。")
+            # 先判定执行策略再写说明：否则会先写"适合一次性规划执行"、随后又
+            # 改判 Agent Loop，两条消息自相矛盾（用户可见）。
+            needs_agent_loop = self._plan_requires_agent_loop(run.plan)
+            if needs_agent_loop:
+                self._begin_execution_trace(
+                    run,
+                    "该任务依赖中间观察结果（检测/确认后才决定下一步），将由 Agent Loop 逐步执行并按结果调整。",
+                )
+            else:
+                self._begin_execution_trace(
+                    run,
+                    "该任务可用一次性计划完成：先生成完整工具序列，再由 runtime 逐步执行、回读和校验。",
+                )
             # skill guidance is injected into the planner prompt as background
             # knowledge — it is NOT a tool call, so it must not be displayed
             # as if a skill had been invoked
-            if self._plan_requires_agent_loop(run.plan):
+            # 步数预算：搜索/识别类 10 步够用；带"追踪/跟踪"的任务需要
+            # 检测→抵近→再检测的循环，给到 16 步，否则会在追踪中途被截断。
+            tracking_task = any(
+                kw in str(run.command or "")
+                for kw in ("追踪", "跟踪", "跟随", "锁定", "track", "follow", "shadow")
+            )
+            # 反应式任务：搜索/识别/追踪依赖中间观察（目标是否出现、是否仍锁定、
+            # 颜色确认结果），必须逐步基于最新观察重新决策（ReAct），而不是把
+            # 一次性计划顺序执行完。
+            search_task = any(
+                kw in str(run.command or "")
+                for kw in ("搜索", "寻找", "检测", "识别", "search", "find", "detect")
+            )
+            if needs_agent_loop:
                 # The plan depends on mid-execution observations (photo ->
                 # decide -> move) or the planner declared agent_loop: a fixed
                 # sequence would fail, so ReAct runs as the primary path.
@@ -2198,6 +2529,12 @@ class AgentRuntime:
                     attachments=attachments or [],
                     label="Agent Loop",
                     command_override=self._agent_loop_primary_command(run),
+                    announce=False,
+                    # 搜索+识别+抵近+跟踪需要多轮"转/走→检测→确认"，给足预算，
+                    # 同时由飞行包线保护兜底安全。
+                    max_steps=28 if (tracking_task or search_task) else 10,
+                    reactive=bool(tracking_task or search_task),
+                    keep_reacting=bool(tracking_task),
                 )
             else:
                 self._run_plan(run, finalize=False, remember=False)
@@ -2249,16 +2586,21 @@ class AgentRuntime:
         attachments: list[dict[str, Any]],
         label: str = "纠错 Loop",
         command_override: str | None = None,
+        announce: bool = True,
+        max_steps: int = 10,
+        reactive: bool = False,
+        keep_reacting: bool = False,
     ) -> None:
-        self._append_process(
-            run,
-            label,
-            "一次性计划未完全达成，进入 Agent Loop 回读当前状态并选择修正动作。"
-            if label == "纠错 Loop"
-            else "任务需要观察-响应循环，进入 Agent Loop 逐步执行。",
-            status="running",
-            kind="reasoning",
-        )
+        if announce:
+            self._append_process(
+                run,
+                label,
+                "一次性计划未完全达成，进入 Agent Loop 回读当前状态并选择修正动作。"
+                if label == "纠错 Loop"
+                else "任务需要观察-响应循环，进入 Agent Loop 逐步执行。",
+                status="running",
+                kind="system",
+            )
         self._update_assistant_message(run.run_id, self._progress_message(run), "running", self._message_details(run))
         correction_command = command_override or self._correction_command(run)
         loop = self.agent_loop.run(
@@ -2268,11 +2610,15 @@ class AgentRuntime:
             tool_cards=tool_runtime.get("tool_cards") or self.tools.list_tool_cards(),
             initial_plan=run.plan,
             model_id=model_id or None,
-            max_steps=6,
+            # 搜索/识别类任务通常需要 10 步上下；追踪类由调用方传入更大预算
+            max_steps=max(1, int(max_steps)),
+            initial_plan_cursor=self._plan_completed_prefix(run),
             execute=True,
             attachments=attachments,
             require_llm=True,
             conversation_context=self._recent_chat_context(),
+            reactive=bool(reactive),
+            keep_reacting=bool(keep_reacting),
         )
         correction_plan = self._plan_from_loop_state(loop)
         if run.plan:
@@ -2325,7 +2671,7 @@ class AgentRuntime:
         run.phase = run.status if run.status in {"completed", "failed", "blocked"} else "completed"
         self._append_process(
             run,
-            label,
+            "模型总结" if loop.summary else label,
             loop.summary or run.failure_reason or f"{label} 已结束。",
             status="completed" if run.status == "completed" else "failed",
             kind="reasoning",
@@ -2512,49 +2858,89 @@ class AgentRuntime:
                 run.status = "running"
                 run.phase = "executing"
             if observation_count > previous_observation_count and decision_count == previous_decision_count:
-                self._append_process(
-                    run,
-                    "模型决策",
-                    "正在根据最新遥测、工具结果和任务目标选择下一步动作。",
-                    status="running",
-                    kind="reasoning",
-                )
+                # 仅当上一轮是模型决策时才提示"模型正在决策"；计划驱动的步骤
+                # 之间没有模型思考，不该显示成思考占位。
+                prior_source = ""
+                if loop.decisions:
+                    prior_source = str(getattr(loop.decisions[-1], "source", "llm") or "llm")
+                if prior_source != "plan":
+                    self._append_process(
+                        run,
+                        "模型决策",
+                        "正在根据最新遥测、工具结果和任务目标选择下一步动作。",
+                        status="running",
+                        kind="reasoning",
+                    )
             if decision_count > previous_decision_count:
                 decision = loop.decisions[-1]
                 decision_text = self._loop_decision_public_text(decision)
+                decision_source = str(getattr(decision, "source", "llm") or "llm")
                 run.thought_trace.append({
                     "timestamp": time.time(),
                     "title": f"循环决策 {decision_count}",
                     "body": decision_text or decision.action or "检查任务是否完成",
                     "status": "completed" if decision.is_complete else "running",
+                    "source": decision_source,
                 })
                 run.thought_trace = run.thought_trace[-30:]
-                if decision.is_complete:
-                    self._append_process(
-                        run,
-                        "模型决策",
-                        "任务目标已满足，正在整理最终报告。",
-                        status="completed",
-                        kind="reasoning",
-                    )
-                if decision_text:
-                    self._append_process(
-                        run,
-                        "模型总结" if decision.is_complete else "模型决策",
-                        decision_text,
-                        status="completed",
-                        kind="reasoning",
-                    )
-                if decision.action:
-                    self._append_process(
-                        run,
-                        decision.action,
-                        self._format_tool_call_body(decision.params),
-                        status="running",
-                        tool=decision.action,
-                        params=decision.params,
-                        kind="tool",
-                    )
+                if decision_source == "plan":
+                    # 按计划执行：这不是模型的"新思考"，只是把 LLM 已给出的
+                    # 计划步骤落地。前端应显示为"执行计划"，不要混进模型思考。
+                    # 同时收掉之前残留的"模型决策 running"占位。
+                    for item in reversed(run.process_trace):
+                        if item.get("kind") == "reasoning" and item.get("status") == "running":
+                            item["status"] = "completed"
+                            if not item.get("body"):
+                                item["body"] = "计划已确定，按计划执行，无需重新决策。"
+                            break
+                    if decision.action:
+                        self._append_process(
+                            run,
+                            decision_text or decision.action,
+                            self._format_tool_call_body(decision.params),
+                            status="running",
+                            tool=decision.action,
+                            params=decision.params,
+                            kind="plan_step",
+                        )
+                else:
+                    # 每个真实 LLM 决策轮次前加分隔标题，前端思考块能看出
+                    # "第 N 轮思考（基于上一步结果）"的 ReAct 节奏
+                    with self._lock:
+                        if not isinstance(run.agent_state, dict):
+                            run.agent_state = {}
+                        prev = str(run.agent_state.get("_reasoning_text") or "")
+                        run.agent_state["_reasoning_text"] = (
+                            prev + f"\n\n── 第 {decision_count} 轮思考 ──\n"
+                        ).strip()[:12000]
+                    if decision.is_complete:
+                        self._append_process(
+                            run,
+                            "模型决策",
+                            "任务目标已满足，正在整理最终报告。",
+                            status="completed",
+                            kind="reasoning",
+                        )
+                    if decision_text:
+                        self._append_process(
+                            run,
+                            "模型总结" if decision.is_complete else "模型决策",
+                            decision_text,
+                            status="completed",
+                            kind="reasoning",
+                        )
+                    if decision.action:
+                        # 顺序由 agent_loop 保证：真正的模型思考事件已先于本
+                        # 决策写入时间线（见 AgentLoop.run）。这里只落工具行。
+                        self._append_process(
+                            run,
+                            decision.action,
+                            self._format_tool_call_body(decision.params),
+                            status="running",
+                            tool=decision.action,
+                            params=decision.params,
+                            kind="tool",
+                        )
             if result_count > previous_result_count and loop.results:
                 result = loop.results[-1]
                 self._append_process(
@@ -2568,6 +2954,8 @@ class AgentRuntime:
                 )
         self._publish_run_update(run)
         self._update_assistant_message(run.run_id, self._progress_message(run), "running", self._message_details(run))
+        self._maybe_start_envelope_guard(run)
+        self._maybe_start_tracking_assist(run)
 
     @staticmethod
     def _loop_decision_public_text(decision: Any) -> str:
@@ -2619,9 +3007,22 @@ class AgentRuntime:
         # reasoning_text——前端思考块一个折叠块看全程思考
         if source == "model_reasoning" and self._current is not None:
             run = self._current
+            # 每轮只展示"本轮新增"的思考。模型（尤其推理模型）常把整段推理连同
+            # 上一轮内容一起再吐一遍，直接累加会让每一轮思考块都把以前的思考又
+            # 显示一次。这里按"最长旧前缀"做增量裁剪，没有新内容就整轮跳过。
+            new_text = str(message or "").strip()
             with self._lock:
                 if not isinstance(run.agent_state, dict):
                     run.agent_state = {}
+                seen = run.agent_state.setdefault("_seen_reasoning", [])
+                delta = reasoning_delta(new_text, seen)
+                if not delta:
+                    return
+                if new_text:
+                    seen.append(new_text)
+                    del seen[:-10]
+                message = delta
+            with self._lock:
                 prev = str(run.agent_state.get("_reasoning_text") or "")
                 run.agent_state["_reasoning_text"] = (prev + "\n" + message).strip()[:12000]
                 # JSON 草稿跨多个事件分块到达，累积原文、组装时统一截断
@@ -2630,6 +3031,34 @@ class AgentRuntime:
                     (m for m in reversed(self._messages) if m.run_id == run.run_id and m.role == "assistant"),
                     None,
                 )
+                # ReAct 每轮思考成为时间线上的独立条目（流式更新同一块），
+                # 下一个工具/决策条目出现时再收尾——形成"思考→工具→思考"交错。
+                # 每轮只放本轮新增的思考（用 round 累积器），否则每轮都显示
+                # 同一段累计文本，看起来重复。
+                last_item = run.process_trace[-1] if run.process_trace else None
+                same_round = bool(
+                    last_item is not None
+                    and last_item.get("kind") == "reasoning"
+                    and last_item.get("status") == "running"
+                )
+                prev_round = str(run.agent_state.get("_round_reasoning") or "") if same_round else ""
+                round_text = (prev_round + "\n" + message).strip()
+                run.agent_state["_round_reasoning"] = round_text[:6000]
+                round_body = self._strip_plan_json_draft(round_text) or message
+                if same_round:
+                    last_item["body"] = self._compact_process_text(round_body)
+                    last_item["timestamp"] = time.time()
+                else:
+                    run.process_trace.append({
+                        "timestamp": time.time(),
+                        "title": "模型思考",
+                        "body": self._compact_process_text(round_body),
+                        "status": "running",
+                        "tool": "",
+                        "params": {},
+                        "kind": "reasoning",
+                    })
+                    run.process_trace = run.process_trace[-80:]
             if target_message is not None:
                 det = target_message.details or {}
                 self._update_assistant_message(
@@ -2711,23 +3140,25 @@ class AgentRuntime:
             active_airframe = bool(drone.get("flying") or drone.get("armed") or abs(z) >= min_altitude)
             if not active_airframe:
                 return None
-            result = self.tools.execute("drone_hover", {}, dry_run=False, blocked_by_supervisor=False)
+            # 任务异常收尾优先"受控降落"而不是原地悬停：历史上悬停会把飞机留在
+            # 离起飞点很远的未知位置，随后失去控制而掉落。降落是明确的安全终态。
+            result = self.tools.execute("drone_land", {}, dry_run=False, blocked_by_supervisor=False)
             payload = result.to_dict()
             self._append_event(
                 "warning" if result.ok else "danger",
                 "tool",
-                "任务异常后安全悬停",
-                {"reason": reason, "hover": payload},
+                "任务异常后安全降落",
+                {"reason": reason, "land": payload},
             )
             if run is not None:
                 self._append_process(
                     run,
-                    "异常安全悬停",
-                    "Agent 决策中断，已发送悬停保位指令。"
+                    "异常安全降落",
+                    "Agent 决策中断，已发送受控降落指令。"
                     if result.ok
-                    else f"Agent 决策中断，悬停保位失败：{result.data.get('message', '')}",
+                    else f"Agent 决策中断，降落失败：{result.data.get('message', '')}",
                     status="completed" if result.ok else "failed",
-                    tool="drone_hover",
+                    tool="drone_land",
                     params={},
                     kind="tool",
                 )
@@ -2745,6 +3176,7 @@ class AgentRuntime:
         connected = bool(runtime.get("connected")) and not bool(runtime.get("stale_connection"))
         if not connected:
             return {"ok": False, "error": "flight controller link is offline or stale"}
+        self._warn_px4_health(runtime)
         vehicles = [v for v in (runtime.get("vehicles") or []) if isinstance(v, dict) and not v.get("error")]
         by_name = {str(v.get("vehicle_name") or ""): v for v in vehicles}
         names = [str(t).strip() for t in (targets or []) if str(t).strip()] or list(by_name.keys()) or [""]
@@ -2779,9 +3211,9 @@ class AgentRuntime:
                 if not r.ok:
                     return {"ok": False, "error": f"{name or '默认机'} 降落指令失败", "vehicles": results}
 
-        # 轮询验证：目标列表里每台都必须确认落地。
-        # 地面基准用 kinematics 帧标定值（GPS 帧与 kinematics 帧有 ~2m 偏差，
-        # 用错帧会把落地误判为未落地、导致降落超时误报）。
+        # 轮询验证：只有在拿到"确实在地面"的强证据后才上锁。
+        # 不能用 flying==False 当落地依据：PX4 一进入 LAND 模式 landed_state 就
+        # 可能报非 IN_AIR，而飞机还在 2~3m 下沉；据此上锁会在空中切电机。
         controller = getattr(self.tools, "controller", None)
         ground_z = {}
         kin_ground = getattr(controller, "ground_z_kin", None) if controller is not None else None
@@ -2805,20 +3237,50 @@ class AgentRuntime:
                     if isinstance(home, dict):
                         ground_z[name] = float(home.get("z", 0.0))
         pending = set(to_land)
+        abort_note = ""
+        unstable_counts: dict[str, int] = {}
         deadline = time.time() + 120.0
         while pending and time.time() < deadline:
             time.sleep(1.5)
             snap = self.tools.status_snapshot()
             for v in snap.get("vehicles") or []:
                 n = str(v.get("vehicle_name") or "")
-                if n in pending:
-                    pos = v.get("position_ned") if isinstance(v.get("position_ned"), dict) else {}
-                    z = float(pos.get("z", 0.0) or 0.0)
-                    near_ground = True
-                    if n in ground_z:
-                        near_ground = abs(z - ground_z[n]) < 1.5
-                    if not v.get("flying") and near_ground:
+                if n not in pending:
+                    continue
+                pos = v.get("position_ned") if isinstance(v.get("position_ned"), dict) else {}
+                vel = v.get("velocity_ned") if isinstance(v.get("velocity_ned"), dict) else {}
+                att = v.get("attitude_rad") if isinstance(v.get("attitude_rad"), dict) else {}
+                z = float(pos.get("z", 0.0) or 0.0)
+                vz = abs(float(vel.get("vz", 0.0) or 0.0))
+                try:
+                    # MAV_LANDED_STATE_ON_GROUND == 1（IN_AIR=2, TAKEOFF=3, LANDING=4）
+                    on_ground_flag = v.get("landed_state") is not None and int(v.get("landed_state")) == 1
+                except (TypeError, ValueError):
+                    on_ground_flag = False
+                near_ground = True if n not in ground_z else abs(z - ground_z[n]) < 0.6
+                if near_ground and vz <= 0.4 and (on_ground_flag or not v.get("armed")):
+                    pending.discard(n)
+                    continue
+                # 姿态失稳保护：降落过程中出现大幅横滚/俯仰振荡时中止降落、转悬停
+                # 并上报，避免在失控姿态下继续下降导致摔机。
+                roll = abs(float(att.get("roll", 0.0) or 0.0))
+                pitch = abs(float(att.get("pitch", 0.0) or 0.0))
+                if max(roll, pitch) > 0.7:  # ~40°
+                    unstable_counts[n] = unstable_counts.get(n, 0) + 1
+                    if unstable_counts[n] >= 2:
+                        try:
+                            self.tools.execute("drone_hover", {"vehicle_name": n} if n else {},
+                                               dry_run=False, blocked_by_supervisor=False)
+                        except Exception:
+                            pass
+                        abort_note = (
+                            f"{n or '默认机'} 降落过程中姿态失稳"
+                            f"(roll/pitch > {math.degrees(0.7):.0f}°)，已中止降落并转为悬停"
+                        )
                         pending.discard(n)
+                        break
+                else:
+                    unstable_counts[n] = 0
 
         landed = [n for n in to_land if n not in pending]
         for name in to_disarm:
@@ -2835,13 +3297,16 @@ class AgentRuntime:
             results.append({"vehicle": name or "默认机", "state": "landed_disarmed", "ok": bool(r.ok)})
 
         ok = not pending and all(r.get("ok") for r in results)
-        if pending:
-            message = f"降落超时未确认: {', '.join(sorted(pending))}"
+        if abort_note:
+            message = abort_note
+        elif pending:
+            message = f"降落超时未确认: {', '.join(sorted(pending))}（未上锁，避免空中切电机）"
         elif len(results) == 1:
             message = "已降落并锁定"
         else:
             message = f"全部降落并锁定: {len(results)} 台"
-        self._append_event("warning", "tool", "手动降落", {"vehicles": results, "message": message})
+        self._append_event("warning" if (pending or abort_note) else "info", "tool", "手动降落",
+                           {"vehicles": results, "message": message})
         return {"ok": ok, "message": message, "vehicles": results}
 
     def _manual_return_home(self, targets: list[str] | None = None) -> dict[str, Any]:
@@ -3038,6 +3503,8 @@ class AgentRuntime:
             self._append_event("info", "safety", "任务已恢复")
             return {"ok": True}
         if action == "emergency_stop":
+            self._stop_envelope_guard()
+            self._stop_tracking_assist("急停")
             self.supervisor.emergency_stop()
             result = self.tools.execute("drone_hover", {}, dry_run=False, blocked_by_supervisor=False)
             # hover every formation drone too — the single-vehicle hover only
@@ -3563,6 +4030,30 @@ class AgentRuntime:
             "result": result.to_dict(),
         }
 
+    def deactivate_connection(self) -> dict[str, Any]:
+        """Disconnect the live MAVLink/AirSim link and forget the active link id.
+
+        Separate from ``activate_connection`` on purpose: the UI may identify the
+        live link from the real endpoint (see the connection panel), and that link
+        is not necessarily the one remembered in settings. Toggling by remembered
+        id would then re-connect instead of disconnecting, so "断开" needs an
+        explicit, id-free path.
+        """
+        result = self.tools.execute("drone_disconnect", {})
+        ok = result.ok
+        if ok:
+            settings = _load_settings()
+            settings["connections"] = settings.get("connections") or {}
+            settings["connections"]["active_connection_id"] = ""
+            _save_settings(settings)
+        self._append_event(
+            "info" if ok else "warning",
+            "tool",
+            "Disconnect link",
+            result.to_dict(),
+        )
+        return {"ok": ok, "action": "disconnect", "result": result.to_dict()}
+
     def activate_connection(self, connection_id: str) -> dict[str, Any]:
         """Connect/disconnect a QGC Links entry.
 
@@ -3587,20 +4078,7 @@ class AgentRuntime:
         currently_connected = bool(tool_runtime.get("connected")) and not tool_runtime.get("stale_connection")
 
         if already_active and currently_connected and active_id == connection_id:
-            result = self.tools.execute("drone_disconnect", {})
-            ok = result.ok
-            if ok:
-                settings = _load_settings()
-                settings["connections"] = settings.get("connections") or {}
-                settings["connections"]["active_connection_id"] = ""
-                _save_settings(settings)
-            self._append_event(
-                "info" if ok else "warning",
-                "tool",
-                "Disconnect link",
-                result.to_dict(),
-            )
-            return {"ok": ok, "action": "disconnect", "result": result.to_dict()}
+            return self.deactivate_connection()
 
         result = self.set_backend(backend_id, connect_params=connect_params, connection_id=connection_id)
         if result.get("ok"):
@@ -3735,14 +4213,57 @@ class AgentRuntime:
         if obstacle_block:
             return obstacle_block
 
-        result = self.tools.execute(
-            tool,
-            params,
-            dry_run=False,
-            blocked_by_supervisor=self.supervisor.is_emergency_stopped(),
-        )
+        # 飞控指令串行闸门：只有真正改变飞行状态的工具才需要独占飞控，
+        # 持锁期间算法级视觉伺服不插入，避免两路线程同时向 PX4 推不同目标点
+        # （历史上会导致突然俯冲/乱转/掉机）。只读/视觉工具不占锁，保证
+        # OFFBOARD 设定值流不中断。视觉伺服 tick 很短，等待上限 30s。
+        needs_gate = tool in self.tools.CONTROL_TOOLS
+        gate_held = self.tools.acquire_control_gate(blocking=True, timeout=30.0) if needs_gate else False
+        try:
+            result = self.tools.execute(
+                tool,
+                params,
+                dry_run=False,
+                blocked_by_supervisor=self.supervisor.is_emergency_stopped(),
+            )
+        finally:
+            if gate_held:
+                self.tools.release_control_gate()
+        # 降落指令返回时飞机通常仍在下沉（LAND 模式下 flying 会提前变 false）。
+        # 这里在不持有执行锁的情况下等它真正落地/上锁，避免随后的完成校验把
+        # "正在降落"误判成"未落地"而触发无谓的纠错循环。
+        if tool == "drone_land" and result.ok:
+            self._await_grounded()
         self._remember_visual_frame_from_payload(result.data, source=tool, params=params)
         return result
+
+    def _await_grounded(self, timeout: float = 30.0) -> bool:
+        """轮询等待飞机真正落地（不持执行锁）。"""
+        deadline = time.time() + max(3.0, float(timeout))
+        while time.time() < deadline:
+            if self.supervisor.is_emergency_stopped():
+                return False
+            try:
+                drone = (self.tools.status_snapshot().get("drone") or {})
+            except Exception:
+                return False
+            pos = drone.get("position_ned") if isinstance(drone.get("position_ned"), dict) else {}
+            vel = drone.get("velocity_ned") if isinstance(drone.get("velocity_ned"), dict) else {}
+            try:
+                alt = abs(float((pos or {}).get("z", 0.0) or 0.0))
+                vz = abs(float((vel or {}).get("vz", 0.0) or 0.0))
+            except (TypeError, ValueError):
+                alt, vz = 99.0, 99.0
+            try:
+                on_ground = int(drone.get("landed_state")) == 1  # MAV_LANDED_STATE_ON_GROUND
+            except (TypeError, ValueError):
+                on_ground = False
+            if (not drone.get("armed")) or (on_ground and alt < 0.6 and vz <= 0.4):
+                return True
+            if not drone.get("flying") and alt < 0.6 and vz <= 0.4:
+                return True
+            time.sleep(1.0)
+        return False
 
     def _low_altitude_motion_guard(
         self,
@@ -3765,15 +4286,18 @@ class AgentRuntime:
         altitude = self._vehicle_altitude_m(drone)
         if altitude is None:
             return None
-        projected_altitude = altitude + max(0.0, up)
-        if bool(drone.get("flying")) and projected_altitude >= 1.5:
+        # 只要"确实在空中"就允许水平移动。之前用 1.5m 阈值会在飞机因模式回退
+        # 短暂掉到 ~1.3m 时误拦，导致 Agent 反复重起飞/解锁、任务被拖死。
+        # 真正要拦的是"没起飞/在地面"的水平移动。
+        if bool(drone.get("flying")) and altitude >= 0.8:
             return None
         return self._blocked_tool_result(
             tool,
             params,
             (
-                "horizontal relative movement is blocked below safe altitude; "
-                f"current altitude is {altitude:.2f} m. Take off to at least 3 m before moving horizontally."
+                "horizontal relative movement is blocked: the vehicle is not airborne "
+                f"(altitude {altitude:.2f} m, flying={bool(drone.get('flying'))}, armed={bool(drone.get('armed'))}). "
+                "Take off first and confirm flying=true before moving horizontally."
             ),
         )
 
@@ -4026,21 +4550,9 @@ class AgentRuntime:
                 time.time(),
             )
 
-        image_base64 = str(params.get("image_base64") or "").strip()
-        source = str(params.get("source") or "last_image").strip().lower()
-        context = dict(params.get("context") or {}) if isinstance(params.get("context"), dict) else {}
-        with self._lock:
-            last_frame = dict(self._last_visual_frame)
-        if not image_base64 and source in {"", "last_image", "latest", "latest_image"}:
-            image_base64 = str(last_frame.get("image_base64") or "")
-            context.setdefault("image_source", last_frame.get("source_tool", "last_image"))
-            context.setdefault("image_saved_to", last_frame.get("image_saved_to", ""))
-            context.setdefault("visual_metadata", last_frame.get("metadata", {}))
-        if not image_base64:
-            image_path = str(params.get("image_path") or params.get("saved_to") or last_frame.get("image_saved_to") or "")
-            image_base64 = self._read_image_base64(image_path)
-            if image_path:
-                context.setdefault("image_saved_to", image_path)
+        # 统一走 _image_for_vlm：含 last_image、显式路径、以及感知轴当前帧
+        # 兜底（LLM 先结构化检测再确认时无需先拍照）。
+        image_base64, context = self._image_for_vlm(params)
         if not image_base64:
             return ToolCallResult(
                 "airsim_vlm_confirm_target",
@@ -4199,6 +4711,30 @@ class AgentRuntime:
             image_base64 = self._read_image_base64(image_path)
             if image_path:
                 context.setdefault("image_saved_to", image_path)
+        if not image_base64:
+            # 兜底：感知轴当前帧。LLM 可能先 detect_objects（结构化检测，
+            # 不写 last_visual_frame）再直接调 VLM 确认，此时并没有"上一次
+            # 拍照"的图。标注帧可能尚未缓存，再退到直连相机抓一帧
+            # （与 inspect_current_frame 的 fallback_capture 同一路径）。
+            jpeg: bytes | None = None
+            axis = getattr(self, "perception_axis", None)
+            if axis is not None and getattr(axis, "enabled", False):
+                try:
+                    jpeg, _dets, _ts = axis.annotated_frame()
+                except Exception:
+                    jpeg = None
+            if not jpeg:
+                capture = getattr(getattr(self, "tools", None), "_capture_current_frame_jpeg", None)
+                if callable(capture):
+                    try:
+                        jpeg = capture()
+                    except Exception:
+                        jpeg = None
+            if jpeg:
+                import base64 as _b64
+
+                image_base64 = _b64.b64encode(jpeg).decode("ascii")
+                context.setdefault("image_source", "perception_frame")
         return image_base64, context
 
     def _remember_visual_frame_from_payload(
@@ -4462,19 +4998,48 @@ class AgentRuntime:
         return {"ok": True, "progress": progress.to_dict()}
 
     def list_sessions(self) -> list[dict[str, Any]]:
+        """列出会话元数据。
+
+        会话文件动辄几 MB（内含跑批状态），而 UI 每秒都会轮询 /api/state，
+        每次都全量解析所有文件会让整个界面发卡。这里按 (mtime, size) 缓存
+        元数据，只有文件真的变了才重新解析。
+        """
+        cache = getattr(self, "_session_meta_cache", None)
+        if cache is None:
+            cache = {}
+            self._session_meta_cache = cache
         sessions: list[dict[str, Any]] = []
+        seen: set[str] = set()
         for path in sorted(SESSIONS_DIR.glob("session_*.json"), key=lambda p: p.stat().st_mtime, reverse=True):
+            key = str(path)
+            seen.add(key)
             try:
-                data = json.loads(path.read_text(encoding="utf-8"))
-                sessions.append({
-                    "id": data.get("id", path.stem),
-                    "name": data.get("name", "未命名对话"),
-                    "created_at": data.get("created_at", 0),
-                    "updated_at": data.get("updated_at", 0),
-                    "message_count": len(data.get("messages", [])),
-                })
-            except Exception:
+                stat = path.stat()
+            except OSError:
                 continue
+            cached = cache.get(key)
+            if cached and cached["mtime"] == stat.st_mtime and cached["size"] == stat.st_size:
+                sessions.append(dict(cached["meta"]))
+                continue
+            data = read_session_file(path)
+            if data is None:
+                logger.warning("session_file_unreadable", path=key)
+                continue
+            messages = data.get("messages") or []
+            meta = {
+                "id": data.get("id", path.stem),
+                "name": data.get("name", "未命名对话"),
+                "created_at": data.get("created_at", 0),
+                "updated_at": data.get("updated_at", 0),
+                "message_count": len(messages),
+                # 左侧导航条是"一条输入一根线"，这里一并给出输入条数，
+                # 免得会话列表写 120 条、导航条只有 60 根，看起来像丢了数据
+                "input_count": sum(1 for m in messages if isinstance(m, dict) and m.get("role") == "user"),
+            }
+            cache[key] = {"mtime": stat.st_mtime, "size": stat.st_size, "meta": meta}
+            sessions.append(dict(meta))
+        for stale_key in [k for k in cache if k not in seen]:
+            cache.pop(stale_key, None)
         return sessions
 
     def session_history(self, session_id: str) -> dict[str, Any]:
@@ -4482,11 +5047,10 @@ class AgentRuntime:
         path = self._session_path(session_id)
         if not path.exists():
             return {"ok": False, "error": "session not found"}
-        try:
-            data = json.loads(path.read_text(encoding="utf-8"))
-        except Exception as exc:
-            return {"ok": False, "error": f"failed to load session: {exc}"}
-        return {"ok": True, "session": data}
+        data = read_session_file(path)
+        if data is None:
+            return {"ok": False, "error": "failed to load session: unreadable session file"}
+        return {"ok": True, "session": self._session_public_dict(data)}
 
     def create_session(self, name: str = "") -> dict[str, Any]:
         now = time.time()
@@ -4500,6 +5064,7 @@ class AgentRuntime:
         }
         self._save_session(session)
         self._current_session_id = session_id
+        self._bind_session_memory(session_id)
         with self._lock:
             self._messages.clear()
             self._current = None
@@ -4511,10 +5076,9 @@ class AgentRuntime:
         path = self._session_path(session_id)
         if not path.exists():
             return {"ok": False, "error": "session not found"}
-        try:
-            data = json.loads(path.read_text(encoding="utf-8"))
-        except Exception as e:
-            return {"ok": False, "error": f"failed to load session: {e}"}
+        data = read_session_file(path)
+        if data is None:
+            return {"ok": False, "error": "failed to load session: unreadable session file"}
 
         messages = []
         for raw in data.get("messages", []):
@@ -4534,6 +5098,7 @@ class AgentRuntime:
 
         with self._lock:
             self._current_session_id = session_id
+            self._bind_session_memory(session_id)
             self._messages = messages
             self._current = None
             self._pending_run_ids.clear()
@@ -4541,14 +5106,16 @@ class AgentRuntime:
         if changed:
             self._persist_current_session()
         self._publish("snapshot", self.state())
-        return {"ok": True, "session": data}
+        return {"ok": True, "session": self._session_public_dict(data)}
 
     def rename_session(self, session_id: str, name: str) -> dict[str, Any]:
         path = self._session_path(session_id)
         if not path.exists():
             return {"ok": False, "error": "session not found"}
         try:
-            data = json.loads(path.read_text(encoding="utf-8"))
+            data = read_session_file(path)
+            if data is None:
+                return {"ok": False, "error": "rename failed: unreadable session file"}
             data["name"] = name.strip() or data.get("name", "未命名对话")
             data["updated_at"] = time.time()
             self._save_session(data)
@@ -4633,9 +5200,8 @@ class AgentRuntime:
             return
         path = self._session_path(self._current_session_id)
         try:
-            if path.exists():
-                data = json.loads(path.read_text(encoding="utf-8"))
-            else:
+            data = read_session_file(path) if path.exists() else None
+            if data is None:
                 data = {"id": self._current_session_id, "name": "新对话", "created_at": time.time()}
             with self._lock:
                 data["messages"] = [m.to_dict() for m in self._messages]
@@ -4644,9 +5210,46 @@ class AgentRuntime:
         except Exception:
             pass
 
+    def _bind_session_memory(self, session_id: str) -> None:
+        """把 Agent 记忆切换到指定会话的独立存储。"""
+        sid = str(session_id or "").strip() or "default"
+        try:
+            self.memory.rebind(SESSION_MEMORY_DIR / sid)
+        except Exception:
+            pass
+
+    def _session_public_dict(self, data: dict[str, Any]) -> dict[str, Any]:
+        """会话发给前端前的瘦身：剥掉 details 里的大字段。
+
+        原始文件里 loop_state.observations 一条就能有 500KB，49 条消息的会话
+        超过 14MB——切一次会话要把这堆东西序列化、传输、再解析，界面自然卡。
+        """
+        payload = dict(data)
+        payload["messages"] = [
+            _trim_session_message(message, for_payload=True) for message in (data.get("messages") or [])
+        ]
+        return payload
+
     def _save_session(self, data: dict[str, Any]) -> None:
         path = self._session_path(data["id"])
-        path.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+        # 落盘前剥掉大字段：否则每条消息都把 500KB 的观测原文写一遍
+        payload = dict(data)
+        payload["messages"] = [
+            _trim_session_message(message) for message in (data.get("messages") or [])
+        ]
+        # 原子写：先写临时文件再替换，避免中断/并发把文件拼成两份 JSON
+        # （历史上有 3 个会话就是这样坏掉、并从列表里消失的）
+        text = json.dumps(payload, ensure_ascii=False, indent=2)
+        temp_path = path.with_suffix(f".json.tmp{os.getpid()}")
+        try:
+            temp_path.write_text(text, encoding="utf-8")
+            os.replace(temp_path, path)
+        finally:
+            if temp_path.exists():
+                try:
+                    temp_path.unlink()
+                except OSError:
+                    pass
 
     def _session_path(self, session_id: str) -> Path:
         return SESSIONS_DIR / f"{session_id}.json"
@@ -4721,7 +5324,7 @@ class AgentRuntime:
         memory["scope"] = {
             "conversation": "per_session",
             "working_state": "global_runtime",
-            "missions_lessons_risks": "global_persistent",
+            "missions_lessons_risks": "per_session",
             "task_runs": "persistent_replay",
             "events": "process_only",
         }
@@ -4795,15 +5398,15 @@ class AgentRuntime:
         run.phase = "executing" if run.execute else "planning"
         if content:
             self._append_thought(run, "思考", content)
-            self._append_process(run, "理解任务", content, status="completed")
+            self._append_process(run, "理解任务", content, status="completed", kind="system")
         else:
             overview = self._thought_overview(run)
             self._append_thought(run, "理解任务", overview)
-            self._append_process(run, "理解任务", overview, status="completed")
+            self._append_process(run, "理解任务", overview, status="completed", kind="system")
         tools = " → ".join(step.tool for step in run.plan.steps if step.tool and step.tool != "memory_store")
         if tools:
             self._append_thought(run, "工具选择", tools)
-            self._append_process(run, "选择工具", tools, status="completed")
+            self._append_process(run, "选择工具", tools, status="completed", kind="plan")
         self._update_assistant_message(
             run.run_id,
             self._progress_message(run),
@@ -4907,10 +5510,20 @@ class AgentRuntime:
     ) -> None:
         body = self._compact_process_text(body)
         item_kind = kind or ("tool" if tool else "reasoning")
+        # 工具/步骤条目出现时，收掉前面仍在流式的思考块（形成思考→工具→思考）
+        if item_kind != "reasoning":
+            for it in reversed(run.process_trace):
+                if it.get("kind") == "reasoning" and it.get("status") == "running":
+                    it["status"] = "completed"
+                    break
         if status in {"running", "completed", "failed", "blocked"}:
             for item in reversed(run.process_trace):
                 same_item = item.get("tool") == tool if tool else item.get("title") == title
                 if same_item and item.get("status") == "running":
+                    # 计划步骤的结果回填时保持"执行计划"标签，不要变成"工具"，
+                    # 这样前端能区分"模型主动调用"与"按计划落地"。
+                    if item.get("kind") == "plan_step" and item_kind == "tool":
+                        item_kind = "plan_step"
                     item.update(
                         {
                             "timestamp": time.time(),
@@ -5580,6 +6193,9 @@ class AgentRuntime:
         return "正在处理任务，请稍候..."
 
     def _message_details(self, run: RunState) -> dict[str, Any]:
+        # 终态 run 的 details 快照前先收尾过程条目，避免前端残留转圈的步骤
+        if run.status in {"completed", "failed", "blocked", "cancelled", "planned"}:
+            self._settle_process_trace(run)
         return {
             "mode": run.mode,
             "phase": run.phase,
@@ -5597,15 +6213,50 @@ class AgentRuntime:
             "agent_state": self._sanitize_for_frontend(run.agent_state),
             "thought_trace": self._sanitize_for_frontend(list(run.thought_trace)),
             "process_trace": self._sanitize_for_frontend(list(run.process_trace)),
+            # 思考全文与计划摘要：优先取 run.agent_state（规划时写入），
+            # 取不到就从 process_trace / run.plan 兜底派生——_message_details
+            # 每次重建，任何一环丢失都会让前端看不到思考或计划面板。
+            "reasoning_text": self._reasoning_text_for_frontend(run),
+            "plan_summary": self._plan_summary_for_frontend(run),
         }
 
+    @staticmethod
+    def _reasoning_text_for_frontend(run: RunState) -> str:
+        text = str((run.agent_state or {}).get("_reasoning_text") or "").strip()
+        if text:
+            return text[:8000]
+        for item in run.process_trace:
+            if item.get("kind") == "reasoning" and str(item.get("body") or "").strip():
+                return str(item.get("body"))[:8000]
+        return ""
+
+    @staticmethod
+    def _plan_summary_for_frontend(run: RunState) -> str:
+        stored = str((run.agent_state or {}).get("_plan_summary") or "").strip()
+        if stored:
+            return stored[:4000]
+        steps = [
+            str(step.tool)
+            for step in (run.plan.steps if run.plan else [])
+            if getattr(step, "tool", "") and step.tool != "memory_store"
+        ]
+        if not steps:
+            return ""
+        return "执行计划（" + str(len(steps)) + " 步）：" + " → ".join(steps)
+
     def _run_public_dict(self, run: RunState) -> dict[str, Any]:
-        return self._sanitize_for_frontend(run.to_dict())
+        return self._sanitize_for_frontend(trim_loop_state_payload(run.to_dict()))
 
     def _message_public_dict(self, message: ChatMessage) -> dict[str, Any]:
-        return self._sanitize_for_frontend(message.to_dict())
+        # 走和会话文件同一套瘦身：每次 /api/state 都带着整批消息，不剥掉
+        # loop_state.observations / agent_state 的话，每轮轮询都要序列化几 MB。
+        return self._sanitize_for_frontend(_trim_session_message(message.to_dict(), for_payload=True))
 
-    def _sanitize_for_frontend(self, value: Any) -> Any:
+    def _sanitize_for_frontend(self, value: Any, _depth: int = 0) -> Any:
+        # 深度上限：run/messages 的嵌套结构可能因共享可变字典形成循环引用，
+        # 无限递归会打爆 run 更新发布（UI 冻结在最后一步）。超限用标记代替。
+        if _depth > 24:
+            return {"[bounded]": True}
         if isinstance(value, dict):
             sanitized: dict[str, Any] = {}
             for key, item in value.items():
@@ -5620,12 +6271,12 @@ class AgentRuntime:
                     sanitized[f"{key_text}_omitted"] = True
                     sanitized[f"{key_text}_bytes"] = len(image_text)
                     continue
-                sanitized[key_text] = self._sanitize_for_frontend(item)
+                sanitized[key_text] = self._sanitize_for_frontend(item, _depth + 1)
             return sanitized
         if isinstance(value, list):
-            return [self._sanitize_for_frontend(item) for item in value]
+            return [self._sanitize_for_frontend(item, _depth + 1) for item in value]
         if isinstance(value, tuple):
-            return [self._sanitize_for_frontend(item) for item in value]
+            return [self._sanitize_for_frontend(item, _depth + 1) for item in value]
         if isinstance(value, str) and len(value) > 12000:
             return f"{value[:12000]}... [omitted {len(value) - 12000} chars]"
         return value
@@ -5692,7 +6343,267 @@ class AgentRuntime:
         except Exception:
             pass
 
+    def _settle_process_trace(self, run: RunState) -> None:
+        """任务收尾：把仍标记为 running 的过程条目收掉。
+
+        否则前端会一直显示转圈的"运行中"步骤（结果回填靠 tool 名匹配，
+        同名工具重复出现或走批量执行时可能漏配）。
+        """
+        terminal_ok = run.status in {"completed", "planned"}
+        for item in run.process_trace:
+            if item.get("status") == "running":
+                item["status"] = "completed" if terminal_ok else "failed"
+                if not item.get("body"):
+                    item["body"] = "已结束"
+
+    @staticmethod
+    def _plan_completed_prefix(run: RunState) -> int:
+        """计划中连续已成功完成的步骤数（纠错重入时跳过它们）。"""
+        steps = list(run.plan.steps if run.plan else [])
+        count = 0
+        for step in steps:
+            if str(getattr(step, "status", "")) == "completed":
+                count += 1
+            else:
+                break
+        return count
+
+    def _maybe_start_envelope_guard(self, run: RunState) -> None:
+        """近距离识别/追踪任务启动飞行包线看门狗。
+
+        这类任务的工作包线是 2~3m 定高、小范围机动。若飞机报出远超包线的高度
+        或水平位移（真实失控，或 EKF 位置估计发散时都会这样），就不能再等
+        Agent 慢慢决策——立即中止并降落。历史事故里飞机曾在无人干预下带着
+        错误的估计值飞了好几分钟。
+        """
+        if run is None or not getattr(run, "execute", False):
+            return
+        try:
+            close_range = self.planner._is_close_range_visual_command(run.command)
+        except Exception:
+            close_range = False
+        if not close_range:
+            return
+        existing = self._envelope_thread
+        if existing is not None and existing.is_alive() and self._envelope_run_id == run.run_id:
+            return
+        self._envelope_stop.clear()
+        self._envelope_run_id = run.run_id
+        self._envelope_thread = threading.Thread(
+            target=self._envelope_guard_loop, args=(run.run_id,), daemon=True, name="flight-envelope-guard"
+        )
+        self._envelope_thread.start()
+
+    def _stop_envelope_guard(self) -> None:
+        self._envelope_stop.set()
+        thread = self._envelope_thread
+        if thread is not None and thread.is_alive():
+            thread.join(timeout=1.5)
+        self._envelope_thread = None
+        self._envelope_run_id = ""
+
+    def _envelope_guard_loop(self, run_id: str) -> None:
+        max_alt_m, max_dist_m = 8.0, 70.0
+        breaches = 0
+        origin: tuple[float, float] | None = None
+        while not self._envelope_stop.is_set():
+            with self._lock:
+                current = self._current
+            if current is None or current.run_id != run_id or current.status not in {"running", "paused"}:
+                break
+            if self.supervisor.is_emergency_stopped():
+                break
+            try:
+                drone = self.tools.status_snapshot().get("drone") or {}
+            except Exception:
+                drone = {}
+            pos = drone.get("position_ned") if isinstance(drone.get("position_ned"), dict) else {}
+            try:
+                alt = abs(float((pos or {}).get("z", 0.0) or 0.0))
+                x = float((pos or {}).get("x", 0.0) or 0.0)
+                y = float((pos or {}).get("y", 0.0) or 0.0)
+            except (TypeError, ValueError):
+                alt, x, y = 0.0, 0.0, 0.0
+            flying = bool(drone.get("flying"))
+            if origin is None and flying:
+                origin = (x, y)
+            dist = math.hypot(x - origin[0], y - origin[1]) if origin else 0.0
+            if flying and (alt > max_alt_m or dist > max_dist_m):
+                breaches += 1
+            else:
+                breaches = 0
+            if breaches >= 3:
+                self._append_event(
+                    "danger", "system",
+                    f"飞行包线保护：高度 {alt:.1f}m / 水平位移 {dist:.1f}m 超出安全包线，"
+                    "已中止任务并执行降落（可能是真实失控或位置估计发散，请检查飞控估计与罗盘）",
+                    {"altitude_m": round(alt, 2), "distance_m": round(dist, 1), "run_id": run_id},
+                )
+                try:
+                    self._cancel_active_work()
+                except Exception:
+                    pass
+                try:
+                    self.tools.execute("drone_land", {}, dry_run=False, blocked_by_supervisor=False)
+                except Exception:
+                    pass
+                with self._lock:
+                    if self._current is not None and self._current.run_id == run_id:
+                        self._current.status = "failed"
+                        self._current.failure_reason = "飞行包线保护触发：超出安全高度/范围，已中止并降落"
+                break
+            time.sleep(1.0)
+
+    def _maybe_start_tracking_assist(self, run: RunState) -> None:
+        """任务带追踪意图且已看到目标时，启动算法级居中伺服线程。
+
+        默认关闭（DRONE_TRACKING_ASSIST=true 才启用）。原因：该伺服依赖
+        OFFBOARD 偏航率流保持连续，一旦因与 Agent 工具抢占飞控而中断，PX4 会
+        回退到 POSCTL/ALTCTL；在位置估计不稳时表现为飞机下沉/漂移（实测已多次
+        触发）。目标居中的稳定性收益目前抵不过飞行风险，故改为显式开启。
+        """
+        if str(os.environ.get("DRONE_TRACKING_ASSIST", "")).strip().lower() not in {"1", "true", "yes", "on"}:
+            return
+        if run is None or not run.execute:
+            return
+        if run.status not in {"running", "queued"}:
+            return
+        command = str(run.command or "")
+        if not any(k in command for k in ("追踪", "跟踪", "跟随", "锁定", "track", "follow")):
+            return
+        existing = self._tracking_assist
+        if existing is not None and existing.is_alive() and self._tracking_assist_run_id == run.run_id:
+            return
+        axis = self.perception_axis
+        if axis is None or not getattr(axis, "enabled", False):
+            return
+        try:
+            if not (axis.snapshot() or {}).get("primary"):
+                return  # 还没看到目标，等确认后再启动
+        except Exception:
+            return
+        self._tracking_assist_stop.clear()
+        self._tracking_assist_run_id = run.run_id
+        self._tracking_assist = threading.Thread(
+            target=self._tracking_assist_loop, args=(run.run_id,), daemon=True, name="tracking-assist"
+        )
+        self._tracking_assist.start()
+        self._append_event("info", "tracking", "居中伺服已启动（目标保持在画面中央）", {"run_id": run.run_id})
+
+    def _stop_tracking_assist(self, reason: str = "") -> None:
+        self._tracking_assist_stop.set()
+        thread = self._tracking_assist
+        if thread is not None and thread.is_alive():
+            thread.join(timeout=1.5)
+        if thread is not None and reason:
+            self._append_event("info", "tracking", f"居中伺服已停止（{reason}）", {})
+        self._tracking_assist = None
+        self._tracking_assist_run_id = ""
+
+    def _tracking_assist_loop(self, run_id: str) -> None:
+        """算法闭环：把感知轴锁定的目标持续拉回画面中央（仅横向 yaw）。
+
+        安全约束（针对历史掉机事故）：
+        - 只在拿到飞控串行闸门时动作；Agent 飞行工具执行期间完全不插手。
+        - 只用 yaw-rate 一个原语，进入 OFFBOARD 后按 4Hz 持续发送设定值；
+          高度由零速度设定保持，不再发升降/位置目标。
+        - 目标丢失、任务结束、急停或闸门被抢占过久 → 退出并释放 OFFBOARD。
+        """
+        axis = self.perception_axis
+        controller = getattr(self.tools, "controller", None)
+        if axis is None or controller is None:
+            return
+        # 只有具备连续速度/偏航率原语的后端（PX4 MAVLink）才启用自动居中，
+        # 避免在 AirSim 等后端上调用不存在的方法。
+        if not all(
+            hasattr(controller, name)
+            for name in ("is_velocity_control_active", "prepare_velocity_control",
+                         "release_velocity_control", "send_yaw_rate_setpoint", "is_flying_now")
+        ):
+            return
+        lost_since = None
+        frame_size = None
+        velocity_mode = False
+        last_prepare = 0.0
+        try:
+            while not self._tracking_assist_stop.is_set():
+                if self.supervisor.is_emergency_stopped():
+                    break
+                with self._lock:
+                    current = self._current
+                if current is None or current.run_id != run_id or current.status not in {"running", "paused"}:
+                    break
+                try:
+                    snap = axis.snapshot() or {}
+                except Exception:
+                    snap = {}
+                primary = snap.get("primary")
+                if not primary:
+                    lost_since = lost_since or time.time()
+                    if time.time() - lost_since > 3.0:
+                        break
+                    time.sleep(0.25)
+                    continue
+                lost_since = None
+                if frame_size is None:
+                    try:
+                        import cv2
+                        import numpy as np
+
+                        annotated = axis.annotated_frame()
+                        img = cv2.imdecode(np.frombuffer(annotated[0], np.uint8), cv2.IMREAD_UNCHANGED)
+                        if img is not None:
+                            frame_size = (img.shape[1], img.shape[0])
+                    except Exception:
+                        frame_size = (640, 480)
+                # 只在没有 Agent 飞行工具占用飞控时动作；拿不到就跳过这一拍。
+                if not self.tools.acquire_control_gate(blocking=False):
+                    time.sleep(0.25)
+                    continue
+                try:
+                    if not velocity_mode or not controller.is_velocity_control_active():
+                        # 重新进入 OFFBOARD 前确认在飞，且失败时不反复重试刷屏。
+                        if not bool(getattr(controller, "is_flying_now", lambda: True)()):
+                            velocity_mode = False
+                            time.sleep(0.25)
+                            continue
+                        now = time.time()
+                        if now - last_prepare < 2.0:
+                            time.sleep(0.25)
+                            continue
+                        last_prepare = now
+                        velocity_mode = bool(controller.prepare_velocity_control())
+                    if velocity_mode:
+                        self.tools.servo_step(primary, frame_size=frame_size)
+                except Exception:
+                    velocity_mode = False
+                finally:
+                    self.tools.release_control_gate()
+                time.sleep(0.25)
+        finally:
+            # 退出时必须释放 OFFBOARD，否则飞控会因设定值中断进入 failsafe。
+            if velocity_mode:
+                try:
+                    if self.tools.acquire_control_gate(blocking=True, timeout=3.0):
+                        try:
+                            controller.release_velocity_control()
+                        finally:
+                            self.tools.release_control_gate()
+                except Exception:
+                    pass
+
     def _finalize_task_run(self, run: RunState) -> None:
+        try:
+            self._stop_envelope_guard()
+        except Exception:
+            pass
+        # 非正常结束时（失败/取消/阻塞）必须给飞机一个安全终态：受控降落。
+        # 否则飞机会带着 OFFBOARD/悬停状态被留在未知位置，随后失去控制掉落。
+        try:
+            if run is not None and getattr(run, "execute", False) and run.status in {"failed", "cancelled", "blocked"}:
+                self._attempt_failure_hover(run, run.failure_reason or run.status)
+        except Exception:
+            pass
         store = getattr(self, "task_runs", None)
         if not store:
             return
@@ -5792,24 +6703,35 @@ class AgentRuntime:
             return any(step.tool == "drone_land" for step in steps[index + 1 :])
 
         if final_landing_expected:
-            # land 工具内部已做最长 45s 的落地确认（并行轮询每架）——工具
-            # 成功即视为落地达标；落地后 AirSim 的遥测枚举/位置有滞后，
-            # 仅凭 end telemetry 会误判"未达目标"而空转纠错循环
+            # 落地判据必须有地理证据：PX4 一进 LAND 模式 flying 就可能变 false，
+            # 但飞机还在 2~3m 下沉。所以要求"高度接近地面"或 PX4 明确报 ON_GROUND
+            # （landed_state=3），或已上锁（armed=false）。
             land_step_ok = any(
                 step.tool == "drone_land" and step.status == "completed"
                 for step in steps
             )
-            landed = bool(
-                end.get("flying") is False
-                or end.get("landed_state") == "landed"
-                or land_step_ok
+            end_z = None
+            if isinstance(end_pos, dict):
+                try:
+                    end_z = abs(float(end_pos.get("z", 0.0) or 0.0))
+                except (TypeError, ValueError):
+                    end_z = None
+            on_ground = (
+                end.get("landed_state") in (1, "landed", "on_ground")  # MAV_LANDED_STATE_ON_GROUND=1
+                or (end_z is not None and end_z < 0.6)
             )
+            landed = bool(on_ground or (land_step_ok and end.get("armed") is False))
             checks.append({
                 "name": "landed_state",
                 "ok": landed,
                 "severity": "hard",
-                "expected": "flying=false 或 landed_state=landed",
-                "actual": {"flying": end.get("flying"), "landed_state": end.get("landed_state")},
+                "expected": "高度接近地面 / PX4 ON_GROUND / 已上锁",
+                "actual": {
+                    "flying": end.get("flying"),
+                    "armed": end.get("armed"),
+                    "landed_state": end.get("landed_state"),
+                    "altitude_m": round(end_z, 2) if end_z is not None else None,
+                },
             })
 
         takeoff_steps = [step for step in steps if step.tool == "drone_takeoff"]
@@ -5819,7 +6741,9 @@ class AgentRuntime:
             gps = end.get("gps") if isinstance(end.get("gps"), dict) else {}
             gps_altitude = abs(self._float(gps.get("alt"))) if isinstance(gps, dict) else 0.0
             actual_altitude = max(ned_altitude, gps_altitude)
-            min_altitude = max(0.5, expected_altitude * 0.85, expected_altitude - 0.5)
+            # PX4 悬停高度实测常与目标差 0.3~0.6m；旧容差 (0.85 倍 / -0.5m)
+            # 会把正常悬停误判为失败。放宽到 0.8 倍 / -1.0m。
+            min_altitude = max(0.5, expected_altitude * 0.8, expected_altitude - 1.0)
             flying = bool(end.get("flying") is True or actual_altitude >= 0.5)
             checks.append({
                 "name": "takeoff_altitude",
@@ -5897,28 +6821,44 @@ class AgentRuntime:
             })
 
         wants_search = any(k in lower for k in ["search", "find", "locate", "搜索", "寻找", "查找", "目标"])
-        search_steps = [step for step in steps if step.tool in {"skill:search", "airsim_search_target", "airsim_vlm_confirm_target"}]
+        search_steps = [step for step in steps if step.tool in {
+            "skill:search", "airsim_search_target", "airsim_vlm_confirm_target",
+            "airsim_vlm_analyze_image", "inspect_current_frame",
+            "airsim_detect_objects", "airsim_take_photo", "perception_status",
+        }]
         if wants_search or search_steps:
             search_statuses = {
                 str(value).strip().lower()
                 for step in search_steps
                 for value in self._collect_field_values(step.result, "status")
             }
-            found_markers = {"candidate_found", "target_found", "found", "locked", "target_confirmed"}
+            found_markers = {"candidate_found", "target_found", "found", "locked",
+                             "target_confirmed", "confirmed", "image_analyzed"}
             failed_markers = {"not_found", "target_not_confirmed", "failed", "cancelled", "canceled", "error", "blocked"}
+            # 真实检出优先于文案状态：只要任一搜索步骤的结果里带了
+            # detections/targets/primary（含 perception_status.snapshot），
+            # 就认为目标确实被检出，而不是只看 status 字段是不是特定词。
+            detected_target = False
+            for step in search_steps:
+                res = step.result
+                if not isinstance(res, dict):
+                    continue
+                snap = res.get("snapshot") if isinstance(res.get("snapshot"), dict) else res
+                if snap.get("primary") or snap.get("targets") or res.get("detections"):
+                    detected_target = True
+                    break
             search_ok = (
                 bool(search_steps)
-                and bool(search_statuses & (found_markers | {"completed"}))
+                and bool(search_statuses & (found_markers | {"completed", "ok"}))
                 and not bool(search_statuses & failed_markers)
+                and (detected_target or bool(search_statuses & (found_markers | {"not_found"})))
             )
-            if search_statuses & found_markers:
-                search_ok = True
             checks.append({
                 "name": "target_search_outcome",
                 "ok": search_ok,
                 "severity": "hard",
-                "expected": "search reaches a terminal non-failure outcome",
-                "actual": sorted(search_statuses),
+                "expected": "检测/搜索得到明确结果（检出目标或如实报告未找到）",
+                "actual": sorted(search_statuses) + ([f"detected={detected_target}"] if detected_target else []),
             })
 
         wants_track = any(k in lower for k in ["track", "follow", "追踪", "跟踪", "跟随"])
@@ -5929,15 +6869,53 @@ class AgentRuntime:
                 for step in tracking_steps
                 for value in self._collect_field_values(step.result, "status")
             }
-            tracking_ok = bool(tracking_steps) and "completed" in tracking_statuses and not bool(
-                tracking_statuses & {"failed", "cancelled", "canceled", "error", "blocked"}
+            # 本架构没有独立追踪工具：追踪 = 感知轴持续锁定目标 + Agent 完成
+            # 多次"检测/确认/抵近"循环。旧判据只认不存在的 airsim_track_object，
+            # 会把成功的追踪任务硬判失败（假失败）。
+            track_loop_tools = {"airsim_detect_objects", "inspect_current_frame",
+                                "airsim_vlm_confirm_target", "airsim_vlm_analyze_image",
+                                "airsim_take_photo"}
+            loop_ok_steps = [
+                step for step in steps
+                if step.tool in track_loop_tools and str(getattr(step, "status", "")) == "completed"
+            ]
+            # 目标是否仍被感知轴锁定（从最后一次 perception_status 结果取）
+            locked = False
+            for step in reversed(steps):
+                if step.tool != "perception_status" or not isinstance(step.result, dict):
+                    continue
+                snap = step.result.get("snapshot") if isinstance(step.result.get("snapshot"), dict) else step.result
+                if snap.get("primary") or snap.get("targets"):
+                    locked = True
+                break
+            confirmed = any(
+                str(value).strip().lower() in {"target_confirmed", "confirmed", "locked"}
+                for step in steps
+                for value in self._collect_field_values(step.result, "status")
             )
+            # 本任务只要跑过一次视觉/检测步骤且目标处于锁定/确认状态，就算追踪
+            # 达成：感知轴本身负责持续锁定，不需要 Agent 再堆很多重复检测步骤。
+            detected_any = False
+            for step in steps:
+                res = step.result
+                if isinstance(res, dict):
+                    snap = res.get("snapshot") if isinstance(res.get("snapshot"), dict) else res
+                    if snap.get("primary") or snap.get("targets") or res.get("detections"):
+                        detected_any = True
+                        break
+            tracking_ok = (
+                bool(tracking_steps) and "completed" in tracking_statuses
+                and not bool(tracking_statuses & {"failed", "cancelled", "canceled", "error", "blocked"})
+            ) or (len(loop_ok_steps) >= 1 and (locked or confirmed or detected_any))
             checks.append({
                 "name": "tracking_outcome",
                 "ok": tracking_ok,
                 "severity": "hard",
-                "expected": "tracking task completed",
-                "actual": sorted(tracking_statuses),
+                "expected": "追踪任务完成（目标被检出并锁定/确认）",
+                "actual": sorted(tracking_statuses) or [
+                    f"track_loop_steps={len(loop_ok_steps)}", f"locked={locked}",
+                    f"confirmed={confirmed}", f"detected={detected_any}",
+                ],
             })
 
         if checks:

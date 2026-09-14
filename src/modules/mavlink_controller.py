@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import math
 import os
+import socket
 import struct
 import subprocess
 import threading
@@ -104,6 +105,13 @@ class MavlinkController(FlightController):
         self._real_vehicle = False
         self._candidate_metadata: dict[str, dict[str, Any]] = {}
         self._active_connection_details: dict[str, Any] = {}
+        # MAVLink 数据报的真实来源。udpin(监听) 模式绑定 0.0.0.0，任何主机都能
+        # 打进来到这个端口——包括用户配置里那台并没有启动 PX4 的机器。界面必须
+        # 报真实来源，不能拿配置地址冒充实际链路。
+        self._rx_peer: tuple[str, int] | None = None
+        self._rx_peer_ts = 0.0
+        self._rx_peer_observed = False
+        self._peer_observations: dict[tuple[str, int], float] = {}
         self._firmware_info: dict[str, Any] = {}
         self._parameters: dict[str, dict[str, Any]] = {}
         self._telemetry_history: dict[str, deque[dict[str, Any]]] = {
@@ -268,7 +276,37 @@ class MavlinkController(FlightController):
 
     @property
     def is_connected(self) -> bool:
-        return self._connected and self._mavlink is not None
+        if self._mavlink is None:
+            return False
+        ts = float(getattr(self, "_last_heartbeat", 0.0) or 0.0)
+        age = (time.time() - ts) if ts else float("inf")
+        if self._connected:
+            # 已建立链路后仍必须看心跳：对端（PX4/SITL）关机或断开时心跳会停，
+            # 只凭标志位会一直显示"已连接"——用户看到的正是这种"断了还显示连接"。
+            # 心跳容忍 8s（跨机链路偶有延迟），超过即判定失联并清标志位。
+            if age > 8.0:
+                self._connected = False
+                logger.info("mavlink_link_lost", heartbeat_age_s=round(age, 2))
+                return False
+            return True
+        # 自愈：进程重启/重连后 _connected 可能仍是 False，但链路其实活着
+        # （心跳持续到达）。仅凭标志位会误判"not connected"，把控制指令拦下。
+        # 注意：_last_heartbeat 只能靠排空 socket 更新，所以这里必须主动探测一次，
+        # 否则一旦判定断开就再也不会自动恢复（对端重启后仍显示未连接）。
+        now = time.time()
+        if now - float(getattr(self, "_last_probe_ts", 0.0) or 0.0) >= 1.0:
+            self._last_probe_ts = now
+            try:
+                self._drain_messages(0.15)
+            except Exception:
+                pass
+            ts = float(getattr(self, "_last_heartbeat", 0.0) or 0.0)
+            age = (time.time() - ts) if ts else float("inf")
+        if ts and age < 6.0:
+            self._connected = True
+            logger.info("mavlink_link_self_healed", heartbeat_age_s=round(age, 2))
+            return True
+        return False
 
     @property
     def last_error(self) -> str:
@@ -276,6 +314,29 @@ class MavlinkController(FlightController):
 
     def connect(self, **kwargs) -> ConnectionInfo:
         url = str(kwargs.get("url") or self._connection_string)
+        # 已在本链路上且链路健康时直接返回：Agent 常会习惯性地先调一次
+        # drone_connect 再飞，若这里重新走一遍 disconnect+connect，会把正在
+        # 工作的链路拆掉，一旦重连失败整个任务就被判为"链路断开"。
+        if (
+            self._connected
+            and self._mavlink is not None
+            and url
+            and url == str(self._connection_string or "")
+            and not kwargs.get("force")
+        ):
+            status = self.get_status()
+            return ConnectionInfo(
+                backend="mavlink",
+                connected=True,
+                details={
+                    "url": url,
+                    "message": "already connected",
+                    "mode": status.mode,
+                    "armed": status.armed,
+                    "flying": status.flying,
+                    "real_vehicle": self._real_vehicle,
+                },
+            )
         self._connection_string = url
         self._real_vehicle = bool(kwargs.get("real_vehicle", False))
         fallback_url = str(kwargs.get("fallback_url") or "")
@@ -342,6 +403,15 @@ class MavlinkController(FlightController):
                     details["fallback_url"] = fallback_url
                 if candidate_meta:
                     details["detected_link"] = candidate_meta
+                # 连上 ≠ 连上了配置里那台设备：把真实心跳来源和比对结论一起返回，
+                # 让 UI/Agent 能立刻提示"来源与配置不一致"。
+                details.update(self._peer_diagnostics(details))
+                if details.get("peer_mismatch"):
+                    logger.warning(
+                        "mavlink_peer_mismatch",
+                        configured=details.get("configured_peer_endpoint"),
+                        actual=details.get("actual_peer_endpoint"),
+                    )
                 self._active_connection_details = dict(details)
                 try:
                     self.get_firmware_info(force=True, timeout=2.5)
@@ -359,6 +429,10 @@ class MavlinkController(FlightController):
             except Exception as exc:
                 errors.append(f"{candidate}: {exc}")
                 logger.error(f"MAVLink connection failed for {candidate}: {exc}")
+                conflict = self._local_port_conflict_hint(candidate)
+                if conflict:
+                    errors.append(conflict)
+                    logger.error("mavlink_local_port_conflict", detail=conflict)
 
         self.disconnect()
         return ConnectionInfo(
@@ -374,6 +448,40 @@ class MavlinkController(FlightController):
             },
         )
 
+    def _local_port_conflict_hint(self, candidate: str) -> str:
+        """监听口收不到心跳时，检查端口是不是被别的进程占着。
+
+        Windows 允许 `0.0.0.0:14550` 与 `127.0.0.1:14550` 同时绑定，但回环流量只会
+        投递给更具体的那个绑定。于是"上一个没退出的 Agent 实例"会把 WSL/PX4 发往
+        127.0.0.1:14550 的心跳全部收走，新实例只能一直等到超时——报出来的是
+        "no MAVLink heartbeat received"，看起来像 PX4 没起来或链路坏了。
+        """
+        if not candidate.startswith("udpin:"):
+            return ""
+        host, separator, port_text = candidate[len("udpin:") :].rpartition(":")
+        if not separator:
+            return ""
+        try:
+            port = int(port_text)
+        except ValueError:
+            return ""
+        probe_hosts = ["127.0.0.1"] if host in {"", "0.0.0.0", "::"} else [host.strip("[]")]
+        for probe_host in probe_hosts:
+            probe = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            try:
+                probe.bind((probe_host, port))
+            except OSError:
+                # 现在能绑上说明没被占，继续看下一个地址
+                continue
+            finally:
+                probe.close()
+            return ""
+        return (
+            f"本地 UDP 端口 {port} 已被其他进程占用（常见原因是上一次启动的 Agent 实例没有退出）。"
+            f"该进程会收走 PX4 发往 127.0.0.1:{port} 的心跳，所以本实例永远等不到心跳；"
+            f"请先结束旧实例或改用其它端口。"
+        )
+
     def disconnect(self) -> None:
         self._stop_offboard_hold()
         with self._lock:
@@ -384,6 +492,10 @@ class MavlinkController(FlightController):
             for history in self._telemetry_history.values():
                 history.clear()
             self._active_connection_details = {}
+            self._rx_peer = None
+            self._rx_peer_ts = 0.0
+            self._rx_peer_observed = False
+            self._peer_observations.clear()
             self._firmware_info = {}
             self._reset_parameter_cache(state="disconnected")
         if mav is not None:
@@ -395,13 +507,23 @@ class MavlinkController(FlightController):
     def update_telemetry(self, timeout: float = 0.2) -> None:
         if not self.is_connected:
             return
+        self._drain_messages(timeout)
 
+    def _drain_messages(self, timeout: float = 0.2) -> None:
+        """只读地排空并处理 MAVLink 消息（不检查连接状态）。
+
+        拆出来是为了给"断开后的自愈探测"复用：is_connected 本身依赖
+        _last_heartbeat，而心跳只能靠排空 socket 更新；若探测也受
+        is_connected 限制，一旦判定断开就永远无法自动恢复。
+        """
+        if self._mavlink is None:
+            return
         end_time = time.time() + max(0.0, timeout)
         while time.time() < end_time:
             with self._lock:
-                if not self.is_connected:
+                if self._mavlink is None:
                     return
-                msg = self._mavlink.recv_match(blocking=False)
+                msg = self._recv_match(blocking=False)
             if msg is None:
                 time.sleep(0.002)
                 continue
@@ -942,19 +1064,61 @@ class MavlinkController(FlightController):
             return False
         altitude = max(0.5, abs(float(altitude)))
 
+        # 幂等：已经在空中且高度足够时不再重复下发起飞。
+        # 计划里常包含 takeoff（LLM 不知道飞机已起飞），重复 takeoffAsync 会
+        # 让飞行中的飞机进入异常状态/报失败，进而触发无谓的纠错绕路。
+        # 注意：判据必须是"真的在空中"，只看 armed+高度会在地面位置读数陈旧时
+        # 返回假成功（随后水平移动被安全门拦下，任务在假状态里空转）。
+        try:
+            current_z = abs(float(self._position.get("z", 0.0) or 0.0))
+            if self._is_flying_now() and current_z >= altitude * 0.9:
+                self._last_action_error = ""
+                logger.info("takeoff skipped: already airborne", altitude=current_z)
+                return True
+            if self._is_armed() and not self._is_flying_now() and current_z > altitude + 1.0:
+                # armed 但 landed_state 说在地面、高度读数却明显偏高：位置估计与
+                # 飞行状态不一致。不要据此假判"已起飞"，改为复位到地面再起飞，
+                # 让随后的高度读数从可信基线重新建立。
+                logger.warning(
+                    "takeoff: inconsistent state (armed, on ground, stale altitude), resetting",
+                    stale_altitude=current_z,
+                )
+                try:
+                    self.disarm(vehicle_name)
+                except Exception:
+                    pass
+        except Exception:
+            pass
+
+        # 原生起飞优先：MAV_CMD_NAV_TAKEOFF 等价于现场验证可用的
+        # `commander takeoff`。OFFBOARD 起飞需要先建立 >2Hz 设定值流并被飞控
+        # 接受，一旦模式切换失败就会留下"已解锁但不起飞、随后 disarm"的坏状态，
+        # 因此降为兜底路径。
+        if self._takeoff_via_native(altitude, vehicle_name):
+            return True
+
         offboard_target = {
             "x": float(self._position.get("x", 0.0) or 0.0),
             "y": float(self._position.get("y", 0.0) or 0.0),
             "z": -altitude,
         }
-        if self._takeoff_via_offboard(offboard_target, altitude, vehicle_name):
-            return True
+        return self._takeoff_via_offboard(offboard_target, altitude, vehicle_name)
 
-        # Fall back to the native takeoff command when OFFBOARD is unavailable.
-        # This keeps older PX4/SITL configurations usable while the preferred
-        # path remains a continuous local-position setpoint loop.
+    def _takeoff_via_native(self, altitude: float, vehicle_name: str = "") -> bool:
+        """原生起飞：MAV_CMD_NAV_TAKEOFF（等价 PX4 commander takeoff）。"""
+        # 上一次 OFFBOARD 起飞失败可能把飞机留在 OFFBOARD：此模式下飞控会
+        # 拒绝起飞指令并随即 disarm。先退回可起飞的位置控制模式再发指令。
+        if self._current_mode() == "OFFBOARD":
+            self._stop_offboard_hold()
+            if not (self._set_mode_one("LOITER") or self._current_mode() == "LOITER"):
+                self._set_mode_one("POSCTL")
         if not self._is_armed() and not self.arm(vehicle_name):
-            logger.warning("takeoff aborted: vehicle did not arm")
+            logger.warning("native takeoff aborted: vehicle did not arm")
+            return False
+        if not self._is_armed():
+            self._last_action_error = self._with_status_text(
+                "takeoff aborted: vehicle is not armed"
+            )
             return False
 
         self._mavlink.mav.command_long_send(
@@ -972,6 +1136,9 @@ class MavlinkController(FlightController):
         )
         ack_ok = self._wait_command_ack(mavutil.mavlink.MAV_CMD_NAV_TAKEOFF, timeout=5.0)
         if not ack_ok:
+            self._last_action_error = self._with_status_text(
+                "native takeoff command was not acknowledged"
+            )
             return False
         timeout = max(20.0, min(45.0, altitude / 0.3 + 15.0))
         minimum_reached = max(0.5, altitude * 0.85, altitude - 0.5)
@@ -1014,7 +1181,7 @@ class MavlinkController(FlightController):
             )
 
         logger.warning(
-            f"takeoff did not reach target altitude: ack={ack_ok} "
+            f"native takeoff did not reach target altitude: ack={ack_ok} "
             f"current_altitude={current_altitude:.2f} "
             f"target_altitude={altitude:.2f} mode={self._current_mode()} "
             f"armed={self._is_armed()}"
@@ -1096,10 +1263,28 @@ class MavlinkController(FlightController):
             0,
             0,
         )
-        ack_ok = self._wait_command_ack(mavutil.mavlink.MAV_CMD_NAV_LAND, timeout=3.0)
+        ack_ok = self._wait_command_ack(mavutil.mavlink.MAV_CMD_NAV_LAND, timeout=5.0)
         if mode_ok or ack_ok:
             self._stop_offboard_hold()
-        return mode_ok or ack_ok
+            return True
+        # ACK/模式回执都可能因为链路延迟或丢包拿不到，但这不代表降落没执行。
+        # 用"结果"兜底判定：只要飞机已经进入 LAND 模式或开始下降，就认为指令
+        # 已生效，交给上层轮询落地。以前只认 ACK，偶发丢包会把降落误报为失败。
+        deadline = time.time() + 6.0
+        while time.time() < deadline:
+            if self._stop_requested():
+                break
+            self.update_telemetry(timeout=0.2)
+            mode = self._current_mode()
+            if mode in {"LAND", "AUTO.LAND"} or self._is_descending():
+                self._stop_offboard_hold()
+                logger.info("land accepted without ack", mode=mode)
+                return True
+            time.sleep(0.2)
+        self._last_action_error = self._with_status_text(
+            "landing command was not acknowledged and the vehicle did not start descending"
+        )
+        return False
 
     def hover(self, vehicle_name: str = "") -> bool:
         """多机：vehicle_name（""=默认机 / all=全部 / px4_sysN）解析后逐机执行。"""
@@ -1275,6 +1460,29 @@ class MavlinkController(FlightController):
                 self._send_velocity_setpoint(
                     self._limit_velocity({"vx": float(vx), "vy": float(vy), "vz": float(vz)})
                 )
+            except Exception:
+                ok = False
+                break
+        return ok
+
+    def send_yaw_rate_setpoint(self, yaw_rate_rad_s: float, vehicle_name: str = "") -> bool:
+        """Send ONE yaw-rate setpoint (rad/s) and return immediately.
+
+        视觉伺服用的轻量原语：不做模式切换、不阻塞，由调用方在已进入
+        OFFBOARD 后按固定频率持续发送；velocity 置零即保持当前位置/高度。
+        """
+        targets = self._resolve_sysids(vehicle_name)
+        if not targets:
+            self._last_action_error = "no MAVLink system available"
+            return False
+        if not self.is_connected:
+            self._last_action_error = "MAVLink link is not connected"
+            return False
+        ok = True
+        for sysid in targets:
+            self._set_target(sysid)
+            try:
+                self._send_yaw_rate_setpoint(float(yaw_rate_rad_s))
             except Exception:
                 ok = False
                 break
@@ -1510,8 +1718,13 @@ class MavlinkController(FlightController):
         extra = {
             "heading_deg": round(float(gps.get("hdg", 0.0) or 0.0), 1),
             "heartbeat_age_s": round(heartbeat_age, 2) if math.isfinite(heartbeat_age) else None,
-            "link_stale": heartbeat_age > 5.0 if math.isfinite(heartbeat_age) else True,
+            # 心跳容忍度放宽到 8s：AirSim HIL 跨机链路上，跑视觉/推理任务时
+            # 主机负载高会让心跳间隔拉到数秒，5s 阈值会把"慢"误判成"断"，
+            # 触发无谓的 LINK_STALE 与重连，表现为连接反复抖动。
+            "link_stale": heartbeat_age > 8.0 if math.isfinite(heartbeat_age) else True,
             "offboard_hold_active": self._offboard_hold_active(),
+            "landed_state": landed_state,
+            "status_text": self._latest_status_text(),
             "custom_mode": heartbeat.get("custom_mode"),
             "base_mode": heartbeat.get("base_mode"),
             "system_status": heartbeat.get("system_status"),
@@ -1586,7 +1799,170 @@ class MavlinkController(FlightController):
         details["real_vehicle"] = self._real_vehicle
         details["heartbeat_age_s"] = round(heartbeat_age, 2) if math.isfinite(heartbeat_age) else None
         details["mavlink_wire_protocol"] = getattr(mavutil.mavlink, "WIRE_PROTOCOL_VERSION", None)
+        details.update(self._peer_diagnostics(details))
         return details
+
+    def _recv_match(self, **kwargs: Any) -> Any:
+        """``MavLink.recv_match`` 的包装：收到数据报后立刻记录它的来源地址。
+
+        pymavlink 不会把数据报来源附在消息上（udpin 模式下只记进
+        ``clients_last_alive``），所以必须在收包那一刻取，之后无法补。
+        """
+        mav = self._mavlink
+        if mav is None:
+            raise RuntimeError("MAVLink endpoint is not open")
+        msg = mav.recv_match(**kwargs)
+        if msg is not None:
+            self._note_rx_peer()
+        return msg
+
+    def _note_rx_peer(self) -> None:
+        """记录最近一次 MAVLink 数据报的来源；无法观测来源时退回发送目标。"""
+        mav = self._mavlink
+        if mav is None:
+            return
+        now = time.time()
+        if getattr(mav, "udp_server", False):
+            alive = getattr(mav, "clients_last_alive", None) or {}
+            address = max(alive.items(), key=lambda item: item[1])[0] if alive else None
+        else:
+            address = getattr(mav, "last_address", None)
+        observed = address is not None
+        if not observed:
+            # udpout 这类拿不到来源的场景，退回"我们发往的目标地址"。
+            # 它是推断值，不能用于判定配置是否命中，所以要带上 observed=False。
+            address = getattr(mav, "destination_addr", None)
+        peer = self._split_peer_address(address)
+        if peer is None:
+            return
+        # 接收线程写、状态轮询线程读，必须用锁隔开，否则读侧可能撞上
+        # "dictionary changed size during iteration"。
+        with self._lock:
+            self._rx_peer = peer
+            self._rx_peer_ts = now
+            self._rx_peer_observed = observed
+            if not observed:
+                return
+            self._peer_observations[peer] = now
+            if len(self._peer_observations) > 8:
+                stale = sorted(self._peer_observations, key=lambda key: self._peer_observations[key])
+                for key in stale[: len(self._peer_observations) - 8]:
+                    self._peer_observations.pop(key, None)
+
+    @staticmethod
+    def _split_peer_address(address: Any) -> tuple[str, int] | None:
+        if not isinstance(address, (tuple, list)) or len(address) < 2:
+            return None
+        host = str(address[0] or "").strip().strip("[]")
+        if not host:
+            return None
+        try:
+            return host, int(address[1])
+        except (TypeError, ValueError):
+            return None
+
+    @staticmethod
+    def _normalize_endpoint_host(value: str) -> tuple[str, int | None]:
+        """``udp:host:port`` / ``host:port`` / ``host`` 都归一成 (host, port|None)。"""
+        text = str(value or "").strip().strip("[]")
+        for prefix in ("udpin:", "udpout:", "udp:", "tcp:", "serial:", "auto:"):
+            if text.lower().startswith(prefix):
+                text = text[len(prefix) :]
+                break
+        host, separator, port_text = text.rpartition(":")
+        if separator and port_text.isdigit():
+            return host.strip().strip("[]"), int(port_text)
+        return text.strip(), None
+
+    @classmethod
+    def _host_matches(cls, left: str, right: str) -> bool:
+        left_host, _ = cls._normalize_endpoint_host(left)
+        right_host, _ = cls._normalize_endpoint_host(right)
+        left_host = left_host.lower()
+        right_host = right_host.lower()
+        if not left_host or not right_host:
+            return False
+        if left_host == right_host:
+            return True
+        loopback = {"localhost", "127.0.0.1", "::1", "0.0.0.0"}
+        return left_host in loopback and right_host in loopback
+
+    def _peer_diagnostics(self, source: dict[str, Any] | None = None) -> dict[str, Any]:
+        """如实回报心跳的真实来源，并与用户配置的 PX4 目标做比对。
+
+        ``connected`` 只说明"收到了合法载具心跳"，不说明"连上了配置里那台设备"：
+        监听模式绑定 0.0.0.0:14550 时，本机 WSL 的 SITL、局域网另一台机器、甚至
+        别的 GCS，只要往这个端口发心跳都会被认成"已连接"。以前界面只显示配置
+        地址，用户会以为连上的是配置的那台设备，所以这里必须把真实来源和比对
+        结论一起给出。
+        """
+        link = source if source is not None else self._active_connection_details
+        diagnostic: dict[str, Any] = {}
+        with self._lock:
+            observed = sorted(self._peer_observations.items(), key=lambda item: item[1], reverse=True)
+            rx_peer = self._rx_peer
+            rx_peer_ts = self._rx_peer_ts
+            rx_peer_observed = self._rx_peer_observed
+        if observed:
+            (host, port), seen_at = observed[0]
+            diagnostic["actual_peer_endpoint"] = f"{host}:{port}"
+            diagnostic["actual_peer_age_s"] = round(max(0.0, time.time() - seen_at), 2)
+            diagnostic["observed_peers"] = [f"{item_host}:{item_port}" for (item_host, item_port), _ in observed]
+            diagnostic["peer_source_verified"] = True
+        elif rx_peer is not None:
+            host, port = rx_peer
+            diagnostic["actual_peer_endpoint"] = f"{host}:{port}"
+            diagnostic["actual_peer_age_s"] = round(max(0.0, time.time() - rx_peer_ts), 2)
+            diagnostic["peer_source_verified"] = bool(rx_peer_observed)
+
+        configured_host_raw = str(link.get("px4_remote_host") or "").strip()
+        if not configured_host_raw:
+            return diagnostic
+        configured_host, embedded_port = self._normalize_endpoint_host(configured_host_raw)
+        configured_port_value = 0
+        if embedded_port:
+            # 用户把 udp:host:port 整串填进 host 字段时，以那一串里的端口为准。
+            configured_port_value = embedded_port
+        else:
+            try:
+                configured_port_value = int(link.get("px4_remote_port") or 0)
+            except (TypeError, ValueError):
+                configured_port_value = 0
+        configured_endpoint = str(link.get("px4_remote_endpoint") or "").strip()
+        if not configured_endpoint:
+            configured_endpoint = (
+                f"{configured_host}:{configured_port_value}" if configured_port_value else configured_host
+            )
+        diagnostic["configured_peer_endpoint"] = configured_endpoint
+        matched = any(
+            self._host_matches(host, configured_host)
+            and (configured_port_value == 0 or port == configured_port_value)
+            for (host, port), _ in observed
+        )
+        # 只有真正观测到来源（且没命中配置）才算不一致：udpout 的目标地址是
+        # 我们自己填的，拿它去比对配置没有意义，不能凭空报警。
+        diagnostic["peer_mismatch"] = bool(observed) and not matched
+        if matched:
+            diagnostic["peer_mismatch_note"] = ""
+            return diagnostic
+        actual = str(diagnostic.get("actual_peer_endpoint") or "")
+        if not actual:
+            diagnostic["peer_mismatch_note"] = (
+                f"尚未收到任何 MAVLink 心跳来源，配置目标 {configured_endpoint} 未确认在线。"
+            )
+            return diagnostic
+        actual_host = actual.rsplit(":", 1)[0]
+        loopback_hint = (
+            "（本机回环地址，通常是本机 / WSL 的 SITL，而不是配置的那台设备）"
+            if self._is_loopback_host(actual_host)
+            else ""
+        )
+        diagnostic["peer_mismatch_note"] = (
+            f"配置的 PX4 目标 {configured_endpoint} 没有收到任何数据报；"
+            f"当前心跳实际来自 {actual}{loopback_hint}。"
+            "监听模式绑定了全部网卡，任何往该端口发心跳的主机都会被当成已连接。"
+        )
+        return diagnostic
 
     def get_firmware_info(self, force: bool = False, timeout: float = 3.0) -> dict[str, Any]:
         """Request and return AUTOPILOT_VERSION, matching QGC's initial connect flow."""
@@ -1621,7 +1997,7 @@ class MavlinkController(FlightController):
             deadline = time.time() + deadline_per_attempt
             while time.time() < deadline:
                 with self._lock:
-                    msg = self._mavlink.recv_match(blocking=True, timeout=0.12)
+                    msg = self._recv_match(blocking=True, timeout=0.12)
                 if msg is None:
                     continue
                 msg_type = msg.get_type()
@@ -1740,7 +2116,7 @@ class MavlinkController(FlightController):
             with self._lock:
                 if not self.is_connected:
                     break
-                msg = self._mavlink.recv_match(blocking=True, timeout=0.15)
+                msg = self._recv_match(blocking=True, timeout=0.15)
             if msg is None:
                 continue
             msg_type = msg.get_type()
@@ -1843,7 +2219,7 @@ class MavlinkController(FlightController):
                 with self._lock:
                     if not self.is_connected:
                         break
-                    msg = self._mavlink.recv_match(blocking=True, timeout=0.25)
+                    msg = self._recv_match(blocking=True, timeout=0.25)
                 if msg is None:
                     continue
                 msg_type = msg.get_type()
@@ -2715,7 +3091,7 @@ class MavlinkController(FlightController):
         last_request_type: str | None = None
         deadline = time.time() + max(15.0, len(mission_items) * 4.0)
         while time.time() < deadline and len(sent) < len(mission_items):
-            msg = self._mavlink.recv_match(
+            msg = self._recv_match(
                 type=["MISSION_REQUEST_INT", "MISSION_REQUEST", "MISSION_ACK"],
                 blocking=True,
                 timeout=1.0,
@@ -3053,7 +3429,7 @@ class MavlinkController(FlightController):
             return
         deadline = time.time() + max(0.0, timeout)
         while time.time() < deadline:
-            msg = self._mavlink.recv_match(
+            msg = self._recv_match(
                 type=["MISSION_REQUEST_INT", "MISSION_REQUEST", "MISSION_ACK"],
                 blocking=False,
             )
@@ -3134,7 +3510,7 @@ class MavlinkController(FlightController):
             with self._lock:
                 if not self.is_connected:
                     return None
-                msg = self._mavlink.recv_match(type=msg_type, blocking=True, timeout=0.3)
+                msg = self._recv_match(type=msg_type, blocking=True, timeout=0.3)
             if msg is None:
                 continue
             if msg.get_type() in {"MISSION_CURRENT", "MISSION_ITEM_REACHED", "HEARTBEAT", "LOCAL_POSITION_NED", "GLOBAL_POSITION_INT"}:
@@ -3147,7 +3523,7 @@ class MavlinkController(FlightController):
             return None
         deadline = time.time() + timeout
         while time.time() < deadline:
-            msg = self._mavlink.recv_match(type=["MISSION_ITEM_INT", "MISSION_ITEM"], blocking=True, timeout=0.3)
+            msg = self._recv_match(type=["MISSION_ITEM_INT", "MISSION_ITEM"], blocking=True, timeout=0.3)
             if msg is None:
                 continue
             try:
@@ -3346,7 +3722,7 @@ class MavlinkController(FlightController):
             with self._lock:
                 if not self.is_connected:
                     return False
-                msg = self._mavlink.recv_match(blocking=True, timeout=0.2)
+                msg = self._recv_match(blocking=True, timeout=0.2)
             if msg is None:
                 continue
             if msg.get_type() == "COMMAND_ACK":
@@ -3387,7 +3763,16 @@ class MavlinkController(FlightController):
             return f"MAV_CMD_{command}"
 
     def _latest_status_text(self) -> str:
-        raw = (self._telemetry.get("STATUSTEXT") or {}).get("text", "")
+        # STATUSTEXT 存在每机遥测表里（table["telemetry"]["STATUSTEXT"]），
+        # 之前读的是只在少数地方写入的全局 self._telemetry，导致 PX4 的告警
+        # （如 "Compass needs calibration - Land now!"）永远拿不到、错误信息里
+        # 看不到真实原因。
+        telemetry = self._telemetry_for_target()
+        entry = telemetry.get("STATUSTEXT")
+        if not entry:
+            telemetry = self._telemetry
+            entry = telemetry.get("STATUSTEXT")
+        raw = (entry or {}).get("text", "")
         if isinstance(raw, bytes):
             raw = raw.decode("utf-8", errors="replace")
         return str(raw or "").strip().strip("\x00")
@@ -3398,7 +3783,8 @@ class MavlinkController(FlightController):
             return f"{message}; PX4: {status_text}"
         return message
 
-    def _link_is_stale(self, max_age_s: float = 5.0) -> bool:
+    # 心跳容忍 8s：跨机 HIL 链路上心跳偶发延迟数秒属正常，5s 会误判为断链。
+    def _link_is_stale(self, max_age_s: float = 8.0) -> bool:
         last_heartbeat = self._system_table(self._target_sysid())["last_heartbeat"]
         if not last_heartbeat:
             return True
@@ -3429,7 +3815,13 @@ class MavlinkController(FlightController):
             with self._lock:
                 if self._mavlink is None:
                     raise RuntimeError("MAVLink endpoint is not open")
-                msg = self._mavlink.recv_match(type="HEARTBEAT", blocking=True, timeout=0.5)
+                try:
+                    msg = self._recv_match(type="HEARTBEAT", blocking=True, timeout=0.5)
+                except OSError:
+                    # Windows UDP 会把之前发往不可达地址收到的 ICMP 端口不可达
+                    # 转成 WSAECONNRESET(10054) 抛在 recv 上。这不是链路故障：
+                    # 监听模式下仍能继续接收载具心跳，忽略即可。
+                    msg = None
             if msg is None:
                 continue
             last_heartbeat = msg
@@ -3457,7 +3849,10 @@ class MavlinkController(FlightController):
                 packet = message.pack(self._mavlink.mav)
                 for target in targets:
                     self._mavlink.port.sendto(packet, target)
-            elif not targets:
+            elif not targets and not str(self._connection_string or "").startswith("udpin:"):
+                # 监听模式(udpin)下没有已知目标时不要盲发：pymavlink 会退回到
+                # 猜测的默认地址，收到 ICMP 端口不可达后下次 recv 直接报
+                # WSAECONNRESET。PX4 会主动把心跳发到本机监听端口，等即可。
                 self._mavlink.mav.heartbeat_send(
                     mavutil.mavlink.MAV_TYPE_GCS,
                     mavutil.mavlink.MAV_AUTOPILOT_INVALID,
@@ -3594,6 +3989,38 @@ class MavlinkController(FlightController):
     def _is_armed(self) -> bool:
         self.update_telemetry(timeout=0.1)
         return bool((self._telemetry_for_target().get("HEARTBEAT") or {}).get("armed", False))
+
+    def is_flying_now(self) -> bool:
+        """Public wrapper：当前是否真在空中（供运行时安全判断使用）。"""
+        return self._is_flying_now()
+
+    def _is_flying_now(self) -> bool:
+        """是否真在空中：armed 且 PX4 landed_state=IN_AIR。
+
+        位置读数可能停留在上一次飞行/失稳的旧值（尤其是高度），所以"是否
+        已经在空中"不能只看 z：必须结合 EXTENDED_SYS_STATE.landed_state。
+        没有该消息时退回高度判据。
+        """
+        self.update_telemetry(timeout=0.1)
+        telemetry = self._telemetry_for_target()
+        heartbeat = telemetry.get("HEARTBEAT") or {}
+        if not bool(heartbeat.get("armed", False)):
+            return False
+        landed_state = (telemetry.get("EXTENDED_SYS_STATE") or {}).get("landed_state")
+        if landed_state is not None:
+            try:
+                return int(landed_state) == int(mavutil.mavlink.MAV_LANDED_STATE_IN_AIR)
+            except (TypeError, ValueError):
+                pass
+        return self._current_altitude_m() > 0.5
+
+    def _is_descending(self, threshold: float = 0.15) -> bool:
+        """NED 下方为正：vz 明显大于 0 表示正在下降（用于降落指令的结果判定）。"""
+        try:
+            vz = float(self._velocity.get("vz", 0.0) or 0.0)
+        except (TypeError, ValueError, AttributeError):
+            return False
+        return vz > threshold
 
     def _current_altitude_m(self) -> float:
         return abs(float(self._system_table(self._target_sysid())["position"].get("z", 0.0) or 0.0))

@@ -240,17 +240,27 @@ def register_core_tools(
     def drone_land(vehicle_name: str = "") -> str:
         """Land the vehicle (default vehicle; "all" for every vehicle)."""
         ok, targets = _run_for_vehicles(vehicle_name, controller.land)
+        status = status_payload()
+        pos = status.get("position_ned") if isinstance(status.get("position_ned"), dict) else {}
+        alt = abs(float((pos or {}).get("z", 0.0) or 0.0))
+        grounded = (not status.get("flying")) and (not status.get("armed") or alt < 0.5)
+        # 降落是"指令已下达"而非"已落地"：下落需要时间，这里如实区分，
+        # 避免上层在飞机仍在 2~3m 下沉时就认定任务收尾完成。
+        if ok:
+            message = "landing complete" if grounded else "landing commanded (descending)"
+        else:
+            message = "landing failed"
         payload = {
             "status": "ok" if ok else "error",
             "backend": controller.backend_name,
-            "message": "landing complete" if ok else "landing failed",
+            "message": message,
             "vehicles": targets,
         }
         if not ok:
             _, detail = action_error("landing failed")
             if detail:
                 payload["error_detail"] = detail
-        payload.update(status_payload())
+        payload.update(status)
         return fmt_result(payload)
 
     @mcp.tool()

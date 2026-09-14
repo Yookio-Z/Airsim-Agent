@@ -71,16 +71,31 @@ _NATIVE_TOOL_PROVIDERS = (
 )
 
 
-def infer_model_capabilities(model: str, provider: str = "", capability_mode: str = "auto") -> dict[str, Any]:
-    """Infer stable UI capabilities without making provider-specific network calls."""
+def infer_model_capabilities(
+    model: str,
+    provider: str = "",
+    capability_mode: str = "auto",
+    capabilities: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Infer stable UI capabilities.
+
+    Priority: manual capability_mode override, then modalities reported by the
+    provider's model catalog (cached on the model entry), then model-ID
+    keyword hints as the offline fallback.
+    """
     mode = str(capability_mode or "auto").strip().lower()
     haystack = f"{provider} {model}".lower()
+    catalog = capabilities if isinstance(capabilities, dict) else {}
+    catalog_mods = _clean_modality_list(catalog.get("input_modalities"))
     if mode == "vision":
         multimodal = True
         source = "manual"
     elif mode == "text":
         multimodal = False
         source = "manual"
+    elif catalog_mods:
+        multimodal = "image" in catalog_mods
+        source = "provider_catalog"
     else:
         multimodal = any(hint in haystack for hint in _VISION_MODEL_HINTS)
         source = "model_id"
@@ -100,6 +115,9 @@ def infer_model_capabilities(model: str, provider: str = "", capability_mode: st
         if any(hint in haystack for hint in hints):
             context_window = size
             break
+    catalog_context = _positive_int(catalog.get("context_length"))
+    if catalog_context:
+        context_window = catalog_context
     return {
         "multimodal": multimodal,
         "capability_source": source,
@@ -107,6 +125,404 @@ def infer_model_capabilities(model: str, provider: str = "", capability_mode: st
         "input_modes": ["text", "image"] if multimodal else ["text"],
         "native_tools": native_tools,
         "native_tools_source": tools_source,
+    }
+
+
+def _clean_modality_list(value: Any) -> list[str]:
+    if not isinstance(value, (list, tuple)):
+        return []
+    return [str(item).strip().lower() for item in value if str(item).strip()]
+
+
+_CATALOG_CAPABILITY_KEYS = (
+    "input_modalities",
+    "output_modalities",
+    "context_length",
+    "supported_parameters",
+    "reasoning",
+    "source",
+    "fetched_at",
+)
+
+
+def _catalog_capabilities(model: dict[str, Any]) -> dict[str, Any]:
+    """Cached provider-catalog capabilities stored on a model entry."""
+    caps = model.get("capabilities")
+    if not isinstance(caps, dict):
+        return {}
+    return {key: caps[key] for key in _CATALOG_CAPABILITY_KEYS if key in caps}
+
+
+# 思考模式 / 思考等级是请求级参数（DeepSeek V4、OpenAI reasoning 系列等），
+# 空值表示"用模型默认"，此时该字段不会出现在请求体里。
+THINKING_MODES = ("enabled", "disabled")
+REASONING_EFFORTS = ("low", "medium", "high", "max")
+_THINKING_ALLOWED = {
+    "thinking_mode": THINKING_MODES,
+    "reasoning_effort": REASONING_EFFORTS,
+}
+
+
+def sanitize_thinking_value(key: str, value: Any) -> str:
+    """把 thinking_mode / reasoning_effort 归一成合法取值，非法值返回空串。
+
+    界面上填错的值直接丢弃，而不是原样转发给上游——否则模型端会以 400 拒绝，
+    表现为"改完思考等级整个请求就失败"。
+    """
+    allowed = _THINKING_ALLOWED.get(key)
+    if not allowed:
+        return ""
+    text = str(value or "").strip().lower()
+    return text if text in allowed else ""
+
+
+def _apply_thinking_settings(entry: dict[str, Any]) -> None:
+    """就地清洗 model 条目上的思考参数，空值直接删掉。"""
+    for key in _THINKING_ALLOWED:
+        if key not in entry:
+            continue
+        value = sanitize_thinking_value(key, entry.get(key))
+        if value:
+            entry[key] = value
+        else:
+            entry.pop(key, None)
+
+
+# 请求体只会发送这几个档位，所以界面也只该提供这些
+_SENDABLE_EFFORTS = ("low", "medium", "high", "max")
+# 没有厂商目录时按模型族推断档位；没把握的模型一律返回空，宁可只给"开/关思考"
+# 仅在"读不到厂商目录"时兜底。DeepSeek 按官方更新日志：V4 系列思考强度为
+# low/high/max 三档；deepseek-chat / deepseek-reasoner 是映射到 v4-flash 的旧名
+# （2026-07-24 下线）。
+_FAMILY_REASONING_LEVELS = (
+    (("deepseek-v4", "deepseek-flash", "deepseek-pro", "deepseek-reasoner", "deepseek-r1"), ("low", "high", "max")),
+    (("deepseek-chat",), ()),
+    (("gpt-5", "o1", "o3", "o4"), ("low", "medium", "high")),
+    (("gemini-2.5", "gemini-3"), ("low", "high")),
+    (("claude-4", "sonnet-4", "opus-4", "claude-3-7", "claude-3.7"), ("low", "medium", "high")),
+)
+
+
+def derive_provider(base_url: str, api_type: str = "openai", model_id: str = "") -> str:
+    """用户只填 Base URL 时，从主机名推断一个 provider 标签。
+
+    这个标签只用于界面上的分组/展示，不影响请求；认不出就退回 API 类型或
+    模型 ID 前缀，保证永远有个可读的值。
+    """
+    host = ""
+    text = str(base_url or "").strip().lower()
+    if text:
+        without_scheme = text.split("://", 1)[-1]
+        host = without_scheme.split("/", 1)[0].split("@")[-1].split(":")[0]
+    for token, label in (
+        ("openrouter", "openrouter"),
+        ("deepseek", "deepseek"),
+        ("moonshot", "moonshot"),
+        ("siliconflow", "siliconflow"),
+        ("dashscope", "dashscope"),
+        ("bigmodel", "zhipu"),
+        ("volces", "volcengine"),
+        ("anthropic", "anthropic"),
+        ("openai", "openai"),
+    ):
+        if token in host:
+            return label
+    if host:
+        if host in {"localhost", "127.0.0.1", "0.0.0.0", "host.docker.internal"} or host.endswith(".local"):
+            return "local"
+        labels = [part for part in host.split(".") if part and part not in {"api", "www", "com", "cn", "ai"}]
+        if labels:
+            return labels[-1]
+    # 没填 Base URL 时不做猜测，直接用 API 类型当标签，行为可预期
+    return str(api_type or "openai").strip().lower() or "openai"
+
+
+def reasoning_profile(entry: dict[str, Any]) -> dict[str, Any]:
+    """这个模型真正可设置的思考档位，供界面只显示可用选项。
+
+    优先用厂商目录（OpenRouter 的 ``reasoning.supported_efforts`` /
+    ``supported_parameters``）；目录没给就只能按模型族推断，推不出来就只暴露
+    "是否思考"、不显示档位——不拿通用四档硬套所有模型。
+    """
+    capabilities = _catalog_capabilities(entry)
+    reasoning = capabilities.get("reasoning") if isinstance(capabilities.get("reasoning"), dict) else {}
+    supported_params = capabilities.get("supported_parameters")
+    declared = {
+        str(item).strip().lower()
+        for item in (reasoning.get("supported_efforts") or [])
+    }
+    catalog_efforts = [value for value in _SENDABLE_EFFORTS if value in declared]
+    model_id = str(entry.get("model") or entry.get("id") or "").lower()
+    levels: list[str] = []
+    source = ""
+    if catalog_efforts:
+        levels, source = catalog_efforts, "provider_catalog"
+    elif reasoning or (isinstance(supported_params, list)
+                       and "reasoning" in {str(item).strip().lower() for item in supported_params}):
+        levels, source = ["low", "medium", "high"], "provider_catalog"
+    else:
+        for family, family_levels in _FAMILY_REASONING_LEVELS:
+            if any(token in model_id for token in family):
+                levels, source = list(family_levels), "model_id_heuristic"
+                break
+    default_effort = str(reasoning.get("default_effort") or "").strip().lower()
+    recognized = bool(source)
+    return {
+        "supports_thinking": bool(levels) or bool(reasoning),
+        # recognized=False 表示"完全没查到依据"，界面应显示"未能识别"而不是
+        # "不支持"——后者会让用户以为模型确实没有推理能力
+        "recognized": recognized,
+        "levels": levels,
+        "default": default_effort if default_effort in levels else "",
+        "source": source,
+        "mandatory": bool(reasoning.get("mandatory")),
+    }
+
+
+def _positive_int(value: Any) -> int:
+    try:
+        number = int(value)
+    except (TypeError, ValueError):
+        return 0
+    return number if number > 0 else 0
+
+
+def parse_catalog_capabilities(entry: dict[str, Any], model_id: str = "", api_type: str = "openai") -> dict[str, Any]:
+    """Extract capabilities from one provider /models entry.
+
+    Handles OpenRouter's ``architecture`` block, top-level ``input_modalities``
+    and the context-length spellings used by OpenRouter, vLLM and LM Studio.
+    Anthropic's catalog publishes no modalities, so Claude 3+ ids are mapped to
+    text+image there. Returns {} when the entry carries nothing usable.
+    """
+    if not isinstance(entry, dict):
+        return {}
+    arch = entry.get("architecture") if isinstance(entry.get("architecture"), dict) else {}
+    capabilities: dict[str, Any] = {"source": "provider_catalog"}
+    input_mods = _clean_modality_list(arch.get("input_modalities") or entry.get("input_modalities"))
+    if not input_mods and str(api_type or "").strip().lower() == "anthropic":
+        mid = str(model_id or entry.get("id") or "").lower()
+        if mid.startswith("claude-") and not mid.startswith(("claude-2", "claude-instant")):
+            input_mods = ["text", "image"]
+    if input_mods:
+        capabilities["input_modalities"] = input_mods
+    output_mods = _clean_modality_list(arch.get("output_modalities") or entry.get("output_modalities"))
+    if output_mods:
+        capabilities["output_modalities"] = output_mods
+    context_length = _positive_int(
+        entry.get("context_length") or entry.get("max_model_len")
+        or entry.get("max_context_length") or entry.get("context_window")
+    )
+    if context_length:
+        capabilities["context_length"] = context_length
+    reasoning = _parse_catalog_reasoning(entry)
+    if reasoning:
+        capabilities["reasoning"] = reasoning
+    supported = entry.get("supported_parameters")
+    if isinstance(supported, list) and supported:
+        cleaned_supported = [str(item).strip() for item in supported if str(item).strip()]
+        if cleaned_supported:
+            capabilities["supported_parameters"] = cleaned_supported
+    return capabilities if len(capabilities) > 1 else {}
+
+
+def _parse_catalog_reasoning(entry: dict[str, Any]) -> dict[str, Any]:
+    """OpenRouter 风格的能力块：是否强制思考、可选档位与默认档位。"""
+    block = entry.get("reasoning") if isinstance(entry.get("reasoning"), dict) else {}
+    parsed: dict[str, Any] = {}
+    if "mandatory" in block:
+        parsed["mandatory"] = bool(block.get("mandatory"))
+    if "default_enabled" in block:
+        parsed["default_enabled"] = bool(block.get("default_enabled"))
+    efforts = block.get("supported_efforts")
+    if isinstance(efforts, list):
+        cleaned = [str(item).strip().lower() for item in efforts if str(item).strip()]
+        if cleaned:
+            parsed["supported_efforts"] = cleaned
+    default_effort = str(block.get("default_effort") or "").strip().lower()
+    if default_effort:
+        parsed["default_effort"] = default_effort
+    return parsed
+
+
+def _find_catalog_entry(catalog: Any, model_id: str) -> dict[str, Any] | None:
+    entries = catalog.get("data") if isinstance(catalog, dict) else None
+    if not isinstance(entries, list):
+        return None
+    for entry in entries:
+        if isinstance(entry, dict) and str(entry.get("id") or "") == str(model_id):
+            return entry
+    lowered = str(model_id or "").lower()
+    for entry in entries:
+        if isinstance(entry, dict) and str(entry.get("id") or "").lower() == lowered:
+            return entry
+    return None
+
+
+_CAPABILITY_PROBE_TIMEOUT_S = 8.0
+
+
+def _catalog_urls(root: str, kind: str) -> list[str]:
+    """厂商模型目录的常见写法。
+
+    base_url 有的带 /v1 有的不带，还有的（如 DeepSeek 的 anthropic 兼容入口）
+    把服务挂在子路径下——只试一种写法就会出现"明明配了 Key 却 404"。
+    """
+    root = str(root or "").strip().rstrip("/")
+    if kind == "anthropic":
+        candidates = [f"{root}/v1/models", f"{root}/models"]
+    else:
+        candidates = [f"{root}/models", f"{root}/v1/models"]
+    if root.endswith("/v1"):
+        candidates.append(f"{root[: -len('/v1')]}/models")
+    # 不同兼容方言的目录位置不一样：DeepSeek 的 Anthropic 入口没有 /models，
+    # 只有 OpenAI 入口有。用户把 API 类型选错时不该直接判"读不到"，所以最后
+    # 再把另一种方言的写法也试一遍。
+    alt_root = root
+    if root.endswith("/anthropic"):
+        alt_root = root[: -len("/anthropic")]
+    alt = [f"{alt_root}/models", f"{alt_root}/v1/models"] if kind == "anthropic" else [f"{root}/v1/models"]
+    candidates.extend(alt)
+    urls: list[str] = []
+    for url in candidates:
+        if url not in urls:
+            urls.append(url)
+    return urls
+
+
+def fetch_provider_catalog(
+    base_url: str,
+    api_type: str = "openai",
+    api_key: str = "",
+    timeout: float = _CAPABILITY_PROBE_TIMEOUT_S,
+) -> dict[str, Any]:
+    """读取厂商的模型目录（``GET /models``）。
+
+    厂商会随版本更新模型命名（DeepSeek 就把 deepseek-chat/reasoner 换成了
+    deepseek-v4-*），所以"当前有哪些模型"必须以官方目录为准，不能靠代码里写死的
+    名字猜。这里返回原始目录与最终使用的地址，供上层复用。
+    """
+    kind = "anthropic" if str(api_type or "").strip().lower() == "anthropic" else "openai"
+    root = str(base_url or "").strip().rstrip("/")
+    if not root:
+        root = "https://api.anthropic.com" if kind == "anthropic" else "https://api.openai.com/v1"
+    tried: list[str] = []
+    last_error = ""
+    for url in _catalog_urls(root, kind):
+        tried.append(url)
+        if kind == "anthropic":
+            req = urllib.request.Request(
+                url, headers={"x-api-key": api_key or "", "anthropic-version": "2023-06-01"}
+            )
+        else:
+            req = urllib.request.Request(url, headers={"Authorization": f"Bearer {api_key or ''}"})
+        try:
+            with urllib.request.urlopen(req, timeout=timeout) as resp:
+                payload = json.loads(resp.read().decode("utf-8"))
+        except urllib.error.HTTPError as e:
+            last_error = f"HTTP {e.code}"
+            continue
+        except Exception as e:
+            last_error = str(e)
+            continue
+        if isinstance(payload, dict):
+            return {"ok": True, "catalog": payload, "url": url, "tried_urls": tried}
+    return {
+        "ok": False,
+        "error": f"catalog probe failed: {last_error or 'unreachable'}",
+        "error_code": "catalog_unreachable",
+        "message": (
+            f"读不到厂商模型目录（{last_error or '无法连接'}）。"
+            f"请检查 Base URL 是否需要以 /v1 结尾、API 类型是否与厂商一致；"
+            f"目录读不到不影响使用，能力会按模型 ID 推断。"
+        ),
+        "tried_urls": tried,
+    }
+
+
+def list_provider_models(
+    base_url: str,
+    api_type: str = "openai",
+    api_key: str = "",
+    timeout: float = _CAPABILITY_PROBE_TIMEOUT_S,
+) -> dict[str, Any]:
+    """给界面用：返回厂商当前实际提供的模型清单（含可识别的能力）。"""
+    fetched = fetch_provider_catalog(base_url, api_type, api_key, timeout=timeout)
+    if not fetched.get("ok"):
+        return fetched
+    entries = (fetched.get("catalog") or {}).get("data")
+    if not isinstance(entries, list):
+        return {
+            "ok": False,
+            "error": "catalog has no model list",
+            "error_code": "catalog_empty",
+            "message": "厂商目录格式无法识别（没有 models 列表）。",
+        }
+    models: list[dict[str, Any]] = []
+    for entry in entries:
+        if not isinstance(entry, dict) or not entry.get("id"):
+            continue
+        caps = parse_catalog_capabilities(entry, model_id=str(entry.get("id")), api_type=api_type)
+        effort = reasoning_profile({"id": entry.get("id"), "model": entry.get("id"), "capabilities": caps})
+        models.append({
+            "id": str(entry.get("id")),
+            "name": str(entry.get("name") or entry.get("id")),
+            "context_length": _positive_int(caps.get("context_length")) or None,
+            "input_modalities": caps.get("input_modalities") or [],
+            "reasoning_levels": effort.get("levels") or [],
+        })
+    models.sort(key=lambda item: item["id"])
+    return {"ok": True, "models": models, "source_url": fetched.get("url"), "count": len(models)}
+
+
+def probe_model_capabilities(
+    model: str,
+    api_type: str = "openai",
+    base_url: str = "",
+    api_key: str = "",
+    timeout: float = _CAPABILITY_PROBE_TIMEOUT_S,
+) -> dict[str, Any]:
+    """Ask the provider's model catalog what this model accepts.
+
+    Best effort: network failures, auth errors and catalogs without modality
+    metadata all return ``{"ok": False}`` — callers keep previously cached
+    capabilities or fall back to model-ID heuristics. Never raises.
+    """
+    kind = "anthropic" if str(api_type or "").strip().lower() == "anthropic" else "openai"
+    fetched = fetch_provider_catalog(base_url, api_type, api_key, timeout=timeout)
+    if not fetched.get("ok"):
+        return {k: v for k, v in fetched.items() if k != "tried_urls"} | {"tried_urls": fetched.get("tried_urls", [])}
+    catalog = fetched.get("catalog")
+    entry = _find_catalog_entry(catalog, str(model or ""))
+    if entry is None:
+        # 把目录里真实存在的模型 ID 带回去：否则用户只看到一句
+        # "model not listed in provider catalog"，不知道模型 ID 到底错在哪
+        entries = catalog.get("data") if isinstance(catalog, dict) else None
+        available = [
+            str(item.get("id"))
+            for item in (entries if isinstance(entries, list) else [])
+            if isinstance(item, dict) and item.get("id")
+        ]
+        return {
+            "ok": False,
+            # error 保持原来那句英文（对外契约），新增字段给界面做可操作提示
+            "error": f"model not listed in provider catalog: '{model}'",
+            "error_code": "catalog_missing_model",
+            "message": (
+                f"厂商目录里没有 '{model}' 这个模型 ID；"
+                + (f"该目录有 {len(available)} 个模型，例如：{'、'.join(available[:4])}" if available else "该目录没有列出任何模型")
+            ),
+            "available_models": available[:12],
+            "available_total": len(available),
+        }
+    capabilities = parse_catalog_capabilities(entry, model_id=str(model or ""), api_type=kind)
+    # 模型在目录里就算成功：一些厂商（如 DeepSeek）只给 id，不给模态/上下文，
+    # 这时候不该报错——按模型 ID 推断即可，报错反而像"这个模型不能用"。
+    return {
+        "ok": True,
+        "capabilities": capabilities,
+        "catalog_metadata": bool(capabilities),
+        "message": "" if capabilities else "厂商目录只提供了模型 ID，模态/上下文按模型 ID 推断",
     }
 
 
@@ -245,6 +661,7 @@ class ModelRegistry:
             str(model.get("model") or ""),
             str(model.get("provider") or ""),
             capability_mode,
+            _catalog_capabilities(model),
         )
         api_key = str(model.get("api_key") or "")
         generation_mode = str(model.get("generation_mode") or "auto")
@@ -262,8 +679,10 @@ class ModelRegistry:
             "enabled": bool(api_key),
             "key_hint": f"••••{api_key[-4:]}" if api_key else "",
             "capability_mode": capability_mode,
+            "capabilities": _catalog_capabilities(model),
             "reasoning_effort": str(model.get("reasoning_effort") or ""),
             "thinking_mode": str(model.get("thinking_mode") or ""),
+            "reasoning": reasoning_profile(model),
             "multimodal": bool(inferred["multimodal"]),
             "capability_source": inferred["capability_source"],
             "input_modes": inferred["input_modes"],
@@ -292,6 +711,7 @@ class ModelRegistry:
             raise ValueError(f"model id '{model['id']}' already exists")
         model.setdefault("capability_mode", "auto")
         model.setdefault("generation_mode", "auto")
+        _apply_thinking_settings(model)
         self._models.append(model)
         if not self._default_id:
             self._default_id = model["id"]
@@ -302,10 +722,21 @@ class ModelRegistry:
         for m in self._models:
             if m.get("id") == model_id:
                 for key, value in updates.items():
+                    if key in _THINKING_ALLOWED:
+                        value = sanitize_thinking_value(key, value) or None
                     if value is None:
                         m.pop(key, None)
                     else:
                         m[key] = value
+                self._save()
+                return m
+        raise ValueError("model not found")
+
+    def set_capabilities(self, model_id: str, capabilities: dict[str, Any]) -> dict[str, Any]:
+        """Cache provider-catalog capabilities on a model entry."""
+        for m in self._models:
+            if m.get("id") == model_id:
+                m["capabilities"] = _catalog_capabilities({"capabilities": capabilities})
                 self._save()
                 return m
         raise ValueError("model not found")
@@ -1101,6 +1532,7 @@ class LLMMissionPlanner:
             str(config.get("model") or ""),
             str(config.get("provider") or ""),
             str(config.get("capability_mode") or "auto"),
+            _catalog_capabilities(config),
         )
         return bool(inferred["multimodal"])
 
@@ -1162,7 +1594,7 @@ class LLMMissionPlanner:
                 "value": json.dumps(self._compact_skill_guidance((agent_state or {}).get("skill_guidance") or []), ensure_ascii=False, default=str),
                 "priority": "guidance",
             },
-            {"key": "memory_snapshot", "value": json.dumps(self._compact_memory(memory), ensure_ascii=False, default=str), "priority": "memory"},
+            {"key": "memory_snapshot", "value": self._dumps_safe(self._compact_memory(memory)), "priority": "memory"},
             {
                 "key": "conversation_context",
                 "value": json.dumps(self._compact_conversation(conversation_context or []), ensure_ascii=False, default=str),
@@ -1266,10 +1698,10 @@ class LLMMissionPlanner:
         sections = [
             {"key": "operator_command", "value": command, "priority": "command"},
             {"key": "output_schema", "value": json.dumps(self._loop_decision_schema_hint(), ensure_ascii=False, default=str), "priority": "command"},
-            {"key": "observation", "value": json.dumps(self._compact_observation(observation), ensure_ascii=False, default=str), "priority": "observation"},
-            {"key": "backend_capabilities", "value": json.dumps(capabilities or {}, ensure_ascii=False, default=str), "priority": "observation"},
-            {"key": "loop_state", "value": json.dumps(self._compact_loop_state(loop_state), ensure_ascii=False, default=str), "priority": "recent"},
-            {"key": "available_tool_cards", "value": json.dumps(self._compact_tool_cards(tool_cards), ensure_ascii=False, default=str), "priority": "tool_cards"},
+            {"key": "observation", "value": self._dumps_safe(self._compact_observation(observation)), "priority": "observation"},
+            {"key": "backend_capabilities", "value": self._dumps_safe(capabilities or {}), "priority": "observation"},
+            {"key": "loop_state", "value": self._dumps_safe(self._compact_loop_state(loop_state)), "priority": "recent"},
+            {"key": "available_tool_cards", "value": self._dumps_safe(self._compact_tool_cards(tool_cards)), "priority": "tool_cards"},
             {"key": "skill_guidance", "value": json.dumps(self._compact_skill_guidance(skill_guidance or []), ensure_ascii=False, default=str), "priority": "guidance"},
             {"key": "memory_snapshot", "value": json.dumps(self._compact_memory(memory), ensure_ascii=False, default=str), "priority": "memory"},
         ]
@@ -1361,6 +1793,7 @@ class LLMMissionPlanner:
             str(config.get("model") or ""),
             str(config.get("provider") or ""),
             str(config.get("capability_mode") or "auto"),
+            _catalog_capabilities(config),
         )
         context_window = int(config.get("context_window") or inferred.get("context_window") or 64000)
         return ContextBudget(context_window=context_window, output_reserve=2048, meter=self._token_meter())
@@ -1616,7 +2049,10 @@ class LLMMissionPlanner:
                     "You are a UAV camera image analyst. Answer only from the provided image and context. "
                     "Do not invent telemetry, GPS, depth, or vehicle state. "
                     "For navigation, only provide a hint; do not claim a 3D target position unless context contains one. "
-                    "Return JSON only, with concise Chinese operator-facing text in summary_zh."
+                    "Return ONE JSON object with these exact top-level keys: "
+                    "summary_zh, visible_objects, target_candidates, navigation_hint, safety_notes. "
+                    "Do NOT echo the request payload and do NOT wrap the answer in output_schema/context; "
+                    "put your Chinese operator-facing answer directly in summary_zh. Return JSON only."
                 ),
             },
             {
@@ -1631,11 +2067,26 @@ class LLMMissionPlanner:
             client = _create_client(config)
             try:
                 parsed, usage = self._chat_json_with_retries(client, messages)
-            except Exception:
+            except Exception as exc:
                 text, usage = client.chat_text(messages, max_tokens=900)
+                import logging
+
+                logging.getLogger(__name__).warning(
+                    "vlm_json_retry_failed error=%s raw=%s", str(exc)[:200], text[:500]
+                )
                 parsed = json.loads(_extract_json(text))
             self.last_error = ""
             self.last_usage = usage
+            if not str((parsed or {}).get("summary_zh") or "").strip():
+                # 模型返回了 JSON 但没有 summary_zh（或返回了别的结构）——把原始
+                # 结构落日志，避免前端只看到"没有返回明确的图像描述"却无从排查。
+                import logging
+
+                logging.getLogger(__name__).warning(
+                    "vlm_missing_summary keys=%s raw=%s",
+                    list(parsed.keys()) if isinstance(parsed, dict) else type(parsed).__name__,
+                    json.dumps(parsed, ensure_ascii=False)[:500] if isinstance(parsed, (dict, list)) else str(parsed)[:500],
+                )
             return self._normalize_vlm_analysis(parsed, prompt)
         except Exception as e:
             message = self._chat_unavailable_message(config, str(e))
@@ -1992,8 +2443,13 @@ class LLMMissionPlanner:
             "For vague movement or scan requests, choose conservative distance, altitude, and velocity instead of expanding the mission. "
             "Treat kind=atomic tools as one direct operation. Tools with execution_mode=async only start an operation; the runtime owns task_id polling, timeout, cancellation, and terminal outcome. "
             "If a requested capability is unavailable, produce a safe status/readback plan and explain the limitation in risk_notes. "
-            "The plan summary must state concrete numbers: vehicle count, coordinates, or altitude reached — never a bare '已完成/任务完成'."
-            "Think and reason in Chinese (中文思考). Return JSON only."
+            "The plan summary must state concrete numbers: vehicle count, coordinates, or altitude reached — never a bare '已完成/任务完成'. "
+            # 输出纪律：规划模型的 reasoning 常花大量篇幅纠结输出格式/是否用循环，
+            # 既慢又没信息量。这里明确约束，减少无效推理与重复步骤。
+            "OUTPUT DISCIPLINE: do not deliberate about the output format, tool list, or JSON schema in reasoning — the schema is fixed. "
+            "Do NOT unroll loops: list a step ONCE even if it repeats (the runtime's agent loop handles repetition); 跟踪/搜索类任务只写一轮典型步骤，不要重复 2~3 遍。 "
+            "Keep reasoning to 2-4 short sentences. Keep steps <= 12. Return JSON only. "
+            "Think and reason in Chinese (中文思考)."
         )
 
     def _schema_hint(self) -> dict[str, Any]:
@@ -2153,10 +2609,40 @@ class LLMMissionPlanner:
             "run_id": loop_state.get("run_id", ""),
             "status": loop_state.get("status", ""),
             "step_count": len(loop_state.get("decisions") or []),
-            "recent_decisions": (loop_state.get("decisions") or [])[-5:],
-            "recent_results": (loop_state.get("results") or [])[-5:],
+            # 决策/结果里可能含共享或自引用的数据结构（工具结果里嵌了
+            # world_state/感知快照等），直接交给 json.dumps 会抛
+            # "Circular reference detected" 把整个 run 打断。这里先做有深度
+            # 上限的安全拷贝再放进提示词。
+            "recent_decisions": self._safe_payload((loop_state.get("decisions") or [])[-5:]),
+            "recent_results": self._safe_payload((loop_state.get("results") or [])[-5:]),
             "failure_reason": loop_state.get("failure_reason", ""),
         }
+
+    @staticmethod
+    def _safe_payload(value: Any, limit: int = 12) -> Any:
+        """有深度上限的循环安全拷贝（防止 json.dumps 遇到自引用抛错）。"""
+        from .planner import _bounded_copy
+
+        try:
+            return _bounded_copy(value, _limit=limit)
+        except Exception:
+            return "[unserializable]"
+
+    @staticmethod
+    def _dumps_safe(value: Any) -> str:
+        """json.dumps 的"永不抛错"包装：遇到自引用/不可序列化时降级为字符串。
+
+        提示词组装不该因为某个工具结果里的循环引用把整个任务打断。
+        """
+        try:
+            return json.dumps(value, ensure_ascii=False, default=str)
+        except (ValueError, TypeError):
+            try:
+                from .planner import _bounded_copy
+
+                return json.dumps(_bounded_copy(value, _limit=12), ensure_ascii=False, default=str)
+            except Exception:
+                return json.dumps({"value": "[unserializable]"}, ensure_ascii=False)
 
     def _compact_observation(self, observation: dict[str, Any]) -> dict[str, Any]:
         world = observation.get("world_state") or {}
@@ -2510,27 +2996,48 @@ class LLMMissionPlanner:
         return rows
 
     def _trim_data(self, data: dict[str, Any]) -> dict[str, Any]:
-        if isinstance(data, dict) and self._contains_image_data(data):
-            trimmed = self._trim_image_payload(data)
-            text = json.dumps(trimmed, ensure_ascii=False, default=str)
+        # 工具结果可能含共享/自引用结构（感知快照、循环引用的 world_state
+        # 等）。先做有深度上限的拷贝再序列化，避免 json.dumps 抛
+        # "Circular reference detected" 把整个 run 打断。
+        from .planner import _bounded_copy
+
+        try:
+            safe = _bounded_copy(data, _limit=12)
+        except Exception:
+            safe = {"[unserializable]": True}
+        if isinstance(safe, dict) and self._contains_image_data(safe):
+            trimmed = self._trim_image_payload(safe)
+            try:
+                text = json.dumps(trimmed, ensure_ascii=False, default=str)
+            except (ValueError, TypeError):
+                return {"summary": "[unserializable tool result]", "has_image": True}
             if len(text) <= 1200:
                 return trimmed
             return {"summary": text[:1200] + "...", "has_image": True}
-        text = json.dumps(data, ensure_ascii=False, default=str)
+        try:
+            text = json.dumps(safe, ensure_ascii=False, default=str)
+        except (ValueError, TypeError):
+            return {"summary": "[unserializable tool result]"}
         if len(text) <= 1200:
-            return data
+            return safe
         return {"summary": text[:1200] + "..."}
 
-    def _contains_image_data(self, value: Any) -> bool:
+    def _contains_image_data(self, value: Any, _depth: int = 0) -> bool:
+        # 深度上限：与 runtime._sanitize_for_frontend 同理，工具结果里共享的
+        # 可变字典可能形成循环引用，无上限会把 agent loop 线程打爆。
+        if _depth > 24:
+            return False
         if isinstance(value, dict):
             if any(key in value for key in ("image_base64", "image_saved_to", "saved_to", "approach_image_saved_to")):
                 return True
-            return any(self._contains_image_data(item) for item in value.values())
+            return any(self._contains_image_data(item, _depth + 1) for item in value.values())
         if isinstance(value, list):
-            return any(self._contains_image_data(item) for item in value)
+            return any(self._contains_image_data(item, _depth + 1) for item in value)
         return False
 
-    def _trim_image_payload(self, value: Any) -> Any:
+    def _trim_image_payload(self, value: Any, _depth: int = 0) -> Any:
+        if _depth > 24:
+            return {"[bounded]": True}
         if isinstance(value, dict):
             keep: dict[str, Any] = {}
             for key, item in value.items():
@@ -2559,10 +3066,10 @@ class LLMMissionPlanner:
                     "target_distance_meters",
                     "vlm_confirmation",
                 }:
-                    keep[key] = self._trim_image_payload(item)
-            return keep or {"has_image": self._contains_image_data(value)}
+                    keep[key] = self._trim_image_payload(item, _depth + 1)
+            return keep or {"has_image": self._contains_image_data(value, _depth)}
         if isinstance(value, list):
-            return [self._trim_image_payload(item) for item in value[:5]]
+            return [self._trim_image_payload(item, _depth + 1) for item in value[:5]]
         return value
 
     @staticmethod
@@ -2612,6 +3119,25 @@ class LLMMissionPlanner:
     def _normalize_vlm_analysis(self, payload: dict[str, Any], question: str) -> dict[str, Any]:
         if not isinstance(payload, dict):
             payload = {}
+        # 模型有时会把请求体原样回显，并把真正的答案塞进 output_schema/answer
+        # 等嵌套字段里（顶层没有 summary_zh）。这里向下展开一层，取第一个含
+        # summary_zh/summary 的字典作为实际结果，避免前端显示"模型没有返回
+        # 明确的图像描述"。
+        if not str(payload.get("summary_zh") or payload.get("summary") or "").strip():
+            for key in ("output_schema", "result", "data", "answer", "response", "output", "analysis"):
+                nested = payload.get(key)
+                if isinstance(nested, dict) and str(
+                    nested.get("summary_zh") or nested.get("summary") or ""
+                ).strip():
+                    payload = nested
+                    break
+            else:
+                for value in payload.values():
+                    if isinstance(value, dict) and str(
+                        value.get("summary_zh") or value.get("summary") or ""
+                    ).strip():
+                        payload = value
+                        break
         visible = payload.get("visible_objects") or []
         if not isinstance(visible, list):
             visible = [str(visible)]
@@ -2853,6 +3379,26 @@ class LLMMissionPlanner:
         except (TypeError, ValueError):
             return default
 
+    @staticmethod
+    def _collapse_repeated_blocks(steps: list[MissionStep], max_steps: int = 14) -> list[MissionStep]:
+        """折叠 LLM 展开的重复步骤块，并限制总步数。
+
+        规划模型常把"检测→确认→抵近"这类循环**手工展开 2~3 遍**（见过 36 步
+        的计划 = 同一 12 步块重复 3 次），既拖慢执行又让计划面板难以阅读。
+        这里检测最小重复周期，只保留一份；循环交给 Agent Loop 在运行时处理。
+        """
+        if len(steps) <= 1:
+            return steps
+        key = lambda s: (s.tool, tuple(sorted((s.params or {}).items(), key=lambda kv: kv[0])))
+        keys = [key(s) for s in steps]
+        for period in range(1, len(keys) // 2 + 1):
+            if len(keys) % period != 0:
+                continue
+            if all(keys[i] == keys[i % period] for i in range(len(keys))):
+                steps = steps[:period]
+                break
+        return steps[:max_steps]
+
     def _plan_from_payload(self, command: str, payload: dict[str, Any], known_tools: set[str]) -> MissionPlan:
         run_id = f"run_{int(time.time() * 1000)}"
         steps: list[MissionStep] = []
@@ -2881,6 +3427,7 @@ class LLMMissionPlanner:
             )
 
         steps = self._normalize_steps(command, steps, known_tools)
+        steps = self._collapse_repeated_blocks(steps)
         if not steps:
             raise RuntimeError("LLM produced no executable known-tool steps")
 
@@ -3002,6 +3549,33 @@ class LLMMissionPlanner:
                 step.params.setdefault("source", "last_image")
             normalized.append(step)
 
+        # 目标识别/追踪类任务定高 2~3m：机载相机前视 15°，这个高度才能平视
+        # 目标；飞高会俯视过度、目标变小、检出率下降。这是安全/性能策略而非
+        # 语义隐藏处理，因此即使 LLM 或被复述的指令写了 5m 也在此收口。
+        if self._is_close_range_visual_command(command):
+            for step in normalized:
+                if step.tool == "drone_takeoff":
+                    alt = self._positive_float(step.params.get("altitude"), 3.0)
+                    step.params["altitude"] = max(2.0, min(3.2, alt))
+                elif step.tool == "drone_fly_to" and "z" in step.params:
+                    z = self._ned_z(step.params.get("z"), -3.0)
+                    step.params["z"] = -max(2.0, min(3.2, abs(z)))
+                elif step.tool in {"skill:search", "airsim_search_target"}:
+                    alt = self._positive_float(step.params.get("search_altitude"), 3.0)
+                    step.params["search_altitude"] = max(2.0, min(3.2, alt))
+
+            # 追踪/搜索类任务的目的是"找到并持续锁定"，不是飞完就收工。除非
+            # 操作员明确要求降落/返航，否则不要把 drone_land 排进计划——之前
+            # 出现"追踪任务执行到一半就降落"的任务理解错误。任务结束时的安全
+            # 落地由 runtime 的收尾逻辑负责，不需要写进计划。
+            explicit_landing = self._command_has_any(
+                command, ["降落", "着陆", "落地", "返航", "返场", "回家", "land", "rtl", "return home", "return to launch"]
+            )
+            if not explicit_landing:
+                normalized = [step for step in normalized if step.tool != "drone_land"]
+
+        normalized = self._ensure_detection_steps(command, normalized, known_tools)
+
         memory_steps = [s for s in normalized if s.tool == "memory_store"]
         normalized = [s for s in normalized if s.tool != "memory_store"]
         visual_tools = {"airsim_take_photo", "airsim_detect_objects"}
@@ -3047,10 +3621,10 @@ class LLMMissionPlanner:
         core_tools = [s.tool for s in normalized if s.tool != "memory_store"]
         if has_control and "drone_get_status" in known_tools and (not core_tools or core_tools[-1] != "drone_get_status"):
             normalized.append(MissionStep("s00", "Read final status", "drone_get_status", {}, "perception"))
-        if memory_steps:
-            normalized.append(memory_steps[0])
-        else:
-            normalized.append(MissionStep("s00", "Store mission memory", "memory_store", {"source": "mission"}, "memory"))
+        # 注意：不要把 memory_store 排进计划。它是 runtime 内部动作（任务结束时由
+        # _close_run_log 写入长期记忆），不在 Agent 的可用工具白名单里；一旦作为
+        # 计划步骤出现，loop 会把它当成"调用了不可用工具"从而把整个任务判失败
+        # （实测发生过）。
 
         for index, step in enumerate(normalized, 1):
             step.id = f"s{index:02d}"
@@ -3059,6 +3633,61 @@ class LLMMissionPlanner:
     def _command_has_any(self, command: str, words: list[str]) -> bool:
         lower = command.lower()
         return any(word in lower for word in words)
+
+    def _is_close_range_visual_command(self, command: str) -> bool:
+        """目标识别/搜索/追踪类任务 → 定高 2~3m（前视相机工作高度）。"""
+        return self._command_has_any(
+            command or "",
+            [
+                "track", "follow", "search", "find", "detect", "target",
+                "跟踪", "追踪", "跟随", "锁定", "搜索", "寻找", "识别", "检测", "目标",
+            ],
+        )
+
+    def _ensure_detection_steps(
+        self,
+        command: str,
+        steps: list[MissionStep],
+        known_tools: set[str],
+    ) -> list[MissionStep]:
+        """识别/追踪任务必须包含一次真正的检测调用。
+
+        规划器有时会把只读的 `perception_status` 当成"检测"，导致计划飞完却
+        从未调用探测器（验证判失败、也没有可跟踪的锁定）。这里做确定性补齐：
+        在同一任务里，只要会起飞且带识别/追踪意图，就保证有
+        `perception_start`（如可用）→ `airsim_detect_objects`，
+        插在视觉确认/降落之前。
+        """
+        if "airsim_detect_objects" not in known_tools:
+            return steps
+        if not self._is_close_range_visual_command(command):
+            return steps
+        if not any(step.tool == "drone_takeoff" for step in steps):
+            return steps
+        if any(step.tool == "airsim_detect_objects" for step in steps):
+            return steps
+        target_class = self._command_target_class(command) or "car"
+        injected: list[MissionStep] = []
+        if "perception_start" in known_tools and not any(step.tool == "perception_start" for step in steps):
+            injected.append(
+                MissionStep("s00", "启动感知服务", "perception_start",
+                            {"target_class": target_class}, "perception")
+            )
+        injected.append(
+            MissionStep("s00", f"检测目标({target_class})", "airsim_detect_objects",
+                        {"target_class": target_class, "confidence": 0.25}, "perception")
+        )
+        # 插在第一个视觉确认步骤之前；否则插在降落之前；再否则插在末尾只读回读之前。
+        visual_first = {"inspect_current_frame", "airsim_vlm_confirm_target", "airsim_vlm_analyze_image"}
+        insert_at = len(steps)
+        for index, step in enumerate(steps):
+            if step.tool in visual_first or step.tool == "drone_land":
+                insert_at = index
+                break
+        else:
+            while insert_at > 0 and steps[insert_at - 1].tool in {"drone_get_status", "memory_store"}:
+                insert_at -= 1
+        return steps[:insert_at] + injected + steps[insert_at:]
 
     def _positive_float(self, value: Any, default: float) -> float:
         try:

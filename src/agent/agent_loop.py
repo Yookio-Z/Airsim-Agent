@@ -71,12 +71,15 @@ class AgentLoop:
         initial_plan: MissionPlan | None = None,
         model_id: str | None = None,
         max_steps: int = 10,
+        initial_plan_cursor: int = 0,
         execute: bool = True,
         attachments: list[dict[str, Any]] | None = None,
         require_llm: bool = False,
         conversation_context: list[dict[str, Any]] | None = None,
         system_prompt: str | None = None,
         fallback_enabled: bool = True,
+        reactive: bool = False,
+        keep_reacting: bool = False,
     ) -> LoopState:
         state = LoopState(
             run_id=run_id,
@@ -89,12 +92,38 @@ class AgentLoop:
         guidance_loader = getattr(self.skills, "guidance_cards", None)
         skill_guidance = guidance_loader(command, capabilities, memory_snapshot) if callable(guidance_loader) else []
         decision_cards = self._decision_cards(command, [], tool_cards, capabilities)
+        # 白名单必须来自"真实注册的工具"，而不是提示用的卡片列表——卡片为了
+        # 控制 prompt 体积会截断（32 张），一旦某工具被挤出，LLM 选了它就会
+        # 被误判成"当前后端不可用"。
         allowed_tools = self._allowed_tools(decision_cards)
+        registered = getattr(self.tools, "list_tools", None)
+        if callable(registered):
+            try:
+                names = {
+                    str(item.get("name") or "")
+                    for item in registered()
+                    if isinstance(item, dict)
+                }
+                names.discard("")
+                names -= self._internal_tools()
+                if names:
+                    allowed_tools = names
+            except Exception:
+                pass
+        for extra in ("memory_recall", "memory_remember", "agent_subtask"):
+            allowed_tools.add(extra)
         last_result: dict[str, Any] | None = None
         failure_count = 0
+        connection_failures = 0
         unresolved_failure = False
         replan_count = 0
         verify_corrected = False
+        # 计划游标：>0 表示正在按 LLM 已给出的计划顺序执行，无需每步再花一次
+        # LLM 决策（dots-studio 单次 15~40s，逐步思考会把普通任务拖到几分钟）。
+        # 一旦步骤失败/偏离计划就置 -1，交回 LLM 做 ReAct 纠错。
+        # 计划游标起点：纠错重入时从"已完成前缀"之后继续，避免把已经成功
+        # 执行过的步骤（连接/起飞/检测…）整条重跑。
+        plan_cursor = max(0, int(initial_plan_cursor or 0))
 
         for step_index in range(1, max_steps + 1):
             if self._should_stop():
@@ -115,6 +144,28 @@ class AgentLoop:
             self._event("info", "agent_loop", f"Observation {step_index}", observation.to_dict(), kind="observation")
 
             decision = None if require_llm else self._preemptive_guard_decision(command, state, observation, allowed_tools, capabilities)
+            plan_decision: LoopDecision | None = None
+            deviation_reason = ""
+            resume_cursor = -1
+            if decision is None:
+                # 优先按计划执行（快）：计划是 LLM 已经想好的，逐字执行不必每步
+                # 再问一次。只在"观察偏离计划假设"时才交给 LLM 重新决策
+                # （检测不到目标 / 确认未通过 / 抵近时目标已丢失），即按需 ReAct。
+                plan_cursor = self._resolve_plan_cursor(initial_plan, plan_cursor)
+                plan_step = self._plan_step_at(initial_plan, plan_cursor)
+                if reactive and plan_step is not None:
+                    deviation_reason = self._plan_step_deviation(plan_step, state)
+                if deviation_reason:
+                    resume_cursor = plan_cursor + 1
+                    self._event(
+                        "warning", "agent_loop",
+                        f"观察偏离计划，转 ReAct 重新决策：{deviation_reason}",
+                        {"step": step_index, "planned_tool": str(getattr(plan_step, "tool", ""))},
+                        kind="replan",
+                    )
+                else:
+                    plan_decision = self._plan_step_decision(initial_plan, plan_cursor, allowed_tools)
+                    decision = plan_decision
             if decision is None:
                 decision = self.planner.decide_next_step(
                     command=command,
@@ -133,16 +184,29 @@ class AgentLoop:
                     conversation_context=conversation_context,
                 )
                 decision = self._guard_decision(command, state, observation, decision, allowed_tools, capabilities)
+                if resume_cursor >= 0:
+                    # 因"观察偏离计划"而临时转 ReAct：本轮由 LLM 决策，但保留计划
+                    # 游标，下一轮继续按原计划推进（避免一次偏离就把整个任务变成
+                    # 每步都问模型）。
+                    plan_cursor = resume_cursor
+                else:
+                    # 计划走完/不可用等：后续不再自动按计划推进
+                    plan_cursor = -1
             decision = self._sanitize_decision(decision, allowed_tools)
+            if plan_decision is not None and decision.action != plan_decision.action:
+                # 守卫/清理改写了动作 → 视为偏离计划，后续交回 LLM
+                plan_cursor = -1
+            # 本轮模型思考必须先于决策/工具行写入时间线，否则前端会出现
+            # "先调工具、后显示思考"的顺序倒错。计划驱动(plan)没有新的模型
+            # 思考，不发出思考事件（避免复用上一轮的陈旧推理）。
+            if str(getattr(decision, "source", "llm") or "llm") != "plan":
+                reasoning_text = str(getattr(self.planner, "last_reasoning", "") or "").strip()
+                decision_rationale = str(decision.reason or decision.reflection or "").strip()
+                combined_reasoning = "\n".join(part for part in (reasoning_text, decision_rationale) if part)
+                if combined_reasoning:
+                    self._event("info", "model_reasoning", combined_reasoning[:1500], {"step": step_index})
             state.decisions.append(decision)
             self._notify_state(state)
-            reasoning_text = str(getattr(self.planner, "last_reasoning", "") or "").strip()
-            # 决策理由（decision.reason/reflection，中文）也是"LLM 的思考"——
-            # 与 reasoning_content 一起进思考块，保证展开必有内容
-            decision_rationale = str(decision.reason or decision.reflection or "").strip()
-            combined_reasoning = "\n".join(part for part in (reasoning_text, decision_rationale) if part)
-            if combined_reasoning:
-                self._event("info", "model_reasoning", combined_reasoning[:1500], {"step": step_index})
             self._event("info", "agent_loop", f"Loop decision {step_index}: {decision.action or 'complete'}", decision.to_dict(), kind="loop.decision")
 
             if decision.is_complete:
@@ -217,6 +281,8 @@ class AgentLoop:
             if not result_row.ok:
                 failure_count += 1
                 unresolved_failure = True
+                # 步骤失败：停止按计划推进，后续交回 LLM 做 ReAct 纠错
+                plan_cursor = -1
                 state.failure_reason = str(result_row.data.get("message") or f"{result_row.tool} failed")
                 # 连接熔断：后端断连/超时后继续决策只会烧 token（重连、拍照、
                 # 再重连的无限循环）。连续两次连接类失败直接终止任务，让操作
@@ -227,21 +293,34 @@ class AgentLoop:
                     term in message_l for term in ("not connected", "connection", "timed out", "timeout", "未连接", "连接")
                 )
                 if connection_failure:
-                    # 一次连接类失败即熔断：后端断连后继续决策只会空转烧
-                    # token（重连、拍图、再重连的循环），立即终止并提醒
-                    # 操作员检查 AirSim/飞控。
-                    state.status = "failed"
-                    state.failure_reason = (
-                        "检测到后端连接断开，任务已终止。"
-                        "AirSim/飞控服务可能已断开，请检查服务后在连接面板重新连接，再重新下发任务。"
-                    )
+                    # 连接类失败：允许一次恢复机会（MAVLink 心跳抖动/瞬时
+                    # 掉线很常见，单次失败就终止会让任务极不可靠）。连续两次
+                    # 才熔断，避免"重连→再失败"的空转烧 token。
+                    connection_failures += 1
+                    if connection_failures >= 2:
+                        state.status = "failed"
+                        state.failure_reason = (
+                            "连续检测到后端连接断开，任务已终止。"
+                            "AirSim/飞控服务可能已断开，请检查服务后在连接面板重新连接，再重新下发任务。"
+                        )
+                        self._event(
+                            "danger",
+                            "agent_loop",
+                            "连接连续失败，任务已终止（请检查 AirSim/飞控服务）",
+                            {"tool": result_row.tool, "message": state.failure_reason[:160]},
+                        )
+                        break
+                    # 第一次：给一轮恢复机会，并提示模型先回读连接状态
                     self._event(
-                        "danger",
+                        "warning",
                         "agent_loop",
-                        "连接断开，任务已终止（请检查 AirSim/飞控服务）",
+                        "连接类失败，先尝试恢复（回读连接状态）",
                         {"tool": result_row.tool, "message": state.failure_reason[:160]},
+                        kind="tool.result",
                     )
-                    break
+                    failure_count = max(0, failure_count - 1)  # 不计入普通失败配额
+                    continue
+                connection_failures = 0
                 if failure_count >= 3:
                     state.status = "failed"
                     break
@@ -255,6 +334,27 @@ class AgentLoop:
                 continue
             if result_row.tool not in {"drone_get_status", "airsim_task_status"}:
                 unresolved_failure = False
+
+            # 本步由计划驱动且成功 → 计划游标前移，继续按计划执行下一步
+            if plan_decision is not None and plan_cursor >= 0:
+                plan_cursor += 1
+
+            # 确定性收敛：计划内的实质步骤（检测/视觉/运动等）都已成功执行过，
+            # 就结束任务并汇报。否则 LLM 收尾时容易反复存记忆/回读状态，
+            # 把一次普通任务拖成几分钟（每轮决策 15~40s）。
+            # keep_reacting（持续追踪类任务）不适用：那时"计划列的动作都跑过"
+            # 不等于目标仍被锁定，需要继续观察-响应直到模型判定完成。
+            if execute and not keep_reacting and self._plan_steps_satisfied(state, initial_plan):
+                state.status = "completed"
+                state.failure_reason = ""
+                state.verification_status = state.verification_status or "ok"
+                self._event(
+                    "info",
+                    "agent_loop",
+                    "计划内步骤已全部成功执行，任务收敛",
+                    {"step": step_index, "tools": [r.tool for r in state.results if r.ok]},
+                )
+                break
 
             if decision.parallel_actions and state.status != "failed":
                 batch_state = self._execute_batch_actions(
@@ -465,7 +565,9 @@ class AgentLoop:
         agent_names = {"memory_recall", "memory_remember", "agent_subtask"}
         agent_cards = [card for card in deduped if card.get("name") in agent_names]
         regular = [card for card in deduped if card.get("name") not in agent_names]
-        return (regular[: max(0, 32 - len(agent_cards))] + agent_cards)[:32]
+        # 提示卡片预算：控制 prompt 体积；白名单不依赖它（见 run() 的注释）。
+        # 35+ 个工具时 32 张会把感知类工具挤出去，这里放宽到 44。
+        return (regular[: max(0, 44 - len(agent_cards))] + agent_cards)[:44]
 
     def _allowed_tools(self, tool_cards: list[dict[str, Any]]) -> set[str]:
         card_names = {card.get("name") for card in tool_cards if isinstance(card, dict)}
@@ -590,6 +692,15 @@ class AgentLoop:
                 {"camera_name": "0", "return_vis": False},
                 "Read depth data before deciding whether target-relative movement is safe.",
             )
+        # 已确认目标且有"受控视觉抵近"工具时，允许做一次有界前向推进：这是
+        # 有界单步 + 要求目标居中 + 由飞行包线看门狗兜底的受控动作，不需要
+        # 3D 世界坐标；每次推进后必须重新检测/确认再决定下一步。
+        if "drone_approach_target" in allowed_tools:
+            return LoopDecision(
+                "drone_approach_target",
+                {"step_m": 2.0},
+                "Approved visual approach: one bounded step toward the centered target, then re-observe.",
+            )
         return LoopDecision(
             action="",
             reason="Target is visible, but no safe 3D target position or visual approach tool is available.",
@@ -680,6 +791,146 @@ class AgentLoop:
         if criteria:
             goal["success_criteria"] = criteria
         return goal
+
+    # 计划收敛时忽略的"辅助/只读"工具：它们不构成任务目标，只用于准备或
+    # 读数；缺少它们不算任务未完成，避免收敛判据永远不成立。
+    _CONVERGENCE_IGNORED_TOOLS = {
+        "memory_store",
+        "memory_remember",
+        "memory_recall",
+        "drone_connect",
+        "drone_get_status",
+        "drone_list_vehicles",
+        "drone_get_firmware_info",
+        "drone_get_parameters",
+        "perception_status",
+        "airsim_task_status",
+    }
+
+    # 反应式任务里允许"照计划自动推进"的确定性准备步骤；其余动作（检测、确认、
+    # 机动、跟踪、降落、汇报）一律交回 LLM 基于最新观察决策。
+    _REACTIVE_AUTO_TOOLS = {
+        "drone_connect",
+        "drone_get_status",
+        "drone_arm",
+        "drone_set_mode",
+        "drone_takeoff",
+        "perception_start",
+        "memory_recall",
+    }
+
+    # 计划里出现这些内部动作时直接跳过：它们不是 Agent 可调用工具，由 runtime
+    # 自己处理（记忆写入在任务收尾完成）。
+    _PLAN_SKIP_TOOLS = {"memory_store", "memory_remember"}
+
+    @classmethod
+    def _resolve_plan_cursor(cls, initial_plan: Any, cursor: int) -> int:
+        """跳过计划里的内部动作步骤（如 memory_store），返回可执行步骤下标。"""
+        steps = list(getattr(initial_plan, "steps", None) or [])
+        while 0 <= cursor < len(steps) and str(getattr(steps[cursor], "tool", "") or "") in cls._PLAN_SKIP_TOOLS:
+            cursor += 1
+        return cursor
+
+    @classmethod
+    def _plan_step_at(cls, initial_plan: Any, cursor: int) -> Any | None:
+        if cursor < 0:
+            return None
+        steps = list(getattr(initial_plan, "steps", None) or [])
+        if cursor >= len(steps):
+            return None
+        return steps[cursor]
+
+    def _plan_step_deviation(self, step: Any, state: LoopState) -> str:
+        """判断"当前观察是否已经偏离计划假设"，偏离才需要交回 LLM 重新决策。
+
+        这是"按需 ReAct"的核心：计划照常快速执行，只有当世界与计划假设不一致
+        （检测不到目标、视觉确认没通过、抵近时目标已丢失）才让模型基于最新观察
+        重新决定，而不是每一步都调用一次模型。
+        """
+        tool = str(getattr(step, "tool", "") or "")
+        if tool == "airsim_detect_objects":
+            data = self._latest_result_data(state, "airsim_detect_objects")
+            if data:
+                try:
+                    count = int(data.get("count") or 0)
+                except (TypeError, ValueError):
+                    count = 0
+                if count == 0:
+                    return "上个检测步骤检出 0 个目标，与计划假设不符（应改为搜索/扫视或换角度）"
+        if tool in {"inspect_current_frame", "airsim_vlm_confirm_target"}:
+            data = self._latest_result_data(state, tool)
+            if data:
+                answer = data.get("answer") if isinstance(data.get("answer"), dict) else data
+                status = str(answer.get("status") or "").lower()
+                if answer.get("target_found") is False or status in {"target_not_confirmed", "not_found"}:
+                    return "视觉确认未通过（目标未确认），应改为抵近或换角度再确认"
+        if tool in {"drone_approach_target", "drone_fly_to", "drone_move_relative"}:
+            axis = getattr(self.tools, "perception_axis", None)
+            primary = None
+            if axis is not None and getattr(axis, "enabled", False):
+                try:
+                    primary = (axis.snapshot() or {}).get("primary")
+                except Exception:
+                    primary = None
+            if not primary:
+                return "当前画面没有锁定目标，不能执行抵近/飞向动作（应先搜索或对准）"
+        return ""
+
+    @classmethod
+    def _plan_step_decision(
+        cls,
+        initial_plan: Any,
+        cursor: int,
+        allowed_tools: set[str],
+    ) -> LoopDecision | None:
+        """按计划取下一步决策（不调用 LLM）。
+
+        计划是 LLM 已经给出的，按序执行不需要每步再思考一次；只有步骤失败、
+        计划走完、或计划里出现了当前不可用的工具时，才把控制权交回 LLM。
+
+        "何时需要 LLM 重新决策"由 run() 里的偏离检测（_plan_step_deviation）
+        负责：只有观察与计划假设不符时才转 ReAct，否则一路按计划推进。
+        """
+        if cursor < 0:
+            return None
+        steps = list(getattr(initial_plan, "steps", None) or [])
+        if cursor >= len(steps):
+            return None
+        step = steps[cursor]
+        tool = str(getattr(step, "tool", "") or "")
+        if not tool:
+            return None
+        if tool not in allowed_tools and tool not in cls._CONVERGENCE_IGNORED_TOOLS:
+            return None
+        params = dict(getattr(step, "params", {}) or {})
+        label = str(getattr(step, "label", "") or tool)
+        return LoopDecision(
+            action=tool,
+            params=params,
+            reason=label,
+            is_complete=False,
+            source="plan",
+        )
+
+    @classmethod
+    def _plan_steps_satisfied(cls, state: LoopState, initial_plan: Any) -> bool:
+        """计划中的实质步骤是否都已成功执行过一次。
+
+        用于确定性收敛：LLM 已经规划并驱动了每一步，runtime 只需在目标动作
+        全部落地后结束任务，避免收尾阶段反复空转。
+        """
+        steps = list(getattr(initial_plan, "steps", None) or [])
+        if not steps:
+            return False
+        required = [
+            str(getattr(step, "tool", "") or "")
+            for step in steps
+            if getattr(step, "tool", "") and step.tool not in cls._CONVERGENCE_IGNORED_TOOLS
+        ]
+        if not required:
+            return False
+        ok_tools = {str(result.tool) for result in state.results if result.ok}
+        return all(tool in ok_tools for tool in dict.fromkeys(required))
 
     def _verify_completion(self, goal: dict[str, Any], state: LoopState, observation: LoopObservation) -> dict[str, Any]:
         criteria = (goal or {}).get("success_criteria") or []
