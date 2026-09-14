@@ -1152,13 +1152,16 @@ function collapsibleText(text, className = "") {
   return body;
 }
 
-function compactJson(value, limit = 90) {
+function compactJson(value, limit = 180) {
+  // 唯一实现：图片 base64 必须脱敏（否则整段 base64 会灌进界面文本），
+  // 长度上限由调用方决定
+  let text = "";
   try {
-    const text = JSON.stringify(value, (k, v) => (k === "image_base64" ? "<image>" : v));
-    return text.length > limit ? text.slice(0, limit) + "…" : text;
-  } catch (e) {
-    return String(value).slice(0, limit);
+    text = JSON.stringify(value, (key, item) => (key === "image_base64" ? "<image>" : item));
+  } catch (error) {
+    text = String(value || "");
   }
+  return text.length > limit ? `${text.slice(0, limit)}...` : text;
 }
 
 function normalizeAgentSettingsCopy() {
@@ -1220,16 +1223,6 @@ function normalizeAgentSettingsCopy() {
     if (strong) strong.textContent = copy[0];
     if (help) help.textContent = copy[1];
   });
-}
-
-function compactJson(value, maxLength = 180) {
-  let text = "";
-  try {
-    text = JSON.stringify(value);
-  } catch (_) {
-    text = String(value || "");
-  }
-  return text.length > maxLength ? `${text.slice(0, maxLength)}...` : text;
 }
 
 function normalizeSystemSettingsCopy() {

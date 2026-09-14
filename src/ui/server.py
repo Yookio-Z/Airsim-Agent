@@ -700,7 +700,10 @@ class AgentRequestHandler(BaseHTTPRequestHandler):
         model["provider"] = str(payload.get("provider", "")).strip() or derive_provider(
             model["base_url"], model["api_type"], model["model"]
         )
-        probed = probe_model_capabilities(model["model"], model["api_type"], model["base_url"], model["api_key"])
+        # 保存路径上的能力探测是"锦上添花"：给它更短的预算，别让用户等太久
+        probed = probe_model_capabilities(
+            model["model"], model["api_type"], model["base_url"], model["api_key"], timeout=4.0
+        )
         if probed.get("ok"):
             model["capabilities"] = {**probed["capabilities"], "fetched_at": _utc_now_iso()}
         try:

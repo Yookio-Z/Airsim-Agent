@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import errno
 import math
 import os
 import socket
@@ -433,6 +434,10 @@ class MavlinkController(FlightController):
                 if conflict:
                     errors.append(conflict)
                     logger.error("mavlink_local_port_conflict", detail=conflict)
+                elif candidate.startswith("udpin:") and isinstance(exc, TimeoutError):
+                    port_text = candidate.rpartition(":")[2]
+                    if port_text.isdigit():
+                        errors.append(self._listen_port_hint(int(port_text)))
 
         self.disconnect()
         return ConnectionInfo(
@@ -470,9 +475,12 @@ class MavlinkController(FlightController):
             probe = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
             try:
                 probe.bind((probe_host, port))
-            except OSError:
-                # 现在能绑上说明没被占，继续看下一个地址
-                continue
+            except OSError as exc:
+                # 只有"地址已被占用"才算冲突：其它错误（例如本机没有这个地址）
+                # 不该报成"端口被别的进程占了"，那会把排查方向带偏
+                if getattr(exc, "errno", None) in (errno.EADDRINUSE, 10048):
+                    continue
+                return ""
             finally:
                 probe.close()
             return ""
@@ -480,6 +488,19 @@ class MavlinkController(FlightController):
             f"本地 UDP 端口 {port} 已被其他进程占用（常见原因是上一次启动的 Agent 实例没有退出）。"
             f"该进程会收走 PX4 发往 127.0.0.1:{port} 的心跳，所以本实例永远等不到心跳；"
             f"请先结束旧实例或改用其它端口。"
+        )
+
+    def _listen_port_hint(self, port: int) -> str:
+        """没有确证占用时的软提示。
+
+        Windows 允许同一端口重复绑定（pymavlink 的监听口就带 SO_REUSEADDR），
+        所以"另一个实例正占着这个端口"探测不到；监听模式下等不到心跳时，这条
+        可能性必须说出来，否则用户只会看到一句 no heartbeat。
+        """
+        return (
+            f"监听 {port} 口等待心跳超时：请确认 PX4 正在运行且目标地址正确。"
+            f"若本机之前启动过 Agent 实例未退出（或还有别的 GCS 在跑），"
+            f"它可能占用着同一端口并收走心跳，建议检查并结束多余进程。"
         )
 
     def disconnect(self) -> None:
@@ -1844,6 +1865,11 @@ class MavlinkController(FlightController):
             if not observed:
                 return
             self._peer_observations[peer] = now
+            # 保留窗口有上限，同时淘汰过老来源：否则换地址后旧来源会一直被当成
+            # "当前链路"，把真正的来源不符掩盖掉
+            cutoff = now - 120.0
+            for key in [k for k, ts in self._peer_observations.items() if ts < cutoff]:
+                self._peer_observations.pop(key, None)
             if len(self._peer_observations) > 8:
                 stale = sorted(self._peer_observations, key=lambda key: self._peer_observations[key])
                 for key in stale[: len(self._peer_observations) - 8]:

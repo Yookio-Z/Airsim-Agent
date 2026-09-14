@@ -7,6 +7,7 @@ import hashlib
 import json
 import math
 import os
+import tempfile
 import re
 import threading
 import time
@@ -138,6 +139,25 @@ def trim_loop_state_payload(payload: Any) -> Any:
     return {**payload, "loop_state": slim}
 
 
+# 同一个会话文件会被多条线程写（/api/state 的 HTTP 线程、运行线程、兜底线程）。
+# 光靠"临时文件 + os.replace"不够：Windows 上并发 replace 会因目标文件正被打开
+# 而抛 WinError 5（拒绝访问），上层又是 except 静默吞掉 —— 表现为内容没落盘。
+# 所以这里按进程串行化会话写入，并对替换做少量重试。
+_SESSION_WRITE_LOCK = threading.RLock()
+_REPLACE_RETRIES = 3
+
+
+def _sessions_by_mtime() -> list[Path]:
+    """按修改时间倒序列出会话文件；stat 失败（并发删除）时退回按名字排。"""
+    def sort_key(path: Path) -> float:
+        try:
+            return path.stat().st_mtime
+        except OSError:
+            return 0.0
+
+    return sorted(SESSIONS_DIR.glob("session_*.json"), key=sort_key, reverse=True)
+
+
 def read_session_file(path: Path) -> dict[str, Any] | None:
     """容错读取会话文件。
 
@@ -145,19 +165,33 @@ def read_session_file(path: Path) -> dict[str, Any] | None:
     "Extra data" 直接失败，会话就会从列表里凭空消失。这里退回解析第一份，
     至少让该会话还能打开（原始文件不修改）。
     """
-    try:
-        text = path.read_text(encoding="utf-8")
-    except OSError:
-        return None
+    text = ""
+    for attempt in range(3):
+        try:
+            text = path.read_text(encoding="utf-8")
+            break
+        except OSError:
+            # 目标可能正被另一个线程 os.replace，短暂退让后重试
+            if attempt == 2:
+                return None
+            time.sleep(0.02 * (attempt + 1))
     if not text.strip():
         return None
     try:
         data = json.loads(text)
     except json.JSONDecodeError:
-        try:
-            data, _ = json.JSONDecoder().raw_decode(text.lstrip())
-        except Exception:
-            return None
+        data = None
+        # 文件被写成"多份 JSON 拼接"时，取最后一份能解析的文档（最新的状态）
+        decoder = json.JSONDecoder()
+        rest = text.lstrip()
+        while rest.strip():
+            try:
+                document, end = decoder.raw_decode(rest)
+            except ValueError:
+                break
+            if isinstance(document, dict):
+                data = document
+            rest = rest[end:].lstrip()
     return data if isinstance(data, dict) else None
 SETTINGS_PATH = REPO_ROOT / "src" / "data" / "settings.json"
 SKILLS_OVERRIDES_PATH = REPO_ROOT / "src" / "data" / "skills.json"
@@ -5010,7 +5044,7 @@ class AgentRuntime:
             self._session_meta_cache = cache
         sessions: list[dict[str, Any]] = []
         seen: set[str] = set()
-        for path in sorted(SESSIONS_DIR.glob("session_*.json"), key=lambda p: p.stat().st_mtime, reverse=True):
+        for path in _sessions_by_mtime():
             key = str(path)
             seen.add(key)
             try:
@@ -5018,7 +5052,9 @@ class AgentRuntime:
             except OSError:
                 continue
             cached = cache.get(key)
-            if cached and cached["mtime"] == stat.st_mtime and cached["size"] == stat.st_size:
+            generation = getattr(self, "_session_write_generation", 0)
+            if (cached and cached["mtime"] == stat.st_mtime and cached["size"] == stat.st_size
+                    and cached.get("generation", -1) == generation):
                 sessions.append(dict(cached["meta"]))
                 continue
             data = read_session_file(path)
@@ -5036,7 +5072,7 @@ class AgentRuntime:
                 # 免得会话列表写 120 条、导航条只有 60 根，看起来像丢了数据
                 "input_count": sum(1 for m in messages if isinstance(m, dict) and m.get("role") == "user"),
             }
-            cache[key] = {"mtime": stat.st_mtime, "size": stat.st_size, "meta": meta}
+            cache[key] = {"mtime": stat.st_mtime, "size": stat.st_size, "meta": meta, "generation": generation}
             sessions.append(dict(meta))
         for stale_key in [k for k in cache if k not in seen]:
             cache.pop(stale_key, None)
@@ -5143,10 +5179,9 @@ class AgentRuntime:
         path = self._session_path(session_id)
         if not path.exists():
             return {"ok": False, "error": "session not found"}
-        try:
-            data = json.loads(path.read_text(encoding="utf-8"))
-        except Exception as exc:
-            return {"ok": False, "error": f"failed to read session: {exc}"}
+        data = read_session_file(path)
+        if data is None:
+            return {"ok": False, "error": "failed to read session: unreadable session file"}
 
         clean_format = str(export_format or "markdown").strip().lower()
         safe_name = re.sub(r"[^a-zA-Z0-9_-]+", "_", str(data.get("name") or session_id)).strip("_") or session_id
@@ -5200,8 +5235,14 @@ class AgentRuntime:
             return
         path = self._session_path(self._current_session_id)
         try:
-            data = read_session_file(path) if path.exists() else None
-            if data is None:
+            if path.exists():
+                data = read_session_file(path)
+                if data is None:
+                    # 文件存在但暂时读不出来（并发替换/损坏）：宁可跳过这次保存，
+                    # 也不能用"新对话"覆盖掉原有的名字与创建时间
+                    logger.warning("session_persist_skipped_unreadable", session=self._current_session_id)
+                    return
+            else:
                 data = {"id": self._current_session_id, "name": "新对话", "created_at": time.time()}
             with self._lock:
                 data["messages"] = [m.to_dict() for m in self._messages]
@@ -5238,16 +5279,32 @@ class AgentRuntime:
             _trim_session_message(message) for message in (data.get("messages") or [])
         ]
         # 原子写：先写临时文件再替换，避免中断/并发把文件拼成两份 JSON
-        # （历史上有 3 个会话就是这样坏掉、并从列表里消失的）
+        # （历史上有 3 个会话就是这样坏掉、并从列表里消失的）。
+        # 临时名必须逐次唯一：/api/state 的 HTTP 线程、运行线程与兜底线程都会
+        # 保存同一个会话，只用 pid 命名会让并发写撞在同一个临时文件上，
+        # 失败又被上层 except 静默吞掉 —— 表现为"最新内容没落盘"。
         text = json.dumps(payload, ensure_ascii=False, indent=2)
-        temp_path = path.with_suffix(f".json.tmp{os.getpid()}")
-        try:
-            temp_path.write_text(text, encoding="utf-8")
-            os.replace(temp_path, path)
-        finally:
-            if temp_path.exists():
+        with _SESSION_WRITE_LOCK:
+            handle, temp_name = tempfile.mkstemp(dir=str(path.parent), prefix=f"{path.name}.", suffix=".tmp")
+            temp_path = Path(temp_name)
+            try:
+                with os.fdopen(handle, "w", encoding="utf-8", newline="") as fh:
+                    fh.write(text)
+                for attempt in range(_REPLACE_RETRIES):
+                    try:
+                        os.replace(temp_path, path)
+                        break
+                    except PermissionError:
+                        # 目标文件此刻被读线程打开：短暂退让后重试
+                        if attempt == _REPLACE_RETRIES - 1:
+                            raise
+                        time.sleep(0.02 * (attempt + 1))
+                # 元数据缓存按 (mtime,size) 判定，同尺寸快速重写可能落在同一个
+                # 时间戳刻度上；这里推进代次，保证刚写的内容立刻可见。
+                self._session_write_generation = getattr(self, "_session_write_generation", 0) + 1
+            finally:
                 try:
-                    temp_path.unlink()
+                    temp_path.unlink(missing_ok=True)
                 except OSError:
                     pass
 

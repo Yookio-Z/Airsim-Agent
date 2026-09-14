@@ -74,8 +74,9 @@ def test_read_session_file_recovers_concatenated_json(tmp_path):
 
     recovered = read_session_file(broken)
 
+    # 拼接文件里靠后的一份才是较新的状态，恢复时应取它
     assert recovered is not None
-    assert recovered["name"] == "第一份"
+    assert recovered["name"] == "第二份"
 
 
 def test_read_session_file_returns_none_for_garbage(tmp_path):
@@ -89,16 +90,19 @@ def test_list_sessions_includes_recovered_session(tmp_path, monkeypatch):
     runtime = _bare_runtime(tmp_path, monkeypatch)
     good = {"id": "s1", "name": "正常", "messages": [{"id": "a"}], "updated_at": 2.0}
     (tmp_path / "session_s1.json").write_text(json.dumps(good, ensure_ascii=False), encoding="utf-8")
-    broken = {"id": "s2", "name": "被写坏的", "messages": [{"id": "a"}, {"id": "b"}], "updated_at": 1.0}
+    first = {"id": "s2", "name": "旧状态", "messages": [{"id": "a"}], "updated_at": 1.0}
+    latest = {"id": "s2", "name": "被写坏的", "messages": [{"id": "a"}, {"id": "b"}], "updated_at": 2.0}
     (tmp_path / "session_s2.json").write_text(
-        json.dumps(broken, ensure_ascii=False) + json.dumps({"id": "s2", "messages": []}, ensure_ascii=False),
+        json.dumps(first, ensure_ascii=False) + json.dumps(latest, ensure_ascii=False),
         encoding="utf-8",
     )
 
     sessions = runtime.list_sessions()
 
     assert {s["id"] for s in sessions} == {"s1", "s2"}
-    assert next(s for s in sessions if s["id"] == "s2")["message_count"] == 2
+    recovered = next(s for s in sessions if s["id"] == "s2")
+    assert recovered["message_count"] == 2
+    assert recovered["name"] == "被写坏的"
 
 
 # ── 元数据缓存：每轮轮询不该重解析几 MB 的文件 ──────────────────────────
@@ -227,3 +231,36 @@ def test_list_sessions_reports_input_count(tmp_path, monkeypatch):
 
     assert meta["message_count"] == 5
     assert meta["input_count"] == 3
+
+
+def test_concurrent_saves_do_not_lose_writes(tmp_path, monkeypatch):
+    """回归：多线程同时保存同一会话时，临时文件与 os.replace 会互相冲突，
+    失败又被上层静默吞掉 —— 表现为"最新内容没落盘"。"""
+    import threading
+
+    runtime = _bare_runtime(tmp_path, monkeypatch)
+    errors: list[str] = []
+
+    def worker(worker_id: int) -> None:
+        for index in range(60):
+            try:
+                runtime._save_session({
+                    "id": "session_race",
+                    "name": f"w{worker_id}",
+                    "messages": [{"id": f"m{worker_id}-{index}", "role": "user", "content": "x" * 50}],
+                    "created_at": 1.0,
+                })
+            except Exception as exc:  # noqa: BLE001 - 测试就是要抓任何异常
+                errors.append(f"{type(exc).__name__}: {exc}")
+
+    threads = [threading.Thread(target=worker, args=(n,)) for n in range(6)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join()
+
+    assert errors == [], f"并发保存出现异常: {errors[:3]}"
+    written = read_session_file(tmp_path / "session_race.json")
+    assert written is not None and written["messages"], "最终文件必须可解析"
+    # 不能残留临时文件
+    assert list(tmp_path.glob("*.tmp*")) == []

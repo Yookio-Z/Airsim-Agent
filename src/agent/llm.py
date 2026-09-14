@@ -359,7 +359,9 @@ def _find_catalog_entry(catalog: Any, model_id: str) -> dict[str, Any] | None:
     return None
 
 
-_CAPABILITY_PROBE_TIMEOUT_S = 8.0
+# 单个候选地址的等待上限。探测会按不同写法串行试多个地址，
+# 时间过长会直接卡住"保存模型"这次请求，所以收紧到 5 秒。
+_CAPABILITY_PROBE_TIMEOUT_S = 5.0
 
 
 def _catalog_urls(root: str, kind: str) -> list[str]:
