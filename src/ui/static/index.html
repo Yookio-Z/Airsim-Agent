@@ -648,6 +648,14 @@
       integrity="sha256-20nQCchB9co0qIjJZRGuk2/Z9VM+kNiyxNV1lvTlZBo="
       crossorigin=""
     ></script>
-    <script src="/app.js"></script>
+    <!-- 前端按域拆分：共享同一脚本作用域，必须保持此加载顺序 -->
+    <script src="/ui-core.js"></script>
+    <script src="/ui-map.js"></script>
+    <script src="/ui-telemetry.js"></script>
+    <script src="/ui-chat.js"></script>
+    <script src="/ui-composer.js"></script>
+    <script src="/ui-camera.js"></script>
+    <script src="/ui-panel-settings.js"></script>
+    <script src="/ui-main.js"></script>
   </body>
 </html>
