@@ -134,7 +134,7 @@ function setupCameraEventListeners() {
       if (win.streamActive && cameraViewerIsVisible(win)) scheduleCameraFrame(win, 0);
     });
   });
-  [els.cameraSource, els.cameraName, els.cameraVehicle, els.cameraImageType, els.cameraTimeout, els.cameraAutoSave]
+  [els.cameraSource, els.cameraRtspUrl, els.cameraRtspTransport, els.cameraName, els.cameraVehicle, els.cameraImageType, els.cameraTimeout, els.cameraAutoSave]
     .filter(Boolean)
     .forEach((control) => {
       control.addEventListener("change", () => {
@@ -164,6 +164,10 @@ function setupConnectionEventListeners() {
   if (els.connectionDetailType) {
     els.connectionDetailType.addEventListener("change", updateConnectionTypeFields);
   }
+  // 勾选真实飞控后要立刻收起 SITL 专用的远端端口项，不能等切类型才刷新。
+  if (els.connectionDetailRealVehicle) {
+    els.connectionDetailRealVehicle.addEventListener("change", updateConnectionTypeFields);
+  }
   if (els.connectionDetailForm) {
     els.connectionDetailForm.addEventListener("submit", submitConnectionDetail);
   }
@@ -182,8 +186,6 @@ function setupConnectionEventListeners() {
       if (!item) return;
       const connId = item.dataset.connectionId;
       renderConnectionDetail(connId);
-      // 保险: 切换预设后强制再渲染一次模板, 避免被中间步骤覆盖
-      renderAirSimSettingsForConnection();
     });
     els.connectionsList.addEventListener("keydown", (event) => {
       if (event.key !== "Enter" && event.key !== " ") return;
@@ -192,7 +194,6 @@ function setupConnectionEventListeners() {
       event.preventDefault();
       const connId = item.dataset.connectionId;
       renderConnectionDetail(connId);
-      renderAirSimSettingsForConnection();
     });
   }
 }
@@ -247,6 +248,9 @@ function isLiveRunStatus(status) {
 function isAgentWorkActive() {
   const run = latestState?.current_run;
   if (run && isLiveRunStatus(run.status)) return true;
+  // 乐观 pending 气泡也代表"已有工作在途"：提交后不再同步 refresh 整页状态，
+  // SSE 消息到达前的短暂窗口里，发送键/中断语义靠这里保持一致。
+  if (localPendingMessages.some((message) => message?.role === "assistant" && message.status === "running")) return true;
   const messages = Array.isArray(latestState?.messages) ? latestState.messages : [];
   return messages.some((message) => (
     message?.role === "assistant"
@@ -573,12 +577,19 @@ function railEntries(messages) {
     }));
 }
 
+// 导航条内容签名（用户消息 id 序列）。内容不变时不重建 innerHTML——
+// 这条栏在每次 renderChat 都会走一遍，重建属于"只加一条消息却整栏重绘"。
+let chatRailSig = "";
+
 function renderChatRail(messages) {
   const rail = els.chatRail;
   if (!rail) return;
   const entries = railEntries(messages);
   // 可见性判据只在这里维护，syncHeader 读 dataset.count，避免两处规则不一致
   rail.dataset.count = String(entries.length);
+  const sig = entries.length < 2 ? "off" : entries.map((entry) => entry.id).join("\u0001");
+  if (sig === chatRailSig) return;
+  chatRailSig = sig;
   hideRailTip();
   if (entries.length < 2) {
     rail.hidden = true;
@@ -868,8 +879,7 @@ function humanToolLabel(tool, label = "") {
     drone_rotate_to: "调整朝向",
     drone_set_mode: "切换飞行模式",
     airsim_take_photo: "拍摄图像",
-    airsim_vlm_analyze_image: "分析摄像头画面",
-    airsim_vlm_confirm_target: "确认画面目标",
+    inspect_current_frame: "分析当前画面",
     airsim_get_sensors: "读取传感器",
     airsim_get_depth_map: "读取深度图",
     airsim_detect_objects: "识别画面目标",
@@ -1110,34 +1120,6 @@ function signedMeters(lat1, lon1, lat2, lon2) {
   return ref < 0 ? -d : d;
 }
 
-function highlightJsonLine(line) {
-  if (!line) return "";
-  // 先 HTML 转义, 再用正则匹配插入 span.
-  const escaped = line
-    .replace(/&/g, "&amp;")
-    .replace(/</g, "&lt;")
-    .replace(/>/g, "&gt;");
-  return escaped.replace(JSON_TOKEN_RE, (match) => {
-    let cls = "";
-    if (match.startsWith('"')) {
-      cls = /:\s*$/.test(match) ? "json-key" : "json-string";
-    } else if (/^(?:true|false)$/.test(match)) {
-      cls = "json-boolean";
-    } else if (match === "null") {
-      cls = "json-null";
-    } else if (/^-?\d/.test(match)) {
-      cls = "json-number";
-    } else {
-      cls = "json-punct";
-    }
-    return `<span class="${cls}">${match}</span>`;
-  });
-}
-
-function initAirSimTemplatesEvents() {
-  document.getElementById("airsimTemplateApply")?.addEventListener("click", applyAirSimSettingsTemplate);
-}
-
 function parseParams(raw) {
   if (!raw) return {};
   try {
@@ -1219,6 +1201,19 @@ function buildAgentTurn(message) {
   errorPill.textContent = "任务执行失败，详见对话内容";
   errorPill.style.display = "none";
 
+  // 活跃轮次的状态占位行：服务端 assistant 消息先以空内容/占位文本创建，
+  // 思考与工具过程要稍后才到；没有这行时气泡会先渲染成完全空白，
+  // 操作员只看到"空气泡闪一下再出字"。这里始终给出一个可读状态。
+  const statusPill = document.createElement("div");
+  statusPill.className = "thinking-pill";
+  statusPill.style.display = "none";
+  const statusPillDot = document.createElement("span");
+  statusPillDot.className = "live-dot";
+  const statusPillText = document.createElement("span");
+  statusPillText.className = "thinking-pill-text";
+  statusPill.appendChild(statusPillDot);
+  statusPill.appendChild(statusPillText);
+
   // 过程折叠块：思考全文 + 工具/校验步骤都在里面。
   // 运行中自动展开（实时看思考与工具追加）；完成后自动收起，只留最终总结；
   // 用户手动切换过（userToggled）则尊重用户选择。
@@ -1289,6 +1284,11 @@ function buildAgentTurn(message) {
     root,
     kind: "agent",
     errorPill,
+    statusPill,
+    statusPillText,
+    lastPillText: "",
+    lastPillShown: false,
+    lastEmptyTurn: false,
     procFold,
     procState,
     procLatest,
@@ -1329,6 +1329,7 @@ function buildAgentTurn(message) {
   });
 
   root.appendChild(errorPill);
+  root.appendChild(statusPill);
   root.appendChild(procFold);
   root.appendChild(answerBody);
   return entry;
@@ -1347,11 +1348,14 @@ function firstThinkLine(text) {
   return (n === -1 ? t : t.slice(0, n)).slice(0, 90);
 }
 
-// 条目分类：技能调用(skill:*) / 工具 / 校验 / 记忆 / 系统说明 / 模型思考
+// 条目分类：技能调用(kind=skill 或 skill:*) / 工具 / 校验 / 记忆 / 系统说明 / 模型思考
+// 后端现在给技能激活单独打 kind="skill"；旧运行（以及运行中还没收到 kind 的
+// 那一行）只有 tool="skill:<name>"，所以前缀兜底继续保留。
 function nodeCategory(item) {
   const tool = String(item?.tool || "");
   if (tool.startsWith("skill:")) return "skill";
   const kind = normalizeProcessKind(item);
+  if (kind === "skill") return "skill";
   if (kind === "plan_step" || kind === "tool") return "tool";
   if (kind === "verify") return "verify";
   if (kind === "memory") return "memory";
@@ -1359,9 +1363,36 @@ function nodeCategory(item) {
   return "reasoning";
 }
 
+// 后端在模型没给出思考时用 "Call <tool>" 占位（llm.py reason=...），
+// 那是合成标签不是推理，不能当模型思考展示
+function isSyntheticToolCallLabel(text) {
+  return /^Call [A-Za-z0-9_.]+$/.test(String(text || "").trim());
+}
+
+// 时间线行的稳定 key：分类/工具名/标题 + 序号，重建时用它恢复折叠状态
+function timelineRowKey(item, idx) {
+  const cat = nodeCategory(item);
+  return `${idx}:${cat}:${String(item.tool || item.title || "")}`;
+}
+
+// 规划期临时思考块的判据：时间线里还没有真实条目（思考/工具/技能/校验/记忆）
+// 时才显示 details.reasoning_text。规划刚开始时时间线上只有一条"理解指令"
+// 阶段说明——它没有 kind，会被 nodeCategory 兜底归成 reasoning——所以"真实行"
+// 按有无 kind 判断，不能只看分类，否则规划期永远插不进临时块。一旦出现真实行
+// （哪怕已是 completed/failed），这份整轮累计文本就永远不能再插，否则运行中
+// 它会重新跑到时间线末尾（工具行之后），看起来就是"流式输出位置不对"。
+function shouldShowPlanPhaseReasoning(items) {
+  return !(Array.isArray(items) ? items : []).some((item) => {
+    const cat = nodeCategory(item);
+    if (cat === "system") return false; // 阶段说明不是真实条目
+    if (cat !== "reasoning") return true; // 工具/技能/校验/记忆都是真实行
+    return Boolean(String(item?.kind || "").trim()); // 真实思考行都带 kind
+  });
+}
+
 function categoryLabel(cat) {
   if (cat === "tool") return "工具";
-  if (cat === "skill") return "Skill";
+  if (cat === "skill") return "技能调用";
   if (cat === "verify") return "校验";
   if (cat === "memory") return "记忆";
   if (cat === "system") return "系统";
@@ -1375,15 +1406,70 @@ function systemNode(item) {
   return row;
 }
 
-// 工具/技能/校验：默认压缩成一行（超出省略），点击展开完整参数与返回
+// ── 可展开行：一行摘要 + 详情 ──────────────────────────────────────────
+// 展开器必须是真正可聚焦的控件：用原生 <details>/<summary>（Tab 可达、
+// 回车/空格切换、读屏播报展开态），不是 div onclick。只有这一行之外还有
+// 内容（参数 / 返回 / 技能指导全文）时才包 details——内容已经全在这行里的
+// 不给假展开器。
+function foldChevron() {
+  const chev = document.createElement("i");
+  chev.className = "tl-fold-chev"; // 装饰：展开态由原生 summary 播报
+  chev.setAttribute("aria-hidden", "true");
+  return chev;
+}
+
+function expandableRow(row, detailNodes, ariaLabel) {
+  if (!detailNodes.length) return row;
+  const fold = document.createElement("details");
+  fold.className = "tl-fold";
+  const summary = document.createElement("summary");
+  summary.className = "tl-fold-head";
+  summary.setAttribute("aria-label", ariaLabel);
+  summary.title = ariaLabel;
+  row.appendChild(foldChevron());
+  summary.appendChild(row);
+  fold.appendChild(summary);
+  detailNodes.forEach((node) => fold.appendChild(node));
+  return fold;
+}
+
+// 展开态恢复：工具/技能行的展开器就是节点自身，思考行的展开器在节点内部
+function findRowFold(node) {
+  if (!node) return null;
+  if (node.tagName === "DETAILS") return node;
+  return node.querySelector("details");
+}
+
+// 详情小节：小标题 + 等宽正文（请求参数 / 返回内容）
+function detailSection(parent, heading, text) {
+  const head = document.createElement("div");
+  head.className = "tl-one-section";
+  head.textContent = heading;
+  const pre = document.createElement("pre");
+  pre.className = "tl-collapse-full";
+  pre.textContent = text;
+  parent.appendChild(head);
+  parent.appendChild(pre);
+}
+
+// 思考全文比一行摘要多才值得展开：有换行，或长到单行肯定被省略号截断。
+// （工具/技能/校验行不再看摘要长短：参数与返回本来就在这一行之外，见各自节点函数。）
+function textNeedsDetail(text) {
+  const value = String(text || "");
+  return value.length > 90 || value.includes("\n");
+}
+
+// 工具/技能/校验：默认压缩成一行（超出省略），整行可点开看完整参数与返回；
+// 只有参数、返回两样都空的行才是真正的纯一行。
 function toolLineNode(item) {
   const status = item.status || "completed";
   const cat = nodeCategory(item);
   const rawTool = String(item.tool || "");
   const label = rawTool ? humanToolLabel(rawTool, item.title) : humanThoughtTitle(item.title || "");
   const nameText = cat === "skill" && rawTool ? rawTool.replace(/^skill:/, "") : (rawTool || label);
-  const paramsText = item.params && Object.keys(item.params).length ? compactJson(item.params, 400) : "";
+  const paramsText = item.params && Object.keys(item.params).length ? compactJson(item.params, 2000) : "";
   const resultText = humanThoughtBody(item.body || "", item.tool || "");
+  const kindLabel = cat === "skill" ? "技能调用" : cat === "verify" ? "校验" : "工具调用";
 
   // 一行摘要：图标 + 标题 + 工具名 + 结果（优先）/参数（次要）
   const row = document.createElement("div");
@@ -1391,15 +1477,31 @@ function toolLineNode(item) {
   const icon = document.createElement("i");
   icon.className = "tl-node-icon";
   icon.textContent = cat === "skill" ? "🧩" : cat === "verify" ? "📋" : "🛠";
+  icon.setAttribute("aria-hidden", "true");
   row.appendChild(icon);
-  const kindLabel = document.createElement("span");
-  kindLabel.className = "tl-node-label";
-  kindLabel.textContent = cat === "skill" ? "技能调用" : cat === "verify" ? "校验" : "工具调用";
-  row.appendChild(kindLabel);
+  const kind = document.createElement("span");
+  kind.className = "tl-node-label";
+  kind.textContent = kindLabel;
+  row.appendChild(kind);
   const name = document.createElement("code");
   name.className = "tool-name";
   name.textContent = nameText;
   row.appendChild(name);
+
+  // 详情就是 process_trace 里已有的字段：params + 格式化后的 body
+  const detailBox = document.createElement("div");
+  detailBox.className = "tl-one-body";
+  let detailCount = 0;
+  if (paramsText) {
+    detailSection(detailBox, "请求参数", paramsText);
+    detailCount += 1;
+  }
+  if (resultText) {
+    detailSection(detailBox, "返回内容", resultText);
+    detailCount += 1;
+  }
+  const detailNodes = detailCount ? [detailBox] : [];
+
   if (status === "running") {
     const spin = document.createElement("i");
     spin.className = "tl-spin";
@@ -1408,46 +1510,149 @@ function toolLineNode(item) {
     t.className = "tl-line-note";
     t.textContent = "执行中…";
     row.appendChild(t);
-    return row;
+    // 运行中也能先看已拿到的参数/返回——那正是这一行之外的内容
+    if (!detailNodes.length) return row;
+    return expandableRow(row, detailNodes, `${kindLabel} ${nameText}：展开查看完整参数与返回`);
+  }
+
+  const brief = document.createElement("span");
+  brief.className = "tl-line-brief";
+  const briefText = resultText || paramsText || "";
+  brief.textContent = briefText;
+  row.appendChild(brief);
+
+  // 展开器不再看摘要长短：摘要永远是一行省略文本，而参数与返回都在这行之外，
+  // 短摘要（如 drone_get_status → ok）同样点得开；参数、返回两样都空才是
+  // 真正的纯一行，那种行不给假展开器。
+  if (!detailNodes.length) return row;
+  return expandableRow(row, detailNodes, `${kindLabel} ${nameText}：展开查看完整参数与返回`);
+}
+
+// 技能激活：与"模型思考/工具调用"同级的一条——图标 + "技能调用" + 技能名 +
+// 指导摘要；整行可点开，展开后完整技能指导内联显示在下方（不再另起一行
+// "点击展开全文"，重建时靠 data-tl-row 恢复展开态）。
+// 状态只沿用 tool 行那套 running / completed / failed，不新增状态。
+function skillNode(item) {
+  const status = item.status || "completed";
+  const rawTool = String(item.tool || "");
+  const nameText = rawTool || humanThoughtTitle(item.title || "") || "技能";
+  const guidance = String(item.body || "").trim();
+  const paramsText = item.params && Object.keys(item.params).length ? compactJson(item.params, 2000) : "";
+  const node = document.createElement("div");
+  node.className = `tl-node tl-skill${status === "running" ? " running" : ""}`;
+  const row = document.createElement("div");
+  row.className = `tl-one-line ${status} cat-skill`;
+  const icon = document.createElement("i");
+  icon.className = "tl-node-icon";
+  icon.textContent = "🧩";
+  icon.setAttribute("aria-hidden", "true");
+  row.appendChild(icon);
+  const kind = document.createElement("span");
+  kind.className = "tl-node-label";
+  kind.textContent = "技能调用";
+  row.appendChild(kind);
+  const name = document.createElement("code");
+  name.className = "tool-name";
+  name.textContent = nameText;
+  row.appendChild(name);
+  if (status === "running") {
+    const spin = document.createElement("i");
+    spin.className = "tl-spin";
+    row.appendChild(spin);
+    const note = document.createElement("span");
+    note.className = "tl-line-note";
+    note.textContent = "取回技能指导…";
+    row.appendChild(note);
+    node.appendChild(row);
+    return node;
   }
   const brief = document.createElement("span");
   brief.className = "tl-line-brief";
-  brief.textContent = resultText || paramsText || "";
+  brief.textContent = guidance ? guidance.replace(/\s+/g, " ") : "（无返回内容）";
   row.appendChild(brief);
-
-  const needsExpand = paramsText.length > 60 || resultText.length > 60
-    || paramsText.includes("\n") || resultText.includes("\n");
-  if (!needsExpand) return row;
-
-  const d = document.createElement("details");
-  d.className = "tl-one";
-  const s = document.createElement("summary");
-  s.appendChild(row);
-  d.appendChild(s);
-  const box = document.createElement("div");
-  box.className = "tl-one-body";
+  // 详情里放的是完整技能指导（backend 把全文放在 body 里，可能很长）与激活
+  // 参数：摘要只是一行省略文本，操作员必须能展开看到全文；两者都空才是纯一行。
+  const detailNodes = [];
   if (paramsText) {
-    const ph = document.createElement("div");
-    ph.className = "tl-one-section";
-    ph.textContent = "请求参数";
-    const pp = document.createElement("pre");
-    pp.className = "tl-collapse-full";
-    pp.textContent = paramsText;
-    box.appendChild(ph);
-    box.appendChild(pp);
+    const box = document.createElement("div");
+    box.className = "tl-one-body";
+    detailSection(box, "请求参数", paramsText);
+    detailNodes.push(box);
   }
-  if (resultText) {
-    const rh = document.createElement("div");
-    rh.className = "tl-one-section";
-    rh.textContent = "返回内容";
-    const rp = document.createElement("pre");
-    rp.className = "tl-collapse-full";
-    rp.textContent = resultText;
-    box.appendChild(rh);
-    box.appendChild(rp);
+  if (guidance) {
+    const full = document.createElement("pre");
+    full.className = "tl-skill-full";
+    full.textContent = guidance;
+    detailNodes.push(full);
   }
-  d.appendChild(box);
-  return d;
+  if (!detailNodes.length) {
+    node.appendChild(row);
+    return node;
+  }
+  node.appendChild(expandableRow(row, detailNodes, `技能调用 ${nameText}：展开查看完整技能指导`));
+  return node;
+}
+
+// 模型思考行：与下方工具/技能/校验行同一套外观——图标 + 加粗标签"模型思考" +
+// 正文（单行省略），整行可点开，展开后全文内联显示在下方——没有单独的
+// "▸ 点击展开全文"行，也没有套边框的可滚动卡片；ReAct 多轮思考与 plan-execute
+// 的思考共用这一种外观。
+// 运行中的行保持简单：图标 + 标签 + 就地增长的正文（仍在流式写入，不做展开器）。
+function timelineThinkNode(item, isLive) {
+  const text = String(item.body || "").trim();
+  const titleText = item.title && item.title !== "模型思考" ? String(item.title) : "";
+  const node = document.createElement("div");
+  node.className = `tl-node tl-reasoning${isLive ? " running" : ""}`;
+  const row = document.createElement("div");
+  row.className = "tl-think-head";
+  const icon = document.createElement("i");
+  icon.className = "tl-node-icon";
+  icon.textContent = "🧠";
+  icon.setAttribute("aria-hidden", "true");
+  row.appendChild(icon);
+  // 标签：restyle 时被漏掉，操作员只能看到图标 + 裸正文，认不出这是哪一类行
+  const kind = document.createElement("span");
+  kind.className = "tl-node-label";
+  kind.textContent = "模型思考";
+  row.appendChild(kind);
+  if (titleText) {
+    const title = document.createElement("span");
+    title.className = "tl-node-title";
+    title.textContent = `· ${titleText}`;
+    row.appendChild(title);
+  }
+  if (isLive) {
+    const body = document.createElement("pre");
+    body.className = "tl-think-body"; // 流式更新按这个类就地写文本
+    body.textContent = text || "思考中…";
+    row.appendChild(body);
+    node.appendChild(row);
+    return node;
+  }
+  const preview = firstThinkLine(text) || "（无内容）";
+  const line = document.createElement("span");
+  line.className = "tl-think-preview"; // 单行省略：CSS nowrap + ellipsis
+  line.textContent = preview;
+  row.appendChild(line);
+  // 全文比这一行多（有换行 / 超出 90 字）才给展开器；短思考本来就看全了
+  if (!textNeedsDetail(text)) {
+    node.appendChild(row);
+    return node;
+  }
+  const full = document.createElement("pre");
+  full.className = "tl-think-full";
+  full.textContent = text;
+  node.appendChild(expandableRow(row, [full], `模型思考：${preview}（展开查看全文）`));
+  return node;
+}
+
+// 活跃轮次的状态文案：优先用 run 的 phase/status（更细），退回消息自身字段。
+// 与已废弃的 renderChatMessage 里的 thinking-pill 文案同源（humanStatus）。
+function agentStatusPillText(message, linkedRun = null) {
+  const status = linkedRun?.status || message?.status || "";
+  const phase = linkedRun?.phase || message?.details?.phase || "";
+  const mode = linkedRun?.mode || message?.details?.mode || "";
+  return humanStatus(status, phase, mode);
 }
 
 function updateAgentTurn(entry, message, run, llm) {
@@ -1479,12 +1684,33 @@ function updateAgentTurn(entry, message, run, llm) {
     // kind=plan 的工具清单与上方"执行计划"块重复，不再重复展示
     if (normalizeProcessKind(item) === "plan") return false;
     const cat = nodeCategory(item);
-    if (cat === "reasoning" || cat === "system") {
+    if (cat === "reasoning") {
+      const body = String(item.body || "").trim();
+      return Boolean(body) && !isSyntheticToolCallLabel(body);
+    }
+    if (cat === "system") {
       return Boolean(String(item.body || "").trim());
     }
     return Boolean(item.tool || humanThoughtTitle(item.title || ""));
   });
   const planSummaryText = String(details.plan_summary || "").trim();
+  // 规划阶段（LLM 正在生成计划）process_trace 里还没有真实思考/工具行：这时把
+  // 消息 details 里的流式推理作为临时思考块显示出来，否则操作员在整个规划期
+  // 只能看到一句"正在解析任务意图…"的占位。判据是"时间线里还没有真实行"，
+  // 而不是"有没有正在流式的真实思考"：真实思考行一旦出现（哪怕已经 completed），
+  // 这份整轮累计文本就永远不能再插，否则运行中它会重新跑到时间线末尾
+  // （工具行之后），看起来就是"流式输出位置不对"。规划期本来就有一条
+  // "理解指令"的阶段说明，所以不能用"时间线为空"当判据（那样永远不会触发）。
+  if (running && shouldShowPlanPhaseReasoning(timelineItems) && reasoning.trim()) {
+    timelineItems.push({
+      title: "模型思考",
+      body: reasoning,
+      status: "running",
+      tool: "",
+      params: {},
+      kind: "reasoning",
+    });
+  }
   const hasProcess = Boolean(reasoning) || timelineItems.length > 0 || Boolean(planSummaryText);
   // 计划文本必须在时间线重建之前写入：重建时按它决定是否插入计划块，
   // 且插入位置在"思考之后、第一个工具之前"（先有思考才有计划）。
@@ -1495,37 +1721,48 @@ function updateAgentTurn(entry, message, run, llm) {
     entry.planBlock.classList.add("flash-in");
   }
   if (planSummaryText) entry.planBlock.style.display = "";
-  // 运行中：以流式 reasoning_text 更新最后一条思考块（打字机效果）
-  if (running && reasoning && timelineItems.length) {
-    const last = timelineItems[timelineItems.length - 1];
-    if (nodeCategory(last) === "reasoning") {
-      last.body = reasoning;
-      last.tool = "";
-    }
-  }
+  // 运行中思考正文由 process_trace 条目自身的 body 流式更新；不可再用累计的
+  // reasoning_text 覆写最后一条，否则新一轮思考块会显示整段历史思考。
   // 内容签名变化就重建时间线：条目状态会从 running → completed/failed，
   // 只做增量追加会让已渲染的行永远停在"转圈"。
   // 注意：不计入"正在流式的那个思考块的正文"，否则每个 token 都会重建、
   // 打字机动画被反复打断；流式正文在重建之外就地更新。
-  const liveIdx = running
-    ? timelineItems.findIndex((i) => nodeCategory(i) === "reasoning" && i.status === "running")
-    : -1;
+  // 活跃行取"最后一个 running 思考"（新一轮追加在末尾）：上一轮的残留
+  // running 行还在时，findIndex 取第一条会把流式文本全部写进旧行。
+  let liveIdx = -1;
+  if (running) {
+    for (let i = timelineItems.length - 1; i >= 0; i -= 1) {
+      if (nodeCategory(timelineItems[i]) === "reasoning" && timelineItems[i].status === "running") {
+        liveIdx = i;
+        break;
+      }
+    }
+  }
+  const liveKey = liveIdx >= 0 ? timelineRowKey(timelineItems[liveIdx], liveIdx) : "";
   let sig = "";
   try {
-    sig = JSON.stringify(
+    sig = JSON.stringify([
+      liveKey, // 活跃行身份入签名：新增/切换 running 行时重建一次，同一行涨文本不重建
       timelineItems.map((i, idx) => [
         i.tool,
         i.status,
         i.params,
         i.title,
         idx === liveIdx ? String(i.body || "").length > 0 : String(i.body || ""),
-      ])
-    );
+      ]),
+    ]);
   } catch (e) {
-    sig = String(timelineItems.length) + "|" + (running ? "1" : "0");
+    sig = String(timelineItems.length) + "|" + (running ? "1" : "0") + "|" + liveKey;
   }
   if (sig !== entry.timelineSig) {
     entry.timelineSig = sig;
+    // 重建会整体替换节点：先按行 key 记下已展开的折叠块，重建后恢复，
+    // 否则流式期间每次重建都会把用户展开的思考块收起。
+    const openRows = new Set(
+      Array.from(entry.timeline.querySelectorAll("details[open]"))
+        .map((d) => d.closest("[data-tl-row]")?.dataset.tlRow)
+        .filter(Boolean)
+    );
     entry.timeline.textContent = "";
     // 计划块插到"思考之后、第一个工具之前"——先有 LLM 思考才有计划，
     // 不能顶在最上面。
@@ -1537,16 +1774,29 @@ function updateAgentTurn(entry, message, run, llm) {
         entry.timeline.appendChild(entry.planBlock);
         planInserted = true;
       }
-      if (cat === "reasoning") entry.timeline.appendChild(reasoningNode(item, idx === liveIdx));
-      else if (cat === "system") entry.timeline.appendChild(systemNode(item));
-      else entry.timeline.appendChild(toolLineNode(item));
+      let node;
+      // 思考行用 ui-chat.js 自己的渲染（图标紧跟正文、展开内联）：ui-composer.js
+      // 里的旧 reasoningNode 是"标题行 + 单独一行点击展开全文"，样式已被替换。
+      if (cat === "reasoning") node = timelineThinkNode(item, idx === liveIdx);
+      else if (cat === "skill") node = skillNode(item);
+      else if (cat === "system") node = systemNode(item);
+      else node = toolLineNode(item);
+      const key = timelineRowKey(item, idx);
+      node.dataset.tlRow = key;
+      if (openRows.has(key)) {
+        const fold = findRowFold(node);
+        if (fold) fold.open = true;
+      }
+      entry.timeline.appendChild(node);
     });
     if (!planInserted && entry.planBody.textContent) entry.timeline.appendChild(entry.planBlock);
   } else if (liveIdx >= 0) {
-    // 结构未变：只把流式文本就地写进正在运行的那个思考块（打字机效果）
-    const liveNode = entry.timeline.querySelector(".tl-node.tl-reasoning.running");
+    // 结构未变：只把流式文本就地写进活跃思考块（打字机效果）。
+    // 按行 key 定位而不是 .running 类，避免命中残留的旧 running 行。
+    const liveNode = Array.from(entry.timeline.children).find((n) => n.dataset.tlRow === liveKey);
     if (liveNode) {
-      const target = liveNode.querySelector(".tl-think-body, .tl-think-result .tl-line");
+      // 运行中的思考行不做展开器，正文就在 .tl-think-body 里就地增长
+      const target = liveNode.querySelector(".tl-think-body");
       const text = String(timelineItems[liveIdx].body || "");
       if (target && target.textContent !== text) target.textContent = text;
     }
@@ -1575,10 +1825,11 @@ function updateAgentTurn(entry, message, run, llm) {
       }
     }
 
-    // 思考内容已在时间线里逐块渲染（运行中的最后一块就地打字机更新），
-    // 这里只维护外层标题行的"最新一句"滚动提示。
-    entry.procLatest.textContent = running ? latestThinkLine(reasoning) : "";
-    entry.procLatest.scrollLeft = running ? entry.procLatest.scrollWidth : 0;
+    // 思考正文只在时间线里显示（运行中的最后一块就地打字机增长）。标题行
+    // 不再滚动"最新一句"：思考文字出现在折叠标题里看起来像"输出位置不对"，
+    // 而且它是整句替换，视觉上就是一句一句蹦，不是流式输出。
+    entry.procLatest.textContent = "";
+    entry.procLatest.scrollLeft = 0;
   } else {
     entry.procFold.style.display = "none";
     entry.planBlock.style.display = "none";
@@ -1593,8 +1844,57 @@ function updateAgentTurn(entry, message, run, llm) {
     entry.answerBody.style.display = text ? "" : "none";
   }
 
+  // 活跃且尚无任何可见内容（过程/正文）时，显示一行状态占位而不是留空白。
+  // 覆盖两个空窗：服务端 message_create 到首条 delta 之间，以及平滑流式
+  // 尚未释放第一批正文期间。正文/过程一出现立即收起（不重建节点，只切
+  // display 与文本，避免闪烁）。
+  const showPill = running && !isError && !text && !hasProcess;
+  if (showPill) {
+    const pillText = agentStatusPillText(message, linkedRun);
+    if (entry.lastPillText !== pillText) {
+      entry.lastPillText = pillText;
+      entry.statusPillText.textContent = pillText;
+    }
+  }
+  if (entry.lastPillShown !== showPill) {
+    entry.lastPillShown = showPill;
+    entry.statusPill.style.display = showPill ? "" : "none";
+  }
+
   entry.root.classList.toggle("error", isError);
+  // 与 renderChatMessage 的既有约定一致：非活跃且完全无内容的助手消息不留
+  // 孤立空气泡（真正有内容的完成/错误消息不受影响）。
+  const emptyTurn = !running && !text && !hasProcess && !isError;
+  if (entry.lastEmptyTurn !== emptyTurn) {
+    entry.lastEmptyTurn = emptyTurn;
+    entry.root.style.display = emptyTurn ? "none" : "";
+  }
   entry.lastStatus = message.status;
+}
+
+// 增量渲染判据：消息对象被 SSE upsert 替换/就地修改（bindPendingRunId 写
+// run_id、updateMessageContent 追加正文）后 key 必变；同一份状态被重复渲染
+// （提交时乐观追加、refresh 与 SSE 重叠触发）时 key 不变，整条消息的 DOM
+// 更新可以直接跳过。details 只取渲染真正读取的字段（含 process_trace 每个
+// 条目的状态与正文长度），不做深比较。
+function messageRenderKey(message) {
+  if (!message) return "";
+  const details = message.details || {};
+  const trace = Array.isArray(details.process_trace) ? details.process_trace : [];
+  return [
+    message.id || "",
+    message.role || "",
+    message.status || "",
+    message.run_id || "",
+    String(message.content || "").length,
+    message.updated_at || message.created_at || 0,
+    details.phase || "",
+    details.mode || "",
+    String(details.reasoning_text || "").length,
+    String(details.plan_summary || "").length,
+    Array.isArray(message.attachments) ? message.attachments.length : 0,
+    trace.map((item) => `${item?.status || ""}:${String(item?.body || "").length}`).join(","),
+  ].join("|");
 }
 
 function renderChat(messages, run, llm) {
@@ -1651,6 +1951,12 @@ function renderChat(messages, run, llm) {
       els.chatThread.appendChild(entry.root);
     }
     orderedRoots.push(entry.root);
+    // 增量纪律：消息 key 与 run 引用都没变时跳过该条的 DOM 更新。乐观追加
+    // 一次只需 O(N) 次字符串比较，不再对整份消息列表做 DOM 写入。
+    const renderKey = messageRenderKey(message);
+    if (entry.lastRenderKey === renderKey && entry.lastRenderRun === run) continue;
+    entry.lastRenderKey = renderKey;
+    entry.lastRenderRun = run;
     if (entry.kind === "agent") updateAgentTurn(entry, message, run, llm);
     else updateUserTurn(entry, message);
   }
@@ -1909,7 +2215,7 @@ function renderAgentThoughts(message, run, active) {
 
 function normalizeProcessKind(item) {
   const explicit = String(item?.kind || "").trim().toLowerCase();
-  if (["reasoning", "tool", "verify", "memory", "system", "plan", "plan_step"].includes(explicit)) {
+  if (["reasoning", "tool", "skill", "verify", "memory", "system", "plan", "plan_step"].includes(explicit)) {
     return explicit;
   }
   const title = String(item?.title || "").toLowerCase();
@@ -1920,6 +2226,7 @@ function normalizeProcessKind(item) {
 
 function processKindLabel(kind) {
   if (kind === "tool") return "工具";
+  if (kind === "skill") return "技能调用";
   if (kind === "plan_step") return "执行计划";
   if (kind === "verify") return "校验";
   if (kind === "memory") return "记忆";
@@ -2013,11 +2320,8 @@ function humanDecisionReason(reason, action = "") {
   if (action === "airsim_take_photo" || normalized.includes("capture the current camera frame")) {
     return "获取当前摄像头画面";
   }
-  if (action === "airsim_vlm_analyze_image" || normalized.includes("analyze the captured camera frame")) {
-    return "调用所选多模态模型分析画面";
-  }
-  if (action === "airsim_vlm_confirm_target" || normalized.includes("confirm the requested target")) {
-    return "确认画面中是否存在目标";
+  if (action === "inspect_current_frame" || normalized.includes("analyze the current camera frame") || normalized.includes("confirm the requested target")) {
+    return normalized.includes("confirm the requested target") ? "确认画面中是否存在目标" : "调用所选多模态模型分析画面";
   }
   if (normalized.includes("visual analysis/confirmation has completed")) {
     return "视觉分析已完成，准备输出结果";
@@ -2099,6 +2403,18 @@ function clearPendingCommand(pendingCommand = {}) {
   if (!ids.size) return;
   localPendingMessages = localPendingMessages.filter((message) => !ids.has(message.id));
   renderChat(latestState?.messages || [], latestState?.current_run || null, latestState?.llm || {});
+}
+
+// 提交成功后的兜底状态同步：正常路径完全由 SSE 推进（message_create/
+// message_update/message_delta/run_update），不做整页重渲染。只有事件流
+// 已断开、且稍后仍收不到该 run 的消息时才拉一次 /api/state。
+function schedulePostSubmitFallback(runId = "") {
+  window.setTimeout(() => {
+    const messages = Array.isArray(latestState?.messages) ? latestState.messages : [];
+    if (runId && messages.some((message) => message.run_id === runId)) return; // SSE 已送达
+    if (streamSource && streamSource.readyState !== 2) return; // 流在线/重连中，继续等推送
+    refresh().catch(() => {});
+  }, 900);
 }
 
 function humanStatus(status, phase = "", mode = "") {
@@ -2187,8 +2503,10 @@ function extendToSafeMarkdown(text, pos) {
     }
     if (start >= pos) break;
   }
-  if (inFence) return fenceFrom > 0 ? fenceFrom : pos;
-  if (inTable) return tableFrom > 0 ? tableFrom : pos;
+  // 未闭合的代码块/表格：退回到它们的起点再释放。注意起点为 0 时同样成立
+  // （此前 `> 0` 会把"整段以未闭合 fence 开头"误判成安全切点）。
+  if (inFence) return fenceFrom >= 0 ? fenceFrom : pos;
+  if (inTable) return tableFrom >= 0 ? tableFrom : pos;
   return pos;
 }
 
@@ -2201,6 +2519,10 @@ function smoothParagraphTarget(text, shown, minChars = 24) {
   else {
     const nl = text.indexOf("\n", need);
     if (nl !== -1) pos = nl + 1;
+    // 单段长文本（整段没有换行）没有可用的段落/行边界：按最小批量释放。
+    // 否则整段正文要等消息完成（smoothFlushMessage）才一次性出现，
+    // 生成期间气泡只有状态占位，操作员会觉得"文字迟迟不出来"。
+    else pos = Math.min(text.length, need);
   }
   if (pos === -1) return shown;
   pos = extendToSafeMarkdown(text, pos);
@@ -2310,7 +2632,15 @@ function handleStreamEvent(type, payload) {
     latestState.current_run = payload;
     latestState.runtime = latestState.runtime || {};
     latestState.runtime.status = payload.status || latestState.runtime.status;
-    render(latestState);
+    // run 进度事件很密集（提交后立刻就有一次）。这里只更新与 run 直接相关的
+    // 区域，不再走 render(latestState) 的整页重建（工具清单/事件流/会话列表/
+    // Skill 列表都是整段 innerHTML），那是提交瞬间可感卡顿的主要来源。
+    renderTopbar(payload, latestState.tool_runtime || {}, latestState.supervisor || {}, latestState.llm || {});
+    renderPlan(payload);
+    renderApprovalDialog(payload, latestState.pending_approvals || []);
+    updateMapView(latestState);
+    scheduleChatRender();
+    syncCommandSubmitState();
     syncRosTelemetryStream();
     return;
   }

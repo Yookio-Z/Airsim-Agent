@@ -825,6 +825,8 @@ function openAgentSettings() {
   if (els.settingsBackdrop) els.settingsBackdrop.hidden = false;
   renderModelConfig();
   renderSkills();
+  // 与其它分区一致：打开面板时加载一次正文；失败只内联提示，不阻塞面板
+  loadAgentPrompt();
 }
 
 function closeAgentSettings() {
@@ -832,6 +834,74 @@ function closeAgentSettings() {
   if (els.settingsBackdrop && (!els.systemSettingsModal || els.systemSettingsModal.hidden)) {
     els.settingsBackdrop.hidden = true;
   }
+}
+
+// ── Agent 操作规范（config/agent_system.md）───────────────────────────────
+// 后端把该文件正文注入 Agent 的规划/决策上下文；这里就地编辑并保存。
+// 只在首次打开抽屉时拉取一次（不轮询），保存走 POST，不刷新页面。
+let agentPromptLoaded = false;
+const agentPromptFields = {
+  text: document.getElementById("agentPromptText"),
+  path: document.getElementById("agentPromptPath"),
+  status: document.getElementById("agentPromptStatus"),
+  save: document.getElementById("agentPromptSave"),
+};
+
+function renderAgentPromptStatus(message = "", level = "") {
+  const status = agentPromptFields.status;
+  if (!status) return;
+  status.hidden = !message;
+  status.textContent = message;
+  status.dataset.level = level;
+}
+
+async function loadAgentPrompt(force = false) {
+  if (agentPromptLoaded && !force) return;
+  const text = agentPromptFields.text;
+  try {
+    const data = await api("/api/settings/agent-prompt");
+    if (text) {
+      text.value = String(data.content ?? "");
+    }
+    if (agentPromptFields.path) {
+      agentPromptFields.path.textContent = String(data.path || "config/agent_system.md");
+    }
+    agentPromptLoaded = true;
+    renderAgentPromptStatus("");
+  } catch (error) {
+    // 加载失败也不锁死编辑器：保留框内已有内容，内联提示原因，仍可编辑并保存
+    const message = error && error.message ? error.message : "未知错误";
+    renderAgentPromptStatus(`规范加载失败: ${message}`, "error");
+    showNotice("Agent 操作规范加载失败: " + message, "error");
+  }
+}
+
+async function saveAgentPrompt() {
+  const text = agentPromptFields.text;
+  if (!text) return;
+  const save = agentPromptFields.save;
+  if (save) save.disabled = true;
+  try {
+    const data = await post("/api/settings/agent-prompt", { content: text.value });
+    agentPromptLoaded = true;
+    if (agentPromptFields.path && data && data.path) {
+      agentPromptFields.path.textContent = String(data.path);
+    }
+    renderAgentPromptStatus("已保存", "ok");
+    showNotice("Agent 操作规范已保存", "success");
+  } catch (error) {
+    const message = error && error.message ? error.message : "未知错误";
+    renderAgentPromptStatus(`保存失败: ${message}`, "error");
+    showNotice("保存 Agent 操作规范失败: " + message, "error");
+  } finally {
+    if (save) save.disabled = false;
+  }
+}
+
+if (agentPromptFields.save) {
+  agentPromptFields.save.addEventListener("click", () => {
+    saveAgentPrompt();
+  });
 }
 
 function initSystemSettingsDrag() {
@@ -894,167 +964,8 @@ async function openSystemSettings() {
   renderConnectionDetail(selectedConnectionId);
   setSystemSettingsSection(activeSystemSettingsSection || "links");
   renderSystemConnection();
-  loadAirSimSettingsTemplates();
 }
 
-async function loadAirSimSettingsTemplates(force = false) {
-  if (airsimTemplatesLoaded && !force) return;
-  try {
-    const data = await api("/api/airsim-settings");
-    airsimTemplatesLoaded = true;
-    airsimTemplatesCache = data.templates || [];
-    renderAirSimSettingsForConnection();
-  } catch (error) {
-    console.warn("AirSim settings templates load failed:", error);
-  }
-}
-
-function airsimTemplateForConnectionType(type) {
-  // 连接预设 → 模板：AirSim → SimpleFlight; PX4 MAVLink(UDP/TCP/auto/serial) → UDP SITL; ROS2 → TCP 边端
-  const mapping = {
-    airsim: "airsim_simpleflight_multirotor",
-    udp: "px4_mavlink_udp_sitl",
-    tcp: "px4_mavlink_udp_sitl",
-    auto: "px4_mavlink_udp_sitl",
-    serial: "px4_mavlink_udp_sitl",
-    px4_ros2: "px4_ros2_tcp_edge",
-  };
-  return mapping[String(type || "").toLowerCase()] || "";
-}
-
-function selectedConnectionTypeForTemplate() {
-  // 1) cache 的 connection.type 最可靠 (持久化), 优先
-  const detail = connectionsCache.find((c) => c.id === selectedConnectionId);
-  if (detail?.type) return detail.type;
-  // 2) 新建 (id 为空), 用表单 select 当前值
-  if (els.connectionDetailType && els.connectionDetailType.value) {
-    return els.connectionDetailType.value;
-  }
-  return latestState?.tool_runtime?.backend || "";
-}
-
-function renderAirSimSettingsForConnection() {
-  const wrap = document.getElementById("airsimSettingsTemplates");
-  const applyBtn = document.getElementById("airsimTemplateApply");
-  const name = document.getElementById("airsimTemplateName");
-  const code = document.getElementById("airsimTemplateCode");
-  if (!wrap || !applyBtn) return;
-
-  const rawType = selectedConnectionTypeForTemplate();
-  const type = String(rawType || "").toLowerCase().trim();
-  const matched = airsimTemplateForConnectionType(type);
-  const template = airsimTemplatesCache.find((t) => t.id === matched) || null;
-  airsimTemplateSelected = template?.id || "";
-
-  // 给应用按钮 dataset 留一份最近一次的 (conn, type, template) 用于兜底/调试;
-  // 不再把诊断信息写到可见 DOM 上.
-  const connId = selectedConnectionId || "(无)";
-  applyBtn.dataset.connId = connId;
-  applyBtn.dataset.connectionType = type;
-  applyBtn.dataset.templateId = airsimTemplateSelected;
-  console.debug("[AirSim template] type=", type, "matched=", matched, "template=", template?.label, "connId=", connId);
-
-  if (!template) {
-    wrap.hidden = true;
-    applyBtn.hidden = true;
-    if (code) code.innerHTML = "";
-    return;
-  }
-  wrap.hidden = false;
-    applyBtn.hidden = false;
-  if (name) name.textContent = template.label || "—";
-
-  const raw = String(template.content || "");
-  const formatted = formatAirSimSettingsJson(raw);
-  if (code) {
-    code.innerHTML = "";
-    code.appendChild(buildHighlightedJsonLines(formatted));
-  }
-}
-
-// ---- 配置预览美化: 行号 + 语法高亮 ----
-
-function formatAirSimSettingsJson(raw) {
-  if (!raw) return "";
-  // 模板可能本来就是合法 JSON 字符串, 也可能是带注释或多余空格的近似 JSON.
-  // 先尝试解析再 2 空格格式化; 失败则按原文逐行轻处理 (保留行结构, 但去掉空行).
-  try {
-    return JSON.stringify(JSON.parse(raw), null, 2);
-  } catch (_) {
-    return raw.replace(/\r\n/g, "\n").replace(/^\s*\n/gm, "").trimEnd();
-  }
-}
-
-function buildHighlightedJsonLines(text) {
-  const ol = document.createElement("ol");
-  ol.className = "airsim-template-lines";
-  const lines = (text || "").split("\n");
-  for (let i = 0; i < lines.length; i++) {
-    const li = document.createElement("li");
-    const ln = document.createElement("span");
-    ln.className = "ln";
-    ln.textContent = String(i + 1);
-    const codeSpan = document.createElement("span");
-    codeSpan.className = "code";
-    const line = lines[i];
-    codeSpan.innerHTML = line ? highlightJsonLine(line) : "<span class=\"empty\">·</span>";
-    li.append(ln, codeSpan);
-    ol.append(li);
-  }
-  return ol;
-}
-
-async function applyAirSimSettingsTemplate() {
-  // 应用前再算一次, 同时从按钮 dataset 拉出最近一次 render 算出的 (type, templateId)
-  // 任意两者任一非空都作为兜底, 拒绝使用完全 stale 的 airsimTemplateSelected.
-  renderAirSimSettingsForConnection();
-
-  const button = document.getElementById("airsimTemplateApply");
-  const fallbackType = String(button?.dataset.connectionType || "").toLowerCase();
-  const fallbackTemplate = String(button?.dataset.templateId || "");
-  if (!airsimTemplateSelected) {
-    if (fallbackTemplate && airsimTemplatesCache.some((t) => t.id === fallbackTemplate)) {
-      airsimTemplateSelected = fallbackTemplate;
-    } else {
-      showNotice("当前连接类型没有可用的 AirSim settings 模板", "error");
-      return;
-    }
-  }
-
-  const type = String(selectedConnectionTypeForTemplate() || fallbackType || "").toLowerCase();
-  const template = airsimTemplatesCache.find((t) => t.id === airsimTemplateSelected);
-  const templateLabel = template?.label || airsimTemplateSelected;
-  console.info(
-    "[AirSim apply] connId=", button?.dataset.connId,
-    "type=", type,
-    "template=", airsimTemplateSelected
-  );
-  if (!confirm(`将备份当前 settings.json 并写入模板：${templateLabel}\n之后需重启 AirSim 生效。继续？`)) return;
-  const original = button.textContent;
-  button.disabled = true;
-  button.textContent = "写入中...";
-  try {
-    const result = await post("/api/airsim-settings/apply", { template: airsimTemplateSelected });
-    const resultEl = document.getElementById("airsimTemplateResult");
-    if (resultEl) {
-      resultEl.hidden = false;
-      resultEl.classList.toggle("error", !result.ok);
-      resultEl.textContent = result.ok
-        ? `已写入模板「${templateLabel}」到 Documents/AirSim/settings.json${result.backup_path ? "（原文件已备份）" : ""}`
-        : `${result.error || "应用失败"}`;
-    }
-  } catch (error) {
-    const resultEl = document.getElementById("airsimTemplateResult");
-    if (resultEl) {
-      resultEl.hidden = false;
-      resultEl.classList.add("error");
-      resultEl.textContent = `${error.message || "应用失败"}`;
-    }
-  } finally {
-    button.disabled = false;
-    button.textContent = original;
-  }
-}
 
 function vehicleSettingsAvailable() {
   const runtime = latestState?.tool_runtime || {};
@@ -1954,7 +1865,6 @@ function renderConnectionDetail(connectionId) {
     if (els.connectionDetailDelete) els.connectionDetailDelete.hidden = true;
     updateConnectionTypeFields();
     renderActualLinkCard();
-    renderAirSimSettingsForConnection();
     return;
   }
 
@@ -1975,8 +1885,6 @@ function renderConnectionDetail(connectionId) {
   if (els.connectionDetailConnect) els.connectionDetailConnect.textContent = actuallyActive ? "断开" : "连接";
   if (els.connectionDetailDelete) els.connectionDetailDelete.hidden = false;
   renderActualLinkCard();
-  // 切换预设后, AirSim settings.json 模板按当前 type 重新计算
-  renderAirSimSettingsForConnection();
 }
 
 function updateConnectionDetailStatus(connected) {
@@ -1994,12 +1902,18 @@ function updateConnectionTypeFields() {
   const tcpFields = document.getElementById("tcpFieldsDetail");
   const portFields = document.getElementById("portFieldsDetail");
   const remotePortFields = document.getElementById("remotePortFieldsDetail");
+  const remotePortHint = document.getElementById("remotePortHintDetail");
   const realVehicleFields = document.getElementById("realVehicleFieldsDetail");
   const usesHostLikeField = ["udp", "airsim", "auto", "px4_ros2"].includes(type);
+  // 18570 这类远端端口是 PX4 SITL 的实例端口约定：真机自带厂商链路，
+  // 填了只会让心跳探测发往错误地址，所以勾选真实飞控后整项隐藏。
+  const realVehicleChecked = Boolean(els.connectionDetailRealVehicle?.checked);
+  const remotePortApplies = type === "udp" || type === "auto";
   if (serialFields) serialFields.hidden = type !== "serial";
   if (udpFields) udpFields.hidden = !usesHostLikeField;
   if (tcpFields) tcpFields.hidden = type !== "tcp";
-  if (remotePortFields) remotePortFields.hidden = type !== "udp" && type !== "auto";
+  if (remotePortFields) remotePortFields.hidden = !remotePortApplies || realVehicleChecked;
+  if (remotePortHint) remotePortHint.hidden = !remotePortApplies || !realVehicleChecked;
   if (realVehicleFields) realVehicleFields.hidden = type === "airsim" || type === "px4_ros2";
   const hostLabel = udpFields?.querySelector("label");
   if (hostLabel) {
@@ -2034,10 +1948,6 @@ function updateConnectionTypeFields() {
     }
     portFields.hidden = !["serial", "udp", "tcp", "airsim", "auto"].includes(type);
   }
-  // 连接类型切换后, AirSim settings.json 模板区按当前 type 联动
-  if (typeof renderAirSimSettingsForConnection === "function") {
-    renderAirSimSettingsForConnection();
-  }
 }
 
 function readConnectionDetailForm() {
@@ -2060,8 +1970,13 @@ function readConnectionDetailForm() {
   if (type === "udp" || type === "tcp" || type === "airsim" || type === "auto") {
     params.portNumber = String(els.connectionDetailPortNumber?.value || "").trim();
   }
-  if (type === "udp" || type === "auto") params.remotePort = String(els.connectionDetailRemotePort?.value || "").trim();
-  if (type !== "airsim" && type !== "px4_ros2") params.realVehicle = Boolean(els.connectionDetailRealVehicle?.checked);
+  const realVehicleChecked = Boolean(els.connectionDetailRealVehicle?.checked);
+  // 真机不写 remotePort：字段隐藏期间留着的旧值（例如从 SITL 预设抄来的
+  // 18570）会被存下来，让心跳探测发往不存在的 SITL 实例端口。
+  if ((type === "udp" || type === "auto") && !realVehicleChecked) {
+    params.remotePort = String(els.connectionDetailRemotePort?.value || "").trim();
+  }
+  if (type !== "airsim" && type !== "px4_ros2") params.realVehicle = realVehicleChecked;
 
   return {
     ok: true,

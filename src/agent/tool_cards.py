@@ -94,7 +94,7 @@ TOOL_CARDS: dict[str, ToolCard] = {
         outputs="mode, stable flag, per-drone positions/targets, coverage progress.",
         required_capabilities=["flight_control"],
         risk="medium",
-        not_for="Single-vehicle tasks — use the drone_* tools instead. Not available on MAVLink/ROS2 backends.",
+        not_for="Single-vehicle tasks — use the drone_* tools instead. Not available on the px4_ros2 backend, and needs at least 2 vehicles.",
         notes=[
             "While a formation is active, single-vehicle flight tools are blocked (use hover_all/land_all/stop first).",
             "Emergency stop and run end automatically hover all formation drones.",
@@ -193,12 +193,17 @@ TOOL_CARDS: dict[str, ToolCard] = {
         name="drone_approach_target",
         purpose="Make one bounded forward step toward the currently centered/locked visual target.",
         when_to_use=(
-            "确认目标且目标已在画面中央、需要缩短距离时使用（视觉伺服式抵近）。"
-            "单步有界 1~3m，只看机体前方；目标未居中或感知无目标会拒绝执行。"
-            "每次抵近后必须重新检测/确认，再决定是否继续靠近或转入持续跟踪。"
+            "确认目标且目标已在画面中央、需要靠近看细节时使用（视觉伺服式抵近）。"
+            "够近的判据是目标在画面里的大小，不是固定距离：目标高度占到画面 "
+            "min_fill（默认 25%）即认为能辨认特征，直接返回 reached。"
+            "目标未居中或感知无目标会拒绝执行；每次抵近后重新检测/确认再决定下一步。"
         ),
-        inputs={"step_m": "本次前向推进距离（米），限制 1~3m，默认 2"},
-        outputs="Approach step result with target track_id, pixel offset ex, and new NED position.",
+        inputs={
+            "min_fill": "目标高度占画面比例达到多少算够近，默认 0.25（越小越靠近）",
+            "step_m": "单步最大前进距离（米），限制 1~12，默认 12",
+            "standoff_m": "可选的绝对距离下限（米），0 = 不启用",
+        },
+        outputs="Approach step result with target_fill, estimated distance_m, target track_id, pixel offset ex, and new NED position.",
         required_capabilities=["flight_control", "object_detection"],
         preconditions=["connected", "target detected and horizontally centered"],
         not_for="Blind movement when no target is locked, or approaching without re-checking afterwards.",
@@ -339,42 +344,6 @@ TOOL_CARDS: dict[str, ToolCard] = {
         required_capabilities=["object_detection"],
         preconditions=["A camera source / perception stream is available"],
         cost="low",
-    ),
-    "airsim_vlm_confirm_target": ToolCard(
-        name="airsim_vlm_confirm_target",
-        purpose="Use the configured multimodal model to confirm whether the current image contains a requested target and report the evidence.",
-        when_to_use=(
-            "目标已经由检测提示可能存在、需要二次确认时调用一次。每次抵近/换角度后最多调用一次；"
-            "若确认结果不确定（目标太远、细节不足），下一步应是抵近观察再确认，而不是原地重复调用。"
-            "确认成功后进入追踪阶段，跟踪复检优先用 airsim_detect_objects。"
-        ),
-        inputs={
-            "target_description": "natural language target description such as red car/person/truck",
-            "source": "last_image or explicit image_base64",
-            "image_base64": "optional PNG/JPEG base64 when not using last_image",
-        },
-        outputs="Structured VLM confirmation: target_found, confidence, evidence, relative direction, and next-action hint.",
-        required_capabilities=["image_capture"],
-        preconditions=["A multimodal model is selected", "An image is available from the perception stream or last capture"],
-        cost="high",
-        risk="low",
-        notes=["This tool does not move the vehicle; it only analyzes imagery."],
-    ),
-    "airsim_vlm_analyze_image": ToolCard(
-        name="airsim_vlm_analyze_image",
-        purpose="[ALIAS for inspect_current_frame] Use the multimodal model to describe the current frame.",
-        when_to_use="[DEPRECATED alias] When you would call this tool, prefer inspect_current_frame which has the same effect. If only this alias is available, the runtime will forward to inspect_current_frame.",
-        inputs={
-            "question": "operator question about the image",
-            "source": "last_image or explicit image_base64",
-            "image_base64": "optional PNG/JPEG base64 when not using last_image",
-        },
-        outputs="Concise scene description, visible objects, target candidates, and safety-relevant notes.",
-        required_capabilities=["image_capture"],
-        preconditions=["A multimodal model is selected", "An image is available from capture/search or image_base64 is provided"],
-        cost="medium",
-        risk="low",
-        notes=["This tool does not move the vehicle; it only analyzes imagery."],
     ),
     "provider_bridge_health": ToolCard(
         name="provider_bridge_health",

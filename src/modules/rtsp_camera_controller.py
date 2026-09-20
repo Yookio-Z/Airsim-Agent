@@ -23,11 +23,25 @@ class RtspCameraController:
 
     backend_name = "rtsp"
 
-    def __init__(self, url: str, stale_after_sec: float = 3.0) -> None:
+    def __init__(
+        self,
+        url: str,
+        stale_after_sec: float = 3.0,
+        transport: str = "",
+        open_timeout_sec: float = 0.0,
+    ) -> None:
         self.url = url
+        # 真机图传链路上 UDP 丢包表现为花屏/卡死，TCP 更容易一次连上；
+        # transport 为空时保持 OpenCV 默认（UDP），不改变既有调用方行为。
+        self.transport = str(transport or "").strip().lower()
         self.is_connected = False
         self.last_error = ""
-        self._source = RtspFrameSource(url, stale_after_sec=stale_after_sec)
+        self._source = RtspFrameSource(
+            url,
+            stale_after_sec=stale_after_sec,
+            transport=transport,
+            open_timeout_sec=open_timeout_sec,
+        )
         self._lock = threading.RLock()
 
     # -- connection ---------------------------------------------------------
@@ -51,7 +65,7 @@ class RtspCameraController:
         return ["rtsp"]
 
     def get_connection_info(self) -> dict[str, Any]:
-        return {"url": self.url, "connected": self.is_connected}
+        return {"url": self.url, "transport": self.transport, "connected": self.is_connected}
 
     def get_status(self, vehicle_name: str = "") -> DroneStatus:
         return DroneStatus(

@@ -23,7 +23,7 @@
 >
 > 实际注册给 LLM 的工具面（manifest 全量核对）：飞行原语（fly_to/fly_velocity/rotate 等）、
 > `airsim_detect_objects`（单帧）、`airsim_get_depth_map`、`airsim_take_photo`、
-> `airsim_vlm_analyze_image/confirm_target`、编队、provider 工具。
+> `inspect_current_frame`（多模态读图）、编队、provider 工具。
 > **没有连续追踪类工具**——LLM 若要追踪只能"检测→飞一步→再检测"手动循环（≈0.5Hz），
 > 这正是 README 明确禁止的 LLM 进入高频控制回路。
 >

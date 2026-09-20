@@ -19,6 +19,8 @@ LoopStopCheck = Callable[[], bool]
 LoopPauseCheck = Callable[[], bool]
 AgentToolExecutor = Callable[[str, dict[str, Any], bool], ToolCallResult]
 LoopStateCallback = Callable[[LoopState], None]
+# 执行中由操作员追加的补充指令（steer）：每次调用返回并清空待注入的指令。
+LoopSteerProvider = Callable[[], list[str]]
 
 # 计划中"可验证目标达成"的运动类工具：LLM 声明任务完成前，这些动作
 # 必须在该循环内留下一次成功执行记录（或被状态回读证明目标已达成）。
@@ -31,6 +33,26 @@ _PLANNED_MOTION_TOOLS = {
     "drone_land",
     "drone_rotate_to",
 }
+
+# 计划步骤"连续偏离"多少次后才放弃该步。第一次偏离只是把控制权交回 LLM 做一次
+# 纠错（例如先搜索/对准目标），下一轮回到原步骤重新判断；只有同一步骤连续偏离
+# 到这个次数，才认为它当前确实不可行并跳过——否则像"抵近目标"这种关键步骤会
+# 因为"那一刻没有锁定目标"被永久跳过，任务再也不会去靠近。
+_PLAN_DEVIATION_RETRIES = 2
+
+# 依赖相机画面的工具：任务用过其中任意一个，感知停滞就必须让任务停下来。
+_PERCEPTION_TOOLS = {
+    "perception_start",
+    "perception_status",
+    "perception_stop",
+    "airsim_detect_objects",
+    "inspect_current_frame",
+    "drone_approach_target",
+}
+
+# 画面停滞多久算异常。相机 4~5 FPS，正常帧龄 < 1s；AirSim 卡住时采集会持续
+# 超时，帧龄单调增长。20 秒留足瞬时抖动的余量，避免误停任务。
+_PERCEPTION_STALL_S = 20.0
 
 
 class AgentLoop:
@@ -49,6 +71,7 @@ class AgentLoop:
         on_state: LoopStateCallback | None = None,
         async_timeout: float = 120.0,
         async_poll_interval: float = 1.0,
+        steer_provider: LoopSteerProvider | None = None,
     ) -> None:
         self.tools = tools
         self.planner = planner
@@ -59,6 +82,7 @@ class AgentLoop:
         self.should_pause = should_pause
         self.execute_tool = execute_tool
         self.on_state = on_state
+        self.steer_provider = steer_provider
         self.async_timeout = max(1.0, float(async_timeout))
         self.async_poll_interval = max(0.05, float(async_poll_interval))
 
@@ -91,7 +115,12 @@ class AgentLoop:
         memory_snapshot = self.memory.snapshot()
         guidance_loader = getattr(self.skills, "guidance_cards", None)
         skill_guidance = guidance_loader(command, capabilities, memory_snapshot) if callable(guidance_loader) else []
-        decision_cards = self._decision_cards(command, [], tool_cards, capabilities)
+        # 技能卡片必须进决策面：技能是"这类任务该怎么做"的指导，模型激活后会拿到
+        # 完整步骤说明再调用底层工具。以前这里固定传空列表，技能永远进不了循环的
+        # 候选动作，操作员也就永远看不到技能参与（实测反馈）。
+        decision_cards = self._decision_cards(
+            command, self._skill_decision_cards(capabilities), tool_cards, capabilities
+        )
         # 白名单必须来自"真实注册的工具"，而不是提示用的卡片列表——卡片为了
         # 控制 prompt 体积会截断（32 张），一旦某工具被挤出，LLM 选了它就会
         # 被误判成"当前后端不可用"。
@@ -112,6 +141,16 @@ class AgentLoop:
                 pass
         for extra in ("memory_recall", "memory_remember", "agent_subtask"):
             allowed_tools.add(extra)
+        # Skill documents are activatable actions, not just prompt text: the
+        # model loads a skill's guidance by emitting its action name, so the
+        # name has to survive _sanitize_decision. Added after the registered-tool
+        # replacement above, which would otherwise wipe them.
+        activatable_loader = getattr(self.skills, "activatable", None)
+        if callable(activatable_loader):
+            try:
+                allowed_tools |= {str(name) for name in activatable_loader(capabilities) if name}
+            except Exception:
+                pass
         last_result: dict[str, Any] | None = None
         failure_count = 0
         connection_failures = 0
@@ -124,6 +163,8 @@ class AgentLoop:
         # 计划游标起点：纠错重入时从"已完成前缀"之后继续，避免把已经成功
         # 执行过的步骤（连接/起飞/检测…）整条重跑。
         plan_cursor = max(0, int(initial_plan_cursor or 0))
+        # 每个计划步骤的连续偏离计数（见 _PLAN_DEVIATION_RETRIES）。
+        plan_deviation_counts: dict[int, int] = {}
 
         for step_index in range(1, max_steps + 1):
             if self._should_stop():
@@ -131,6 +172,18 @@ class AgentLoop:
                 state.failure_reason = "supervisor emergency stop"
                 break
             self._wait_if_paused()
+            steered = self._take_steer()
+            if steered:
+                # 操作员在执行中追加的要求：并入命令文本后模型下一轮就能看到，
+                # 任务、计划和已完成的动作全部保留——不需要推倒重来，也就不会
+                # 触发中断收尾的降落。
+                command = "\n".join([command, *[f"[操作员补充指令] {item}" for item in steered]])
+                self._event(
+                    "info", "agent_loop",
+                    "已并入操作员补充指令",
+                    {"step": step_index, "steer": steered},
+                    kind="steer",
+                )
 
             observation = LoopObservation(
                 step_index=step_index,
@@ -142,6 +195,20 @@ class AgentLoop:
             state.observations.append(observation)
             self._notify_state(state)
             self._event("info", "agent_loop", f"Observation {step_index}", observation.to_dict(), kind="observation")
+
+            stall = self._perception_stall(observation, state)
+            if stall:
+                # 相机链路卡住但飞控心跳照旧时，循环会继续基于陈旧画面决策。
+                # 依赖感知的任务必须停下来（保持悬停），而不是接着盲飞。
+                state.status = "blocked"
+                state.failure_reason = stall
+                self._event(
+                    "danger", "agent_loop",
+                    "感知画面长时间没有更新，任务已停止（飞机保持悬停）",
+                    {"detail": stall, "step": step_index},
+                    kind="perception",
+                )
+                break
 
             decision = None if require_llm else self._preemptive_guard_decision(command, state, observation, allowed_tools, capabilities)
             plan_decision: LoopDecision | None = None
@@ -156,13 +223,29 @@ class AgentLoop:
                 if reactive and plan_step is not None:
                     deviation_reason = self._plan_step_deviation(plan_step, state)
                 if deviation_reason:
-                    resume_cursor = plan_cursor + 1
-                    self._event(
-                        "warning", "agent_loop",
-                        f"观察偏离计划，转 ReAct 重新决策：{deviation_reason}",
-                        {"step": step_index, "planned_tool": str(getattr(plan_step, "tool", ""))},
-                        kind="replan",
-                    )
+                    planned_tool = str(getattr(plan_step, "tool", ""))
+                    attempts = plan_deviation_counts.get(plan_cursor, 0) + 1
+                    plan_deviation_counts[plan_cursor] = attempts
+                    if attempts >= _PLAN_DEVIATION_RETRIES:
+                        # 同一步骤反复偏离：它当前确实不可行，跳过以免死循环。
+                        plan_deviation_counts.pop(plan_cursor, None)
+                        resume_cursor = plan_cursor + 1
+                        self._event(
+                            "warning", "agent_loop",
+                            f"观察持续偏离计划，跳过该步骤：{deviation_reason}",
+                            {"step": step_index, "planned_tool": planned_tool, "attempts": attempts},
+                            kind="replan",
+                        )
+                    else:
+                        # 保留游标：本轮交给 LLM 纠错（搜索/对准），下一轮回到这一步
+                        # 重新判断，而不是把关键动作永久跳过。
+                        resume_cursor = plan_cursor
+                        self._event(
+                            "warning", "agent_loop",
+                            f"观察偏离计划，转 ReAct 重新决策（稍后回到该步骤）：{deviation_reason}",
+                            {"step": step_index, "planned_tool": planned_tool, "attempts": attempts},
+                            kind="replan",
+                        )
                 else:
                     plan_decision = self._plan_step_decision(initial_plan, plan_cursor, allowed_tools)
                     decision = plan_decision
@@ -338,6 +421,8 @@ class AgentLoop:
             # 本步由计划驱动且成功 → 计划游标前移，继续按计划执行下一步
             if plan_decision is not None and plan_cursor >= 0:
                 plan_cursor += 1
+                # 步骤已经推进，之前的偏离计数不再适用
+                plan_deviation_counts.clear()
 
             # 确定性收敛：计划内的实质步骤（检测/视觉/运动等）都已成功执行过，
             # 就结束任务并汇报。否则 LLM 收尾时容易反复存记忆/回读状态，
@@ -478,34 +563,34 @@ class AgentLoop:
 
         wants_open_analysis = self._wants_open_image_analysis(command)
         wants_target = self._wants_target_confirmation(command)
-        has_analysis = self._has_successful_tool(state, "airsim_vlm_analyze_image")
-        has_confirm = self._has_successful_tool(state, "airsim_vlm_confirm_target")
+        # inspect_current_frame 是视觉分析的唯一入口：开放问题和目标确认都走它。
+        has_analysis = self._has_successful_tool(state, "inspect_current_frame")
 
-        if has_image and wants_open_analysis and not has_analysis and "airsim_vlm_analyze_image" in allowed_tools and needs_guard_action:
+        if has_image and wants_open_analysis and not has_analysis and "inspect_current_frame" in allowed_tools and needs_guard_action:
             return LoopDecision(
-                "airsim_vlm_analyze_image",
-                {"question": command, "source": "last_image"},
-                "Analyze the captured camera frame with the selected multimodal model.",
+                "inspect_current_frame",
+                {"question": command},
+                "Analyze the current camera frame with the selected multimodal model.",
             )
 
-        if has_image and wants_target and not has_confirm and "airsim_vlm_confirm_target" in allowed_tools and needs_guard_action:
+        if has_image and wants_target and not has_analysis and "inspect_current_frame" in allowed_tools and needs_guard_action:
             return LoopDecision(
-                "airsim_vlm_confirm_target",
-                {"target_description": self._target_description(command), "source": "last_image"},
+                "inspect_current_frame",
+                {"question": self._confirmation_question(self._target_description(command))},
                 "Confirm the requested target in the captured frame before any movement.",
             )
 
-        if wants_target and has_confirm and self._wants_search(command):
+        if wants_target and has_analysis and self._wants_search(command):
             search = self._search_decision_after_confirmation(command, state, allowed_tools)
             if search is not None:
                 return search
 
-        if self._wants_visual_approach(command) and has_confirm:
+        if self._wants_visual_approach(command) and has_analysis:
             approach = self._approach_decision_from_confirmation(command, state, allowed_tools)
             if approach is not None:
                 return approach
 
-        if (wants_open_analysis and has_analysis) or (wants_target and has_confirm and not self._wants_visual_approach(command)):
+        if (wants_open_analysis and has_analysis) or (wants_target and has_analysis and not self._wants_visual_approach(command)):
             if not decision.action or decision.is_complete:
                 return LoopDecision(
                     action="",
@@ -539,6 +624,36 @@ class AgentLoop:
         if guarded.action or guarded.is_complete or guarded.reflection:
             return guarded
         return None
+
+    def _skill_decision_cards(self, capabilities: dict[str, Any]) -> list[dict[str, Any]]:
+        """可激活的技能，作为决策卡片暴露给模型（名称 + 一句话用途）。
+
+        只列当前后端能力满足、且未被禁用的技能；模型激活某个技能时会拿到它完整
+        的 SKILL.md（渐进披露第二层），然后按里面的步骤调用底层工具。
+        """
+        loader = getattr(self.skills, "usable_doc_cards", None)
+        if not callable(loader):
+            return []
+        try:
+            cards = loader(capabilities) or []
+        except Exception:
+            return []
+        result: list[dict[str, Any]] = []
+        for card in cards:
+            if not isinstance(card, dict):
+                continue
+            name = str(card.get("name") or "").strip()
+            if not name:
+                continue
+            result.append(
+                {
+                    "name": name,
+                    "purpose": str(card.get("description") or card.get("when_to_use") or "").strip()
+                    or "技能操作指导（激活后给出这类任务的完整步骤）",
+                    "kind": "skill",
+                }
+            )
+        return result
 
     def _decision_cards(
         self,
@@ -601,6 +716,42 @@ class AgentLoop:
     def _target_class(self, command: str) -> str:
         return extract_target_class(command) or "target"
 
+    @staticmethod
+    def _confirmation_question(target: str) -> str:
+        """把目标确认转成 inspect_current_frame 的问题。"""
+        target = target.strip() or "目标"
+        return f"画面中是否有{target}？请确认目标是否存在，并简述其位置和外观。"
+
+    @staticmethod
+    def _visual_target_found(data: dict[str, Any]) -> bool:
+        """从 inspect_current_frame 的结果里判断目标是否被视觉确认。
+
+        视觉模型返回 target_found 时以它为准；否则以确认问题下的
+        target_candidates 是否为空作为依据（开放问题同样可能给出候选，
+        这里保持宽松——它只用于阻断/放行"视觉确认后才抵近"的决策）。
+        """
+        if not isinstance(data, dict):
+            return False
+        answer = data.get("answer") if isinstance(data.get("answer"), dict) else data
+        if answer.get("target_found") is not None:
+            return answer.get("target_found") is True
+        candidates = answer.get("target_candidates")
+        if isinstance(candidates, list):
+            return bool(candidates)
+        status = str(answer.get("status") or "").lower()
+        return status in {"target_confirmed", "confirmed", "found", "locked"}
+
+    @staticmethod
+    def _visual_summary(data: dict[str, Any], default: str) -> str:
+        if not isinstance(data, dict):
+            return default
+        answer = data.get("answer") if isinstance(data.get("answer"), dict) else data
+        for key in ("summary_zh", "message", "summary"):
+            text = str(answer.get(key) or "").strip()
+            if text:
+                return text
+        return default
+
     def _has_successful_tool(self, state: LoopState, tool: str) -> bool:
         return any(item.get("tool") == tool and bool(item.get("ok")) for item in self._iter_tool_results(state))
 
@@ -614,6 +765,29 @@ class AgentLoop:
             ):
                 return True
         return False
+
+    def _perception_stall(self, observation: LoopObservation, state: LoopState) -> str:
+        """画面长时间不更新时返回停止原因（"" 表示正常）。
+
+        判据用感知轴自己上报的帧龄，而不是"最后一次图像结果的时间戳"：工具调用
+        可以成功返回，但里面的画面可能早就不动了（AirSim 卡住时就是这样）。
+        """
+        perception = (observation.world_state or {}).get("perception") or {}
+        if not perception.get("enabled"):
+            return ""
+        try:
+            age = float(perception.get("capture_age_s"))
+        except (TypeError, ValueError):
+            return ""
+        if age < _PERCEPTION_STALL_S:
+            return ""
+        used_perception = any(str(result.tool) in _PERCEPTION_TOOLS for result in state.results)
+        if not used_perception:
+            return ""
+        return (
+            f"感知画面已 {age:.0f} 秒没有更新（相机链路可能卡住，飞控心跳仍正常），"
+            "任务已停止以免基于陈旧画面继续动作。"
+        )
 
     def _latest_image_age(self, state: LoopState) -> float | None:
         """Seconds since the newest image-bearing result (None if no image)."""
@@ -678,13 +852,13 @@ class AgentLoop:
         state: LoopState,
         allowed_tools: set[str],
     ) -> LoopDecision | None:
-        confirmation = self._latest_result_data(state, "airsim_vlm_confirm_target")
-        if not confirmation.get("target_found"):
+        confirmation = self._latest_result_data(state, "inspect_current_frame")
+        if not self._visual_target_found(confirmation):
             return LoopDecision(
                 action="",
                 reason="Target was not confirmed in the camera frame, so movement toward it is blocked.",
                 is_complete=False,
-                reflection=str(confirmation.get("message") or confirmation.get("summary_zh") or "target not confirmed"),
+                reflection=self._visual_summary(confirmation, "target not confirmed"),
             )
         if "airsim_get_depth_map" in allowed_tools and not self._has_successful_tool(state, "airsim_get_depth_map"):
             return LoopDecision(
@@ -717,8 +891,8 @@ class AgentLoop:
         state: LoopState,
         allowed_tools: set[str],
     ) -> LoopDecision | None:
-        confirmation = self._latest_result_data(state, "airsim_vlm_confirm_target")
-        if confirmation.get("target_found"):
+        confirmation = self._latest_result_data(state, "inspect_current_frame")
+        if self._visual_target_found(confirmation):
             return None
         target = self._target_class(command)
         if "skill:search" in allowed_tools and not self._has_successful_tool(state, "skill:search"):
@@ -759,7 +933,7 @@ class AgentLoop:
         "position_reached": "drone_get_status",
         "photo_taken": "airsim_take_photo",
         "mission_progress_complete": "drone_get_mission_progress",
-        "target_confirmed": "airsim_vlm_confirm_target",
+        "target_confirmed": "inspect_current_frame",
         "formation_stable": "formation_command",
     }
     # Frames older than this are treated as "no recent image" by the guards.
@@ -857,12 +1031,16 @@ class AgentLoop:
                     count = 0
                 if count == 0:
                     return "上个检测步骤检出 0 个目标，与计划假设不符（应改为搜索/扫视或换角度）"
-        if tool in {"inspect_current_frame", "airsim_vlm_confirm_target"}:
+        if tool == "inspect_current_frame":
             data = self._latest_result_data(state, tool)
             if data:
                 answer = data.get("answer") if isinstance(data.get("answer"), dict) else data
                 status = str(answer.get("status") or "").lower()
+                question = str(data.get("question") or "")
                 if answer.get("target_found") is False or status in {"target_not_confirmed", "not_found"}:
+                    return "视觉确认未通过（目标未确认），应改为抵近或换角度再确认"
+                # 确认型提问（而不是开放描述）没有得到候选目标，同样视为未通过。
+                if ("是否有" in question or "确认" in question) and not self._visual_target_found(data):
                     return "视觉确认未通过（目标未确认），应改为抵近或换角度再确认"
         if tool in {"drone_approach_target", "drone_fly_to", "drone_move_relative"}:
             axis = getattr(self.tools, "perception_axis", None)
@@ -976,7 +1154,7 @@ class AgentLoop:
         elif metric == "target_confirmed":
             found = self._target_found_any(state)
             explicitly_not_found = self._target_not_found_explicit(state)
-            looked = self._has_successful_tool(state, "skill:search") or self._has_successful_tool(state, "airsim_take_photo") or self._has_successful_tool(state, "airsim_vlm_confirm_target")
+            looked = self._has_successful_tool(state, "skill:search") or self._has_successful_tool(state, "airsim_take_photo") or self._has_successful_tool(state, "inspect_current_frame")
             satisfied = bool(found) or (explicitly_not_found and looked)
             base.update(satisfied=satisfied, detail=f"found={found} not_found={explicitly_not_found}")
         elif metric == "landed":
@@ -1034,7 +1212,7 @@ class AgentLoop:
             tool = self._CORRECTIVE_TOOLS.get(str(item.get("metric") or ""))
             if tool is None or tool not in allowed_tools:
                 continue
-            if tool == "airsim_vlm_confirm_target":
+            if tool == "inspect_current_frame":
                 if not self._has_recent_image(state):
                     if "airsim_take_photo" in allowed_tools:
                         return LoopDecision(
@@ -1045,8 +1223,8 @@ class AgentLoop:
                         )
                     continue
                 return LoopDecision(
-                    "airsim_vlm_confirm_target",
-                    {"target_description": str(criterion.get("target") or state.command[:160]), "source": "last_image"},
+                    "inspect_current_frame",
+                    {"question": self._confirmation_question(str(criterion.get("target") or state.command[:160]))},
                     "Re-confirm the target before accepting completion.",
                     is_complete=False,
                 )
@@ -1065,9 +1243,21 @@ class AgentLoop:
             )
         return None
 
+    @staticmethod
+    def _is_confirmation_result(data: dict[str, Any]) -> bool:
+        question = str(data.get("question") or "")
+        return "是否有" in question or "确认" in question
+
     def _target_found_any(self, state: LoopState) -> bool:
         for item in self._iter_tool_results(state):
             if self._nested_bool(item.get("data"), "target_found") is True:
+                return True
+            data = item.get("data") or {}
+            if (
+                item.get("tool") == "inspect_current_frame"
+                and self._is_confirmation_result(data)
+                and self._visual_target_found(data)
+            ):
                 return True
         return False
 
@@ -1077,6 +1267,12 @@ class AgentLoop:
             if self._nested_bool(data, "target_found") is False:
                 return True
             if self._nested_value(data, "status") == "target_not_confirmed":
+                return True
+            if (
+                item.get("tool") == "inspect_current_frame"
+                and self._is_confirmation_result(data)
+                and not self._visual_target_found(data)
+            ):
                 return True
         return False
 
@@ -1384,6 +1580,16 @@ class AgentLoop:
     def _should_stop(self) -> bool:
         return bool(self.should_stop and self.should_stop())
 
+    def _take_steer(self) -> list[str]:
+        """取回操作员在执行中追加的补充指令（provider 负责清空）。"""
+        if self.steer_provider is None:
+            return []
+        try:
+            items = self.steer_provider() or []
+        except Exception:
+            return []
+        return [text for text in (str(item or "").strip() for item in items) if text]
+
     def _event(self, level: str, source: str, message: str, data: dict[str, Any], kind: str = "") -> None:
         if kind:
             data = {**data, "kind": kind}
@@ -1396,11 +1602,12 @@ class AgentLoop:
 
     def _summary(self, state: LoopState) -> str:
         ok_count = sum(1 for result in state.results if result.ok)
+        # 面向操作员的中文总结：这句话会直接出现在对话里。
         if state.status == "completed":
-            return f"Agent loop completed with {ok_count} successful action(s)."
+            return f"任务完成：本次共成功执行 {ok_count} 个动作。"
         if state.failure_reason.startswith("agent loop reached max_steps=") and state.results:
             return self._step_limit_summary(state, state.max_steps)
-        return state.failure_reason or f"Agent loop stopped after {len(state.results)} action(s)."
+        return state.failure_reason or f"任务在 {len(state.results)} 个动作后停止。"
 
     def _step_limit_summary(self, state: LoopState, max_steps: int) -> str:
         ok_tools = [result.tool for result in state.results if result.ok]

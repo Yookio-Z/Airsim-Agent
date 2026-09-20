@@ -142,6 +142,12 @@ const els = {
   cameraSource: $("cameraSource"),
   cameraRtspUrlRow: $("cameraRtspUrlRow"),
   cameraRtspUrl: $("cameraRtspUrl"),
+  cameraRtspTransportRow: $("cameraRtspTransportRow"),
+  cameraRtspTransport: $("cameraRtspTransport"),
+  cameraNameRow: $("cameraNameRow"),
+  cameraVehicleRow: $("cameraVehicleRow"),
+  cameraImageTypeRow: $("cameraImageTypeRow"),
+  cameraSourceHint: $("cameraSourceHint"),
   cameraName: $("cameraName"),
   cameraVehicle: $("cameraVehicle"),
   cameraImageType: $("cameraImageType"),
@@ -393,6 +399,10 @@ const VEHICLE_TELEMETRY_POLL_MS = 250;
 const VEHICLE_SENSOR_RENDER_THROTTLE_MS = 220;
 const DEFAULT_CAMERA_SETTINGS = {
   source: "airsim",
+  url: "",
+  // RTSP 传输协议：真机走 WiFi/图传时 UDP 丢包会表现为花屏或卡死，
+  // 所以默认 TCP（与 QGC 视频链路的可选项一致，只是默认值不同）。
+  transport: "tcp",
   camera_name: "0",
   vehicle_name: "",
   image_type: "scene",
@@ -528,14 +538,6 @@ function calculateBearing(lat1, lon1, lat2, lon2) {
     Math.sin(toRad(lat1)) * Math.cos(toRad(lat2)) * Math.cos(dLon);
   return (Math.atan2(y, x) * (180 / Math.PI) + 360) % 360;
 }
-
-// ── AirSim settings.json（按连接类型联动，详情内嵌 + 共享 detail-footer 应用按钮） ──
-let airsimTemplatesLoaded = false;
-let airsimTemplatesCache = [];
-let airsimTemplateSelected = "";
-
-// 经典 JSON 语法高亮 (highlight.js 同款正则), 改为每行调用一次以保留行号结构.
-const JSON_TOKEN_RE = /("(?:\\u[a-zA-Z0-9]{4}|\\[^u]|[^\\"])*"(?:\s*:)?|\b(?:true|false|null)\b|-?\d+(?:\.\d+)?(?:[eE][+\-]?\d+)?|[{}\[\],])/g;
 
 // 设置面板只保留「通信链路 / 摄像头」：其余分区（通用、地图遥测、任务默认值、
 // 安全、以及整组 Vehicle Settings）已移除，Vehicle Settings 交给 QGC。

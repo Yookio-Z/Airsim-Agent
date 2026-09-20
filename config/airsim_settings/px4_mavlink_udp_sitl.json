@@ -1,7 +1,7 @@
 {
   "SettingsVersion": 1.2,
   "SimMode": "Multirotor",
-  "ApiServerPort": 41452,
+  "ApiServerPort": 41451,
   "ClockSpeed": 1.0,
   "ClockType": "SteppableClock",
   "ViewMode": "FlyWithMe",

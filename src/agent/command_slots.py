@@ -58,6 +58,18 @@ HOVER_TERMS = ("hover", "悬停", "暂停")
 
 STATUS_TERMS = ("status", "state", "telemetry", "查看状态", "状态", "遥测")
 
+# A bare keyword cannot tell "check the status" from "do NOT check the status",
+# and the second form appears in ordinary operator wording ("不需要检查无人机状态，
+# 直接告诉我..."). Without this the negation reads as a request and the intent is
+# inverted. Same style as the hover negation below.
+STATUS_NEGATION_TERMS = (
+    "不需要检查", "不用检查", "不要检查", "无需检查", "不必检查",
+    "不需要查看", "不用查看", "不要查看",
+    "不需要状态", "不用状态", "不要状态",
+    "do not check", "dont check", "don't check", "no need to check",
+    "without checking", "skip the status",
+)
+
 CONNECT_TERMS = ("connect", "连接")
 
 VISUAL_APPROACH_TERMS = ("fly to", "go to", "move to", "approach", "toward", "towards", "飞向", "飞到", "靠近", "前往", "移动到")
@@ -114,7 +126,7 @@ def extract_intents(text: str) -> dict[str, bool]:
         "land": _has_any(lower, LAND_TERMS),
         "return_home": _has_any(lower, RETURN_TERMS),
         "hover": _has_any(lower, HOVER_TERMS),
-        "status": _has_any(lower, STATUS_TERMS),
+        "status": _has_any(lower, STATUS_TERMS) and not _has_any(lower, STATUS_NEGATION_TERMS),
         "connect": _has_any(lower, CONNECT_TERMS),
         "visual_approach": _has_any(lower, VISUAL_APPROACH_TERMS),
         "open_image_analysis": _has_any(lower, OPEN_IMAGE_ANALYSIS_TERMS) and not target_confirmation,

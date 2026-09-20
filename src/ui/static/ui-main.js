@@ -217,9 +217,19 @@ els.commandForm.addEventListener("submit", async (event) => {
     if (resp?.run_id) bindPendingRunId(pendingCommand.agentId, resp.run_id);
     pendingImages = [];
     renderImagePreview();
-    await refresh();
+    // 提交成功后不再同步 await refresh()：那会在乐观气泡刚上屏时触发一次
+    // 整页重渲染（工具清单/事件流/会话与 Skill 列表/地图都是整段重建），
+    // 正是"点发送后卡一下"的主因。对话与运行态由 SSE
+    // （message_create/message_update/run_update）实时推进，这里只保留
+    // 事件流不可用时的兜底同步。
+    schedulePostSubmitFallback(resp?.run_id || "");
     if (resp && resp.ok) {
-      showNotice(mode === "execute" ? "任务已进入执行流程" : "Chat 已提交，正在生成回复", "success");
+      if (resp.status === "steered") {
+        // 任务已在执行：这条指令作为补充指令并入了正在跑的循环，而不是新任务
+        showNotice("已作为补充指令并入当前任务执行", "success");
+      } else {
+        showNotice(mode === "execute" ? "任务已进入执行流程" : "Chat 已提交，正在生成回复", "success");
+      }
     } else {
       // 服务端拒绝了提交：清掉“正在理解指令”的 pending 气泡，避免它
       // 与错误消息并存变红，让用户误以为任务失败后还会继续执行
@@ -646,7 +656,6 @@ normalizeAgentSettingsCopy();
 normalizeSystemSettingsCopy();
 
 connectEventStream();
-initAirSimTemplatesEvents();
 
 renderInitialDefaults();
 

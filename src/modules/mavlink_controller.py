@@ -1117,6 +1117,8 @@ class MavlinkController(FlightController):
         # 因此降为兜底路径。
         if self._takeoff_via_native(altitude, vehicle_name):
             return True
+        if self._stop_requested() or self._link_is_stale():
+            return False
 
         offboard_target = {
             "x": float(self._position.get("x", 0.0) or 0.0),
@@ -1125,8 +1127,27 @@ class MavlinkController(FlightController):
         }
         return self._takeoff_via_offboard(offboard_target, altitude, vehicle_name)
 
+    def _native_takeoff_altitude_amsl(self, altitude: float) -> float | None:
+        # NAV_TAKEOFF param7 is AMSL, while our target is local NED z=-altitude.
+        table = self._system_table(self._target_sysid())
+        with self._lock:
+            now = time.time()
+            if any(now - table[key] > 1.0 for key in ("last_global_position", "last_local_position")):
+                return None
+            global_alt = (table["telemetry"].get("GLOBAL_POSITION_INT") or {}).get("alt")
+            local_z = table["position"].get("z")
+        if global_alt is None or local_z is None:
+            return None
+        values = (float(global_alt), float(local_z), float(altitude))
+        return sum(values) if all(math.isfinite(v) for v in values) else None
+
     def _takeoff_via_native(self, altitude: float, vehicle_name: str = "") -> bool:
-        """原生起飞：MAV_CMD_NAV_TAKEOFF（等价 PX4 commander takeoff）。"""
+        """原生起飞：将本地目标高度转换成 NAV_TAKEOFF 要求的海拔高度。"""
+        self.update_telemetry(timeout=0.2)
+        altitude_amsl = self._native_takeoff_altitude_amsl(altitude)
+        if altitude_amsl is None:
+            self._last_action_error = "native takeoff requires fresh global and local altitude telemetry"
+            return False
         # 上一次 OFFBOARD 起飞失败可能把飞机留在 OFFBOARD：此模式下飞控会
         # 拒绝起飞指令并随即 disarm。先退回可起飞的位置控制模式再发指令。
         if self._current_mode() == "OFFBOARD":
@@ -1153,8 +1174,9 @@ class MavlinkController(FlightController):
             math.nan,
             math.nan,
             math.nan,
-            altitude,
+            altitude_amsl,
         )
+        logger.info("native_takeoff_sent", target_local_altitude_m=altitude, param7_amsl_m=altitude_amsl)
         ack_ok = self._wait_command_ack(mavutil.mavlink.MAV_CMD_NAV_TAKEOFF, timeout=5.0)
         if not ack_ok:
             self._last_action_error = self._with_status_text(
@@ -1165,15 +1187,32 @@ class MavlinkController(FlightController):
         minimum_reached = max(0.5, altitude * 0.85, altitude - 0.5)
         deadline = time.time() + timeout
         stable_since: float | None = None
+        reached_since: float | None = None
         while time.time() < deadline:
+            if self._stop_requested():
+                self.hover(vehicle_name)
+                self._last_action_error = "takeoff interrupted by emergency stop / cancel"
+                return False
+            if self._link_is_stale():
+                self._last_action_error = self._stale_link_message()
+                return False
             self.update_telemetry(timeout=0.2)
             current_altitude = self._current_altitude_m()
-            if current_altitude >= minimum_reached:
-                mode = self._current_mode()
-                return mode in {"LOITER", "POSCTL"} or self.hover(vehicle_name)
-
             mode = self._current_mode()
             vertical_speed = abs(float(self._velocity.get("vz", 0.0) or 0.0))
+            if current_altitude >= minimum_reached:
+                table = self._system_table(self._target_sysid())
+                fresh = time.time() - table["last_local_position"] <= 1.0
+                if mode in {"LOITER", "POSCTL"} and vertical_speed <= 0.2 and fresh:
+                    reached_since = reached_since or time.monotonic()
+                    if time.monotonic() - reached_since >= 1.0:
+                        logger.info("native_takeoff_settled", altitude_m=current_altitude, mode=mode, vertical_speed_m_s=vertical_speed)
+                        return True
+                else:
+                    reached_since = None
+                stable_since = None
+                continue
+            reached_since = None
             native_takeoff_stopped = (
                 current_altitude >= 0.5
                 and mode in {"LOITER", "POSCTL"}

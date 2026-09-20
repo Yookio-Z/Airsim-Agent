@@ -332,14 +332,6 @@ FLIGHT_TOOL_CONSTRAINTS: dict[str, dict[str, dict[str, Any]]] = {
         "auto_save": {"type": "boolean"},
         "verify_target_class": {"type": "string"},
     },
-    "airsim_vlm_confirm_target": {
-        "target_description": {"type": "string", "description": "What to look for in the frame"},
-        "source": {"type": "string", "enum": ["last_image", "capture_new"]},
-    },
-    "airsim_vlm_analyze_image": {
-        "question": {"type": "string", "description": "Open question about the camera frame"},
-        "source": {"type": "string", "enum": ["last_image", "capture_new"]},
-    },
     "airsim_get_depth_map": {
         "camera_name": {"type": "string"},
         "return_vis": {"type": "boolean"},

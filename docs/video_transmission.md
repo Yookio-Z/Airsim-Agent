@@ -71,6 +71,6 @@ Wi-Fi / 4G / 专用数图传模块，只要地面站侧能拿到 RTSP（或 UDP 
 ## 5. 与感知管道的衔接
 
 - RTSP 帧同样可接入 `perception_hub` 的 YOLO 检测（`FrameSource` 统一接口）
-- 拍照工具返回 `image_base64`，LLM 多模态分析（`airsim_vlm_analyze_image`
+- 拍照工具返回 `image_base64`，LLM 多模态分析（`inspect_current_frame`
   的 provider 形态）后续可通过 ROS Camera provider 复用同一帧源
 - 录制：`src/replay` 当前只录遥测 JSONL，图像录制（jpg 序列/mp4）为后续项

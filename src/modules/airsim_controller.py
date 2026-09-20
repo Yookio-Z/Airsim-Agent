@@ -22,6 +22,7 @@ from typing import Optional, Any, Callable
 import airsim
 
 from .flight_controller import FlightController, DroneStatus, ConnectionInfo
+from .camera_stabilization import CameraStabilization
 from ..logging_config import get_logger
 
 logger = get_logger(__name__)
@@ -115,6 +116,8 @@ class AirSimController(FlightController):
         self._executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="airsim_rpc")
         self._rpc_exec_lock = threading.Lock()
         self._last_connected_check = 0.0
+        self._rpc_timing = threading.local()
+        self._camera_stabilization = CameraStabilization()  # disabled until explicitly configured
         # land 成功后记录落地事实（AirSim 落地后遥测滞后/位置残留，见 get_status）
         self._landed_vehicles: set[str] = set()
         # External stop/cancel signal (emergency stop / task cancel). Polled
@@ -128,9 +131,15 @@ class AirSimController(FlightController):
     def _rpc(self, fn, *args, timeout=10.0, **kwargs):
         """在独立线程中执行 AirSim RPC 调用（带执行锁 + 超时）。"""
         result_box = {"value": None, "error": None}
+        submitted = time.perf_counter()
+        timing = {}
 
         def _call():
+            entered = time.perf_counter()
+            timing["queue_ms"] = (entered - submitted) * 1000
             acquired = self._rpc_exec_lock.acquire(timeout=20.0)
+            started = time.perf_counter()
+            timing["lock_ms"] = (started - entered) * 1000
             if not acquired:
                 result_box["error"] = TimeoutError("RPC 执行锁获取超时(20s)")
                 return
@@ -139,6 +148,7 @@ class AirSimController(FlightController):
             except Exception as e:
                 result_box["error"] = e
             finally:
+                timing["service_ms"] = (time.perf_counter() - started) * 1000
                 self._rpc_exec_lock.release()
 
         future = self._executor.submit(_call)
@@ -149,6 +159,9 @@ class AirSimController(FlightController):
             self._reset_rpc_runtime()
             raise TimeoutError(f"AirSim RPC 超时 ({timeout}s)")
 
+        timing["total_ms"] = (time.perf_counter() - submitted) * 1000
+        if hasattr(self, "_rpc_timing"):
+            self._rpc_timing.last = timing
         if isinstance(result_box["error"], Exception):
             raise result_box["error"]
         return result_box["value"]
@@ -199,6 +212,23 @@ class AirSimController(FlightController):
     # 拍照
     # ------------------------------------------------------------------
 
+    def configure_camera_stabilization(self, camera_name, enabled=True, vehicle_name=""):
+        """Opt in locally; no RPC until this camera/vehicle is captured.
+
+        Idempotent. Disable restores the original relative mount once on its next
+        capture. This is sampled software compensation, not a native gimbal.
+        Do not enable alongside native gimbal settings.
+        """
+        if not hasattr(self, "_camera_stabilization"):
+            self._camera_stabilization = CameraStabilization()
+        self._camera_stabilization.configure(camera_name, enabled, vehicle_name)
+
+    def camera_stabilization_status(self, camera_name, vehicle_name=""):
+        """Local health only: capture success does not imply compensation success."""
+        stabilization = getattr(self, "_camera_stabilization", None)
+        return (stabilization.status(camera_name, vehicle_name) if stabilization else
+                {"enabled": False, "applied": False, "error": ""})
+
     def capture_image(
         self,
         camera_name: str = "0",
@@ -207,21 +237,59 @@ class AirSimController(FlightController):
         timeout: float = 15.0,
     ) -> Optional[bytes]:
         """用 simGetImages 拍照，返回 PNG bytes。"""
+        response = self._capture_response(camera_name, image_type, vehicle_name, timeout, compressed=True)
+        return bytes(response.image_data_uint8) if response is not None else None
+
+    def capture_frame(self, camera_name="0", image_type=0, vehicle_name="", timeout=15.0):
+        """Return an owned BGR array without PNG compression or decoding."""
+        import numpy as np
+
+        response = self._capture_response(camera_name, image_type, vehicle_name, timeout, compressed=False)
+        if response is None:
+            return None
+        width, height = int(response.width), int(response.height)
+        data = np.frombuffer(response.image_data_uint8, dtype=np.uint8)
+        if width <= 0 or height <= 0 or data.size != width * height * 3:
+            raise ValueError("AirSim raw Scene frame must contain width * height * 3 BGR bytes")
+        return data.reshape(height, width, 3).copy()
+
+    def _capture_response(self, camera_name, image_type, vehicle_name, timeout, *, compressed):
         if not self._ensure_connected():
             raise RuntimeError("AirSim not connected")
 
-        request = airsim.ImageRequest(camera_name, image_type, False, True)
+        # A paused simulator stops producing frames, and simGetImages blocks until
+        # one is available. Issuing it while paused occupies AirSim's single RPC
+        # thread indefinitely -- that is what froze the Unreal editor whenever the
+        # operator hit pause after a mission. Probe first with a short timeout so
+        # the blocking request is never started. Every capture path (perception
+        # axis, depth, preview, photo) funnels through here.
         try:
-            responses = self._rpc(
-                self._client.simGetImages,
-                [request],
-                timeout=timeout,
-                vehicle_name=vehicle_name,
-            )
+            if bool(self._rpc(self._client.simIsPause, timeout=1.0)):
+                raise RuntimeError(
+                    "AirSim 仿真处于暂停状态；暂停期间不请求图像（否则会占死 AirSim 的 RPC 线程）"
+                )
+        except RuntimeError:
+            raise
+        except Exception:
+            pass  # pause probe unavailable: fall through to the normal path
+
+        request = airsim.ImageRequest(camera_name, image_type, False, compressed)
+        client = self._client  # keep this job bound to its originating runtime
+        stabilization = getattr(self, "_camera_stabilization", None)
+
+        def capture():
+            # Direct calls inside the SAME RPC worker/lock as simGetImages.
+            # Never queue nested RPC work or use estimated flight telemetry.
+            if stabilization is not None:
+                stabilization.before_capture(client, camera_name, vehicle_name)
+            return client.simGetImages([request], vehicle_name=vehicle_name)
+
+        try:
+            responses = self._rpc(capture, timeout=timeout)
             if responses and len(responses) > 0:
                 img_data = responses[0].image_data_uint8
                 if img_data and len(img_data) > 0:
-                    return bytes(img_data)
+                    return responses[0]
             return None
         except TimeoutError:
             logger.warning(f"capture_image 超时 ({timeout}s)，标记连接不健康")
@@ -321,6 +389,11 @@ class AirSimController(FlightController):
         Swapping the lock and executor lets future commands proceed instead of
         waiting forever behind a stale lock.
         """
+        stabilization = getattr(self, "_camera_stabilization", None)
+        if stabilization is not None:
+            # reset_runtime returns a detached copy: a worker still blocked inside
+            # the old instance must not be able to write into the live state.
+            self._camera_stabilization = stabilization.reset_runtime()
         try:
             self._executor.shutdown(wait=False, cancel_futures=True)
         except Exception:
@@ -340,6 +413,9 @@ class AirSimController(FlightController):
             return False
         try:
             self._rpc(self._client.reset)
+            stabilization = getattr(self, "_camera_stabilization", None)
+            if stabilization is not None:
+                self._camera_stabilization = stabilization.reset_runtime(simulator_reset=True)
             self._armed.discard(vehicle_name)
             self._control_enabled.discard(vehicle_name)
             time.sleep(1.0)

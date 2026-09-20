@@ -22,9 +22,33 @@ class PerceptionProfile:
     frame_source: str = "airsim"     # airsim | rtsp | usb
     deploy: str = "local"            # local | remote
     remote_url: str = ""             # deploy=remote: http://<jetson_ip>:<port>
+    # AirSim camera name to capture from. The simulator names cameras in
+    # settings.json; ours used to hardcode "0" everywhere, which breaks the
+    # moment a config names them (e.g. CameraImage/CameraDepth).
+    camera_name: str = "0"
+    # Horizontal FOV of that camera, in degrees. MUST match FOV_Degrees in the
+    # simulator settings: the depth projection converts pixel offsets to angles
+    # with it, and AirSim does not report the FOV over RPC, so a mismatch is
+    # silent. Vertical FOV is derived from it using the image aspect ratio.
+    fov_h: float = 90.0
+    # Sample depth every Nth detection. Distance is a slow variable, and the
+    # depth RPC shares the controller's RPC mutex with frame capture -- at
+    # ~580 ms per sample, sampling too often starves capture and collapses the
+    # effective detection rate. Measured: 1-in-5 left detect_fps at ~0.7 Hz
+    # with ~46% of displayed boxes being extrapolated rather than measured.
+    depth_sample_every: int = 15
     target_class: str = "car"
     confidence: float = 0.25
     update_fps: float = 5.0
+    # YOLO inference rate, decoupled from capture. This used to be hardcoded at
+    # 2.0 inside the engine with no way to change it, while capture ran at
+    # update_fps -- so the detection snapshot could lag the picture by up to half
+    # a second, which shows up as flicker. Measured inference is ~120 ms on CPU
+    # for a 720p frame, so values above ~6 Hz buy little.
+    detect_fps: float = 2.0
+    # Inference resolution. 0 = detector default (1280, measured to give a
+    # far larger confidence margin than 640 on live AirSim frames).
+    imgsz: int = 0
     health_timeout_sec: float = 3.0
     # 检测模型选择：auto（COCO 类别用固定类模型）| world（YOLO-World 开放词表）| coco
     model: str = "auto"
@@ -35,9 +59,14 @@ class PerceptionProfile:
             "frame_source": self.frame_source,
             "deploy": self.deploy,
             "remote_url": self.remote_url,
+            "camera_name": self.camera_name,
+            "fov_h": self.fov_h,
+            "depth_sample_every": self.depth_sample_every,
             "target_class": self.target_class,
             "confidence": self.confidence,
             "update_fps": self.update_fps,
+            "detect_fps": self.detect_fps,
+            "imgsz": self.imgsz,
             "health_timeout_sec": self.health_timeout_sec,
             "model": self.model,
         }
@@ -57,12 +86,22 @@ class PerceptionProfile:
             merged["deploy"] = cfg.perception_deploy
         if getattr(cfg, "perception_remote_url", ""):
             merged["remote_url"] = cfg.perception_remote_url
+        if getattr(cfg, "perception_depth_sample_every", None) is not None:
+            merged["depth_sample_every"] = int(cfg.perception_depth_sample_every)
+        if getattr(cfg, "perception_fov_h", None) is not None:
+            merged["fov_h"] = float(cfg.perception_fov_h)
+        if getattr(cfg, "perception_camera_name", ""):
+            merged["camera_name"] = str(cfg.perception_camera_name)
         if getattr(cfg, "perception_target_class", ""):
             merged["target_class"] = cfg.perception_target_class
         if getattr(cfg, "perception_confidence", None) is not None:
             merged["confidence"] = float(cfg.perception_confidence)
         if getattr(cfg, "perception_update_fps", None) is not None:
             merged["update_fps"] = float(cfg.perception_update_fps)
+        if getattr(cfg, "perception_detect_fps", None) is not None:
+            merged["detect_fps"] = float(cfg.perception_detect_fps)
+        if getattr(cfg, "perception_imgsz", None) is not None:
+            merged["imgsz"] = int(cfg.perception_imgsz)
         if getattr(cfg, "perception_health_timeout_sec", None) is not None:
             merged["health_timeout_sec"] = float(cfg.perception_health_timeout_sec)
         if getattr(cfg, "perception_model", ""):

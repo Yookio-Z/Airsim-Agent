@@ -34,7 +34,12 @@ class DroneConfig(BaseSettings):
 
     # AirSim.
     airsim_ip: str = "127.0.0.1"
-    airsim_port: int = 41452
+    # AirSim's own default. This was 41452, which silently broke the camera: the
+    # running simulator listens on whatever ApiServerPort its settings.json says
+    # (41451 by default), so a mismatch makes every capture fail with no obvious
+    # error in the UI. Keep this equal to the live settings.json, or set
+    # DRONE_AIRSIM_PORT explicitly.
+    airsim_port: int = 41451
 
     # Flight defaults.
     default_takeoff_altitude: float = 3.0
@@ -69,9 +74,14 @@ class DroneConfig(BaseSettings):
     perception_frame_source: str = "airsim"     # airsim | rtsp | usb
     perception_deploy: str = "local"            # local | remote
     perception_remote_url: str = ""             # deploy=remote 时: http://<ip>:<port>
+    perception_camera_name: str = "0"            # AirSim camera name (settings.json key)
+    perception_fov_h: float = 90.0              # must equal FOV_Degrees in settings.json
+    perception_depth_sample_every: int = 15     # sample depth every Nth detection
     perception_target_class: str = "car"
     perception_confidence: float = 0.25
     perception_update_fps: float = 5.0
+    perception_detect_fps: float = 2.0          # YOLO inference rate, decoupled from update_fps
+    perception_imgsz: int = 0                   # 0 = detector default (1280); measured, see yolo_detection._resolve_imgsz
     perception_health_timeout_sec: float = 3.0
     perception_model: str = "auto"              # auto | world(YOLO-World) | coco
     perception_rtsp_url: str = ""               # frame_source=rtsp 时的流地址

@@ -80,7 +80,7 @@ def test_motion_only_plan_stays_plan_execute() -> None:
 
 
 def test_observation_only_plan_stays_plan_execute() -> None:
-    plan = _plan(_step("airsim_take_photo"), _step("airsim_vlm_analyze_image"))
+    plan = _plan(_step("airsim_take_photo"), _step("inspect_current_frame"))
     assert AgentRuntime._plan_has_observation_dependency(plan) is False
 
 
@@ -89,10 +89,10 @@ def test_observation_after_motion_does_not_count() -> None:
     assert AgentRuntime._plan_has_observation_dependency(plan) is False
 
 
-def test_vlm_confirm_before_approach_routes_to_agent_loop() -> None:
+def test_frame_inspection_before_approach_routes_to_agent_loop() -> None:
     plan = _plan(
         _step("airsim_take_photo"),
-        _step("airsim_vlm_confirm_target"),
+        _step("inspect_current_frame"),
         _step("drone_fly_to"),
     )
     assert AgentRuntime._plan_has_observation_dependency(plan) is True

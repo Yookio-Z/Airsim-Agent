@@ -1919,7 +1919,10 @@ class LLMMissionPlanner:
                 LoopDecision(
                     action=name,
                     params=dict(arguments),
-                    reason=text.strip() or f"Call {name}",
+                    # 模型只回了 tool_call、没有正文时 reason 保持为空：合成一个
+                    # "Call <tool>" 会让时间线把工具名当成模型思考显示出来
+                    # （调用方用 decision.action 兜底，见 runtime 的 thought_trace）。
+                    reason=text.strip(),
                     is_complete=False,
                 )
             )
@@ -2436,9 +2439,10 @@ class LLMMissionPlanner:
             "For any flight mission, include connection and state readback. "
             "For takeoff/search/patrol, include drone_arm before drone_takeoff. "
             "MULTI-VEHICLE RULE: when the operator's command targets several or every vehicle (全部/所有/每架/三架无人机/机群), set vehicle_name='all' on EVERY flight step (arm, takeoff, move, land, hover) so all vehicles act together; a missing or empty vehicle_name only moves the default (first) vehicle. After multi-vehicle actions, add a readback step and verify EVERY vehicle reached the expected state before reporting success. "
-            "Use skill_guidance as Markdown operating knowledge, not as callable tools. "
-            "For short ordered UAV workflows, follow the flight_sequence guidance when present while still choosing native tools from available_tool_cards. "
-            "For visual tasks, follow any relevant Markdown guidance, then use airsim_take_photo plus airsim_vlm_analyze_image for open-ended image descriptions or airsim_vlm_confirm_target for named targets. "
+            "SKILL RULE (do this first): skill_guidance lists available skills, and EVERY skill IS a callable action named skill:<name> — it appears in available_tool_cards too. "
+            "When a skill's description matches the operator's task, the FIRST step of your plan MUST be that skill activation ({\"tool\": \"skill:<name>\", \"params\": {}}); it returns the full operating steps for this kind of task, and you then plan the native tool steps accordingly. "
+            "Do not merely read the guidance as background text: activating the skill is what loads the detail. Skipping the activation means planning from memory and missing the preconditions and coordinate rules it carries. "
+            "For visual tasks, follow any relevant Markdown guidance, then use airsim_take_photo plus inspect_current_frame for image questions (open-ended descriptions and named-target confirmation). "
             "For geometric path requests such as square, rectangle, orbit, circle, grid, 正方形, 矩形, 绕圈, or 航线, prefer drone_fly_path when available. Compute conservative local NED waypoints from the latest observed position and avoid rotate-to-heading plus repeated drone_move_relative unless the operator specifically asks to point the camera. "
             "Respect backend_capabilities and available_tool_cards. Never plan tools whose required capabilities are unavailable. "
             "Markdown skills are references, not executable shortcuts; do not prefer kind=skill unless a real executable skill card is explicitly available. "
@@ -2468,6 +2472,14 @@ class LLMMissionPlanner:
                 "outcome decides the next action. Use auto for fixed sequences "
                 "such as takeoff -> waypoints -> land."
             ),
+            "keep_reacting": (
+                "true only when the task has no natural stopping point after the "
+                "listed steps — continuous tracking, shadowing, or keeping a "
+                "target locked until the operator says otherwise. One-shot tasks "
+                "(take a photo, fly to a point, inspect and report, approach and "
+                "confirm) are false: the runtime should converge once the steps "
+                "are done."
+            ),
             "steps": [
                 {
                     "label": "Chinese step label",
@@ -2488,21 +2500,22 @@ class LLMMissionPlanner:
             "At each step, choose exactly one next tool action, or mark the task complete after the latest observation proves the goal is handled. "
             "CORRECTION DISCIPLINE: when entering a correction loop, FIRST read the current vehicle status (drone_get_status) and verify from the observation whether the goal action actually failed — never blindly repeat an action that the previous step already reported as completed (e.g. landing completed means the vehicle is on the ground; calling land again is wrong). If the observation shows the goal is already satisfied, mark is_complete=true instead of re-executing. "
             "NEVER declare is_complete=true while any planned motion step (takeoff/hover/move/fly/land/rotate) is still failed or unexecuted from a previous attempt: you must first successfully re-execute that action (fixing its cause first, e.g. climb to the safe altitude before a blocked horizontal move), or prove with fresh drone_get_status telemetry that the target state is genuinely reached. Declaring the task complete while a goal motion is still missing is a hard error and the run will be marked failed. "
-            "You may additionally batch up to 2 independent read-only tool calls (drone_get_status, drone_list_vehicles, drone_get_mission_progress, airsim_take_photo, airsim_get_sensors, airsim_get_depth_map, airsim_vlm_analyze_image, airsim_vlm_confirm_target) "
+            "You may additionally batch up to 2 independent read-only tool calls (drone_get_status, drone_list_vehicles, drone_get_mission_progress, airsim_take_photo, airsim_get_sensors, airsim_get_depth_map, inspect_current_frame) "
             "in the 'actions' array (JSON mode) or as extra tool calls (native mode). "
             "Never place flight-control tools (arm, disarm, takeoff, land, hover, fly, move, rotate, set_mode, mission upload/start) in that batch — one flight tool per turn. "
             "Use only available_tool_cards. Do not call unavailable tools. "
             "Parse the operator's full instruction yourself, including multi-step Chinese or English commands. Do not rely on keyword routing. "
             "Never bypass safety, never invent telemetry, and do not perform low-level continuous control. "
-            "skill_guidance contains Markdown skills that teach how to work; they are not actions. Never output action=skill:* unless that exact action appears in available_tool_cards. "
+            "skill_guidance is a CATALOG of skills: each entry has a name and a description saying what it covers and when to use it. It teaches how to work; a catalog entry is not itself an action. "
+            "When an entry's description matches the operator's task, your first action should be that skill's action name (for example skill:region-search). That loads the full Markdown guidance as an observation; follow it while choosing native tools. Skills whose description does not match the task must be ignored. "
+            "Never output action=skill:* for a name that is not in skill_guidance. "
             "If the operator's command is a knowledge question, explanation request, or non-UAV task that does not require vehicle tools or backend state, mark is_complete=true in the first turn and put a concise Chinese natural-language answer in reason. Do not force a drone tool call for questions unrelated to UAV operation. "
-            "If flight_sequence guidance is present and the request is a short ordered workflow such as status -> takeoff -> move -> photo/VLM -> return -> land, use that Markdown to choose the next native tool and keep the sequence concise. "
             "For vague scan/move wording such as '一点距离' or '简单扫描', keep horizontal movement to 1-2 meters, use velocity around 1.0-1.5 m/s, and take off to at least 3 m before horizontal movement. "
             "For open-ended 'what is in the photo' requests, use inspect_current_frame (vision-model analysis of the current perception frame). Use it whenever the user asks what the drone sees, the color/type/size of an object, or any '看看画面里.../描述当前画面' question. "
             "For return-to-start, use the first observed position when available instead of guessing home coordinates. "
             "For square/rectangle/orbit/circle/grid path tasks, prefer one drone_fly_path action with explicit local NED waypoints over many rotate-to-heading plus drone_move_relative turns. Use rotate_to only when camera orientation matters. "
             "For multi-step goals, call one available tool per turn, then use the next observation to decide the following tool. "
-            "Prefer status/readback after uncertain results. After a photo or visual sweep produces an image, call airsim_vlm_confirm_target with source=last_image before declaring a target found. "
+            "Prefer status/readback after uncertain results. After a photo or visual sweep produces an image, call inspect_current_frame with a direct confirmation question before declaring a target found. "
             "Use memory_snapshot.guidance to prefer historically reliable skills/tools and to avoid repeating known failure patterns. "
             "An async tool is not complete when it returns started/running; wait for the runtime-provided terminal observation before declaring completion. "
             "If the backend lacks a requested capability, stop safely and explain the limitation in reflection. "
@@ -2521,7 +2534,7 @@ class LLMMissionPlanner:
             "reflection": "optional brief public reflection on the latest observation/result",
             "actions": [
                 {
-                    "action": "additional read-only tool name (drone_get_status, airsim_take_photo, sensors, depth, VLM analysis/confirm) — never flight-control tools",
+                    "action": "additional read-only tool name (drone_get_status, airsim_take_photo, sensors, depth, inspect_current_frame) — never flight-control tools",
                     "params": {"name": "value"},
                     "reason": "optional short text",
                 }
@@ -2704,25 +2717,48 @@ class LLMMissionPlanner:
                     is_complete=False,
                     reflection="The target must be found and identified before a tracking operation is allowed.",
                 )
-        completed_vlm_confirm = self._loop_has_action(loop_state, "airsim_vlm_confirm_target")
-        if completed_navigation_skill or (completed_search_skill and completed_vlm_confirm and not wants_track):
+        completed_frame_inspection = self._loop_has_action(loop_state, "inspect_current_frame")
+        if completed_navigation_skill or (completed_search_skill and completed_frame_inspection and not wants_track):
             return LoopDecision(
                 action="",
                 reason="The selected high-level visual workflow has already run and produced a confirmation.",
                 is_complete=True,
                 reflection="Skill result is available in the previous observation.",
             )
-        if completed_search_skill and not completed_vlm_confirm and not self._loop_has_recent_image(loop_state):
+        if completed_search_skill and not completed_frame_inspection and not self._loop_has_recent_image(loop_state):
             return LoopDecision(
                 action="",
                 reason="Search did not produce an image for multimodal target confirmation.",
                 is_complete=False,
-                reflection="No recent image is available for airsim_vlm_confirm_target.",
+                reflection="No recent image is available for inspect_current_frame.",
             )
 
         if not connected and "drone_connect" in allowed_tools and not self._loop_has_action(loop_state, "drone_connect"):
             return LoopDecision("drone_connect", {}, "Connect before advanced task execution.")
-        if "drone_get_status" in allowed_tools and not self._loop_has_action(loop_state, "drone_get_status"):
+        # Only observe the vehicle when the task is going to act on it. This line
+        # used to fire unconditionally, so the fallback could never answer a pure
+        # question -- it inserted a status read first and the operator saw vehicle
+        # telemetry in reply to "what does that car look like". An information-only
+        # request (visual question or named-target confirmation) with no flight
+        # intent is finished by answering, not by flying.
+        # An explicit request for vehicle state is honoured on its own terms. This
+        # branch used to be missing: the unconditional read below was what served
+        # "查看状态", so gating that line without adding this one would have broken
+        # an explicit status request.
+        if intents["status"]:
+            return LoopDecision("drone_get_status", {}, "Operator asked for vehicle state.")
+        # For everything else, decide by the absence of any *action* intent rather
+        # than by a list of question phrasings: enumerating ways to ask a question
+        # is the same keyword-matching trap that caused this bug. If nothing is
+        # going to be flown, there is nothing to observe first.
+        action_intents = ("motion", "takeoff", "land", "hover", "return_home",
+                          "search", "track", "patrol", "visual_approach", "connect")
+        information_only = not any(intents[k] for k in action_intents)
+        if (
+            not information_only
+            and "drone_get_status" in allowed_tools
+            and not self._loop_has_action(loop_state, "drone_get_status")
+        ):
             return LoopDecision("drone_get_status", {}, "Observe current vehicle state before acting.")
 
         if wants_visual and not (capabilities.get("target_search") or capabilities.get("image_capture") or capabilities.get("target_tracking")):
@@ -2739,13 +2775,13 @@ class LLMMissionPlanner:
         velocity = slots.velocity or 2.0
         if (
             wants_visual
-            and "airsim_vlm_confirm_target" in allowed_tools
-            and not completed_vlm_confirm
+            and "inspect_current_frame" in allowed_tools
+            and not completed_frame_inspection
             and self._loop_has_recent_image(loop_state)
         ):
             return LoopDecision(
-                "airsim_vlm_confirm_target",
-                {"target_description": target, "source": "last_image"},
+                "inspect_current_frame",
+                {"question": f"画面中是否有{target}？请确认目标是否存在，并简述其位置和外观。"},
                 "Use the multimodal model to confirm whether the latest captured frame contains the requested target.",
             )
         if wants_search and "skill:search" in allowed_tools and not completed_search_skill:
@@ -2885,6 +2921,13 @@ class LLMMissionPlanner:
         return keep[:40]
 
     def _compact_skill_guidance(self, cards: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        """Compact the skill CATALOG for the prompt.
+
+        Entries are metadata only (name + description), so the cap is generous:
+        hiding a skill from the catalog means the model can never discover it.
+        The markdown truncation is retained defensively in case a caller passes
+        full doc cards.
+        """
         keep: list[dict[str, Any]] = []
         for card in cards:
             if not isinstance(card, dict) or not card.get("name"):
@@ -2904,7 +2947,7 @@ class LLMMissionPlanner:
                     "executable": False,
                 }
             )
-        return keep[:4]
+        return keep[:20]
 
     def _compact_memory(self, memory: dict[str, Any]) -> dict[str, Any]:
         return {
@@ -3081,6 +3124,18 @@ class LLMMissionPlanner:
             return text
         return f"data:image/png;base64,{text}"
 
+    @staticmethod
+    def _visual_result_text(result: dict[str, Any]) -> str:
+        """从 inspect_current_frame 的结果里取可读的视觉摘要。"""
+        if not isinstance(result, dict):
+            return ""
+        answer = result.get("answer") if isinstance(result.get("answer"), dict) else result
+        for key in ("summary_zh", "message", "summary"):
+            text = str(answer.get(key) or "").strip()
+            if text:
+                return text
+        return ""
+
     def _normalize_vlm_confirmation(self, payload: dict[str, Any], target: str) -> dict[str, Any]:
         if not isinstance(payload, dict):
             payload = {}
@@ -3242,10 +3297,10 @@ class LLMMissionPlanner:
             for row in reversed(tool_results if isinstance(tool_results, list) else []):
                 if not isinstance(row, dict):
                     continue
-                if row.get("tool") not in {"airsim_vlm_analyze_image", "airsim_vlm_confirm_target"}:
+                if row.get("tool") != "inspect_current_frame":
                     continue
                 result = row.get("result") if isinstance(row.get("result"), dict) else {}
-                message = str(result.get("summary_zh") or result.get("message") or "").strip()
+                message = self._visual_result_text(result)
                 if message:
                     return message
 
@@ -3311,8 +3366,7 @@ class LLMMissionPlanner:
             "drone_land": "降落",
             "drone_hover": "悬停",
             "airsim_take_photo": "拍摄图像",
-            "airsim_vlm_analyze_image": "图像分析",
-            "airsim_vlm_confirm_target": "目标确认",
+            "inspect_current_frame": "画面分析",
         }
         completed: list[str] = []
         failed: list[str] = []
@@ -3327,13 +3381,8 @@ class LLMMissionPlanner:
             elif row.get("status") == "failed":
                 failed.append(label)
             result = row.get("result") if isinstance(row.get("result"), dict) else {}
-            if tool in {"airsim_vlm_analyze_image", "airsim_vlm_confirm_target", "airsim_take_photo"}:
-                image_text = str(
-                    result.get("summary_zh")
-                    or result.get("message")
-                    or result.get("summary")
-                    or image_text
-                ).strip()
+            if tool in {"inspect_current_frame", "airsim_take_photo"}:
+                image_text = self._visual_result_text(result) or image_text
         chain = "、".join(dict.fromkeys(completed)) or "已有工具调用"
         failed_text = f"失败或未确认步骤：{'、'.join(dict.fromkeys(failed))}。" if failed else ""
 
@@ -3412,7 +3461,10 @@ class LLMMissionPlanner:
             if not isinstance(raw, dict):
                 continue
             tool = str(raw.get("tool", "")).strip()
-            if tool not in known_tools and tool != "memory_store":
+            # skill:* 永远允许：激活技能只是把该技能的步骤说明取回来（只读，
+            # 不含飞控指令）。以前这里把"不在原生工具表里"的计划步骤一律丢弃，
+            # 模型即使写了 skill:* 也会被静默删掉。
+            if tool not in known_tools and tool != "memory_store" and not tool.startswith("skill:"):
                 continue
             params = raw.get("params") or {}
             if not isinstance(params, dict):
@@ -3447,6 +3499,7 @@ class LLMMissionPlanner:
             execution_mode=str(payload.get("execution_mode") or "auto").strip().lower()
             if str(payload.get("execution_mode") or "").strip().lower() in {"auto", "agent_loop"}
             else "auto",
+            keep_reacting=bool(payload.get("keep_reacting")),
             goal=self._goal_from_payload(payload.get("goal"), command),
         )
 
@@ -3545,10 +3598,17 @@ class LLMMissionPlanner:
                     step.params.setdefault("target_class", target_class)
                 step.params.setdefault("max_steps", 4)
                 step.params.setdefault("scene_description", command)
-            elif step.tool == "airsim_vlm_confirm_target":
-                target_class = self._command_target_class(command)
-                step.params.setdefault("target_description", target_class or command)
-                step.params.setdefault("source", "last_image")
+            elif step.tool == "inspect_current_frame":
+                # 目标确认参数收口成 inspect_current_frame 的提问（该工具只收 question）。
+                step.params.pop("source", None)
+                step.params.pop("target_description", None)
+                if not str(step.params.get("question") or "").strip():
+                    target_class = self._command_target_class(command)
+                    step.params["question"] = (
+                        f"画面中是否有{target_class}？请确认目标是否存在，并简述其位置和外观。"
+                        if target_class
+                        else command
+                    )
             normalized.append(step)
 
         # 目标识别/追踪类任务定高 2~3m：机载相机前视 15°，这个高度才能平视
@@ -3585,37 +3645,29 @@ class LLMMissionPlanner:
             command,
             ["what", "describe", "scene", "see", "look", "有什么", "看到", "看看", "画面", "照片", "图像内容"],
         )
-        needs_vlm_analyze = (
-            "airsim_vlm_analyze_image" in known_tools
-            and not any(s.tool in {"airsim_vlm_analyze_image", "airsim_vlm_confirm_target"} for s in normalized)
-            and any(s.tool in visual_tools for s in normalized)
-            and wants_open_image_analysis
+        wants_target_look = self._command_has_any(
+            command,
+            ["search", "find", "detect", "识别", "搜索", "寻找", "找", "目标", "photo", "image", "拍照", "图像"],
         )
-        needs_vlm_confirm = (
-            "airsim_vlm_confirm_target" in known_tools
-            and not any(s.tool == "airsim_vlm_confirm_target" for s in normalized)
-            and not needs_vlm_analyze
+        needs_frame_inspection = (
+            "inspect_current_frame" in known_tools
+            and not any(s.tool == "inspect_current_frame" for s in normalized)
             and any(s.tool in visual_tools for s in normalized)
-            and self._command_has_any(command, ["search", "find", "detect", "识别", "搜索", "寻找", "找", "目标", "photo", "image", "拍照", "图像"])
+            and (wants_open_image_analysis or wants_target_look)
         )
-        if needs_vlm_analyze:
-            normalized.append(
-                MissionStep(
-                    "s00",
-                    "Analyze camera image",
-                    "airsim_vlm_analyze_image",
-                    {"question": command, "source": "last_image"},
-                    "perception",
-                )
-            )
-        if needs_vlm_confirm:
+        if needs_frame_inspection:
             target_class = self._command_target_class(command)
+            question = (
+                f"画面中是否有{target_class}？请确认目标是否存在，并简述其位置和外观。"
+                if target_class and wants_target_look and not wants_open_image_analysis
+                else command
+            )
             normalized.append(
                 MissionStep(
                     "s00",
-                    "Confirm visual target",
-                    "airsim_vlm_confirm_target",
-                    {"target_description": target_class or command, "source": "last_image"},
+                    "Inspect camera frame",
+                    "inspect_current_frame",
+                    {"question": question},
                     "perception",
                 )
             )
@@ -3680,7 +3732,7 @@ class LLMMissionPlanner:
                         {"target_class": target_class, "confidence": 0.25}, "perception")
         )
         # 插在第一个视觉确认步骤之前；否则插在降落之前；再否则插在末尾只读回读之前。
-        visual_first = {"inspect_current_frame", "airsim_vlm_confirm_target", "airsim_vlm_analyze_image"}
+        visual_first = {"inspect_current_frame"}
         insert_at = len(steps)
         for index, step in enumerate(steps):
             if step.tool in visual_first or step.tool == "drone_land":

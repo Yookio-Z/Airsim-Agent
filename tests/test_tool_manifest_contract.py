@@ -89,8 +89,6 @@ def test_airsim_atomic_tools_are_documented() -> None:
         "airsim_take_photo",
         "airsim_task_cancel",
         "airsim_task_status",
-        "airsim_vlm_analyze_image",
-        "airsim_vlm_confirm_target",
     }
     missing = sorted(airsim_atomics - set(TOOL_MANIFEST))
     assert missing == [], f"airsim atomic tools missing from TOOL_MANIFEST: {missing}"
@@ -112,8 +110,6 @@ def test_every_atomic_manifest_entry_has_a_registration_source() -> None:
         "airsim_take_photo",
         "airsim_task_cancel",
         "airsim_task_status",
-        "airsim_vlm_analyze_image",
-        "airsim_vlm_confirm_target",
         # registered dynamically by ToolRuntime._ensure_formation_tools on the
         # AirSim backend (multi-vehicle formation control)
         "formation_command",

@@ -428,14 +428,18 @@ def test_agent_loop_keeps_atomic_tools_available_with_markdown_guidance() -> Non
     assert tools.calls == ["drone_takeoff"]
 
 
-def test_visual_question_forces_capture_then_vlm_analysis() -> None:
+def test_visual_question_forces_capture_then_frame_inspection() -> None:
     tools = FakeTools({
         "drone_get_status": _result("drone_get_status", True, {"status": "ok"}),
         "airsim_take_photo": _result("airsim_take_photo", True, {"status": "ok", "image_base64": "aW1hZ2U="}),
-        "airsim_vlm_analyze_image": _result(
-            "airsim_vlm_analyze_image",
+        "inspect_current_frame": _result(
+            "inspect_current_frame",
             True,
-            {"status": "image_analyzed", "summary_zh": "画面中可见地面和无人机结构。"},
+            {
+                "status": "ok",
+                "question": "现在看一下无人机看到了什么信息",
+                "answer": {"status": "image_analyzed", "summary_zh": "画面中可见地面和无人机结构。"},
+            },
         ),
     })
     planner = SequencePlanner([
@@ -454,22 +458,27 @@ def test_visual_question_forces_capture_then_vlm_analysis() -> None:
     )
 
     assert state.status == "completed"
-    assert [item.tool for item in state.results] == ["airsim_take_photo", "airsim_vlm_analyze_image"]
-    assert tools.calls == ["airsim_take_photo", "airsim_vlm_analyze_image"]
+    assert [item.tool for item in state.results] == ["airsim_take_photo", "inspect_current_frame"]
+    assert tools.calls == ["airsim_take_photo", "inspect_current_frame"]
     assert planner.calls == 0
 
 
 def test_visual_confirmation_guard_uses_native_tools_before_blocking_2d_approach() -> None:
     tools = FakeTools({
         "airsim_take_photo": _result("airsim_take_photo", True, {"status": "ok", "image_base64": "aW1hZ2U="}),
-        "airsim_vlm_confirm_target": _result(
-            "airsim_vlm_confirm_target",
+        "inspect_current_frame": _result(
+            "inspect_current_frame",
             True,
             {
-                "status": "target_confirmed",
-                "target_found": True,
-                "relative_direction": "center",
-                "summary_zh": "red car visible",
+                "status": "ok",
+                "question": "画面中是否有fly to the red car in the camera view？请确认目标是否存在，并简述其位置和外观。",
+                "answer": {
+                    "status": "image_analyzed",
+                    "target_found": True,
+                    "relative_direction": "center",
+                    "summary_zh": "red car visible",
+                    "target_candidates": [{"label": "car", "confidence": 0.9}],
+                },
             },
         ),
     })
@@ -485,8 +494,8 @@ def test_visual_confirmation_guard_uses_native_tools_before_blocking_2d_approach
     )
 
     assert state.status == "failed"
-    assert [item.tool for item in state.results] == ["airsim_take_photo", "airsim_vlm_confirm_target"]
-    assert tools.calls == ["airsim_take_photo", "airsim_vlm_confirm_target"]
+    assert [item.tool for item in state.results] == ["airsim_take_photo", "inspect_current_frame"]
+    assert tools.calls == ["airsim_take_photo", "inspect_current_frame"]
     assert "2D image target" in state.failure_reason
     assert planner.calls == 0
 
@@ -494,14 +503,19 @@ def test_visual_confirmation_guard_uses_native_tools_before_blocking_2d_approach
 def test_visual_approach_is_blocked_without_safe_3d_target_or_approach_tool() -> None:
     tools = FakeTools({
         "airsim_take_photo": _result("airsim_take_photo", True, {"status": "ok", "image_base64": "aW1hZ2U="}),
-        "airsim_vlm_confirm_target": _result(
-            "airsim_vlm_confirm_target",
+        "inspect_current_frame": _result(
+            "inspect_current_frame",
             True,
             {
-                "status": "target_confirmed",
-                "target_found": True,
-                "relative_direction": "center",
-                "summary_zh": "确认画面中央有红色车辆。",
+                "status": "ok",
+                "question": "画面中是否有飞向画面中红色车辆位置？请确认目标是否存在，并简述其位置和外观。",
+                "answer": {
+                    "status": "image_analyzed",
+                    "target_found": True,
+                    "relative_direction": "center",
+                    "summary_zh": "确认画面中央有红色车辆。",
+                    "target_candidates": [{"label": "car", "confidence": 0.9}],
+                },
             },
         ),
     })
@@ -521,7 +535,7 @@ def test_visual_approach_is_blocked_without_safe_3d_target_or_approach_tool() ->
     )
 
     assert state.status == "failed"
-    assert [item.tool for item in state.results] == ["airsim_take_photo", "airsim_vlm_confirm_target"]
+    assert [item.tool for item in state.results] == ["airsim_take_photo", "inspect_current_frame"]
     assert "2D image target" in state.failure_reason
     assert planner.calls == 0
 
@@ -953,7 +967,7 @@ def test_agent_loop_require_llm_does_not_run_preemptive_guard_actions() -> None:
 
     tools = FakeTools({
         "airsim_take_photo": _result("airsim_take_photo", True, {"status": "ok", "image_base64": "abc"}),
-        "airsim_vlm_analyze_image": _result("airsim_vlm_analyze_image", True, {"status": "ok"}),
+        "inspect_current_frame": _result("inspect_current_frame", True, {"status": "ok"}),
     })
     loop = AgentLoop(
         tools,  # type: ignore[arg-type]
@@ -968,7 +982,7 @@ def test_agent_loop_require_llm_does_not_run_preemptive_guard_actions() -> None:
             capabilities={"image_capture": True},
             tool_cards=[
                 {"name": "airsim_take_photo"},
-                {"name": "airsim_vlm_analyze_image"},
+                {"name": "inspect_current_frame"},
             ],
             require_llm=True,
         )
@@ -986,7 +1000,7 @@ def test_fast_final_report_includes_flight_chain_and_image_result() -> None:
         [
             MissionStep("s01", "起飞", "drone_takeoff", {"altitude": 3}, "action", status="completed", result={"message": "takeoff complete"}),
             MissionStep("s02", "拍照", "airsim_take_photo", {"image_type": "scene"}, "perception", status="completed", result={"message": "image captured"}),
-            MissionStep("s03", "图像分析", "airsim_vlm_analyze_image", {"source": "last_image"}, "perception", status="completed", result={"summary_zh": "画面中可见道路和建筑。"}),
+            MissionStep("s03", "画面分析", "inspect_current_frame", {"question": "画面里有什么？"}, "perception", status="completed", result={"status": "ok", "answer": {"status": "image_analyzed", "summary_zh": "画面中可见道路和建筑。"}}),
             MissionStep("s04", "降落", "drone_land", {}, "action", status="completed", result={"message": "landing complete"}),
         ],
         planner_source="test",

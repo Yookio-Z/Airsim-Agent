@@ -10,7 +10,6 @@ import time
 import pytest
 
 from src.agent.tool_executor import (
-    TOOL_OUTPUT_SCHEMAS,
     ToolCollector,
     ToolCallResult,
     ToolRuntime,
@@ -164,12 +163,6 @@ def test_output_schema_accepts_good_shapes():
     result = rt.execute("drone_get_status", {})
     assert result.ok is True
     assert "validation_errors" not in result.data
-
-
-def test_vlm_confirm_output_schema_exists():
-    schema = TOOL_OUTPUT_SCHEMAS["airsim_vlm_confirm_target"]
-    assert schema["properties"]["target_found"]["type"] == "boolean"
-    assert schema["properties"]["confidence"]["type"] == "number"
 
 
 # ---------------------------------------------------------------------------

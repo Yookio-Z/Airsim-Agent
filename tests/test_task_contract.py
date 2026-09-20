@@ -78,7 +78,7 @@ def _loop():
 
 
 class _FakeTools:
-    READ_ONLY_TOOLS = {"drone_get_status", "airsim_take_photo", "airsim_vlm_confirm_target"}
+    READ_ONLY_TOOLS = {"drone_get_status", "airsim_take_photo", "inspect_current_frame"}
 
     def __init__(self, drone: dict | None = None) -> None:
         self.drone = drone or {"flying": True, "position_ned": {"x": 0.0, "y": 0.0, "z": -3.0}}

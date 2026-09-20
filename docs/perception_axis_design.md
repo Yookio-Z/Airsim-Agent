@@ -79,7 +79,7 @@ class PerceptionService(Protocol):
    - **Jetson 侧将来运行与 Local 相同的算法代码**（同一份 `perception_service` 包，仅换帧源为本地相机），通过轻量 HTTP 服务暴露 `health/snapshot/events`
    - 协议字段在本文档 §7 冻结，Jetson 实现必须兼容
 
-**运行时选路**：`PerceptionHub 生命周期管理器`（新建 `src/modules/perception_hub.py` 的正式版本 —— 注意：现有 `perception_hub.py` 已确认是死代码，本次以新骨架文件 `perception_axis.py` 承载，避免与旧文件冲突；旧文件保持不动，后续删除在单独提交处理）
+**运行时选路**：`PerceptionAxis 生命周期管理器`（由 `src/modules/perception_axis.py` 承载；旧骨架 `perception_hub.py` 已确认是死代码，已连同 `target_lock.py` / `video_stream.py` / `visual_servoing.py` 一并删除）
 选路规则：
 ```
 remote_url 配置且可达(探测成功)  -> RemotePerceptionService
@@ -141,7 +141,7 @@ GET {remote_url}/events  -> 200 {"events":[...]}   # 消费式(读取后清空)
 2. 感知 SKILL.md 三份：detect / track_object / patrol_area（guidance 模板沿用 formation/flight_sequence）
 3. Jetson 侧感知服务进程化 + HTTP 桥（remote 形态上线，先图像推流后本地相机）
 4. 真机 Profile 显式化 + 链路健康状态机 + 地理围栏
-5. `perception_hub.py` 旧死代码删除（单独提交）
+5. ~~`perception_hub.py` 旧死代码删除~~（已完成：`perception_hub.py` / `target_lock.py` / `video_stream.py` / `visual_servoing.py` 四个死文件已删除）
 6. `ground_plane` locator（真机单目兜底）+ 云台角外参旋转
 
 ## 10. 验收清单（本次框架完成标准）

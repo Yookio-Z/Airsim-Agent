@@ -77,7 +77,9 @@ def register_perception_axis_tools(
                 pass
         if hasattr(axis, "start"):
             try:
-                started = bool(axis.start())
+                # detect=True：相机画面本来就在跑，这里要的是把检测（YOLO）也
+                # 打开；轴已经在运行时它只启动检测线程，不重启采集。
+                started = bool(axis.start(detect=True))
             except Exception as exc:
                 return fmt({"status": "error", "message": f"感知启动失败: {exc}"})
         online = bool(getattr(axis, "is_online", lambda: False)())
@@ -91,14 +93,20 @@ def register_perception_axis_tools(
 
     @mcp.tool()
     def perception_stop() -> str:
-        """停止后台目标检测服务（释放模型与相机通道）。"""
+        """停止目标检测（相机画面保留，随时可以再点开始检测）。
+
+        只停检测线程：停画面会让操作员失去观察手段，而检测才是吃算力的部分。
+        """
         if axis is None:
             return fmt({"status": "error", "message": "perception axis unavailable", "enabled": False})
         try:
-            axis.stop()
+            if hasattr(axis, "stop_detection"):
+                axis.stop_detection()
+            else:
+                axis.stop()
         except Exception as exc:
-            return fmt({"status": "error", "message": f"感知停止失败: {exc}"})
-        return fmt({"status": "ok", "online": False, "message": "检测服务已停止"})
+            return fmt({"status": "error", "message": f"检测停止失败: {exc}"})
+        return fmt({"status": "ok", "detecting": False, "message": "检测已停止（相机画面保留）"})
 
     @mcp.tool()
     def airsim_detect_objects(target_class: str = "", confidence: float = 0.25) -> str:
@@ -109,7 +117,9 @@ def register_perception_axis_tools(
 
         Args:
             target_class: 可选，过滤类别（如 car/person/truck）；留空返回全部
-            confidence: 可选，最低置信度过滤，默认 0.25
+            confidence: 可选，最低置信度过滤。实际生效值不会高于探测器自身的
+                灵敏度（见返回里的 effective_confidence），避免调用方习惯性
+                传高阈值把真实检出全部滤掉。
         """
         if axis is None:
             return fmt({"status": "error", "message": "perception axis unavailable", "enabled": False})
@@ -124,8 +134,12 @@ def register_perception_axis_tools(
             requested = 0.25
         # 复检阈值不得比探测器本身更严格：夜间/远距离小目标的原始置信度常常
         # 只有 0.1 左右，调用方习惯性传 0.25 会把真实检出全部滤掉（表现为
-        # "画面里明明有车却检测不到"）。这里以探测器灵敏度为上限收口。
-        min_conf = min(requested, 0.08)
+        # "画面里明明有车却检测不到"）。所以以探测器灵敏度为上限收口——上限
+        # 取自感知轴当前 profile，而不是写死的常数，否则改了 detector 阈值
+        # 这里就会与之脱节。
+        detector_conf = float(getattr(getattr(axis, "profile", None), "confidence", 0.0) or 0.0)
+        ceiling = detector_conf if detector_conf > 0.0 else requested
+        min_conf = min(requested, ceiling)
         wanted = str(target_class or "").strip().lower()
         detections = [
             t
@@ -138,6 +152,8 @@ def register_perception_axis_tools(
                 "status": "ok",
                 "target_class": wanted,
                 "confidence": min_conf,
+                "requested_confidence": requested,
+                "effective_confidence": min_conf,
                 "detections": detections,
                 "count": len(detections),
                 "total_frames": snap.get("total_frames", 0),
@@ -187,20 +203,23 @@ def register_perception_axis_tools(
         return fmt(payload)
 
     @mcp.tool()
-    def drone_approach_target(step_m: float = 2.0) -> str:
+    def drone_approach_target(step_m: float = 12.0, min_fill: float = 0.25, standoff_m: float = 0.0) -> str:
         """向当前锁定/居中的目标做一次有界的前向抵近（视觉伺服式靠近）。
 
-        单步、有界（1~3m）地向机体前方推进，用于"目标已在画面中央"时缩短
-        距离；每次调用后必须重新检测/确认再决定下一步，避免盲飞。目标不在
-        画面中央、或感知无目标时拒绝执行——先转向对准再靠近。
+        "够近"看的是目标在画面里的大小，不是固定距离：目标高度占到画面
+        min_fill（默认 25%）就认为已经能辨认特征，直接返回 reached 不再前进。
+        用深度图换算出"走到阈值还需要多远"，一步到位；目标不在画面中央、或
+        感知无目标时拒绝执行——先转向对准再靠近。
 
         Args:
-            step_m: 本次前向推进距离（米），会被限制在 1~3m
+            min_fill: 目标高度占画面比例达到多少算够近（0.05~0.9），默认 0.25
+            step_m: 单步最大前进距离（米），限制 1~12，默认 12
+            standoff_m: 可选的绝对距离下限（米），0 = 不启用
         """
         if approach is None:
             return fmt({"status": "error", "message": "当前运行时不支持视觉抵近(未注入 approach 回调)"})
         try:
-            data = approach(float(step_m))
+            data = approach(float(step_m), standoff_m=float(standoff_m), min_fill=float(min_fill))
         except Exception as exc:
             return fmt({"status": "error", "message": f"抵近执行失败: {exc}"})
         return fmt(data)

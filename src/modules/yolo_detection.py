@@ -18,8 +18,6 @@ from typing import Any
 import numpy as np
 
 from src.logging_config import get_logger
-from src.modules.airsim_controller import AirSimController
-from src.modules.occupancy_map import DepthProjection
 
 logger = get_logger(__name__)
 
@@ -160,11 +158,17 @@ def build_search_classes(target_class: str) -> list[str]:
     return classes[:8]
 
 
-def run_yolo_detection(model: Any, img: Any, target_class: str, confidence: float) -> list[dict[str, Any]]:
+def run_yolo_detection(
+    model: Any,
+    img: Any,
+    target_class: str,
+    confidence: float,
+    imgsz: int | float | str | None = None,
+) -> list[dict[str, Any]]:
     """Run YOLO inference and return detections matching the requested target."""
 
     with _yolo_infer_lock:
-        results = model(img, verbose=False)
+        results = model(img, verbose=False, imgsz=_resolve_imgsz(imgsz))
     boxes = results[0].boxes
     # 归一化后再比对：这样 target="blue car" 也能匹配到模型输出的 "car"。
     canonical = canonical_target_class(target_class)
@@ -192,91 +196,6 @@ def run_yolo_detection(model: Any, img: Any, target_class: str, confidence: floa
                 "center": [round(cx), round(cy)],
             }
         )
-
-    return detections
-
-
-def get_depth_image(
-    controller: AirSimController,
-    camera_name: str,
-    vehicle_name: str,
-) -> np.ndarray | None:
-    """Read an AirSim DepthPlanar image as a float32 array in meters."""
-
-    try:
-        import airsim
-
-        responses = controller._rpc_call(
-            lambda: controller._client.simGetImages(
-                [airsim.ImageRequest(camera_name, airsim.ImageType.DepthPlanar, False, False)],
-                vehicle_name=vehicle_name,
-            ),
-            timeout=10.0,
-        )
-        if not responses:
-            return None
-        img_data = responses[0]
-        if not img_data.image_data_float:
-            return None
-        depth_1d = np.array(img_data.image_data_float, dtype=np.float32)
-        width = int(img_data.width)
-        height = int(img_data.height)
-        if width > 0 and height > 0 and len(depth_1d) == width * height:
-            return depth_1d.reshape((height, width))
-    except Exception as exc:
-        logger.warning("depth_image_failed", error=str(exc))
-    return None
-
-
-def project_detections_to_3d(
-    detections: list[dict[str, Any]],
-    controller: AirSimController,
-    camera_name: str,
-    vehicle_name: str,
-    fov_h: float = 90.0,
-    fov_v: float = 60.0,
-) -> list[dict[str, Any]]:
-    """Project 2D detection boxes into local 3D coordinates using depth."""
-
-    depth_img = get_depth_image(controller, camera_name, vehicle_name)
-    if depth_img is None:
-        logger.warning("depth_image_missing_for_projection")
-        for det in detections:
-            det["world_3d"] = {"valid": False}
-        return detections
-
-    try:
-        status = controller.get_status(vehicle_name)
-        drone_pos = (
-            status.position_ned["x"],
-            status.position_ned["y"],
-            status.position_ned["z"],
-        )
-        drone_yaw = controller.get_heading(vehicle_name)
-    except Exception as exc:
-        logger.warning("vehicle_pose_missing_for_projection", error=str(exc))
-        for det in detections:
-            det["world_3d"] = {"valid": False}
-        return detections
-
-    for det in detections:
-        projection = DepthProjection.project_detection_to_world(
-            bbox=det["bbox"],
-            depth_img=depth_img,
-            drone_pos=drone_pos,
-            drone_yaw=drone_yaw,
-            fov_h=fov_h,
-            fov_v=fov_v,
-        )
-        det["world_3d"] = projection
-        if projection["valid"]:
-            logger.info(
-                "detection_projected_to_3d",
-                class_name=det.get("class"),
-                depth_m=projection.get("depth_meters"),
-                world_pos=projection.get("world_pos"),
-                distance_m=projection.get("distance_to_drone"),
-            )
 
     return detections
 
@@ -336,10 +255,11 @@ class AxisDetector:
     """
 
     def __init__(self, target_class: str = "car", confidence: float = 0.25, tracker: str = "bytetrack.yaml",
-                 model: str = "") -> None:
+                 model: str = "", imgsz: int | float | str | None = None) -> None:
         self.canonical = canonical_target_class(target_class) or "car"
         self.confidence = float(confidence)
         self.tracker = tracker
+        self.imgsz = _resolve_imgsz(imgsz)
         self.kind = self._select_kind(self.canonical, model)
         if self.kind == "coco":
             self._model = get_coco_model()
@@ -370,7 +290,13 @@ class AxisDetector:
 
     @property
     def describe(self) -> dict[str, Any]:
-        return {"model": self.kind, "target": self.canonical, "tracker": self.tracker, "track_error": self._track_error}
+        return {
+            "model": self.kind,
+            "target": self.canonical,
+            "tracker": self.tracker,
+            "imgsz": self.imgsz,
+            "track_error": self._track_error,
+        }
 
     def _iter_boxes(self, result: Any) -> list[dict[str, Any]]:
         boxes = getattr(result, "boxes", None)
@@ -412,25 +338,41 @@ class AxisDetector:
 
     def detect(self, frame: Any) -> list[dict[str, Any]]:
         """单帧检测（无跟踪状态），用于预览/验证等场景。"""
+        frame = _to_three_channel(frame)
         with self._lock:
-            results = self._model.predict(frame, verbose=False, conf=self.confidence)
+            results = self._model.predict(frame, verbose=False, conf=self.confidence, imgsz=self.imgsz)
         return self._iter_boxes(results[0]) if results else []
 
     def track(self, frame: Any) -> list[dict[str, Any]]:
-        """带 ByteTrack 的检测：返回带 track_id 的目标；失败自动回退单帧检测。"""
+        """带 ByteTrack 的检测：返回带 track_id 的目标；失败自动回退单帧检测。
+
+        注意回退是**静默**的：一旦跟踪器抛错就走无状态检测，track_id 全部丢失、
+        保活也失效——表现出来就是画面标注闪断，而日志里只有一条 warning。所以
+        这里先把 4 通道帧转成 3 通道：BGRA 会让卷积层直接报维度错（实测
+        "expected input[1, 4, ...] to have 3 channels"），而任何调用方都可能传入
+        未去 alpha 的帧。
+        """
+        frame = _to_three_channel(frame)
         now = time.time()
         locked = now < self._locked_until
         conf = self.confidence * 0.6 if locked else self.confidence
         try:
             with self._lock:
                 results = self._model.track(
-                    frame, persist=True, tracker=self.tracker, verbose=False, conf=conf
+                    frame, persist=True, tracker=self.tracker, verbose=False, conf=conf, imgsz=self.imgsz
                 )
             self._track_error = ""
             dets = self._iter_boxes(results[0]) if results else []
             if dets:
                 # 命中即续锁 5s：期间用低阈值维持
                 self._locked_until = now + 5.0
+            # Deliberately NO fallback on an empty result. Substituting stateless
+            # detections here looks harmless but they carry no track id, so the
+            # engine's IouTracker cannot associate them with the live track: the
+            # track breaks and the box disappears for a sample or two. Measured:
+            # this took the lock duty cycle from 100% to 92.8% with 1.4 s gaps.
+            # An empty result here is better handled by the keep-alive, which
+            # extrapolates the existing track instead of replacing it.
             return dets
         except Exception as exc:  # 跟踪器不可用时不能拖垮感知
             self._track_error = str(exc)
@@ -438,17 +380,69 @@ class AxisDetector:
             return self.detect(frame)
 
 
-def detect_objects_stateless(frame: Any, target_class: str = "car", confidence: float = 0.25) -> list[dict[str, Any]]:
+def _to_three_channel(frame: Any) -> Any:
+    """Drop an alpha channel if present (BGRA -> BGR).
+
+    AirSim Scene frames arrive as BGRA; the frame sources normally strip it, but
+    not every caller does, and a 4-channel tensor fails inside the first conv
+    layer. That failure is not loud: `track()` degrades to stateless detection,
+    so track ids and keep-alive silently disappear and the on-screen boxes start
+    flickering -- a symptom that looks like a detector problem and is not one.
+    """
+    try:
+        if hasattr(frame, "ndim") and frame.ndim == 3 and frame.shape[2] == 4:
+            import cv2
+
+            return cv2.cvtColor(frame, cv2.COLOR_BGRA2BGR)
+    except Exception:
+        pass
+    return frame
+
+
+def _resolve_imgsz(override: int | float | str | None = None) -> int:
+    """Inference resolution.
+
+    Defaults to 1280 rather than ultralytics' 640. Measured on live AirSim
+    frames (a car 32 px across at the default camera geometry, 12 frames x 4
+    repeats, warmup excluded):
+
+        imgsz 640  -> median conf 0.509, min 0.454, 145 ms (6.9 Hz)
+        imgsz 960  -> median conf 0.763, min 0.740, 319 ms (3.1 Hz)
+        imgsz 1280 -> median conf 0.839, min 0.822, 492 ms (2.0 Hz)
+
+    At 640 the margin above a sane threshold is thin, so one marginal frame can
+    drop the target. 1280 costs 2.0 Hz, which is exactly the configured
+    detect_fps, so the margin is bought for free in this pipeline. YOLO-World
+    does not benefit (its conf fell 0.673 -> 0.625 at 1280), which is a further
+    reason standard classes should route to COCO.
+    """
+    value = override
+    if value in (None, "", 0, "0"):
+        value = os.environ.get("DRONE_PERCEPTION_IMGSZ", "")
+    try:
+        parsed = int(float(value))
+    except (TypeError, ValueError):
+        return 1280
+    return parsed if parsed >= 160 else 1280
+
+
+def detect_objects_stateless(
+    frame: Any,
+    target_class: str = "car",
+    confidence: float = 0.25,
+    imgsz: int | float | str | None = None,
+) -> list[dict[str, Any]]:
     """无跟踪状态的单帧检测（预览标注 / 拍照验证用）。
 
     标准类别走 COCO 固定类别模型（更准更快），生僻词回退 YOLO-World。
     """
     canonical = canonical_target_class(target_class) or "car"
+    size = _resolve_imgsz(imgsz)
     if canonical in COCO_CANONICAL:
         model = get_coco_model()
         accept = _coco_names_for(canonical)
         with _yolo_infer_lock:
-            results = model.predict(frame, verbose=False, conf=float(confidence))
+            results = model.predict(frame, verbose=False, conf=float(confidence), imgsz=size)
         boxes = getattr(results[0], "boxes", None) if results else None
         out: list[dict[str, Any]] = []
         if boxes is None:
@@ -468,4 +462,4 @@ def detect_objects_stateless(frame: Any, target_class: str = "car", confidence: 
             })
         return out
     model = get_yolo_model(build_search_classes(canonical))
-    return run_yolo_detection(model, frame, canonical, confidence)
+    return run_yolo_detection(model, frame, canonical, confidence, imgsz=size)

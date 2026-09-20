@@ -162,7 +162,7 @@ AgentRuntime (submit_command / plan_execute / approval)
      `target_confirmed`（VLM confirm target_found）、`position_reached(x,y,z,tolerance)`、`flying_at(altitude,tolerance)`、
      `landed`、`photo_taken`、`status_ok`（无失败工具）、`mission_progress_complete`。
    - LLM plan 路径：LLM 输出 goal（criteria 从固定词汇表选择）；规则路径：按 intent 合成（search→target_confirmed 可选、fly_to→position_reached、land→landed、takeoff→flying_at、patrol→mission_progress_complete 或 flight 完成；默认 []）。
-   - loop 侧：`decision.is_complete` 时先跑 `verify_success(goal, state, telemetry)`；不满足 → 允许**一次**纠正动作（按 criteria 类型映射：position_reached→drone_get_status 重读、target_confirmed→airsim_vlm_confirm_target 重确认、landed→drone_get_status），再验证；仍不满足 → 完成但 summary/memory 标记 `verification_status="failed"`（与 plan 路径 `_verify_run_outcome` 语义对齐）。criteria 无法评估（无遥测）→ 接受完成并记录 warning。
+   - loop 侧：`decision.is_complete` 时先跑 `verify_success(goal, state, telemetry)`；不满足 → 允许**一次**纠正动作（按 criteria 类型映射：position_reached→drone_get_status 重读、target_confirmed→inspect_current_frame 重确认、landed→drone_get_status），再验证；仍不满足 → 完成但 summary/memory 标记 `verification_status="failed"`（与 plan 路径 `_verify_run_outcome` 语义对齐）。criteria 无法评估（无遥测）→ 接受完成并记录 warning。
 2. **工具 JSON Schema 来源**：`tool_schema_from_spec(name, spec, card)` 合成器——ToolSpec.parameters（annotation→type、无 default→required）+ ToolCard.inputs（description）+ 飞行工具手工约束表（altitude 0.5-120、velocity 0.2-20、x/y/z 范围、target_class enum）。集中维护在 `llm_protocol.py`。
 3. **原生工具调用降级判定**：ModelRegistry 每模型显式 `native_tools` 能力标志（并入 `infer_model_capabilities`，可被用户配置覆盖）为主闸门；错误解析 `error.param == "tools"` 优先、消息关键字兜底；降级原因写入 RunLog 并区分"provider 不支持"（降级）与"schema 无效"（抛错）。
 4. **native 模式完成/过程文本协议**：响应含 tool_calls → 非完成，展开执行；无 tool_calls → `is_complete=True`，assistant 文本作为 reason（UI 过程文本依赖它）。

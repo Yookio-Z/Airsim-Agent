@@ -54,8 +54,8 @@
               <div id="cameraViewerDragHandle" class="camera-viewer-drag-handle">
                 <strong>Camera Stream</strong>
               </div>
+              <span id="cameraLiveIndicator" class="camera-live-indicator"><i></i>LIVE</span>
               <label class="camera-viewer-source-inline">
-                <span>图像源</span>
                 <select id="cameraViewerSource" aria-label="选择图像源">
                   <option value="airsim">AirSim 无人机</option>
                   <option value="rtsp">RTSP 视频流</option>
@@ -63,6 +63,10 @@
                 </select>
               </label>
               <span id="cameraSnapshotStatus" data-camera-role="status"></span>
+              <div class="camera-viewer-detect">
+                <span id="cameraDetectStatus" class="camera-detect-status" data-health="idle" title="目标检测未运行，画面仍会持续更新；点『开启目标检测』启动 YOLO">未检测</span>
+                <button id="cameraDetectToggle" class="camera-detect-toggle" type="button" title="启动后台 YOLO 目标检测（模型加载可能需要十几秒）">开启目标检测</button>
+              </div>
               <div class="camera-viewer-actions">
                 <button id="cameraViewerNewWindow" type="button" title="新建摄像头窗口" aria-label="新建摄像头窗口">+</button>
                 <button id="cameraViewerClose" type="button" title="关闭画面" aria-label="关闭画面">×</button>
@@ -92,7 +96,7 @@
                 <span>无人机</span>
                 <select id="cameraViewerVehicle" aria-label="选择无人机"></select>
               </label>
-              <span id="cameraLiveIndicator" class="camera-live-indicator"><i></i>LIVE</span>
+              <span id="cameraPerf" class="camera-perf" hidden></span>
             </div>
             <div class="camera-frame">
               <img id="cameraImage" alt="无人机摄像头画面" hidden>
@@ -302,6 +306,10 @@
           <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="11" width="18" height="10" rx="2"/><path d="M7 11V7a5 5 0 0110 0v4"/><circle cx="12" cy="16" r="1"/></svg>
           <span>模型</span>
         </button>
+        <button data-settings-tab="prompt" title="操作规范：注入 Agent 规划与决策的基本操作规范">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M14 2H6a2 2 0 00-2 2v16a2 2 0 002 2h12a2 2 0 002-2V8z"/><path d="M14 2v6h6"/><path d="M8 13h8M8 17h5"/></svg>
+          <span>操作规范</span>
+        </button>
         <button data-settings-tab="skills" title="技能">
           <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M19 11a2 2 0 012 2v4a2 2 0 01-2 2h-1.8a2 2 0 00-1.4.6l-3 3a2 2 0 01-2.8 0l-3-3a2 2 0 00-1.4-.6H5a2 2 0 01-2-2v-4a2 2 0 012-2h1.8a2 2 0 001.4-.6l3-3a2 2 0 012.8 0l3 3a2 2 0 001.4.6H19z"/><circle cx="12" cy="15" r="1"/></svg>
           <span>技能</span>
@@ -368,6 +376,19 @@
           </header>
           <p class="settings-help">支持 OpenAI-compatible Chat Completions 与 Anthropic Messages API。默认按模型 ID 自动识别图像输入与上下文窗口，识别不准确时可手动覆盖。</p>
           <div id="modelConfigList" class="model-config-list"></div>
+        </div>
+      </section>
+
+      <section class="settings-panel" data-settings-panel="prompt">
+        <div class="settings-card">
+          <header>
+            <strong>Agent 操作规范</strong>
+            <button class="text-action" id="agentPromptSave" type="button" title="保存后注入后续任务的规划与决策上下文">保存</button>
+          </header>
+          <p class="settings-help">这段文字会注入 Agent 的规划与决策上下文，作为无人机基本操作规范；编辑后点击保存立即生效，无需重启服务。</p>
+          <p class="agent-prompt-path" id="agentPromptPath">config/agent_system.md</p>
+          <textarea id="agentPromptText" class="agent-prompt-editor" spellcheck="false" autocomplete="off" placeholder="在此编辑 Agent 基本操作规范（Markdown）"></textarea>
+          <p class="agent-prompt-status" id="agentPromptStatus" hidden></p>
         </div>
       </section>
 
@@ -483,6 +504,9 @@
                     <label for="connectionDetailRemotePort">PX4 远端端口</label>
                     <input type="text" id="connectionDetailRemotePort" placeholder="18570（可留空）">
                   </div>
+                  <div class="form-row connection-type-fields" id="remotePortHintDetail" hidden>
+                    <p class="modal-hint">真机连接不需要这一项：18570 是 PX4 SITL 的实例端口，只在本机或机载 SITL 场景填写。</p>
+                  </div>
                   <div class="form-row connection-type-fields" id="realVehicleFieldsDetail">
                     <label for="connectionDetailRealVehicle">真实飞控</label>
                     <label class="toggle-switch small" title="真实飞控连接启用高风险操作审批">
@@ -491,26 +515,8 @@
                     </label>
                   </div>
 
-                  <div id="airsimSettingsTemplates" class="airsim-settings-templates" hidden>
-                    <div class="airsim-template-row">
-                      <span class="airsim-template-label">AirSim settings.json</span>
-                      <span class="airsim-template-name" id="airsimTemplateName">—</span>
-                    </div>
-                    <details class="airsim-template-preview" open>
-                      <summary>
-                        <span class="airsim-template-preview-label">
-                          <span class="airsim-template-preview-dot"></span>
-                          配置预览
-                        </span>
-                      </summary>
-                      <div class="airsim-template-code" id="airsimTemplateCode" aria-label="AirSim settings.json 预览"></div>
-                    </details>
-                    <div id="airsimTemplateResult" class="airsim-template-result" hidden></div>
-                  </div>
-
                   <div class="detail-footer">
                     <button type="button" id="connectionDetailCancel" class="secondary">取消</button>
-                    <button type="button" id="airsimTemplateApply" class="secondary airsim-apply-btn" hidden>应用到 settings.json</button>
                     <button type="submit" class="primary">保存设置</button>
                   </div>
                 </form>
@@ -554,16 +560,23 @@
                   <label for="cameraRtspUrl">RTSP URL</label>
                   <input type="text" id="cameraRtspUrl" placeholder="rtsp://user:pass@host:554/stream">
                 </div>
-                <div class="form-row">
+                <div class="form-row" id="cameraRtspTransportRow" hidden>
+                  <label for="cameraRtspTransport">传输协议</label>
+                  <select id="cameraRtspTransport">
+                    <option value="tcp">TCP（更稳，推荐）</option>
+                    <option value="udp">UDP（延迟更低）</option>
+                  </select>
+                </div>
+                <div class="form-row" id="cameraNameRow">
                   <label for="cameraName">相机 ID</label>
                   <input type="text" id="cameraName" placeholder="0">
                 </div>
-                <div class="form-row">
+                <div class="form-row" id="cameraVehicleRow">
                   <label for="cameraVehicle">车辆名</label>
                   <input type="text" id="cameraVehicle" list="vehicleOptions" placeholder="留空使用第一架">
                   <datalist id="vehicleOptions"></datalist>
                 </div>
-                <div class="form-row">
+                <div class="form-row" id="cameraImageTypeRow">
                   <label for="cameraImageType">图像类型</label>
                   <select id="cameraImageType">
                     <option value="scene">Scene</option>
@@ -584,6 +597,7 @@
                   </span>
                 </label>
               </div>
+              <p class="modal-hint" id="cameraSourceHint" hidden></p>
             </section>
           </div>
         </div>

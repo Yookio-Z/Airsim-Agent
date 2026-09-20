@@ -3,7 +3,7 @@ name: formation
 display_name: Formation & Coverage Guidance
 status: guidance
 type: guidance
-description: Use this Markdown skill to plan multi-vehicle formation flight and area coverage missions with the formation_command tool.
+description: Use this skill when the operator asks for multi-vehicle formation flight, swarm movement, or area coverage with several drones — for example "菱形编队飞到(50,50)", "三角队形", "编队巡航", "覆盖扫描 100x50 区域", "三机分区搜索整个场地", or any command naming a formation shape (line / v_shape / triangle / diamond / square / hexagon / circle / arrow) or an area to cover with more than one vehicle. Covers the one-intent-per-turn rule, the need to re-check status between moves, the ban on mixing single-vehicle tools while a formation is active, and the stable/percent completion criteria.
 required_capabilities: [flight_control]
 subtools: [formation_command, drone_list_vehicles, drone_get_status]
 cost: medium
@@ -14,10 +14,13 @@ risk: high
 
 ## Purpose
 
-Guide the LLM through multi-vehicle formation flight and area coverage missions on the
-AirSim and PX4 MAVLink backends. This skill is read as guidance — do not call `skill:formation`.
-Use only tools that appear in `available_tool_cards` (formation_command is only
-available on the airsim / px4_mavlink backends with at least 2 vehicles).
+Guide multi-vehicle formation flight and area coverage missions on the AirSim and
+PX4 MAVLink backends. This is operating knowledge: read it, then choose tools from
+`available_tool_cards`. Activating this skill loads guidance only — it performs no
+flight action.
+
+`formation_command` needs at least 2 vehicles and is unavailable on the px4_ros2
+backend.
 
 ## When to Use
 

@@ -149,6 +149,9 @@ class AgentRequestHandler(BaseHTTPRequestHandler):
         if path == "/api/settings/connections":
             self._send_json({"ok": True, **RUNTIME.connection_settings()})
             return
+        if path == "/api/settings/agent-prompt":
+            self._send_json({"ok": True, **RUNTIME.agent_instructions_payload()})
+            return
         if path == "/api/settings/application":
             self._send_json({"ok": True, "application": RUNTIME.application_settings()})
             return
@@ -333,6 +336,9 @@ class AgentRequestHandler(BaseHTTPRequestHandler):
             self._send_json(RUNTIME.save_connection_settings(payload))
             return
 
+        if path == "/api/settings/agent-prompt":
+            self._send_json(RUNTIME.save_agent_instructions(str(payload.get("content") or "")))
+            return
         if path == "/api/settings/application":
             self._send_json(RUNTIME.save_application_settings(payload))
             return

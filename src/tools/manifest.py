@@ -213,8 +213,6 @@ TOOL_MANIFEST: dict[str, ToolManifestEntry] = {
         ("object_detection",),
         notes="Single-frame inference is atomic. Search/tracking loops are not.",
     ),
-    "airsim_vlm_confirm_target": _atomic("airsim_vlm_confirm_target", "perception", "vlm", ("image_capture",)),
-    "airsim_vlm_analyze_image": _atomic("airsim_vlm_analyze_image", "perception", "vlm", ("image_capture",)),
     "provider_bridge_health": _atomic(
         "provider_bridge_health",
         "provider",
@@ -325,6 +323,39 @@ TOOL_MANIFEST: dict[str, ToolManifestEntry] = {
         stable=True,
         notes="Read-only perception axis health/snapshot/events; independent of the flight backend.",
         future_backend_notes="Works unchanged for sim (local engine) and real vehicles (remote Jetson engine).",
+    ),
+    "perception_start": ToolManifestEntry(
+        name="perception_start",
+        group="perception",
+        kind="atomic",
+        surface="perception",
+        recommended_layer="tool",
+        stable=True,
+        notes="Start/ensure the perception axis detector and optionally set the target class.",
+        future_backend_notes="Same call starts a local or onboard engine; only the profile differs.",
+    ),
+    "perception_stop": ToolManifestEntry(
+        name="perception_stop",
+        group="perception",
+        kind="atomic",
+        surface="perception",
+        recommended_layer="tool",
+        stable=True,
+        notes="Stop the perception axis detector.",
+        future_backend_notes="Same call stops a local or onboard engine.",
+    ),
+    "drone_approach_target": ToolManifestEntry(
+        name="drone_approach_target",
+        group="perception",
+        kind="atomic",
+        surface="perception",
+        recommended_layer="tool",
+        stable=True,
+        notes=(
+            "One bounded 1-3 m body-forward step toward the centred locked target. Refuses when "
+            "horizontal pixel error exceeds 0.35, so the target must be centred first."
+        ),
+        future_backend_notes="Needs a locked target plus velocity control; currently PX4 MAVLink for the closed loop.",
     ),
 }
 

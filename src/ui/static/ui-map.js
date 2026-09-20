@@ -11,6 +11,7 @@ function cameraWindowParts(el) {
     imageTypeSelect: el.querySelector("[data-camera-role='imageType']"),
     sourceSelect: el.querySelector("[data-camera-role='source']"),
     liveIndicator: el.querySelector("[data-camera-role='live']"),
+    perfEl: el.querySelector("[data-camera-role='perf']"),
     cameraFieldEl: el.querySelector("[data-camera-role='cameraField']"),
     vehicleFieldEl: el.querySelector("[data-camera-role='vehicleField']"),
     imageTypeFieldEl: el.querySelector("[data-camera-role='imageTypeField']"),
@@ -1466,6 +1467,23 @@ function updateMapView(state) {
     : `等待 ${backendName} 链路`;
 }
 
+// GeoJSON setData makes MapLibre re-parse the data and repaint the canvas.
+// These run on every telemetry tick (250 ms, and 20 Hz on the ROS stream), so
+// re-uploading unchanged collections repainted the map 4-20 times a second.
+// That is what made the translucent HUD above the map look like it gained and
+// lost a shadow: each canvas paint invalidates the backdrop blur behind it.
+// Styling could not fix it -- the repaints had to stop.
+const _sourceDataMemo = new Map();
+function setSourceData(source, data) {
+  if (!source) return;
+  let key = null;
+  try { key = JSON.stringify(data); } catch (err) { key = null; }
+  const name = source.id || (typeof source.serialize === 'function' ? source.serialize().id : '') || '';
+  if (key !== null && _sourceDataMemo.get(name) === key) return;
+  if (key !== null) _sourceDataMemo.set(name, key);
+  source.setData(data);
+}
+
 function drawMissionPath() {
   if (!maplibreMap) return;
   const pathSource = maplibreMap.getSource("path-source");
@@ -1474,7 +1492,7 @@ function drawMissionPath() {
 
   // 航线统一由 plan-source 按机配色绘制（每机一色，当前目标机高亮），
   // 旧的白色 path-line 不再使用，保持 source 存在以兼容既有 layer 定义。
-  pathSource.setData({ type: "FeatureCollection", features: [] });
+  setSourceData(pathSource, { type: "FeatureCollection", features: [] });
 
   const planSource = maplibreMap.getSource("plan-source");
   if (planSource) {
@@ -1509,7 +1527,7 @@ function drawMissionPath() {
       }
       addRoute(activeTarget, missionWaypoints);
     }
-    planSource.setData({ type: "FeatureCollection", features });
+    setSourceData(planSource, { type: "FeatureCollection", features });
   }
 
   // 航点 GeoJSON features（id 用于 setFeatureState，type 用于 sprite 配色）
@@ -1519,7 +1537,7 @@ function drawMissionPath() {
     properties: { seq: index + 1, type: wp.type || "waypoint" },
     geometry: { type: "Point", coordinates: [wp.lon, wp.lat] },
   }));
-  wpSource.setData({ type: "FeatureCollection", features });
+  setSourceData(wpSource, { type: "FeatureCollection", features });
 
   // 拖拽中只更新数据，不清除/设置选中态（避免中断拖拽）
   if (wpDragging) return;
@@ -1552,14 +1570,14 @@ function drawFence() {
   if (!fenceSource) return;
 
   if (missionFence.length < 2) {
-    fenceSource.setData({ type: "FeatureCollection", features: [] });
+    setSourceData(fenceSource, { type: "FeatureCollection", features: [] });
     return;
   }
 
   const coords = missionFence.map((p) => [p.lon, p.lat]);
   if (missionFence.length >= 3) coords.push(coords[0]);
 
-  fenceSource.setData({
+  setSourceData(fenceSource, {
     type: "FeatureCollection",
     features: [
       {
@@ -1657,10 +1675,10 @@ function updateActiveLeg(lngLat, target = currentTargetWaypoint(lngLat)) {
   const source = maplibreMap?.getSource("active-leg-source");
   if (!source) return;
   if (!target) {
-    source.setData({ type: "FeatureCollection", features: [] });
+    setSourceData(source, { type: "FeatureCollection", features: [] });
     return;
   }
-  source.setData({
+  setSourceData(source, {
     type: "FeatureCollection",
     features: [{
       type: "Feature",
@@ -1672,7 +1690,7 @@ function updateActiveLeg(lngLat, target = currentTargetWaypoint(lngLat)) {
 
 function clearActiveLeg() {
   const source = maplibreMap?.getSource("active-leg-source");
-  if (source) source.setData({ type: "FeatureCollection", features: [] });
+  if (source) setSourceData(source, { type: "FeatureCollection", features: [] });
 }
 
 function refreshActiveLegFromCurrentPosition() {

@@ -91,6 +91,12 @@ class MissionPlan:
     # "agent_loop" (task needs observe-respond cycles: visual search, tracking,
     # conditional steps — execute step-by-step instead of as a fixed sequence).
     execution_mode: str = "auto"
+    # Declared by the planner: the task has no natural stopping point after the
+    # listed steps (continuous tracking / keep a target locked), so the loop must
+    # keep observing and reacting instead of converging when the plan is "done".
+    # This used to be inferred from keywords in the operator's wording, which
+    # gave the same task different behaviour depending on phrasing.
+    keep_reacting: bool = False
     # Task contract: machine-verifiable completion criteria. The agent loop
     # checks these before accepting an is_complete decision (LLM 提议 +
     # 确定性验证), so "model said done" is never the only gate.
@@ -110,6 +116,7 @@ class MissionPlan:
             "reasoning": self.reasoning,
             "risk_notes": list(self.risk_notes),
             "execution_mode": self.execution_mode,
+            "keep_reacting": bool(self.keep_reacting),
             "goal": dict(self.goal),
         }
 
@@ -345,8 +352,14 @@ class MissionPlanner:
             add(photo_title, "airsim_take_photo", {"image_type": "scene"}, layer="perception")
             add(
                 "多模态确认目标" if search_with_camera else "多模态确认图像",
-                "airsim_vlm_confirm_target",
-                {"target_description": target_class or normalized, "source": "last_image"},
+                "inspect_current_frame",
+                {
+                    "question": (
+                        f"画面中是否有{target_class or '目标'}？请确认目标是否存在，并简述其位置和外观。"
+                        if search_with_camera
+                        else "请描述当前画面中可见的信息。"
+                    )
+                },
                 layer="perception",
             )
 

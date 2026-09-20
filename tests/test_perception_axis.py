@@ -130,7 +130,7 @@ def test_local_engine_snapshot_and_events():
         update_fps=50.0,
         health_timeout_sec=5.0,
     )
-    assert engine.start() is True
+    assert engine.start(detect=True) is True
     try:
         deadline = time.time() + 5.0
         # 阶段1: 等目标出现
@@ -174,8 +174,11 @@ def test_axis_disabled_engine_none():
     assert axis.enabled is False
     assert axis.start() is True  # no-op for disabled axis
     assert axis.is_online() is False
-    assert axis.snapshot() == {"targets": [], "primary": None, "timestamp": 0.0}
+    # frame_width/height are always present (0 until a frame arrives) so
+    # consumers never have to guess whether the key exists.
+    assert axis.snapshot() == {"targets": [], "primary": None, "timestamp": 0.0, "frame_width": 0, "frame_height": 0}
     assert axis.pop_events() == []
+    assert axis.health()["online"] is False
 
 
 def test_axis_remote_misconfig_fails_fast():
@@ -245,12 +248,15 @@ def test_annotated_frame_cache_roundtrip():
         update_fps=50.0,
         health_timeout_sec=5.0,
     )
-    assert engine.start() is True
+    assert engine.start(detect=True) is True
     try:
         deadline = time.time() + 5.0
+        jpeg, dets, ts = None, [], 0.0
         while time.time() < deadline:
             jpeg, dets, ts = engine.annotated_frame()
-            if jpeg is not None:
+            # 抓帧与检测是两个线程，第一张标注图往往在首次检测之前就缓存好了
+            # （那时 dets 还是空的）。等到图和检测结果一起出现再断言。
+            if jpeg is not None and dets:
                 break
             time.sleep(0.05)
         assert jpeg is not None
@@ -273,15 +279,17 @@ def test_preview_uses_axis_cache_first():
         update_fps=50.0,
         health_timeout_sec=5.0,
     )
-    assert engine.start() is True
+    assert engine.start(detect=True) is True
     axis = PerceptionAxis(profile=None)
     axis._engine = engine  # noqa: SLF001 -- test wiring
     rt = ToolRuntime(backend_id="px4_mavlink", camera_settings_provider=lambda: {"source": "airsim"}, perception_axis=axis)
     deadline = time.time() + 5.0
     ok = False
+    meta: dict = {}
     while time.time() < deadline:
         ok, body, mime, meta = rt.capture_camera_preview({"source": "airsim", "detect": "1"})
-        if ok:
+        # 同上：标注图先于首次检测就绪，只有带上检测结果的那一帧才算可用
+        if ok and meta.get("detections"):
             break
         time.sleep(0.05)
     engine.stop()
@@ -289,6 +297,11 @@ def test_preview_uses_axis_cache_first():
     assert body.startswith(b"\xff\xd8")
     assert meta.get("vehicle") == "perception-axis"
     assert meta.get("detections"), "axis detections must flow into preview meta"
+    # 帧率不再烧进画面，改由面板固定位置的徽标显示，数值必须随 meta 走
+    assert "fps" in meta, "axis frame rate must travel in preview meta"
+    # 前端用时间戳去重缓存帧：缓存帧必须带采集时刻与缓存标记
+    assert meta.get("preview_cached") is True
+    assert float(meta.get("frame_timestamp") or 0.0) > 0
 
 
 def test_inspect_current_frame_with_vlm_stub():
@@ -302,7 +315,7 @@ def test_inspect_current_frame_with_vlm_stub():
         update_fps=50.0,
         health_timeout_sec=5.0,
     )
-    assert engine.start() is True
+    assert engine.start(detect=True) is True
     axis = PerceptionAxis(profile=None)
     axis._engine = engine  # noqa: SLF001
     calls = {"n": 0}

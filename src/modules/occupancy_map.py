@@ -159,11 +159,20 @@ class DepthProjection:
         cx_px = (x1 + x2) // 2
         cy_px = (y1 + y2) // 2
 
-        # 在 bbox 中心区域采样深度 (偏下方采样，避免目标顶部无效深度)
-        patch_y1 = max(0, cy_px - 5)
-        patch_y2 = min(h, cy_px + 20)
-        patch_x1 = max(0, cx_px - 5)
-        patch_x2 = min(w, cx_px + 20)
+        # 在 bbox 内部采样深度。窗口随 bbox 大小缩放，而不是固定像素数：
+        # 固定窗口（曾经是 cy-5..cy+20 共 25 行）在低分辨率深度图上会跨过很大
+        # 的俯仰范围，把目标下方更近的地面一起算进来，实测让距离偏小一半以上
+        # （车在 640x480 检测框里 15px 高，映射到 144 行的深度图只有 5 行，而
+        # 窗口有 25 行）。向下略偏仍保留：目标顶边常常取到其后方背景的深度。
+        box_w = max(1, x2 - x1)
+        box_h = max(1, y2 - y1)
+        half_w = max(1, box_w // 2)
+        half_h = max(1, box_h // 2)
+        center_y = cy_px + max(0, box_h // 6)
+        patch_y1 = max(0, center_y - half_h)
+        patch_y2 = min(h, center_y + half_h)
+        patch_x1 = max(0, cx_px - half_w)
+        patch_x2 = min(w, cx_px + half_w)
 
         patch = depth_img[patch_y1:patch_y2, patch_x1:patch_x2]
         valid_pixels = patch[(patch > min_depth) & (patch < max_depth)]

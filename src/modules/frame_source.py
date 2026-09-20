@@ -8,6 +8,7 @@ source-agnostic.
 
 from __future__ import annotations
 
+import os
 import threading
 import time
 from typing import Any, Protocol
@@ -36,17 +37,100 @@ class FrameSource(Protocol):
         ...
 
 
+def _normalize_rtsp_transport(transport: str) -> str:
+    """Return "tcp"/"udp", or "" to keep OpenCV's own default."""
+    value = str(transport or "").strip().lower()
+    return value if value in {"tcp", "udp"} else ""
+
+
+def _normalize_open_timeout(seconds: Any) -> float:
+    """Clamp the RTSP handshake timeout; 0 keeps OpenCV's default."""
+    try:
+        value = float(seconds)
+    except (TypeError, ValueError):
+        return 0.0
+    if value <= 0:
+        return 0.0
+    return max(1.0, min(60.0, value))
+
+
+def _open_rtsp_capture(cv2_module: Any, url: str, transport: str, open_timeout_sec: float = 0.0) -> Any:
+    """Open an RTSP capture, preferring FFmpeg with an explicit transport.
+
+    Two knobs, both matching what QGC's RTSP video source exposes:
+
+    * transport -- FFmpeg takes it through the process-wide
+      ``OPENCV_FFMPEG_CAPTURE_OPTIONS`` env var (OpenCV has no per-capture
+      API for it), so it is set immediately before opening.
+    * handshake timeout -- passed per-capture via ``CAP_PROP_OPEN_TIMEOUT_MSEC``.
+
+    Both are best-effort: an older OpenCV that rejects the parameterised
+    constructor falls back to the plain call rather than failing the stream.
+    """
+    transport = _normalize_rtsp_transport(transport)
+    if transport:
+        # 只设置我们需要的键；其余交给 FFmpeg 默认值（含 stimeout 之类的
+        # 版本差异选项，写死反而容易在新旧 FFmpeg 之间踩坑）。
+        os.environ["OPENCV_FFMPEG_CAPTURE_OPTIONS"] = f"rtsp_transport;{transport}"
+    timeout_ms = int(_normalize_open_timeout(open_timeout_sec) * 1000)
+    if timeout_ms > 0 and hasattr(cv2_module, "CAP_PROP_OPEN_TIMEOUT_MSEC"):
+        try:
+            return cv2_module.VideoCapture(
+                url,
+                getattr(cv2_module, "CAP_FFMPEG", 0),
+                [
+                    int(cv2_module.CAP_PROP_OPEN_TIMEOUT_MSEC),
+                    timeout_ms,
+                ],
+            )
+        except TypeError:
+            # 老版本 OpenCV 不支持带 params 的构造：退回普通调用，
+            # 由 stale_after_sec 的重连逻辑兜底。
+            pass
+    return cv2_module.VideoCapture(url)
+
+
+class CaptureSource(Protocol):
+    """A camera-capable flight controller, as used by ``LazyControllerFrameSource``.
+
+    This was previously an implicit contract: the frame source called
+    ``capture_image`` on whatever object it was handed. Naming it makes the
+    requirement explicit, so an alternative implementation (a ROS image bridge,
+    a different autopilot) knows exactly what to provide.
+    """
+
+    def capture_image(self, camera_name: str = "0", image_type: int = 0, **kwargs: Any) -> bytes | None:
+        """Return one encoded frame (PNG/JPEG bytes) or None.
+
+        Implementations must enforce their own timeout: the caller is a
+        background thread that cannot afford to block on a dead transport.
+        """
+
+
 class RtspFrameSource:
     """RTSP camera stream decoded with OpenCV (v4l2src -> h264 -> rtsp).
 
     Used for real onboard cameras (Jetson) and 图传 receivers that expose an
     RTSP endpoint. OpenCV's RTSP backend handles reconnection internally; we
     additionally re-open the stream when frames stop arriving (stale link).
+
+    ``transport`` selects the RTSP transport handed to FFmpeg ("tcp" | "udp").
+    OpenCV defaults to UDP, which over a WiFi / 图传 link shows up as a stream
+    that opens and then tears/blocks instead of failing outright -- the same
+    reason QGC exposes a UDP/TCP choice for its RTSP video source.
     """
 
-    def __init__(self, url: str, stale_after_sec: float = 3.0) -> None:
+    def __init__(
+        self,
+        url: str,
+        stale_after_sec: float = 3.0,
+        transport: str = "",
+        open_timeout_sec: float = 0.0,
+    ) -> None:
         self.url = url
         self.stale_after_sec = max(0.5, float(stale_after_sec))
+        self.transport = _normalize_rtsp_transport(transport)
+        self.open_timeout_sec = _normalize_open_timeout(open_timeout_sec)
         self._capture: Any | None = None
         self._lock = threading.RLock()
         self._last_frame_ts = 0.0
@@ -68,7 +152,7 @@ class RtspFrameSource:
             self.close()
             self._last_error = ""
             try:
-                capture = cv2.VideoCapture(self.url)
+                capture = _open_rtsp_capture(cv2, self.url, self.transport, self.open_timeout_sec)
                 if not capture.isOpened():
                     capture.release()
                     self._last_error = f"无法打开 RTSP 流: {self.url}"
@@ -265,6 +349,36 @@ class LazyControllerFrameSource:
             self._warn_rate_limited("controller unavailable")
             return None
         try:
+            import os
+
+            # AirSim stabilises the camera every render tick from the settings.json
+            # "Gimbal" block (world pitch/roll held, yaw still follows the airframe).
+            # That is the preferred path. The sampled RPC compensation below is only
+            # a fallback for rigs that cannot use a Gimbal block -- and while it runs
+            # it overwrites the engine gimbal target via simSetCameraPose -- so it is
+            # opt-in and the default path never touches the controller at all.
+            stabilize = getattr(controller, "configure_camera_stabilization", None)
+            if (
+                self.image_type == 0
+                and os.environ.get("DRONE_CAMERA_STABILIZATION", "0") == "1"
+                and getattr(controller, "_ip", "") in {"127.0.0.1", "localhost", "::1"}
+                and callable(stabilize)
+            ):
+                stabilize(self.camera_name, enabled=True)
+            capture_frame = getattr(controller, "capture_frame", None)
+            use_raw = (
+                self.image_type == 0
+                and getattr(controller, "_ip", "") in {"127.0.0.1", "localhost", "::1"}
+                and os.environ.get("DRONE_PERCEPTION_RAW_SCENE", "1") == "1"
+                and callable(capture_frame)
+            )
+            if use_raw:
+                frame = capture_frame(self.camera_name, self.image_type, timeout=self.timeout_sec)
+                if frame is None:
+                    raise ValueError("capture returned empty frame")
+                self._consecutive_failures = 0
+                self.last_error = ""
+                return frame
             raw = controller.capture_image(self.camera_name, self.image_type, timeout=self.timeout_sec)
             self._consecutive_failures = 0
         except Exception as exc:

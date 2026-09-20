@@ -393,9 +393,13 @@ body.resizing .h-resizer::after {
   grid-template-columns: auto 1fr auto;
   align-items: center;
   gap: 14px 20px;
-  background: linear-gradient(180deg, rgba(0, 0, 0, 0.82) 0%, rgba(0, 0, 0, 0.55) 70%, rgba(0, 0, 0, 0) 100%);
-  -webkit-backdrop-filter: blur(8px);
-  backdrop-filter: blur(8px);
+  /* 不用 backdrop-filter。HUD 直接盖在 MapLibre 的 WebGL 画布上，而画布每次遥测
+     轮询(250ms)都会重绘；画布一重绘，这层背景模糊就得重算，渐变最后一段 alpha=0
+     把模糊边缘完全暴露在画面上，于是状态栏会时不时多出一条"阴影"并闪动（打开摄像头
+     面板后画面帧也在刷新，闪得更明显）。之前的做法是给 HUD 提层 + isolation +
+     contain 想把模糊缓存住，但那只是减弱、没有消除。渐变本身已经足够压暗画面，
+     去掉模糊后这条带子不再依赖背后画布，闪动从根上消失。 */
+  background: linear-gradient(180deg, rgba(0, 0, 0, 0.88) 0%, rgba(0, 0, 0, 0.66) 68%, rgba(0, 0, 0, 0.28) 100%);
   z-index: 10;
   pointer-events: none;
 }
@@ -552,9 +556,10 @@ body.resizing .h-resizer::after {
   height: 380px;
   border: 1px solid rgba(255, 255, 255, 0.12);
   border-radius: 8px;
-  background: rgba(16, 18, 24, 0.72);
-  -webkit-backdrop-filter: blur(12px);
-  backdrop-filter: blur(12px);
+  /* 同样不用 backdrop-filter：面板每 0.7s 换一帧画面，每次重绘都会让同一 backdrop
+     根下的模糊(含顶部 HUD 那条)重新计算，正是"HUD 阴影闪动"的放大器。这里也是
+     MapLibre 画布之上，模糊会被渲染成黑块(同 #systemSettingsModal 的结论)。 */
+  background: rgba(16, 18, 24, 0.94);
   box-shadow: 0 10px 32px rgba(0, 0, 0, 0.36);
   overflow: hidden;
   z-index: 8;
@@ -581,8 +586,12 @@ body.resizing .h-resizer::after {
   min-height: 34px;
   padding: 5px 8px;
   display: flex;
+  /* 标题行里现在是「标题 + LIVE 徽标 + 图像源 + 状态 + 检测组 + 窗口按钮」：
+     面板拉到最小宽度(300px)一行放不下时，让尾部元素整体换到下一行，而不是
+     把下拉/按钮挤出面板外；正常宽度下保持一行。 */
+  flex-wrap: wrap;
   align-items: center;
-  gap: 8px;
+  gap: 4px 6px;
   cursor: move;
   border-bottom: 1px solid rgba(255, 255, 255, 0.08);
   background: rgba(255, 255, 255, 0.03);
@@ -602,6 +611,15 @@ body.resizing .h-resizer::after {
   display: flex;
   align-items: center;
   gap: 5px;
+}
+
+/* LIVE 徽标从控制条移到标题行（紧跟标题、图像源之前）：高度与 24px 的
+   下拉/图标按钮对齐，不额外撑高标题行。健康色语义不变，见下方
+   [data-health] 规则。 */
+.camera-viewer header > .camera-live-indicator {
+  flex: 0 0 auto;
+  height: 24px;
+  padding: 0 3px;
 }
 
 .camera-viewer.dragging {
@@ -651,11 +669,25 @@ body.resizing .h-resizer::after {
   white-space: nowrap;
 }
 
+/* 状态槽只承载短标签（连接中…/连接失败/已暂停），完整原因与恢复办法在
+   title 提示和画面区占位文字里（见 setCameraViewerState）。这里显式钉死
+   "单行 + 可收缩 + 超长省略"：这个槽 flex-grow 会吃掉标题行的剩余宽度，
+   一旦文案变长，基准宽度就会把后面的检测开关与窗口按钮挤到下一行（截图反馈）。 */
 .camera-viewer header > [data-camera-role="status"] {
   flex: 1 1 auto;
   min-width: 0;
   text-align: right;
   line-height: 1.1;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+/* 这个状态槽平时是空的（画面正常时 setCameraViewerState 写入空串）。空 span
+   没有内容也拿不到任何样式，在标题行里就是一个多余的空盒子（截图反馈）；
+   没有状态文案时让它完全不参与布局，有 loading/错误文案时才出现。 */
+.camera-viewer header > [data-camera-role="status"]:empty {
+  display: none;
 }
 
 .camera-viewer[data-state="error"] [data-camera-role="status"] {
@@ -670,6 +702,8 @@ body.resizing .h-resizer::after {
   display: flex;
   gap: 4px;
   flex: 0 0 auto;
+  /* 标题行换行时两个图标按钮仍贴右侧 */
+  margin-left: auto;
 }
 
 .camera-viewer-actions button {
@@ -691,6 +725,16 @@ body.resizing .h-resizer::after {
   background: rgba(85, 223, 244, 0.09);
 }
 
+/* 检测徽标 + 开关：作为一个整体放在标题行里（原先开关单独占控制条第二行，
+   面板被撑得很挤）。窄面板下整组可以收缩，徽标先被裁短，开关保持完整。 */
+.camera-viewer-detect {
+  flex: 0 1 auto;
+  min-width: 0;
+  display: flex;
+  align-items: center;
+  gap: 4px;
+}
+
 .camera-stream-play-icon {
   display: none;
 }
@@ -706,15 +750,19 @@ body.resizing .h-resizer::after {
 .camera-viewer-controls {
   min-height: 42px;
   padding: 6px 9px;
-  display: grid;
-  grid-template-columns: minmax(0, 1fr) minmax(0, 1fr) minmax(0, 1fr) auto;
-  align-items: end;
+  /* 一行放不下时（面板拉到很小）让帧率徽标换行，而不是把三个下拉压成
+     只剩箭头——原先固定 5 列网格在 340px 宽下面板里就是这样。
+     LIVE 徽标已移到标题行，不再占这一行。 */
+  display: flex;
+  flex-wrap: wrap;
+  align-items: flex-end;
   gap: 8px;
   border-bottom: 1px solid rgba(255, 255, 255, 0.08);
   background: rgba(8, 10, 14, 0.28);
 }
 
 .camera-viewer-controls label {
+  flex: 1 1 76px;
   min-width: 0;
   display: grid;
   gap: 3px;
@@ -745,6 +793,7 @@ body.resizing .h-resizer::after {
 }
 
 .camera-live-indicator {
+  flex: 0 0 auto;
   height: 27px;
   padding: 0 4px;
   display: inline-flex;
@@ -769,6 +818,135 @@ body.resizing .h-resizer::after {
 .camera-viewer[data-streaming="true"] .camera-live-indicator i {
   background: var(--green);
   box-shadow: 0 0 8px rgba(78, 230, 164, 0.7);
+}
+
+/* 画面在但不够"全绿"（无新帧 / 飞控离线）：用琥珀色区别于 LIVE */
+.camera-viewer[data-streaming="true"] .camera-live-indicator[data-health="warn"] {
+  color: var(--amber);
+}
+
+.camera-viewer[data-streaming="true"] .camera-live-indicator[data-health="warn"] i {
+  background: var(--amber);
+  box-shadow: 0 0 8px rgba(240, 184, 74, 0.65);
+}
+
+/* 帧率徽标：面板固定位置（控制条内），不再烧录进画面。
+   画面用 object-fit: cover 铺满，烧在画面左上角的字在小面板上会被裁掉，
+   只有把面板放大才看得到；放在这里任何尺寸都完整可见。 */
+.camera-perf {
+  flex: 0 0 auto;
+  height: 27px;
+  padding: 0 7px;
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  border: 1px solid rgba(78, 230, 164, 0.28);
+  border-radius: 5px;
+  background: rgba(78, 230, 164, 0.08);
+  color: var(--green);
+  font: 700 10px/1 Consolas, monospace;
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+}
+
+.camera-perf[hidden] {
+  display: none;
+}
+
+.camera-perf .camera-perf-det {
+  color: var(--amber);
+}
+
+/* 检测状态徽标：检测是操作员手动开关的（相机流自己跑），徽标说明检测在不在跑、
+   检测率与目标数；陈旧用琥珀色，请求失败用红色。徽标与开关一起放在面板标题行
+   的 .camera-viewer-detect 组里，不再占控制条的位置。 */
+.camera-detect-status {
+  flex: 0 0 auto;
+  height: 27px;
+  padding: 0 7px;
+  display: inline-flex;
+  align-items: center;
+  border: 1px solid rgba(255, 255, 255, 0.12);
+  border-radius: 5px;
+  background: rgba(255, 255, 255, 0.04);
+  color: var(--muted);
+  font: 700 10px/1 Consolas, monospace;
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+}
+
+/* 标题行里与 24px 的 +/- 图标按钮对齐；最长文案（检测中 · x/s · N 目标）
+   放不下时徽标先收缩裁短，开关键始终完整可见 */
+.camera-viewer header .camera-detect-status {
+  flex: 0 1 auto;
+  height: 24px;
+  min-width: 0;
+  max-width: 220px;
+}
+
+/* 错误文案要能读全：允许换行、高度自适应，不被 24px 行高裁掉 */
+.camera-viewer header .camera-detect-status[data-health="error"] {
+  height: auto;
+  min-height: 24px;
+  padding: 3px 7px;
+  overflow: visible;
+}
+
+.camera-viewer header .camera-detect-toggle {
+  height: 24px;
+  padding: 0 8px;
+}
+
+.camera-detect-status[data-health="live"] {
+  border-color: rgba(78, 230, 164, 0.28);
+  background: rgba(78, 230, 164, 0.08);
+  color: var(--green);
+}
+
+.camera-detect-status[data-health="warn"] {
+  border-color: rgba(240, 184, 74, 0.32);
+  background: rgba(240, 184, 74, 0.09);
+  color: var(--amber);
+}
+
+.camera-detect-status[data-health="error"] {
+  border-color: rgba(255, 107, 107, 0.38);
+  background: rgba(255, 107, 107, 0.1);
+  color: var(--danger);
+  white-space: normal;
+}
+
+.camera-detect-toggle {
+  flex: 0 0 auto;
+  height: 27px;
+  padding: 0 9px;
+  border: 1px solid rgba(255, 255, 255, 0.12);
+  border-radius: 5px;
+  background: rgba(31, 34, 42, 0.92);
+  color: var(--ink);
+  font-family: inherit;
+  font-size: 10px;
+  font-weight: 700;
+  line-height: 1;
+  white-space: nowrap;
+  cursor: pointer;
+}
+
+.camera-detect-toggle:hover:not(:disabled) {
+  color: var(--cyan);
+  border-color: rgba(85, 223, 244, 0.28);
+  background: rgba(85, 223, 244, 0.09);
+}
+
+.camera-detect-toggle[data-detecting="true"] {
+  color: var(--amber);
+  border-color: rgba(240, 184, 74, 0.32);
+  background: rgba(240, 184, 74, 0.08);
+}
+
+.camera-detect-toggle:disabled {
+  opacity: 0.55;
+  cursor: wait;
 }
 
 .camera-frame {
@@ -1831,10 +2009,11 @@ body[data-profile-collapsed="true"] .mission-profile {
 .proc-timeline,
 .plan-block,
 .tl-node,
-.tl-one,
+.tl-fold,
 .tl-one-body,
 .tl-collapse,
 .tl-node-head,
+.tl-think-head,
 .tl-one-line {
   min-width: 0;
   max-width: 100%;
@@ -1843,6 +2022,9 @@ body[data-profile-collapsed="true"] .mission-profile {
 .chat-bubble,
 .tl-line,
 .tl-think-body,
+.tl-think-preview,
+.tl-think-full,
+.tl-skill-full,
 .plan-body,
 .tl-one-body,
 .chat-bubble p,
@@ -1855,6 +2037,8 @@ body[data-profile-collapsed="true"] .mission-profile {
 .chat-bubble pre,
 .chat-bubble code,
 .tl-think-body,
+.tl-think-full,
+.tl-skill-full,
 .tl-collapse-full,
 .plan-body {
   white-space: pre-wrap;
@@ -2001,6 +2185,14 @@ body[data-profile-collapsed="true"] .mission-profile {
   color: #dce5f5;
   background: rgba(255, 255, 255, 0.10);
   font-size: 12px;
+}
+
+/* 活跃轮次的状态占位行：圆点 + 文案。空内容气泡靠它保持可读，
+   正文/过程一到就由 JS 切 display 收起，节点不重建。 */
+.chat-bubble.agent .thinking-pill {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
 }
 
 .error-pill {
@@ -3023,7 +3215,7 @@ body[data-profile-collapsed="true"] .mission-profile {
 .settings-tabs {
   padding: 8px;
   display: grid;
-  grid-template-columns: repeat(6, minmax(0, 1fr));
+  grid-template-columns: repeat(7, minmax(0, 1fr));
   gap: 6px;
   border-bottom: 1px solid var(--line-soft);
 }
@@ -3076,6 +3268,70 @@ body[data-profile-collapsed="true"] .mission-profile {
   color: var(--muted);
   font-size: 12px;
   line-height: 1.55;
+}
+
+/* ── Agent 操作规范编辑器（config/agent_system.md）：长文在框内滚动，不撑高面板 ── */
+.agent-prompt-path {
+  margin: 0 0 8px;
+  color: var(--faint);
+  font-family: "Fira Code", "Cascadia Code", Consolas, monospace;
+  font-size: 11px;
+  line-height: 1.4;
+  overflow-wrap: anywhere;
+}
+
+.agent-prompt-editor {
+  display: block;
+  width: 100%;
+  height: 280px;
+  min-height: 240px;
+  max-height: 320px;
+  padding: 10px 12px;
+  border: 1px solid rgba(255, 255, 255, 0.12);
+  border-radius: 8px;
+  background: rgba(0, 0, 0, 0.28);
+  color: var(--ink);
+  font-family: "Fira Code", "Cascadia Code", Consolas, monospace;
+  font-size: 12.5px;
+  line-height: 1.6;
+  tab-size: 4;
+  resize: vertical;
+  overflow-y: auto;
+  overflow-x: hidden;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  outline: none;
+  color-scheme: dark;
+}
+
+.agent-prompt-editor:focus {
+  border-color: rgba(85, 223, 244, 0.5);
+}
+
+/* 抽屉默认隐藏所有滚动条；编辑器例外，长文的滚动位置要看得见 */
+.settings-drawer .agent-prompt-editor::-webkit-scrollbar {
+  display: block;
+  width: 8px;
+}
+
+.settings-drawer .agent-prompt-editor::-webkit-scrollbar-thumb {
+  border-radius: 999px;
+  background: rgba(255, 255, 255, 0.18);
+}
+
+.agent-prompt-status {
+  margin: 8px 0 0;
+  font-size: 11.5px;
+  line-height: 1.5;
+  color: var(--muted);
+}
+
+.agent-prompt-status[data-level="ok"] {
+  color: var(--green);
+}
+
+.agent-prompt-status[data-level="error"] {
+  color: var(--danger);
 }
 
 .model-capability-check {
@@ -6783,220 +7039,6 @@ body.dragging-system-settings #systemSettingsModal .modal-head {
   color: var(--ink);
 }
 
-/* AirSim settings.json（连接详情 → 平铺、受连接类型约束，只读模板名 + 可选预览） */
-.airsim-settings-templates {
-  margin-top: 6px;
-  border: 1px solid rgba(255, 255, 255, 0.10);
-  border-radius: 8px;
-  background: rgba(10, 16, 24, 0.45);
-  padding: 10px 12px;
-  display: flex;
-  flex-direction: column;
-  gap: 8px;
-}
-
-.airsim-template-row {
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  gap: 12px;
-  min-height: 28px;
-}
-
-.airsim-template-label {
-  font-size: 11px;
-  font-weight: 600;
-  letter-spacing: 0.04em;
-  text-transform: uppercase;
-  color: var(--text-tertiary, #7c8794);
-}
-
-.airsim-template-name {
-  font-size: 12.5px;
-  font-weight: 600;
-  color: #d9e2f3;
-  text-align: right;
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-  flex: 1;
-}
-
-.airsim-template-preview {
-  border-top: 1px solid rgba(255, 255, 255, 0.08);
-  padding-top: 4px;
-}
-
-.airsim-template-preview > summary {
-  list-style: none;
-  cursor: pointer;
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  gap: 8px;
-  padding: 6px 0;
-  font-size: 11px;
-  color: var(--text-tertiary, #7c8794);
-  text-transform: uppercase;
-  letter-spacing: 0.05em;
-  user-select: none;
-}
-
-.airsim-template-preview > summary::-webkit-details-marker {
-  display: none;
-}
-
-.airsim-template-preview > summary::before {
-  content: "▸";
-  font-size: 10px;
-  color: var(--cyan, #55dff4);
-  transition: transform 120ms ease;
-  margin-right: 2px;
-}
-
-.airsim-template-preview[open] > summary::before {
-  transform: rotate(90deg);
-}
-
-.airsim-template-preview-label {
-  display: inline-flex;
-  align-items: center;
-  gap: 6px;
-  margin-left: 4px;
-  color: var(--text-secondary, #a3aebd);
-}
-
-.airsim-template-preview-dot {
-  width: 5px;
-  height: 5px;
-  border-radius: 50%;
-  background: var(--cyan, #55dff4);
-  box-shadow: 0 0 6px rgba(85, 223, 244, 0.55);
-}
-
-.airsim-template-code {
-  margin: 8px 0 0;
-  padding: 12px 0;
-  border-radius: 8px;
-  background: linear-gradient(180deg, rgba(0, 0, 0, 0.55), rgba(0, 0, 0, 0.42));
-  border: 1px solid rgba(255, 255, 255, 0.08);
-  box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.04);
-  max-height: 240px;
-  overflow: auto;
-  scrollbar-width: thin;
-  scrollbar-color: rgba(255, 255, 255, 0.25) transparent;
-}
-
-.airsim-template-code::-webkit-scrollbar {
-  width: 6px;
-  height: 6px;
-}
-
-.airsim-template-code::-webkit-scrollbar-thumb {
-  background: rgba(255, 255, 255, 0.25);
-  border-radius: 6px;
-}
-
-.airsim-template-lines {
-  margin: 0;
-  padding: 0;
-  list-style: none;
-  font-family: Consolas, "Courier New", ui-monospace, SFMono-Regular, monospace;
-  font-size: 11.5px;
-  line-height: 1.65;
-  color: #c8d3de;
-}
-
-.airsim-template-lines > li {
-  display: flex;
-  align-items: flex-start;
-  padding: 0 14px 0 0;
-  white-space: pre;
-}
-
-.airsim-template-lines > li:hover {
-  background: rgba(255, 255, 255, 0.025);
-}
-
-.airsim-template-lines .ln {
-  flex: 0 0 auto;
-  width: 38px;
-  padding: 0 10px 0 12px;
-  margin-right: 10px;
-  text-align: right;
-  color: rgba(255, 255, 255, 0.22);
-  border-right: 1px solid rgba(255, 255, 255, 0.06);
-  font-variant-numeric: tabular-nums;
-  user-select: none;
-}
-
-.airsim-template-lines .code {
-  flex: 1 1 auto;
-  min-width: 0;
-  padding-left: 6px;
-}
-
-.airsim-template-code .json-key {
-  color: #82d8ff;
-}
-.airsim-template-code .json-string {
-  color: #c8e6a3;
-}
-.airsim-template-code .json-number {
-  color: #ffb774;
-}
-.airsim-template-code .json-boolean {
-  color: #f29ad4;
-  font-weight: 600;
-}
-.airsim-template-code .json-null {
-  color: #f29ad4;
-  font-style: italic;
-}
-.airsim-template-code .json-punct {
-  color: rgba(255, 255, 255, 0.45);
-}
-
-.airsim-template-code .empty {
-  color: rgba(255, 255, 255, 0.15);
-}
-
-.airsim-apply-btn {
-  position: relative;
-}
-
-.airsim-apply-btn::before {
-  content: "▾";
-  margin-right: 6px;
-  font-size: 10px;
-  color: var(--cyan, #55dff4);
-}
-
-.detail-footer .airsim-apply-btn {
-  border-color: rgba(85, 223, 244, 0.35);
-  color: #d2f1fa;
-  background: rgba(85, 223, 244, 0.10);
-}
-
-.detail-footer .airsim-apply-btn:hover {
-  background: rgba(85, 223, 244, 0.18);
-}
-
-.airsim-template-result {
-  padding: 6px 9px;
-  border-radius: 6px;
-  font-size: 12px;
-  line-height: 1.5;
-  background: rgba(85, 223, 244, 0.08);
-  border: 1px solid rgba(85, 223, 244, 0.25);
-  word-break: break-all;
-}
-
-.airsim-template-result.error {
-  background: rgba(255, 107, 107, 0.08);
-  border-color: rgba(255, 107, 107, 0.3);
-}
-
 /* markdown 表格（chat/execute 消息正文） */
 .md-table {
   border-collapse: collapse;
@@ -7276,16 +7318,97 @@ body.dragging-system-settings #systemSettingsModal .modal-head {
 }
 .turn .tl-node-label { font-weight: 600; letter-spacing: 0.3px; }
 .turn .tl-node-title { color: rgba(255, 255, 255, 0.38); font-weight: 400; }
-.turn .tl-node.tl-reasoning .tl-node-head { color: rgba(170, 180, 255, 0.75); }
-.turn .tl-node.running .tl-node-head { color: rgba(180, 220, 255, 0.98); }
 
-/* 思考正文：与标题缩进对齐 */
-.turn .tl-think-body,
+/* ── 可展开行（思考 / 工具 / 技能 / 校验）────────────────────────────
+   整行就是 <summary>（原生可聚焦控件，回车/空格切换），展开后详情内联
+   接在下面；箭头只是装饰，展开态由 summary 自己播报。 */
+.turn details.tl-fold {
+  display: block;
+  min-width: 0;
+}
+.turn details.tl-fold > summary.tl-fold-head {
+  display: block;
+  cursor: pointer;
+  list-style: none;
+  min-width: 0;
+}
+.turn details.tl-fold > summary.tl-fold-head::-webkit-details-marker { display: none; }
+.turn details.tl-fold > summary.tl-fold-head:focus-visible {
+  outline: 1.5px solid rgba(140, 200, 255, 0.75);
+  outline-offset: 2px;
+  border-radius: 4px;
+}
+.turn .tl-fold-chev {
+  flex: 0 0 auto;
+  font-style: normal;
+  font-size: 10px;
+  line-height: 1;
+  color: rgba(150, 200, 255, 0.8);
+}
+.turn .tl-fold-chev::before { content: "▸"; }
+.turn details.tl-fold[open] > summary .tl-fold-chev::before { content: "▾"; }
+
+/* ── 模型思考：图标 + 加粗标签 + 正文（单行省略），整行点开，全文内联在
+      下方；排版与工具/技能行同一条线 ──────────────────────────────── */
+.turn .tl-think-head {
+  display: flex;
+  align-items: center;
+  gap: 5px;
+  min-width: 0;
+  font-size: 12px;
+  color: rgba(170, 180, 255, 0.75);
+}
+/* 标签不能被长正文挤掉（正文用 flex:1 1 auto 自行省略） */
+.turn .tl-think-head .tl-node-label {
+  flex: 0 0 auto;
+  font-size: 11.5px;
+  color: rgba(178, 192, 255, 0.95);
+}
+.turn .tl-node.running .tl-think-head { color: rgba(180, 220, 255, 0.98); }
+.turn .tl-think-preview {
+  flex: 1 1 auto;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-size: 12.5px;
+  color: rgba(255, 255, 255, 0.62);
+}
+.turn .tl-node.tl-reasoning.running .tl-think-preview { color: rgba(255, 255, 255, 0.72); }
+/* 展开后的全文：内联正文，不套边框/滚动卡片 */
+.turn .tl-think-full,
+.turn .tl-skill-full {
+  margin: 2px 0 4px 20px;
+  font-family: inherit;
+  font-size: 12.5px;
+  line-height: 1.65;
+  color: rgba(255, 255, 255, 0.72);
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+
+/* ── 技能调用：与"模型思考/工具调用"同级的一条，紫色标识 ──────────── */
+.turn .tl-node.tl-skill .tl-one-line .tool-name {
+  font-family: ui-monospace, Consolas, monospace;
+  font-size: 12.5px;
+  font-weight: 600;
+  color: rgba(235, 190, 255, 0.95);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  min-width: 0;
+}
+.turn .tl-node-head .tl-line-note { color: rgba(180, 220, 255, 0.85); font-size: 11.5px; }
+
+/* 思考正文：运行中就地增长（流式），与标题缩进对齐 */
 .turn .tl-node .tl-collapse {
   margin-left: 20px;
   min-width: 0;
 }
 .turn .tl-think-body {
+  flex: 1 1 auto;
+  min-width: 0;
+  margin: 0;
   font-family: inherit;
   font-size: 12.5px;
   line-height: 1.6;
@@ -7301,14 +7424,6 @@ body.dragging-system-settings #systemSettingsModal .modal-head {
 }
 
 /* ── 工具调用：默认一行，超出省略；点击展开完整参数/返回 ───────── */
-.turn details.tl-one { display: block; }
-.turn details.tl-one > summary {
-  list-style: none;
-  cursor: pointer;
-  display: block;
-  min-width: 0;
-}
-.turn details.tl-one > summary::-webkit-details-marker { display: none; }
 .turn .tl-one-line {
   display: flex;
   align-items: center;
@@ -7357,7 +7472,8 @@ body.dragging-system-settings #systemSettingsModal .modal-head {
   box-sizing: border-box;
   animation: iconSpin 0.9s linear infinite;
 }
-.turn summary:hover .tl-one-line { background: rgba(255, 255, 255, 0.03); }
+.turn summary:hover .tl-one-line,
+.turn summary:hover .tl-think-head { background: rgba(255, 255, 255, 0.03); }
 .turn .tl-one-body {
   margin: 4px 0 6px 20px;
   display: flex;
@@ -7419,3 +7535,7 @@ body.dragging-system-settings #systemSettingsModal .modal-head {
 .agent-column.tight .composer-left-actions { gap: 5px; }
 .agent-column.tight .composer-right-actions { gap: 5px; }
 .agent-column.tight .mode-option { padding: 0 7px; }
+
+/* 未检测时不显示这块占位文字：面板本来就窄，把宽度让给按钮与画面。
+   一旦开始检测，徽标带着速率/目标数再出现。 */
+.camera-detect-status[data-health="idle"] { display: none; }

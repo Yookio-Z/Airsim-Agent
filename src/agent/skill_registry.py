@@ -244,7 +244,7 @@ class SearchAgentSkill(_SequentialSkill):
             "drone_rotate_to",
             "airsim_take_photo",
             "airsim_detect_objects",
-            "airsim_vlm_confirm_target",
+            "inspect_current_frame",
         ],
         failure_policy="Stop if the vehicle cannot safely become airborne or the camera cannot capture a frame.",
         verification="Reports target_class, search_radius, sweep headings, image captures, and any provider/VLM evidence.",
@@ -291,7 +291,7 @@ class SearchAgentSkill(_SequentialSkill):
 
         rotate_available = _tool_available(tools, "drone_rotate_to")
         detection_available = _tool_available(tools, "airsim_detect_objects")
-        vlm_available = _tool_available(tools, "airsim_vlm_confirm_target")
+        vlm_available = _tool_available(tools, "inspect_current_frame")
 
         for index, heading in enumerate(headings, 1):
             if rotate_available:
@@ -364,8 +364,8 @@ class SearchAgentSkill(_SequentialSkill):
                 confirmation = self._call(
                     tools,
                     results,
-                    "airsim_vlm_confirm_target",
-                    {"target_description": target_class, "source": "last_image"},
+                    "inspect_current_frame",
+                    {"question": f"画面中是否有{target_class}？请确认目标是否存在，并简述其位置和外观。"},
                     dry_run=dry_run,
                     execute_tool=execute_tool,
                 )
@@ -380,7 +380,7 @@ class SearchAgentSkill(_SequentialSkill):
                             "search_altitude": altitude,
                             "search_radius": radius,
                             "target_found": True,
-                            "provider": "airsim_vlm_confirm_target",
+                            "provider": "inspect_current_frame",
                             "heading_deg": heading,
                             "evidence": evidence,
                         },
@@ -421,7 +421,7 @@ class VisualObserveAgentSkill(_SequentialSkill):
         },
         cost="medium",
         risk="low",
-        subtools=["airsim_take_photo", "airsim_vlm_analyze_image", "airsim_vlm_confirm_target"],
+        subtools=["airsim_take_photo", "inspect_current_frame"],
         failure_policy="Never move the vehicle. If capture or VLM analysis fails, return the failure with camera context.",
         verification="Reports capture result and VLM analysis/confirmation result.",
     )
@@ -453,25 +453,25 @@ class VisualObserveAgentSkill(_SequentialSkill):
             analysis = self._call(
                 tools,
                 results,
-                "airsim_vlm_confirm_target",
-                {"target_description": target, "source": "last_image"},
+                "inspect_current_frame",
+                {"question": f"画面中是否有{target}？请确认目标是否存在，并简述其位置和外观。"},
                 dry_run=dry_run,
                 execute_tool=execute_tool,
             )
             if not analysis.ok:
-                return self._finish(False, "airsim_vlm_confirm_target failed", results, analysis.data)
+                return self._finish(False, "inspect_current_frame failed", results, analysis.data)
             return self._finish(True, "visual target confirmation complete", results, {"target_description": target})
 
         analysis = self._call(
             tools,
             results,
-            "airsim_vlm_analyze_image",
-            {"question": question or "Describe the current drone camera frame.", "source": "last_image"},
+            "inspect_current_frame",
+            {"question": question or "请描述当前无人机摄像头画面中可见的信息。"},
             dry_run=dry_run,
             execute_tool=execute_tool,
         )
         if not analysis.ok:
-            return self._finish(False, "airsim_vlm_analyze_image failed", results, analysis.data)
+            return self._finish(False, "inspect_current_frame failed", results, analysis.data)
         return self._finish(True, "visual observation complete", results, {"question": question})
 
 
@@ -607,10 +607,16 @@ class SkillRegistry:
         """Return markdown skill documents, including docs without executors."""
         cards: list[dict[str, Any]] = []
         for action_name, overrides in sorted(self._doc_overrides.items()):
+            description = str(overrides.get("description") or "")
             cards.append({
                 "name": action_name,
                 "display_name": overrides.get("display_name") or action_name,
-                "purpose": overrides.get("description", ""),
+                # Both keys are emitted on purpose. `description` is the trigger
+                # signal the catalog and the model read; `purpose` is the key
+                # the UI tool-card code reads. Emitting only one of them is what
+                # previously left the trigger empty for every skill document.
+                "description": description,
+                "purpose": description,
                 "when_to_use": overrides.get("when_to_use", ""),
                 "inputs": dict(overrides.get("parameters") or {}),
                 "outputs": "See the markdown skill document.",
@@ -629,57 +635,65 @@ class SkillRegistry:
             })
         return cards
 
-    def guidance_cards(
-        self,
-        command: str,
-        capabilities: dict[str, Any],
-        memory: dict[str, Any] | None = None,
-        limit: int = 3,
-    ) -> list[dict[str, Any]]:
-        """Return SKILL.md guidance documents for the LLM; these are not executable tools."""
-        cards = [
+    def usable_doc_cards(self, capabilities: dict[str, Any]) -> list[dict[str, Any]]:
+        """Skill documents that are enabled and supported by this backend.
+
+        Disabled/archived docs and docs whose ``required_capabilities`` the
+        backend cannot satisfy are dropped entirely rather than listed and then
+        blocked, so the model never spends turns on an unusable skill.
+        """
+        return [
             card
             for card in self.doc_cards()
             if str(card.get("doc_status") or "").lower() not in {"disabled", "archived"}
             if _supports(capabilities, list(card.get("required_capabilities") or []))
         ]
-        scored = sorted(
-            ((self._guidance_score(command, card), card) for card in cards),
-            key=lambda item: (-item[0], str(item[1].get("name", ""))),
-        )
-        selected = [card for score, card in scored if score > 0][: max(0, int(limit))]
-        # 不再 fallback：命令与 skill 无关时不返回 guidance，避免 prompt 膨胀误导 LLM
-        return [self._compact_guidance_card(card) for card in selected]
 
-    def _guidance_score(self, command: str, card: dict[str, Any]) -> int:
-        text = " ".join([
-            str(command or ""),
-            str(card.get("name") or ""),
-            str(card.get("display_name") or ""),
-            str(card.get("description") or ""),
-            str(card.get("when_to_use") or ""),
-        ]).lower()
-        score = 0
-        groups = [
-            ("flight", "takeoff", "move", "photo", "image", "return", "land"),
-            ("状态", "起飞", "飞行", "移动", "拍照", "图像", "返航", "降落"),
-        ]
-        for terms in groups:
-            score += sum(1 for term in terms if term in text)
-        return score
+    def activatable(self, capabilities: dict[str, Any]) -> set[str]:
+        """Skill action names the model is allowed to activate on this backend."""
+        return {str(card.get("name") or "") for card in self.usable_doc_cards(capabilities) if card.get("name")}
 
-    def _compact_guidance_card(self, card: dict[str, Any]) -> dict[str, Any]:
-        markdown = str(card.get("markdown") or "")
-        if len(markdown) > 5000:
-            markdown = markdown[:5000] + "\n..."
+    def skill_body(self, action_name: str) -> str:
+        """Full SKILL.md text for one skill ('' when unknown).
+
+        This is the second tier of progressive disclosure: only loaded when the
+        model actually activates the skill.
+        """
+        return self._doc_markdown.get(action_name, "")
+
+    def guidance_cards(
+        self,
+        command: str,
+        capabilities: dict[str, Any],
+        memory: dict[str, Any] | None = None,
+        limit: int = 20,
+    ) -> list[dict[str, Any]]:
+        """Return the skill CATALOG for the prompt: metadata only, no bodies.
+
+        Two-tier progressive disclosure. This catalog is always present (roughly
+        50-100 tokens per skill) so the model knows what guidance exists; the
+        full SKILL.md body is loaded only when the model activates the skill via
+        the ``skill:<name>`` action (see ``skill_body`` / ``execute``).
+
+        ``command`` is accepted for call-site compatibility and deliberately NOT
+        used for matching. Harness-side keyword scoring was removed: the
+        ``description`` field is the trigger signal and the model decides
+        relevance. Scoring here previously ranked skills by keywords found in
+        their own prose, which made two docs match every command and left the
+        search/tracking doc permanently unselected.
+        """
+        cards = self.usable_doc_cards(capabilities)
+        return [self._catalog_entry(card) for card in cards[: max(0, int(limit))]]
+
+    @staticmethod
+    def _catalog_entry(card: dict[str, Any]) -> dict[str, Any]:
+        """One catalog line: enough to decide whether to activate, nothing more."""
         return {
             "name": card.get("name", ""),
             "display_name": card.get("display_name", ""),
             "description": card.get("description", ""),
-            "when_to_use": card.get("when_to_use", ""),
             "required_capabilities": list(card.get("required_capabilities") or []),
             "subtools": list(card.get("subtools") or []),
-            "markdown": markdown,
             "executable": False,
         }
 
@@ -747,9 +761,29 @@ class SkillRegistry:
         execute_tool: ToolExecuteCallback | None = None,
     ) -> AgentSkillResult:
         skill = self.get(action_name)
-        if not skill:
-            return AgentSkillResult(action_name, False, f"unknown skill: {action_name}")
-        return skill.execute(params, tools, dry_run=dry_run, execute_tool=execute_tool)
+        if skill:
+            return skill.execute(params, tools, dry_run=dry_run, execute_tool=execute_tool)
+
+        # Documentation-only skill: activating it loads the Markdown body as
+        # operating knowledge. It returns guidance, not an action -- the model
+        # then picks native tools from the catalog it already has.
+        markdown = self.skill_body(action_name)
+        if markdown:
+            return AgentSkillResult(
+                action_name,
+                True,
+                f"activated skill guidance: {action_name}",
+                data={
+                    "status": "activated",
+                    "skill": action_name,
+                    "markdown": markdown,
+                    "message": (
+                        "Skill guidance loaded. Follow it while choosing native tools from "
+                        "available_tool_cards; this skill itself is not an action."
+                    ),
+                },
+            )
+        return AgentSkillResult(action_name, False, f"unknown skill: {action_name}")
 
 
 def _supports(capabilities: dict[str, Any], required: list[str]) -> bool:
@@ -834,7 +868,7 @@ def _target_evidence(data: Any, target_class: str) -> dict[str, Any] | None:
         return {"source_field": "status", "value": status}
 
     target = str(target_class or "").strip().lower()
-    for key in ("verify_detections", "detections", "objects", "candidates", "matches"):
+    for key in ("verify_detections", "detections", "objects", "candidates", "target_candidates", "matches"):
         items = data.get(key)
         if not isinstance(items, list) or not items:
             continue

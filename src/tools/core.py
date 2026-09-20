@@ -193,6 +193,18 @@ def register_core_tools(
     @mcp.tool()
     def drone_arm(vehicle_name: str = "") -> str:
         """Arm the vehicle motors (default vehicle; "all" arms every vehicle)."""
+        # 幂等：已经解锁就别再发一次解锁指令。计划里写死的"先解锁"在飞机已经
+        # 解锁时纯属空转，有些飞控还会对重复解锁报错，让整份计划在第一步就翻车。
+        if not vehicle_name:
+            status = status_payload()
+            if status.get("armed"):
+                return fmt_result({
+                    "status": "ok",
+                    "backend": controller.backend_name,
+                    "message": "already armed（已解锁，跳过重复解锁）",
+                    "skipped": True,
+                    "vehicles": [],
+                })
         ok, targets = _run_for_vehicles(vehicle_name, controller.arm)
         message, detail = action_error("arm failed") if not ok else ("motors armed", "")
         payload = {
@@ -223,6 +235,23 @@ def register_core_tools(
     @mcp.tool()
     def drone_takeoff(altitude: float = 3.0, vehicle_name: str = "") -> str:
         """Take off to the requested positive altitude in meters (default vehicle; "all" for every vehicle)."""
+        # 幂等（也是安全项）：已经在空中时再执行一次起飞会让飞机意外爬升。
+        # 计划模板里写死的"先起飞"遇到已经在空中的飞机必须变成空操作。
+        if not vehicle_name:
+            status = status_payload()
+            pos = status.get("position_ned") if isinstance(status.get("position_ned"), dict) else {}
+            alt = abs(float((pos or {}).get("z", 0.0) or 0.0))
+            # 只认"明确在空中"：高度字段在拿不到真实遥测时会给出占位值，靠它判断
+            # 会把地面上的飞机当成在空中、把起飞整个跳过。
+            if status.get("flying") is True or status.get("landed_state") in (2, "flying"):
+                return fmt_result({
+                    "status": "ok",
+                    "backend": controller.backend_name,
+                    "message": f"already airborne（当前高度约 {alt:.1f}m，跳过重复起飞）",
+                    "skipped": True,
+                    "vehicles": [],
+                    **status,
+                })
         ok, targets = _run_for_vehicles(vehicle_name, lambda name: controller.takeoff(altitude, name))
         message, detail = action_error("takeoff failed") if not ok else (f"takeoff complete ({altitude}m)", "")
         payload = {
