@@ -2824,6 +2824,14 @@ class AgentRuntime:
                 "level": "failed",
                 "summary": f"完成判据未满足：{loop.summary or loop.failure_reason or '任务目标未达成'}",
             }
+        if not run.verification:
+            # 任务没有声明可校验的成功判据：把"正在回读…"那行收尾，否则它会
+            # 永远停在运行中（前端一直转圈）。
+            for item in reversed(run.process_trace):
+                if item.get("kind") == "verify" and item.get("status") == "running":
+                    item["status"] = "completed"
+                    item["body"] = "该任务未声明可校验的成功判据，已回读最终状态。"
+                    break
         if run.status == "completed" and run.verification.get("level") == "failed":
             run.status = "failed"
             run.failure_reason = run.verification.get("summary", "纠错后任务校验仍未通过")
@@ -3209,23 +3217,146 @@ class AgentRuntime:
             payload = str(params)
         return f"参数 {payload}"
 
-    @staticmethod
-    @staticmethod
-    def _result_body_fallback(data: dict[str, Any], message: str) -> str:
-        """工具返回的正文：能读出内容就给 JSON，别只留一句 "ok"。
+    # 协议噪音：这些键对操作员没有信息量，渲染时剔除
+    _RESULT_NOISE_KEYS = {
+        "status", "backend", "vehicle_name", "vehicles", "safety", "raw",
+        "duration_ms", "skipped", "skip_reason", "error_code", "requested_url",
+        "offboard_hold_active", "link_stale",
+        # 连接细节与 MAVLink 原始字段：排障用，操作员看要点时是噪音
+        "active_link", "connection", "connection_error", "custom_mode", "base_mode",
+        "system_status", "autopilot", "vehicle_type", "real_vehicle", "position_source",
+        "status_text", "local_listen_url", "configured_peer_endpoint", "observed_peers",
+        "probe_targets", "peer_source_verified", "actual_peer_endpoint", "actual_peer_age_s",
+        "px4_remote_host", "px4_remote_port", "px4_remote_endpoint", "system_id",
+        "component_id", "message",
+        # 位置有效性/链路细节：排障字段，操作员看要点时同样是噪音
+        "map_position_valid", "navigation_position_valid", "local_position_age_s",
+        "global_position_age_s", "gcs_source_system", "gcs_source_component",
+        "mavlink_wire_protocol", "gps_fix_type", "position_source",
+        # 参数缓存与固件原始信息属于设置面板的内容，出现在工具行只会淹没要点
+        "parameter_status", "parameters", "firmware", "capabilities",
+        "satellites_visible", "gps_horizontal_accuracy_m", "gps_vertical_accuracy_m",
+    }
+    _RESULT_TELEMETRY_KEYS = {
+        "position_ned", "velocity_ned", "velocity", "attitude_rad", "armed", "flying",
+        "mode", "flight_mode", "heading_deg", "battery_voltage", "gps", "drone",
+        "altitude", "altitude_m", "landed_state", "heartbeat_age_s",
+    }
 
-        展开一行工具调用却只看到 "Read vehicle status → ok"，等于没展开——
-        遥测、坐标这些真正的返回值都在 data 里，格式化出来给操作员看。
+    @classmethod
+    def _humanize_result(cls, data: dict[str, Any]) -> str:
+        """把工具返回渲染成操作员能读的要点，而不是一整块 JSON。
+
+        原始 JSON 里混着 status/backend/vehicle_name 这类协议字段和嵌套结构，
+        操作员要的只是"飞机在哪、什么状态、目标如何"。这里按已知字段逐项写成
+        中文要点，只把无法归类的内容压成一行精简 JSON 兜底。
         """
+        src = data.get("drone") if isinstance(data.get("drone"), dict) else data
+        lines: list[str] = []
+
+        pos = src.get("position_ned")
+        if isinstance(pos, dict):
+            try:
+                x = float(pos.get("x", 0.0) or 0.0)
+                y = float(pos.get("y", 0.0) or 0.0)
+                z = float(pos.get("z", 0.0) or 0.0)
+                lines.append(f"位置 N {x:.2f} / E {y:.2f} / D {z:.2f} m（高度 {abs(z):.2f} m）")
+            except (TypeError, ValueError):
+                pass
+
+        vel = src.get("velocity_ned") or src.get("velocity")
+        if isinstance(vel, dict):
+            try:
+                vx = float(vel.get("vx", 0.0) or 0.0)
+                vy = float(vel.get("vy", 0.0) or 0.0)
+                vz = float(vel.get("vz", 0.0) or 0.0)
+                lines.append(f"速度 {vx:.2f} / {vy:.2f} / {vz:.2f} m/s")
+            except (TypeError, ValueError):
+                pass
+
+        flags: list[str] = []
+        if "armed" in src:
+            flags.append("已解锁" if src.get("armed") else "未解锁")
+        if "flying" in src:
+            flags.append("飞行中" if src.get("flying") else "在地面")
+        mode = src.get("mode") or src.get("flight_mode")
+        if mode:
+            flags.append(f"{mode} 模式")
+        if flags:
+            lines.append("状态: " + " · ".join(str(f) for f in flags))
+
+        extra: list[str] = []
+        if src.get("heading_deg") is not None:
+            try:
+                extra.append(f"航向 {float(src['heading_deg']):.1f}°")
+            except (TypeError, ValueError):
+                pass
+        if src.get("battery_voltage") is not None:
+            try:
+                extra.append(f"电量 {float(src['battery_voltage']):.2f} V")
+            except (TypeError, ValueError):
+                pass
+        gps = src.get("gps")
+        satellites = None
+        if isinstance(gps, dict):
+            satellites = gps.get("satellites", gps.get("satellites_visible"))
+        satellites = satellites if satellites is not None else src.get("satellites_visible")
+        if satellites is not None:
+            extra.append(f"GPS {satellites} 颗星")
+        if isinstance(gps, dict) and gps.get("fix_type"):
+            extra.append(f"定位 {gps['fix_type']}")
+        if src.get("heartbeat_age_s") is not None:
+            try:
+                extra.append(f"心跳 {float(src['heartbeat_age_s']):.2f}s")
+            except (TypeError, ValueError):
+                pass
+        if extra:
+            lines.append(" · ".join(extra))
+
+        flat = {
+            key: value
+            for key, value in {**src, **data}.items()
+            if key not in cls._RESULT_NOISE_KEYS
+            and key not in cls._RESULT_TELEMETRY_KEYS
+            and not isinstance(value, (dict, list))
+        }
+        if flat:
+            lines.append("，".join(f"{key}={value}" for key, value in list(flat.items())[:8]))
+
+        nested = {
+            key: value
+            for key, value in {**src, **data}.items()
+            if isinstance(value, (dict, list))
+            and key not in cls._RESULT_TELEMETRY_KEYS
+            and key not in cls._RESULT_NOISE_KEYS
+        }
+        if nested:
+            try:
+                import json as _json
+
+                rendered = _json.dumps(nested, ensure_ascii=False, default=str)
+            except Exception:
+                rendered = str(nested)
+            if len(rendered) > 700:
+                rendered = rendered[:700] + " …"
+            lines.append("其他: " + rendered)
+        return chr(10).join(lines)
+
+    @classmethod
+    def _result_body_fallback(cls, data: dict[str, Any], message: str) -> str:
+        """工具返回的正文：优先渲染成可读要点，实在没有可读内容才退回 JSON。"""
+        humanized = cls._humanize_result(data) if isinstance(data, dict) else ""
+        if humanized.strip():
+            return humanized
         try:
             import json as _json
 
-            payload = {k: v for k, v in data.items() if k not in {"safety", "raw"}}
+            payload = {k: v for k, v in (data or {}).items() if k not in cls._RESULT_NOISE_KEYS}
             rendered = _json.dumps(payload, ensure_ascii=False, indent=2, default=str)
         except Exception:
             return message
-        if len(rendered) > 4000:
-            rendered = rendered[:4000] + chr(10) + "…（已截断）"
+        if len(rendered) > 1200:
+            rendered = rendered[:1200] + " …"
         return rendered if rendered.strip() not in {"{}", "null"} else message
 
     def _format_loop_result_body(data: dict[str, Any] | None) -> str:
@@ -3262,25 +3393,79 @@ class AgentRuntime:
         return fallback or message
 
     @staticmethod
+    @staticmethod
     def _verification_body(verification: dict[str, Any] | None) -> str:
-        """校验行的正文：摘要 + 逐条判据结果（展开可见）。
+        """校验行的正文：结论 + 回读到的状态 + 逐条校验项。
 
-        只显示"任务执行后状态已回读"这类摘要，操作员无从判断判据到底过没过。
+        以前只显示一句 summary，操作员根本不知道"在校验什么、依据是什么"；
+        真正的数据在 checks / 起点终点位置里，这里如实列出来。
         """
         payload = verification if isinstance(verification, dict) else {}
+        lines: list[str] = []
         summary = str(payload.get("summary") or "").strip()
-        criteria = payload.get("results")
-        lines: list[str] = [summary] if summary else []
-        if isinstance(criteria, list):
-            for item in criteria[:12]:
+        if summary:
+            lines.append(summary)
+
+        def _fmt(pos: Any) -> str:
+            if not isinstance(pos, dict):
+                return "—"
+            try:
+                return (
+                    f"N {float(pos.get('x', 0.0)):.2f} / E {float(pos.get('y', 0.0)):.2f} "
+                    f"/ D {float(pos.get('z', 0.0)):.2f} m"
+                )
+            except Exception:
+                return "—"
+
+        start_pos = payload.get("start_position_ned")
+        final_pos = payload.get("final_position_ned")
+        if isinstance(start_pos, dict):
+            lines.append(f"起点: {_fmt(start_pos)}")
+        if isinstance(final_pos, dict):
+            lines.append(f"终点: {_fmt(final_pos)}")
+        if "final_flying" in payload:
+            flying = payload.get("final_flying")
+            landed = payload.get("final_landed_state")
+            tail = f"（landed_state={landed}）" if landed is not None else ""
+            lines.append(f"结束状态: {'飞行中' if flying else '已落地'}{tail}")
+
+        checks = payload.get("checks") or payload.get("results")
+        if isinstance(checks, list) and checks:
+            lines.append("校验项:")
+            for item in checks[:12]:
                 if not isinstance(item, dict):
                     continue
-                metric = str(item.get("metric") or "判据")
-                satisfied = item.get("satisfied")
-                mark = "通过" if satisfied is True else ("未通过" if satisfied is False else "未评估")
-                detail = str(item.get("detail") or "").strip()
-                lines.append(f"- {metric}: {mark}" + (f"（{detail}）" if detail else ""))
-        return chr(10).join(lines) or summary
+                name = str(item.get("name") or item.get("metric") or "检查")
+                ok = item.get("ok", item.get("satisfied"))
+                mark = "通过" if ok is True else ("未通过" if ok is False else "未评估")
+                severity = str(item.get("severity") or "").strip()
+                detail = str(
+                    item.get("detail") or item.get("message") or item.get("reason") or ""
+                ).strip()
+                suffix = f"【{severity}】" if severity else ""
+                lines.append(f"- {name}: {mark}{suffix}" + (f" — {detail}" if detail else ""))
+                expected = item.get("expected")
+                if isinstance(expected, dict) and expected:
+                    rendered = "，".join(
+                        f"{key}={value}" for key, value in list(expected.items())[:4]
+                    )
+                    lines.append(f"    期望: {rendered}")
+        if not lines:
+            lines.append("未声明可校验的成功判据，仅回读最终状态。")
+        return chr(10).join(lines)
+
+    def _upsert_verify_row(self, run: RunState, body: str, status: str = "completed") -> None:
+        """就地更新最后一条校验行，而不是再追加一条。
+
+        "正在回读…"那条占位行被收尾成 completed 之后，再追加结果就会在时间线
+        上出现两条校验结果——操作员看到的正是这个（实测反馈："为啥每次返回两次"）。
+        """
+        with self._lock:
+            for item in reversed(run.process_trace):
+                if item.get("kind") == "verify":
+                    item.update({"timestamp": time.time(), "body": body, "status": status})
+                    return
+        self._append_process(run, "回读与校验", body, status=status, kind="verify")
 
     def _on_agent_event(self, level: str, source: str, message: str, data: dict[str, Any]) -> None:
         self._append_event(level, source, message, data)
@@ -5634,6 +5819,34 @@ class AgentRuntime:
         )
         self._frontend_render_grace(0.08)
 
+    def _plan_step_body(self, step: Any, label: str, message: str, ok: bool) -> str:
+        """计划执行路径的时间线正文：首行摘要 + 完整数据。
+
+        这条路径以前只写 "{label} → {message}"，展开后看不到任何返回值，
+        技能激活也只显示一句 "activated skill guidance"——正文本身（指导全文、
+        遥测、坐标）全丢了。
+        """
+        tool = str(getattr(step, "tool", "") or "")
+        summary = f"{label} → {message}" if message else ("完成" if ok else "失败")
+        if tool.startswith("skill:"):
+            getter = getattr(self.skills, "skill_body", None)
+            guidance = ""
+            if callable(getter):
+                try:
+                    guidance = str(getter(tool) or "").strip()
+                except Exception:
+                    guidance = ""
+            if guidance:
+                return summary + chr(10) + chr(10) + guidance
+            return summary
+        result = getattr(step, "result", None)
+        if isinstance(result, dict):
+            detail = self._result_body_fallback(result, message)
+            if message and detail and not detail.lstrip().startswith(message):
+                return message + chr(10) + chr(10) + detail
+            return detail or summary
+        return summary
+
     def _update_execution_trace_after_step(
         self,
         run: RunState,
@@ -5655,11 +5868,11 @@ class AgentRuntime:
         self._append_process(
             run,
             label,
-            f"{label} → {message}" if message else ("完成" if ok else "失败"),
+            self._plan_step_body(step, label, message, ok),
             status="completed" if ok else "failed",
             tool=step.tool,
             params=step.params,
-            kind="tool",
+            kind="skill" if str(step.tool).startswith("skill:") else "tool",
         )
         self._update_assistant_message(
             run.run_id,
@@ -5917,17 +6130,11 @@ class AgentRuntime:
             run.phase = "failed"
             run.failure_reason = run.verification.get("summary", "任务后状态校验失败")
             self._append_thought(run, "校验未通过", run.failure_reason, status="failed")
-            self._append_process(run, "回读与校验", run.failure_reason, status="failed", kind="verify")
+            self._upsert_verify_row(run, run.failure_reason, status="failed")
             self._append_event("warning", "verifier", "任务后状态校验失败", run.verification)
         elif run.verification:
             self._append_thought(run, "校验完成", str(run.verification.get("summary") or ""), status="completed")
-            self._append_process(
-                run,
-                "回读与校验",
-                AgentRuntime._verification_body(run.verification),
-                status="completed",
-                kind="verify",
-            )
+            self._upsert_verify_row(run, AgentRuntime._verification_body(run.verification))
             self._append_event("info", "verifier", "任务后状态校验完成", run.verification)
         if run.status == "completed":
             run.phase = "completed"

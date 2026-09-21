@@ -2054,13 +2054,8 @@ body[data-profile-collapsed="true"] .mission-profile {
   display: block;
   overflow-x: auto;
 }
-/* 极窄面板下工具名允许收缩省略，而不是把整行顶出边界 */
-.tl-one-line .tool-name {
-  flex: 0 1 auto;
-  min-width: 0;
-  overflow: hidden;
-  text-overflow: ellipsis;
-}
+/* 工具/技能/校验行的名字不参与收缩：这条旧规则允许它被摘要挤到零宽，正是
+   "工具调用看不到名字"的来源。名字保持完整，只有 .tl-line-brief 截断。 */
 
 .chat-empty {
   display: grid;
@@ -7348,25 +7343,38 @@ body.dragging-system-settings #systemSettingsModal .modal-head {
 .turn .tl-fold-chev::before { content: "▸"; }
 .turn details.tl-fold[open] > summary .tl-fold-chev::before { content: "▾"; }
 
-/* ── 模型思考：图标 + 加粗标签 + 正文（单行省略），整行点开，全文内联在
-      下方；排版与工具/技能行同一条线 ──────────────────────────────── */
+/* ── 模型思考：图标 + 加粗标签 + 可选阶段名 + 正文预览（单行省略），整行点开，
+      全文内联在下方；排版与工具/技能行同一条线 ──────────────────────── */
 .turn .tl-think-head {
   display: flex;
+  flex-wrap: nowrap;
   align-items: center;
   gap: 5px;
   min-width: 0;
   font-size: 12px;
   color: rgba(170, 180, 255, 0.75);
 }
-/* 标签不能被长正文挤掉（正文用 flex:1 1 auto 自行省略） */
+/* 标签不能被长正文挤掉（正文用 flex 自行省略），也绝不换行、不参与收缩 */
 .turn .tl-think-head .tl-node-label {
   flex: 0 0 auto;
   font-size: 11.5px;
   color: rgba(178, 192, 255, 0.95);
+  white-space: nowrap;
+}
+/* 阶段名（如"· 理解指令"）：单行省略，长阶段名不会换行去压住正文 */
+.turn .tl-think-head .tl-node-title {
+  flex: 0 1 auto;
+  min-width: 0;
+  max-width: 45%;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
 }
 .turn .tl-node.running .tl-think-head { color: rgba(180, 220, 255, 0.98); }
+/* 正文预览：恒为一行，短文本只占自身宽度（后面的运行指示符紧跟文字），
+   超宽则收缩并以省略号截断——绝不换行、绝不压到别的元素上 */
 .turn .tl-think-preview {
-  flex: 1 1 auto;
+  flex: 0 1 auto;
   min-width: 0;
   overflow: hidden;
   text-overflow: ellipsis;
@@ -7375,6 +7383,14 @@ body.dragging-system-settings #systemSettingsModal .modal-head {
   color: rgba(255, 255, 255, 0.62);
 }
 .turn .tl-node.tl-reasoning.running .tl-think-preview { color: rgba(255, 255, 255, 0.72); }
+/* 运行指示符：原来那个闪烁的 ▍ 光标，做成独立元素——预览被省略号截断时
+   它也不会跟着被裁掉；展开后同样在头部，一眼能看出还在流式写入 */
+.turn .tl-think-caret {
+  flex: 0 0 auto;
+  color: rgba(180, 220, 255, 0.95);
+  animation: dotPulse 1s steps(1, end) infinite;
+}
+.turn .tl-think-caret::before { content: "▍"; }
 /* 展开后的全文：内联正文，不套边框/滚动卡片 */
 .turn .tl-think-full,
 .turn .tl-skill-full {
@@ -7442,6 +7458,10 @@ body.dragging-system-settings #systemSettingsModal .modal-head {
 .turn .tl-one-line.cat-verify .tl-node-label { color: rgba(240, 184, 74, 0.9); }
 .turn .tl-one-line.cat-skill .tl-node-label { color: rgba(230, 170, 255, 0.95); }
 .turn .tl-one-line .tool-name {
+  /* 工具/技能/校验行的名字（工具名、"校验结果"等）必须完整可读：不收缩、不
+     省略、不被旁边的摘要挤掉——一行里唯一允许截断的是后面的 .tl-line-brief
+     （flex:1 1 auto + ellipsis）。所以这里保持 flex: 0 0 auto，不要给它加
+     min-width:0/overflow:hidden：一旦允许收缩，长摘要会按比例把名字压到零宽。 */
   flex: 0 0 auto;
   font-family: ui-monospace, Consolas, monospace;
   font-size: 12.5px;

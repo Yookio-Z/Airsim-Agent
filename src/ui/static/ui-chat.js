@@ -1594,15 +1594,22 @@ function skillNode(item) {
 }
 
 // 模型思考行：与下方工具/技能/校验行同一套外观——图标 + 加粗标签"模型思考" +
-// 正文（单行省略），整行可点开，展开后全文内联显示在下方——没有单独的
-// "▸ 点击展开全文"行，也没有套边框的可滚动卡片；ReAct 多轮思考与 plan-execute
-// 的思考共用这一种外观。
-// 运行中的行保持简单：图标 + 标签 + 就地增长的正文（仍在流式写入，不做展开器）。
-function timelineThinkNode(item, isLive) {
+// 可选阶段名 + 正文预览（单行省略），整行可点开，展开后全文内联显示在下方——
+// 没有单独的"▸ 点击展开全文"行，也没有套边框的可滚动卡片；ReAct 多轮思考与
+// plan-execute 的思考共用这一种外观。
+// 头部恒为一行：正文一律走 .tl-think-preview（CSS nowrap + ellipsis），绝不把
+// 正文节点塞进这一行的 flex 容器里——否则长文本会在标题行里换行，把
+// "图标 + 模型思考 + 阶段名 + 正文"挤成一团多层重叠的头部。
+// 运行中的行同样只显示这一行预览（+ 运行指示符），默认收起；点开后在下方就地
+// 增长全文——长规划文本不再自动铺满时间线，操作员想看才展开。
+// 运行态按条目自身的 status 判定（不是"是否最后一个流式行"）：状态由后端收尾时
+// 时间线按签名重建，转圈/光标不会残留。
+function timelineThinkNode(item) {
+  const isRunning = (item.status || "completed") === "running";
   const text = String(item.body || "").trim();
   const titleText = item.title && item.title !== "模型思考" ? String(item.title) : "";
   const node = document.createElement("div");
-  node.className = `tl-node tl-reasoning${isLive ? " running" : ""}`;
+  node.className = `tl-node tl-reasoning${isRunning ? " running" : ""}`;
   const row = document.createElement("div");
   row.className = "tl-think-head";
   const icon = document.createElement("i");
@@ -1617,32 +1624,31 @@ function timelineThinkNode(item, isLive) {
   row.appendChild(kind);
   if (titleText) {
     const title = document.createElement("span");
-    title.className = "tl-node-title";
+    title.className = "tl-node-title"; // 阶段名：CSS nowrap + 省略，不许换行压正文
     title.textContent = `· ${titleText}`;
     row.appendChild(title);
   }
-  if (isLive) {
-    const body = document.createElement("pre");
-    body.className = "tl-think-body"; // 流式更新按这个类就地写文本
-    body.textContent = text || "思考中…";
-    row.appendChild(body);
-    node.appendChild(row);
-    return node;
+  const preview = document.createElement("span");
+  preview.className = "tl-think-preview"; // 单行省略：CSS nowrap + ellipsis
+  const previewText = firstThinkLine(text) || (isRunning ? "思考中…" : "（无内容）");
+  preview.textContent = previewText;
+  row.appendChild(preview);
+  // 运行指示符：独立元素（不是预览的 ::after），缩略成省略号时也不会被裁掉；
+  // 仍是原来那个闪烁的 ▍ 光标，样式见 styles.css 的 .tl-think-caret。
+  if (isRunning) {
+    const caret = document.createElement("i");
+    caret.className = "tl-think-caret";
+    caret.setAttribute("aria-hidden", "true");
+    row.appendChild(caret);
   }
-  const preview = firstThinkLine(text) || "（无内容）";
-  const line = document.createElement("span");
-  line.className = "tl-think-preview"; // 单行省略：CSS nowrap + ellipsis
-  line.textContent = preview;
-  row.appendChild(line);
-  // 全文比这一行多（有换行 / 超出 90 字）才给展开器；短思考本来就看全了
-  if (!textNeedsDetail(text)) {
-    node.appendChild(row);
-    return node;
-  }
+  // 全文（展开后在下方内联显示）：运行中同样生成——折叠时按格式就地更新，
+  // 展开时"到目前为止的全部文本"原地增长，重建不重放动画、不丢展开态。
+  // 已完成的短思考本来就看全了，不给假展开器（与工具/技能行同一约定）。
   const full = document.createElement("pre");
   full.className = "tl-think-full";
   full.textContent = text;
-  node.appendChild(expandableRow(row, [full], `模型思考：${preview}（展开查看全文）`));
+  const detailNodes = isRunning || textNeedsDetail(text) ? [full] : [];
+  node.appendChild(expandableRow(row, detailNodes, `模型思考：${previewText}（展开查看全文）`));
   return node;
 }
 
@@ -1694,22 +1700,38 @@ function updateAgentTurn(entry, message, run, llm) {
     return Boolean(item.tool || humanThoughtTitle(item.title || ""));
   });
   const planSummaryText = String(details.plan_summary || "").trim();
-  // 规划阶段（LLM 正在生成计划）process_trace 里还没有真实思考/工具行：这时把
-  // 消息 details 里的流式推理作为临时思考块显示出来，否则操作员在整个规划期
-  // 只能看到一句"正在解析任务意图…"的占位。判据是"时间线里还没有真实行"，
-  // 而不是"有没有正在流式的真实思考"：真实思考行一旦出现（哪怕已经 completed），
-  // 这份整轮累计文本就永远不能再插，否则运行中它会重新跑到时间线末尾
-  // （工具行之后），看起来就是"流式输出位置不对"。规划期本来就有一条
-  // "理解指令"的阶段说明，所以不能用"时间线为空"当判据（那样永远不会触发）。
-  if (running && shouldShowPlanPhaseReasoning(timelineItems) && reasoning.trim()) {
-    timelineItems.push({
-      title: "模型思考",
-      body: reasoning,
-      status: "running",
-      tool: "",
-      params: {},
-      kind: "reasoning",
-    });
+  // 规划阶段（LLM 正在生成计划）process_trace 里只有一条没有 kind 的"理解指令"
+  // 占位行：这时把消息 details 里的流式推理就地写进那条已有思考行——写进去的
+  // 是同一行，绝不追加第二行，否则会出现两条"模型思考"（一条占位、一条流式），
+  // 流式文本还落在第二条里。只有时间线上一条思考行都没有时才新建。
+  // 判据仍是"时间线里还没有真实条目"：真实思考行一旦出现（哪怕已经 completed），
+  // 这份整轮累计文本就永远不能再写进去，否则运行中它会重新跑到时间线末尾
+  // （工具行之后），看起来就是"流式输出位置不对"；ReAct 的每轮正文由 process_trace
+  // 条目自己流式更新，累计文本写进去会让新一轮显示整段历史思考。
+  // 规划期本来就有一条"理解指令"的阶段说明，所以不能用"时间线为空"当判据。
+  if (running && reasoning.trim() && shouldShowPlanPhaseReasoning(timelineItems)) {
+    let thinkIdx = -1;
+    for (let i = timelineItems.length - 1; i >= 0; i -= 1) {
+      if (nodeCategory(timelineItems[i]) === "reasoning") {
+        thinkIdx = i;
+        break;
+      }
+    }
+    if (thinkIdx < 0) {
+      timelineItems.push({
+        title: "模型思考",
+        body: reasoning,
+        status: "running",
+        tool: "",
+        params: {},
+        kind: "reasoning",
+      });
+    } else if (timelineItems[thinkIdx].status === "running") {
+      // 就地更新：只换正文，title/status/行 key 都不动，签名不变、不触发重建，
+      // 流式正文由下面的就地写入按 .tl-think-preview/.tl-think-full 更新。
+      timelineItems[thinkIdx] = { ...timelineItems[thinkIdx], body: reasoning };
+    }
+    // 已有思考行但已收尾：不新增、不覆写（本轮思考已经显示过了）。
   }
   const hasProcess = Boolean(reasoning) || timelineItems.length > 0 || Boolean(planSummaryText);
   // 计划文本必须在时间线重建之前写入：重建时按它决定是否插入计划块，
@@ -1721,8 +1743,10 @@ function updateAgentTurn(entry, message, run, llm) {
     entry.planBlock.classList.add("flash-in");
   }
   if (planSummaryText) entry.planBlock.style.display = "";
-  // 运行中思考正文由 process_trace 条目自身的 body 流式更新；不可再用累计的
-  // reasoning_text 覆写最后一条，否则新一轮思考块会显示整段历史思考。
+  // 运行中思考正文由 process_trace 条目自身的 body 流式更新（规划期则由上面
+  // 把那一条占位行改写为本轮流式文本）；除了规划期这一条已收尾的行，不可再用
+  // 累计的 reasoning_text 覆写 ReAct 的最后一条，否则新一轮思考块会显示整段
+  // 历史思考。
   // 内容签名变化就重建时间线：条目状态会从 running → completed/failed，
   // 只做增量追加会让已渲染的行永远停在"转圈"。
   // 注意：不计入"正在流式的那个思考块的正文"，否则每个 token 都会重建、
@@ -1777,7 +1801,8 @@ function updateAgentTurn(entry, message, run, llm) {
       let node;
       // 思考行用 ui-chat.js 自己的渲染（图标紧跟正文、展开内联）：ui-composer.js
       // 里的旧 reasoningNode 是"标题行 + 单独一行点击展开全文"，样式已被替换。
-      if (cat === "reasoning") node = timelineThinkNode(item, idx === liveIdx);
+      // 运行态由条目自身的 status 决定，不再传"是否活跃行"。
+      if (cat === "reasoning") node = timelineThinkNode(item);
       else if (cat === "skill") node = skillNode(item);
       else if (cat === "system") node = systemNode(item);
       else node = toolLineNode(item);
@@ -1791,14 +1816,21 @@ function updateAgentTurn(entry, message, run, llm) {
     });
     if (!planInserted && entry.planBody.textContent) entry.timeline.appendChild(entry.planBlock);
   } else if (liveIdx >= 0) {
-    // 结构未变：只把流式文本就地写进活跃思考块（打字机效果）。
+    // 结构未变：只把流式文本就地写进活跃思考行（打字机效果），不重建节点，
+    // 因此用户展开的折叠块保持展开、也不重放进入动画。
     // 按行 key 定位而不是 .running 类，避免命中残留的旧 running 行。
     const liveNode = Array.from(entry.timeline.children).find((n) => n.dataset.tlRow === liveKey);
     if (liveNode) {
-      // 运行中的思考行不做展开器，正文就在 .tl-think-body 里就地增长
-      const target = liveNode.querySelector(".tl-think-body");
       const text = String(timelineItems[liveIdx].body || "");
-      if (target && target.textContent !== text) target.textContent = text;
+      // 头部预览（恒一行，省略号截断）与展开后的全文各自就地更新：折叠时只动
+      // 这一行预览，展开时全文在下方原地增长。
+      const preview = liveNode.querySelector(".tl-think-preview");
+      if (preview) {
+        const line = firstThinkLine(text) || "思考中…";
+        if (preview.textContent !== line) preview.textContent = line;
+      }
+      const full = liveNode.querySelector(".tl-think-full");
+      if (full && full.textContent !== text) full.textContent = text;
     }
   }
   entry.renderedTrace = timelineItems.length;
