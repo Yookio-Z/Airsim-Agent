@@ -49,6 +49,17 @@ class DroneConfig(BaseSettings):
     offboard_setpoint_hz: float = 15.0
     heartbeat_hz: float = 2.0
 
+    # Flight safety envelope (SafetyValidator / FlightConstraint).
+    # These were hard-coded in ToolRuntime.__init__, which meant the declared
+    # limits could not be matched to a deployment (e.g. a long-range survey
+    # still got the 100 m fence, and max_velocity here was ignored by the
+    # validator). Raise geofence_m deliberately: every position command, path
+    # waypoint, mission item and velocity instruction is checked against it.
+    safety_max_altitude_m: float = 50.0
+    safety_min_altitude_m: float = 0.5
+    safety_max_velocity_mps: float = 8.0
+    safety_geofence_m: float = 100.0
+
     # Search defaults.
     search_altitude: float = 15.0
     search_overlap: float = 0.3

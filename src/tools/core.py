@@ -336,6 +336,19 @@ def register_core_tools(
 
         Duration 0 sends one backend update when supported.
         """
+        f_vx, f_vy, f_vz = finite_float(vx), finite_float(vy), finite_float(vz)
+        f_duration = finite_float(duration)
+        if None in (f_vx, f_vy, f_vz, f_duration) or f_duration < 0.0:
+            return fmt_result({
+                "status": "error",
+                "backend": controller.backend_name,
+                "message": (
+                    "invalid parameters: vx/vy/vz/duration must be finite numbers "
+                    "and duration must not be negative"
+                ),
+                "received": {"vx": vx, "vy": vy, "vz": vz, "duration": duration},
+            })
+        vx, vy, vz, duration = f_vx, f_vy, f_vz, f_duration
         ok, targets = _run_for_vehicles(vehicle_name, lambda name: controller.move_by_velocity(vx, vy, vz, duration, name))
         payload = {
             "status": "ok" if ok else "error",
@@ -355,6 +368,23 @@ def register_core_tools(
         vehicle_name: str = "",
     ) -> str:
         """Move relative to the current vehicle heading (default vehicle; "all" for every vehicle)."""
+        f_forward = finite_float(forward_m)
+        f_right = finite_float(right_m)
+        f_up = finite_float(up_m)
+        f_velocity = finite_float(velocity)
+        if None in (f_forward, f_right, f_up, f_velocity):
+            return fmt_result({
+                "status": "error",
+                "backend": controller.backend_name,
+                "message": (
+                    "invalid parameters: forward_m/right_m/up_m/velocity must be finite numbers"
+                ),
+                "received": {
+                    "forward_m": forward_m, "right_m": right_m,
+                    "up_m": up_m, "velocity": velocity,
+                },
+            })
+        forward_m, right_m, up_m, velocity = f_forward, f_right, f_up, f_velocity
         targets = _resolve_target_vehicles(vehicle_name)
         ok = True
         pos: dict = {}
@@ -406,6 +436,37 @@ def register_core_tools(
 
         if not isinstance(waypoints, list) or not waypoints:
             return fmt_result({"status": "error", "message": "waypoints must be a non-empty list"})
+
+        f_velocity = finite_float(velocity)
+        if f_velocity is None:
+            return fmt_result({
+                "status": "error",
+                "message": f"invalid parameters: velocity must be a finite number (got {velocity!r})",
+            })
+        velocity = f_velocity
+        # 航点值同样必须是有限数：NaN 会让 move_on_path 内部的到达判断永远为假，
+        # 飞机在"未到达"状态下无限等待；Inf 则被当成合法目标点直接下发。
+        cleaned_waypoints = []
+        for index, waypoint in enumerate(waypoints):
+            if not isinstance(waypoint, dict):
+                return fmt_result({
+                    "status": "error",
+                    "message": f"waypoint #{index} must be an object with x, y, z",
+                })
+            coords = {}
+            for axis in ("x", "y", "z"):
+                value = finite_float(waypoint.get(axis))
+                if value is None:
+                    return fmt_result({
+                        "status": "error",
+                        "message": (
+                            f"waypoint #{index} has a non-finite {axis}: "
+                            f"{waypoint.get(axis)!r}"
+                        ),
+                    })
+                coords[axis] = value
+            cleaned_waypoints.append({**waypoint, **coords})
+        waypoints = cleaned_waypoints
 
         ok, targets = _run_for_vehicles(vehicle_name, lambda name: controller.move_on_path(waypoints, velocity, name))
         payload = {
@@ -671,14 +732,21 @@ def register_core_tools(
         except TypeError:
             # backends whose get_status has no vehicle_name parameter
             status = controller.get_status()
-        return fmt_result(
-            {
-                "status": "ok",
-                "backend": controller.backend_name,
-                "vehicle_name": vehicle_name or getattr(status, "vehicle_name", ""),
-                **status.to_dict(),
-            }
-        )
+        payload = {
+            "status": "ok",
+            "backend": controller.backend_name,
+            "vehicle_name": vehicle_name or getattr(status, "vehicle_name", ""),
+            **status.to_dict(),
+        }
+        # 控制器用 extra.connection_error 表示"这次读取失败了"，但 DroneStatus
+        # .to_dict() 里没有 status 字段，而上面是硬编码 "ok"，于是链路已断时这个
+        # 工具仍然报成功：执行器不会重连、AgentLoop 的连接熔断永不触发，而位置
+        # 读数只是 {0,0,0} 的占位值，却被下游当成真实遥测。
+        connection_error = str(payload.get("connection_error") or "").strip()
+        if connection_error:
+            payload["status"] = "error"
+            payload["message"] = f"遥测读取失败: {connection_error}"
+        return fmt_result(payload)
 
     @mcp.tool()
     def drone_set_mode(mode: str, vehicle_name: str = "") -> str:

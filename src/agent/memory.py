@@ -3,11 +3,16 @@
 from __future__ import annotations
 
 import json
+import os
 import re
 import threading
 import time
 from pathlib import Path
 from typing import Any
+
+from ..logging_config import get_logger
+
+logger = get_logger(__name__)
 
 
 class AgentMemory:
@@ -64,6 +69,7 @@ class AgentMemory:
             data.setdefault("skill_candidates", [])
             data.setdefault("facts", {})
             data.setdefault("runs", [])
+            self._sanitize(data)
             return data
         except Exception:
             backup = self.path.with_suffix(f".corrupt_{int(time.time())}.json")
@@ -83,12 +89,50 @@ class AgentMemory:
                 "runs": [],
             }
 
+    _LIST_KEYS = ("missions", "lessons", "risk_events", "skill_candidates", "runs")
+
+    @classmethod
+    def _sanitize(cls, data: dict[str, Any]) -> None:
+        """把被手改/损坏的记忆文件收敛回可用形状。
+
+        以前只保证根是 dict 就返回，于是 `"missions": {}` 或某一行把 timestamp
+        写成字符串，会让 recall 里 float(row["timestamp"]) 抛 TypeError/ValueError
+        并顺着 memory_recall 工具把整个 run 打挂。这里逐行丢弃坏数据，而不是让
+        一行坏记录毁掉一次任务。
+        """
+        for key in cls._LIST_KEYS:
+            rows = data.get(key)
+            if not isinstance(rows, list):
+                data[key] = []
+                continue
+            data[key] = [row for row in rows if isinstance(row, dict)]
+        facts = data.get("facts")
+        if not isinstance(facts, dict):
+            data["facts"] = {}
+        else:
+            data["facts"] = {
+                str(key): value
+                for key, value in facts.items()
+                if isinstance(value, dict)
+            }
+        if not isinstance(data.get("tool_stats"), dict):
+            data["tool_stats"] = {}
+        if not isinstance(data.get("session"), dict):
+            data["session"] = {}
+
     def _save(self) -> None:
-        tmp = self.path.with_suffix(".tmp")
         with self._lock:
-            with tmp.open("w", encoding="utf-8") as f:
-                json.dump(self._data, f, ensure_ascii=False, indent=2)
-            tmp.replace(self.path)
+            # 临时名带 pid：固定的 memory.tmp 在两个进程共用同一份记忆时会互相
+            # 覆盖，Windows 上 replace 还可能因为对方持有句柄直接失败。
+            tmp = self.path.with_name(f"{self.path.stem}.{os.getpid()}.tmp")
+            try:
+                with tmp.open("w", encoding="utf-8") as f:
+                    json.dump(self._data, f, ensure_ascii=False, indent=2)
+                tmp.replace(self.path)
+            except Exception as exc:
+                # 写入失败不能把异常抛进 AgentLoop：remember_tool_call 是在循环
+                # 里同步调用的，一次磁盘问题不该把飞行任务判失败。
+                logger.warning("memory_save_failed", error=str(exc))
 
     def remember_tool_call(self, tool: str, ok: bool) -> None:
         with self._lock:
@@ -439,13 +483,18 @@ class AgentMemory:
             removed = {
                 "missions": len(data.get("missions") or []),
                 "lessons": len(data.get("lessons") or []),
-                "risks": len(data.get("risks") or []),
+                # 风险事件的实际键名是 risk_events（remember_mission 写的就是它），
+                # 原来这里读写的 "risks" 根本不存在，等于风险记录从没被清过。
+                "risk_events": len(data.get("risk_events") or []),
+                "skill_candidates": len(data.get("skill_candidates") or []),
+                "runs": len(data.get("runs") or []),
                 "facts": len(data.get("facts") or {}),
             }
-            for key in ("missions", "lessons", "risks"):
+            for key in ("missions", "lessons", "risk_events", "skill_candidates", "runs"):
                 data[key] = []
             data["facts"] = {}
-            self._save(data)
+            self._data = data
+            self._save()
         return removed
 
     def snapshot(self) -> dict[str, Any]:

@@ -132,7 +132,11 @@ class SubAgentRunner:
         def on_state(loop_state: Any) -> None:
             if self.on_ui_state:
                 try:
-                    loop_state.run_id = parent_run_id  # echo sub progress into the parent UI
+                    # 借用父 run_id 只为让 UI 把子步骤挂在同一个任务卡片下；同时
+                    # 标注 sub_run_id，父 run 才能分辨"这是子循环的回显"而不是
+                    # 自己的状态，从而不会被子循环的 decisions/results 冒充。
+                    loop_state.sub_run_id = sub_id
+                    loop_state.run_id = parent_run_id
                     self.on_ui_state(loop_state)
                 except Exception:
                     pass

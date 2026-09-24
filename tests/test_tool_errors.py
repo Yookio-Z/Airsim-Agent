@@ -146,9 +146,14 @@ def test_output_schema_records_validation_errors():
     collector.tools["drone_get_status"] = bad_status
     rt = _runtime(collector)
     result = rt.execute("drone_get_status", {})
-    # shape violations gate the result: ok=False + INVALID_TOOL_OUTPUT
-    assert result.ok is False
-    assert result.error_code == "INVALID_TOOL_OUTPUT"
+    # Shape violations are diagnostic only: the tool itself succeeded, so the
+    # result stays ok=True and the mismatch is recorded for whoever reads it.
+    # Flipping ok to False here used to burn AgentLoop's 3-strike failure budget
+    # on a merely stale schema (e.g. AirSim reporting has_collided as None while
+    # the schema declares boolean) and fail the task while data.status was
+    # still "ok" — the opposite of what this file's own comment promises.
+    assert result.ok is True
+    assert result.error_code == ""
     assert "validation_errors" in result.data
     assert any("expected boolean" in v for v in result.data["validation_errors"])
 

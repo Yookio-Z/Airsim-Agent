@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import math
 import os
 import random
 import re
@@ -760,13 +761,68 @@ def _config_value(config: dict[str, Any], key: str, default: Any) -> Any:
     return config.get(key, default)
 
 
+def _as_bool(value: Any) -> bool:
+    """严格布尔解析。
+
+    模型在 JSON 模式下经常把布尔值写成字符串，而 bool("false") 是 True：
+    {"is_complete": "false"} 会被判成"任务已完成"（一个动作都不执行就收工），
+    {"target_found": "false"} 会被判成"目标已确认"（于是照着一个没确认的目标
+    继续抵近）。两个方向都是危险的，所以只认真正的真值表示。
+    """
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        return value != 0
+    if isinstance(value, str):
+        return value.strip().lower() in {"true", "1", "yes", "y", "on", "是", "真"}
+    return False
+
+
+def _finite_float(value: Any) -> float | None:
+    """float(value)，非数字或非有限值时返回 None。"""
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return None
+    return number if math.isfinite(number) else None
+
+
 def _extract_json(text: str) -> str:
-    text = text.strip()
+    """从模型回复里取出 JSON 主体。
+
+    以前只在文本"以 ``` 开头"时剥围栏——名字叫 extract 却并不提取。模型回复
+    前面带一句解释、或者写成单行 ```json{...}``` 都会让 json.loads 失败，而
+    这是确定性失败：重试三次照样失败，然后要么降级到规则决策（可能选出不同的
+    飞行动作），要么直接把 run 判为 LLM 不可用。这里改成先剥围栏，再从第一个
+    { 或 [ 取到最后一个对应的 } 或 ]。
+    """
+    text = (text or "").strip()
     if text.startswith("```"):
-        text = text.split("\n", 1)[1] if "\n" in text else text
-    if text.endswith("```"):
-        text = text.rsplit("\n", 1)[0]
-    return text.strip()
+        # 去掉首行围栏标记（``` 或 ```json），以及结尾的 ```
+        first_newline = text.find("\n")
+        text = text[first_newline + 1 :] if first_newline >= 0 else text
+        text = text.strip()
+        if text.endswith("```"):
+            text = text[: -len("```")]
+        text = text.strip()
+    # 单行 ```json{...}``` 剥完围栏后可能仍是 ```json{...} 的形式
+    if text.startswith("```"):
+        text = text[3:]
+        if text.lower().startswith("json"):
+            text = text[4:]
+        if text.endswith("```"):
+            text = text[: -len("```")]
+        text = text.strip()
+
+    starts = [index for index in (text.find("{"), text.find("[")) if index >= 0]
+    if not starts:
+        return text
+    start = min(starts)
+    closing = "}" if text[start] == "{" else "]"
+    end = text.rfind(closing)
+    if end <= start:
+        return text
+    return text[start : end + 1]
 
 
 # ---------------------------------------------------------------------------
@@ -1467,7 +1523,12 @@ class LLMMissionPlanner:
                 output_reserve=2048,
                 meter=self._token_meter(),
             )
-        return budget.with_reserve(images * IMAGE_TOKEN_QUOTA).fit(sections)
+        budget = budget.with_reserve(images * IMAGE_TOKEN_QUOTA)
+        fitted = budget.fit(sections)
+        # 记下这次实际用的预算对象：溢出重试前要据此判断"减半是否有意义"
+        # （必需段自己就超预算时，减半不可能生效）。
+        self._last_budget = budget
+        return fitted
 
     def _chat_with_overflow_recovery(
         self,
@@ -1488,6 +1549,16 @@ class LLMMissionPlanner:
         except Exception as exc:
             if not is_context_overflow_error(exc):
                 raise
+            budget = getattr(self, "_last_budget", None)
+            if budget is not None and getattr(budget, "essential_overflow", 0) > 0:
+                # 指令/观察段自己就超了预算，减半 context_window 不可能削减它们，
+                # 这一次重试注定以同样的溢出失败告终——直接说明原因，别浪费一次
+                # 昂贵的往返再报一个更难懂的错。
+                self.last_error = (
+                    "context overflow: 指令/观察等必需段本身超出上下文预算 "
+                    f"约 {budget.essential_overflow} tokens，无法通过裁剪其它段解决"
+                )
+                raise LLMUnavailableError(self.last_error) from exc
             self.last_error = f"context overflow; retrying with a tighter budget: {exc}"
             return call(client, build_messages(0.5))
 
@@ -1902,7 +1973,17 @@ class LLMMissionPlanner:
         failing the whole turn — one hallucinated name must not kill the run.
         """
         if not tool_calls:
-            return LoopDecision(action="", reason=text.strip() or "complete", is_complete=True)
+            # 空回复不能当成"任务完成"。原生协议下 content 为空且没有 tool_calls
+            # 是内容过滤、拒答、首 token 前截断这类情况的典型形状；以前直接返回
+            # is_complete=True，于是 run 被标成 completed、summary 就是 "complete"，
+            # 而一个动作都没执行过。有文字说明才接受隐式完成。
+            summary = (text or "").strip()
+            if not summary:
+                raise LLMUnavailableError(
+                    "native tool-calling model returned an empty response "
+                    "(no content, no tool calls)"
+                )
+            return LoopDecision(action="", reason=summary, is_complete=True)
         decisions: list[LoopDecision] = []
         rejected: list[str] = []
         for call in tool_calls:
@@ -2564,7 +2645,7 @@ class LLMMissionPlanner:
                             action = inner_action
             except (ValueError, TypeError, json.JSONDecodeError):
                 pass
-        is_complete = bool(payload.get("is_complete", False))
+        is_complete = _as_bool(payload.get("is_complete", False))
         if is_complete:
             action = ""
         elif action and action not in allowed_tools:
@@ -2582,7 +2663,7 @@ class LLMMissionPlanner:
             params=params,
             reason=str(payload.get("reason") or action or "complete"),
             is_complete=is_complete,
-            needs_replan=bool(payload.get("needs_replan", False)),
+            needs_replan=_as_bool(payload.get("needs_replan", False)),
             reflection=str(payload.get("reflection") or ""),
         )
         raw_actions = payload.get("actions")
@@ -3065,7 +3146,45 @@ class LLMMissionPlanner:
             return {"summary": "[unserializable tool result]"}
         if len(text) <= 1200:
             return safe
-        return {"summary": text[:1200] + "..."}
+        return self._truncate_keeping_long_text(safe, text)
+
+    # 技能正文（SKILL.md）是"这类任务该怎么做"的操作知识，模型必须读到全文才
+    # 能照着做；4 个内置技能都在 4~9KB。它以前和普通工具结果一起被 1200 字符
+    # 截断，模型拿到的是半截 JSON——渐进披露对每个技能都是坏的。
+    _LONG_TEXT_FIELDS = ("markdown", "guidance", "skill_markdown")
+    _LONG_TEXT_CAP = 12000
+
+    def _truncate_keeping_long_text(self, safe: dict[str, Any], text: str) -> dict[str, Any]:
+        """超长结果的结构化截断：长文本字段保真，其余字段摘掉。
+
+        直接切序列化后的字符串会得到非法 JSON，模型既看不到正文也拿不到字段名。
+        这里改成保留 markdown/guidance 这类长文本字段（上限 _LONG_TEXT_CAP），
+        其它字段用一行说明替代，保证输出仍是合法 JSON。
+        """
+        long_text = {
+            key: value
+            for key, value in safe.items()
+            if key in self._LONG_TEXT_FIELDS and isinstance(value, str) and value
+        }
+        if not long_text:
+            return {"summary": text[:1200] + "..."}
+        kept: dict[str, Any] = {}
+        for key, value in long_text.items():
+            if len(value) <= self._LONG_TEXT_CAP:
+                kept[key] = value
+            else:
+                kept[key] = value[: self._LONG_TEXT_CAP] + "\n...[truncated]"
+        for key, value in safe.items():
+            if key in kept or key in self._LONG_TEXT_FIELDS:
+                continue
+            if isinstance(value, (str, int, float, bool)) or value is None:
+                rendered = json.dumps(value, ensure_ascii=False, default=str)
+                if len(rendered) <= 400:
+                    kept[key] = value
+        kept["_truncated_fields"] = [
+            key for key in safe if key not in kept and key != "_truncated_fields"
+        ]
+        return kept
 
     def _contains_image_data(self, value: Any, _depth: int = 0) -> bool:
         # 深度上限：与 runtime._sanitize_for_frontend 同理，工具结果里共享的
@@ -3144,7 +3263,7 @@ class LLMMissionPlanner:
             confidence = max(0.0, min(1.0, float(confidence)))
         except (TypeError, ValueError):
             confidence = 0.0
-        found = bool(payload.get("target_found")) and confidence >= 0.5
+        found = _as_bool(payload.get("target_found")) and confidence >= 0.5
         action = str(payload.get("recommended_next_action") or "").strip().lower()
         if action not in {"continue_search", "approach", "hold", "reposition", "insufficient_image"}:
             action = "approach" if found and confidence >= 0.65 else "continue_search"
@@ -3476,7 +3595,7 @@ class LLMMissionPlanner:
                     tool=tool,
                     params=params,
                     layer=str(raw.get("layer") or "tool"),
-                    needs_observation=bool(raw.get("needs_observation")),
+                    needs_observation=_as_bool(raw.get("needs_observation")),
                 )
             )
 
@@ -3499,7 +3618,7 @@ class LLMMissionPlanner:
             execution_mode=str(payload.get("execution_mode") or "auto").strip().lower()
             if str(payload.get("execution_mode") or "").strip().lower() in {"auto", "agent_loop"}
             else "auto",
-            keep_reacting=bool(payload.get("keep_reacting")),
+            keep_reacting=_as_bool(payload.get("keep_reacting")),
             goal=self._goal_from_payload(payload.get("goal"), command),
         )
 

@@ -198,6 +198,8 @@ class ContextBudget:
         self.context_window = max(1024, int(context_window))
         self.output_reserve = max(256, int(output_reserve))
         self.meter = meter or TokenMeter()
+        # 最近一次 fit() 里"必需段自己就超预算"的超出量（token）。0 表示没有。
+        self.essential_overflow = 0
 
     @property
     def budget(self) -> int:
@@ -242,6 +244,20 @@ class ContextBudget:
             else:
                 result[key] = "[omitted]"
                 used += 12
+        # 必需段（指令/观察）本身超预算时，上面的循环只能把其它段全丢成
+        # "[omitted]"，请求照样超长，而且不会有任何提示。这里把实情记进属性，
+        # 调用方据此决定是否值得重试——把 context_window 减半不可能削减必需段，
+        # 那种重试注定失败。
+        self.essential_overflow = 0
+        if used > self.budget:
+            essential_used = sum(
+                self.meter.estimate(str(section.get("value") or ""))
+                for section in ordered
+                if self._priority(section) in self.ESSENTIAL
+                and str(section.get("value") or "")
+            )
+            if essential_used > self.budget:
+                self.essential_overflow = essential_used - self.budget
         return result
 
     @classmethod

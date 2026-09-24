@@ -97,6 +97,10 @@ class LoopState:
 
     run_id: str
     command: str
+    # 非空表示这是子 Agent 循环回显给父 run 的状态（sub_agent 会临时用父 run_id
+    # 做路由）。父 run 收到这种状态时只更新 UI 行，绝不覆盖自己的 loop_state /
+    # 进度 / 看门狗——否则子循环的 decisions/results 会冒充父 run 的轨迹。
+    sub_run_id: str = ""
     status: str = "created"
     original_plan: dict[str, Any] | None = None
     observations: list[LoopObservation] = field(default_factory=list)
@@ -113,6 +117,7 @@ class LoopState:
     def to_dict(self) -> dict[str, Any]:
         return {
             "run_id": self.run_id,
+            "sub_run_id": self.sub_run_id,
             "command": self.command,
             "status": self.status,
             "original_plan": self.original_plan,

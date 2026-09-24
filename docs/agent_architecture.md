@@ -550,6 +550,15 @@ Aliases such as `px4`, `mavlink`, and `sitl` should resolve to
 - Route complex tasks to Agent Loop.
 - Route high-risk tasks through supervisor approval.
 
+> **Status: superseded (kept for history).** `TaskRouter` was removed in commit
+> `2967378`; nothing references it. The runtime now has exactly one route —
+> `plan_execute`. The execution *shape* is chosen structurally by
+> `AgentRuntime._plan_requires_agent_loop`: a plan whose observation step
+> (photo / VLM / depth) precedes a motion step, or one where the planner declared
+> `execution_mode="agent_loop"`, runs on the observe-decide-act loop; everything
+> else runs as a fixed tool sequence with up to two ReAct correction rounds.
+> High-risk actions still pass the operator approval gate.
+
 ### Phase 5: Agent Loop / ReAct
 
 - Add structured loop state:

@@ -100,6 +100,26 @@ def _segment_crosses_circle(
     return _distance_2d(closest_x, closest_y, cx, cy) < r
 
 
+def _non_finite(values: dict[str, Any]) -> list[str]:
+    """列出不是有限数值的入参（NaN / ±Inf / 非数字）。
+
+    NaN 会污染本模块的每一次边界比较——NaN 与任何阈值比较都是 False，于是
+    一个 NaN 位置能同时躲过"z>=0""高度过低""高度过高""超出围栏"全部检查，
+    被判定为 safe；而 Inf 速度会在降速分支里算出 NaN 修正值，调用方套用后
+    直接把 NaN 送进控制器。所以必须先显式拒绝，再做任何范围判断。
+    """
+    bad: list[str] = []
+    for label, value in values.items():
+        try:
+            number = float(value)
+        except (TypeError, ValueError):
+            bad.append(f"{label}={value!r} 不是数字")
+            continue
+        if not math.isfinite(number):
+            bad.append(f"{label}={number!r} 不是有限数值（NaN/Inf）")
+    return bad
+
+
 class SafetyValidator:
     """飞行安全验证器
 
@@ -128,6 +148,16 @@ class SafetyValidator:
         violations: list[str] = []
         level = "safe"
         corrected: dict[str, Any] = {}
+
+        # 非有限值必须最先拒绝：NaN 与任何阈值比较都是 False，会一路"通过"。
+        bad = _non_finite({"x": x, "y": y, "z": z})
+        if bad:
+            return ValidationResult(
+                is_safe=False,
+                violations=[f"位置参数非法: {item}" for item in bad],
+                corrected=None,
+                level="danger",
+            )
 
         # --- 高度检查 ---
         altitude = abs(z)  # NED下高度取绝对值
@@ -191,6 +221,15 @@ class SafetyValidator:
 
     def validate_velocity(self, vx: float, vy: float, vz: float) -> ValidationResult:
         """验证速度是否在安全范围内"""
+        bad = _non_finite({"vx": vx, "vy": vy, "vz": vz})
+        if bad:
+            return ValidationResult(
+                is_safe=False,
+                violations=[f"速度参数非法: {item}" for item in bad],
+                corrected=None,
+                level="danger",
+            )
+
         speed = math.sqrt(vx ** 2 + vy ** 2 + vz ** 2)
 
         if speed <= self.constraints.max_velocity:

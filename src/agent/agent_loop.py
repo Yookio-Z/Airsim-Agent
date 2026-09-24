@@ -279,6 +279,22 @@ class AgentLoop:
             if plan_decision is not None and decision.action != plan_decision.action:
                 # 守卫/清理改写了动作 → 视为偏离计划，后续交回 LLM
                 plan_cursor = -1
+            # 本轮决策是在一次 15~40 秒的模型往返之前取得的观察上做出的，期间
+            # 操作员可能已经暂停/取消/急停。以前这里不复查：UI 已经显示"已暂停"，
+            # 模型返回后那个动作（可能是起飞/移动）仍然会执行。决策已过期就丢弃，
+            # 回到循环顶部重新观察后再决策。
+            if self._should_stop():
+                state.status = "blocked"
+                state.failure_reason = "supervisor emergency stop"
+                break
+            if self._paused_now():
+                self._event(
+                    "info", "agent_loop",
+                    "决策期间任务被暂停，丢弃本轮决策，等待恢复后重新观察",
+                    {"step": step_index, "discarded_action": decision.action},
+                    kind="loop.decision",
+                )
+                continue
             # 本轮模型思考必须先于决策/工具行写入时间线，否则前端会出现
             # "先调工具、后显示思考"的顺序倒错。计划驱动(plan)没有新的模型
             # 思考，不发出思考事件（避免复用上一轮的陈旧推理）。
@@ -1459,11 +1475,18 @@ class AgentLoop:
                 "raw": skill_result.to_dict(),
             }
         tool_result = self._call_tool(decision.action, decision.params, dry_run)
+        # error_code 是 ToolCallResult 的独立字段，而这里以前只把 data 交出去，
+        # 于是 AgentLoop 读 result_row.data.get("error_code") 永远是空串，连接
+        # 熔断只能退化成按消息子串匹配。这里把它并进 data，审计轨迹与前端也能
+        # 直接看到结构化错误码。
+        data = dict(tool_result.data or {})
+        if tool_result.error_code:
+            data.setdefault("error_code", tool_result.error_code)
         return {
             "tool": tool_result.tool,
             "params": tool_result.params,
             "ok": tool_result.ok,
-            "data": tool_result.data,
+            "data": data,
             "safety": tool_result.safety,
             "duration_ms": round((tool_result.finished_at - tool_result.started_at) * 1000, 1),
             "raw": tool_result.to_dict(),
@@ -1576,6 +1599,15 @@ class AgentLoop:
             return
         while self.should_pause() and not self._should_stop():
             time.sleep(0.2)
+
+    def _paused_now(self) -> bool:
+        """此刻是否处于暂停态（不含急停：急停由 _should_stop 判定）。"""
+        if not self.should_pause:
+            return False
+        try:
+            return bool(self.should_pause())
+        except Exception:
+            return False
 
     def _should_stop(self) -> bool:
         return bool(self.should_stop and self.should_stop())

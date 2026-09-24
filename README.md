@@ -22,7 +22,9 @@ enters the high-frequency flight control loop.
 ## Features
 
 - **Agent runtime** - LLM-driven task understanding, capability-aware planning,
-  L0-L4 task routing, task state/events, cancel/pause, and human approval flows.
+  a single plan-execute route (one LLM plan, then either a fixed tool sequence
+  or an observe-decide-act loop with on-demand ReAct), task state/events,
+  cancel/pause, and human approval flows.
 - **Tool registry** - a manifest-driven tool surface (flight, telemetry,
   perception, VLM, memory, sub-agent) served to the LLM through native
   function calling or JSON-schema prompting, over AirSim / PX4 MAVLink /

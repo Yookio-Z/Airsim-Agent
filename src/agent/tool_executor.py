@@ -12,6 +12,7 @@ from typing import Any, Callable
 
 from .backends import BackendProfile, BackendRegistry, create_builtin_backend_registry
 from .llm_protocol import validate_json_schema
+from src.config import config
 from src.modules.formation import FLIGHT_ACTIONS, FormationController
 from src.modules.safety_validator import FlightConstraint, SafetyValidator
 from src.tools.manifest import manifest_metadata, list_tool_manifest
@@ -171,6 +172,55 @@ def _agent_memory_tool_cards() -> list[dict[str, Any]]:
     ]
 
 
+def _non_finite_params(params: dict[str, Any] | None) -> list[str]:
+    """顶层参数里不是有限数值的键名（NaN / ±Inf，含 "nan"/"inf" 这类字符串）。
+
+    每个校验分支都用 float() 取参，而 float("nan") 和 JSON 的 NaN 字面量都能
+    转换成功；NaN 之后与任何阈值比较都是 False，于是逐条躲过范围检查。字符串
+    "nan"/"inf" 同理也要拦。真正的字符串参数（串口 URL、航点 JSON）解析会失败，
+    不会因为这道扫描被误判。
+    """
+    bad: list[str] = []
+    for key, value in (params or {}).items():
+        if isinstance(value, bool) or value is None:
+            continue
+        if isinstance(value, (int, float)):
+            if not math.isfinite(value):
+                bad.append(str(key))
+            continue
+        if isinstance(value, str):
+            try:
+                number = float(value.strip())
+            except (TypeError, ValueError):
+                continue
+            if not math.isfinite(number):
+                bad.append(str(key))
+    return bad
+
+
+def _finite_or_none(value: Any) -> float | None:
+    """float(value)，非数字或非有限值时返回 None。"""
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return None
+    return number if math.isfinite(number) else None
+
+
+def _gps_distance_m(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
+    """两个经纬度之间的近似水平距离（米）。
+
+    用等距圆柱投影（与 mavlink_controller._gps_offset_m 同一套近似）：在围栏
+    量级（几十米~几公里）误差远小于围栏本身，够用来判断"这个航点是不是飞出去
+    了"，而且不引入新的依赖。
+    """
+    meters_per_lat = 111_320.0
+    meters_per_lon = meters_per_lat * math.cos(math.radians((lat1 + lat2) / 2.0))
+    north = (lat2 - lat1) * meters_per_lat
+    east = (lon2 - lon1) * meters_per_lon
+    return math.hypot(north, east)
+
+
 class ToolRuntime:
     """Executes backend tools locally with safety validation."""
 
@@ -224,18 +274,16 @@ class ToolRuntime:
 
     CONNECTION_ERROR_MARKERS = (
         "not connected",
-        "connection",
+        "connection refused",
         "connect timed out",
-        "timeout",
-        "timed out",
-        "rpc",
-        "airsim",
-        "winerror",
-        "refused",
-        "reset",
+        "connection timed out",
+        "connect timeout",
+        "unreachable",
+        "no backend",
         "broken pipe",
+        "refused",
         "\u8d85\u65f6",
-        "\u8fde\u63a5",
+        "\u8fde\u63a5\u5931\u8d25",
         "\u672a\u8fde\u63a5",
         "\u62d2\u7edd",
     )
@@ -281,10 +329,10 @@ class ToolRuntime:
         self._control_gate = threading.RLock()
         self.safety = SafetyValidator(
             FlightConstraint(
-                max_altitude=50.0,
-                min_altitude=0.5,
-                max_velocity=8.0,
-                max_distance_from_home=100.0,
+                max_altitude=float(config.safety_max_altitude_m),
+                min_altitude=float(config.safety_min_altitude_m),
+                max_velocity=float(config.safety_max_velocity_mps),
+                max_distance_from_home=float(config.safety_geofence_m),
             )
         )
 
@@ -2259,10 +2307,25 @@ class ToolRuntime:
                     time.time(),
                     error_code="INVALID_PARAMS",
                 )
-            if safety.get("level") == "danger" and not safety.get("corrected_params"):
+            if safety.get("level") == "danger":
+                # 安全层是闸门，不是夹紧器：danger 一律拒绝执行。
+                # 修正值只作为"建议的安全参数"回给模型/操作员，让他们带正确
+                # 参数重试；静默套用修正值曾把「10 米高空」的意图变成 0.5 米
+                # 贴地飞（z>=0 的修正值是 -min_altitude），把超围栏目标夹到
+                # 围栏边界后照飞。warning 级（如高度超过上限、速度偏快）仍然
+                # 走下面的自动夹紧/降速，那些是收敛到安全值而不是改换目标。
+                suggested = dict(safety.get("corrected_params") or {})
+                message = "flight command blocked by safety layer"
+                if suggested:
+                    message += "；suggested_params 是安全参数，请带它重试"
                 return ToolCallResult(
                     name, params, False,
-                    {"status": "blocked", "message": "flight command blocked by safety layer", "violations": safety.get("violations", [])},
+                    {
+                        "status": "blocked",
+                        "message": message,
+                        "violations": safety.get("violations", []),
+                        "suggested_params": suggested,
+                    },
                     started, time.time(), safety=safety, error_code="SAFETY_BLOCKED",
                 )
             if safety.get("corrected_params"):
@@ -2290,11 +2353,21 @@ class ToolRuntime:
                     ok = status not in {"error", "blocked", "failed", "cancelled", "canceled"}
                     if name == "drone_connect" and data.get("connected") is False:
                         ok = False
-                    if name == "drone_connect" and self.backend_id == "px4_mavlink" and ok:
+                    if name == "drone_connect" and ok:
+                        # 记录"这条链路是不是真机"，并把它写回 _last_connect_params
+                        # 供自动重连复用（重连若拿不到这两个信息，会退回 default_
+                        # connect_params，即配置里的默认端点，而不是操作员实际连的
+                        # 那个）。以前这段只覆盖 px4_mavlink，ros2 网关永远记不上
+                        # 真机标记。
+                        requested_real = params.get("real_vehicle")
                         self._real_vehicle = bool(
-                            data.get("real_vehicle", self._real_vehicle)
-                            or str(data.get("url") or "").startswith("serial:")
-                        )
+                            self._real_vehicle
+                            if requested_real is None
+                            else requested_real
+                        ) or bool(data.get("real_vehicle")) or str(
+                            data.get("url") or params.get("url") or ""
+                        ).startswith("serial:")
+                        self._last_connect_params.update(dict(params))
                         self._last_connect_params["real_vehicle"] = self._real_vehicle
                     task_id = str(data.get("task_id") or "")
                     terminal = status not in {"accepted", "started", "pending", "queued", "running", "in_progress"}
@@ -2329,8 +2402,11 @@ class ToolRuntime:
                     if name in TOOL_OUTPUT_SCHEMAS:
                         violations = validate_json_schema(data, TOOL_OUTPUT_SCHEMAS[name])
                         if violations:
-                            result.ok = False
-                            result.error_code = "INVALID_TOOL_OUTPUT"
+                            # 只标注、不改判：schema 有遗漏（例如 AirSim 在没有
+                            # 碰撞体时把 has_collided 写成 None，而 schema 声明
+                            # boolean）不该把一次成功的状态读取翻成失败——那会消耗
+                            # AgentLoop 的失败预算，3 次就把任务判失败，而 data 里
+                            # 的 status 明明还是 ok。与本文件顶部的注释保持一致。
                             result.data = {**data, "validation_errors": violations}
                     return result
                 except Exception as e:
@@ -2350,6 +2426,61 @@ class ToolRuntime:
         finally:
             self._lock.release()
 
+    def _current_position(self) -> tuple[float, float, float] | None:
+        """当前 NED 位置；链路不可用/读数非法时返回 None。
+
+        validate() 之外的调用方都不在 try 里，控制器抛出的异常会直接穿出
+        execute()（它只接 TypeError/ValueError/JSONDecodeError），所以这里
+        必须自己兜住，读不到就当作"位置未知"由调用方决定是拒绝还是退化。
+        """
+        controller = self.controller
+        if controller is None or not getattr(controller, "is_connected", False):
+            return None
+        try:
+            status = controller.get_status()
+        except Exception:
+            return None
+        position = getattr(status, "position_ned", None) or {}
+        try:
+            x = float(position.get("x", 0.0) or 0.0)
+            y = float(position.get("y", 0.0) or 0.0)
+            z = float(position.get("z", 0.0) or 0.0)
+        except (TypeError, ValueError):
+            return None
+        if not (math.isfinite(x) and math.isfinite(y) and math.isfinite(z)):
+            return None
+        return (x, y, z)
+
+    def _current_global_position(self) -> tuple[float, float] | None:
+        """当前 GPS 经纬度；无定位/读数非法/未连接时返回 None。"""
+        controller = self.controller
+        if controller is None or not getattr(controller, "is_connected", False):
+            return None
+        try:
+            status = controller.get_status()
+        except Exception:
+            return None
+        gps = getattr(status, "gps", None)
+        if not isinstance(gps, dict):
+            return None
+        lat = _finite_or_none(gps.get("lat"))
+        lon = _finite_or_none(gps.get("lon"))
+        if lat is None or lon is None:
+            return None
+        # (0,0) 是"没有定位"的占位值，不是几内亚湾
+        if abs(lat) <= 0.001 and abs(lon) <= 0.001:
+            return None
+        return (lat, lon)
+
+    def _safety_constraints(self) -> dict[str, Any]:
+        constraints = self.safety.constraints
+        return {
+            "max_altitude": constraints.max_altitude,
+            "min_altitude": constraints.min_altitude,
+            "max_velocity": constraints.max_velocity,
+            "geofence_radius": constraints.max_distance_from_home,
+        }
+
     def validate(self, name: str, params: dict[str, Any]) -> dict[str, Any]:
         corrected: dict[str, Any] = {}
         violations: list[str] = []
@@ -2363,6 +2494,20 @@ class ToolRuntime:
                 level = "danger"
             elif result.level == "warning" and level != "danger":
                 level = "warning"
+
+        # 每个分支都用 float() 取参，而 float("nan")/JSON 的 NaN 字面量都能成功
+        # 转换；NaN 之后与任何阈值比较都是 False，会逐条躲过下面的范围检查。
+        # 所以先扫一遍原始参数，在任何按名分支之前就拒掉非有限值。
+        bad_params = _non_finite_params(params)
+        if bad_params:
+            return {
+                "level": "danger",
+                "violations": [
+                    f"参数不是有限数值（NaN/Inf），拒绝执行: {', '.join(bad_params)}"
+                ],
+                "corrected_params": {},
+                "constraints": self._safety_constraints(),
+            }
 
         if name == "drone_takeoff":
             altitude = abs(float(params.get("altitude", 3.0)))
@@ -2395,14 +2540,36 @@ class ToolRuntime:
                 corrected["velocity"] = abs(float(vel.corrected["vx"]))
 
         elif name == "drone_fly_velocity":
-            result = self.safety.validate_velocity(
-                float(params.get("vx", 0.0)),
-                float(params.get("vy", 0.0)),
-                float(params.get("vz", 0.0)),
-            )
+            vx = float(params.get("vx", 0.0))
+            vy = float(params.get("vy", 0.0))
+            vz = float(params.get("vz", 0.0))
+            result = self.safety.validate_velocity(vx, vy, vz)
             merge(result)
             if result.corrected:
                 corrected.update(result.corrected)
+            # 速度校验只看瞬时矢量，看不出 duration 蕴含的位移：5m/s 下降 60 秒
+            # 会从 3 米高度扎进地面，8m/s 飞 300 秒会飞出 100 米围栏 2.4 公里。
+            # 所以按 duration 推算落点，走与 drone_fly_to 相同的检查；读不到
+            # 当前位置时退化为"整段位移必须放得进围栏"这个不需要遥测的界。
+            duration = float(params.get("duration", 0.0) or 0.0)
+            if duration > 0.0:
+                speed = math.sqrt(vx * vx + vy * vy + vz * vz)
+                displacement = speed * duration
+                position = self._current_position()
+                if position is not None:
+                    end = self.safety.validate_position(
+                        position[0] + vx * duration,
+                        position[1] + vy * duration,
+                        position[2] + vz * duration,
+                    )
+                    merge(end)
+                elif displacement > self.safety.constraints.max_distance_from_home:
+                    level = "danger"
+                    violations.append(
+                        f"速度指令位移 {displacement:.1f}m 超过围栏半径 "
+                        f"{self.safety.constraints.max_distance_from_home:.0f}m，"
+                        "且当前无法读取位置以确认落点"
+                    )
 
         elif name == "drone_move_relative":
             forward_m = float(params.get("forward_m", 0.0))
@@ -2513,7 +2680,11 @@ class ToolRuntime:
                     if not isinstance(item, dict):
                         continue
                     safe_item = dict(item)
-                    if all(safe_item.get(axis) is not None for axis in ("x", "y", "z")):
+                    has_local = all(safe_item.get(axis) is not None for axis in ("x", "y", "z"))
+                    has_global = (
+                        safe_item.get("lat") is not None and safe_item.get("lon") is not None
+                    )
+                    if has_local:
                         x = float(safe_item.get("x", 0.0))
                         y = float(safe_item.get("y", 0.0))
                         z = float(safe_item.get("z", -3.0))
@@ -2525,12 +2696,64 @@ class ToolRuntime:
                             z = float(result.corrected.get("z", z))
                             safe_item.update({"x": x, "y": y, "z": z, "alt_m": abs(z)})
                             changed = True
-                    elif "alt_m" in safe_item:
-                        altitude = abs(float(safe_item.get("alt_m", 3.0) or 3.0))
+                    elif has_global:
+                        # 全球坐标航点：以前只处理"含 alt_m"的条目，lat/lon 条目
+                        # 既没有 x/y/z 也不含 alt_m 时直接落进 safe_items，一路
+                        # 不做任何检查。上传后 drone_start_mission 会把飞机交给
+                        # 自驾仪，自动飞行脱离 agent 循环和包线看门狗，所以围栏
+                        # 必须在这里守住；无法定位时宁可拒绝也不放行。
+                        altitude = _finite_or_none(
+                            safe_item.get("alt_m", safe_item.get("alt"))
+                        )
+                        if altitude is None:
+                            level = "danger"
+                            violations.append(
+                                "全球航点缺少合法高度（alt_m / alt 必须是有限数值）"
+                            )
+                        result = self.safety.validate_position(0.0, 0.0, -abs(altitude or 3.0))
+                        merge(result)
+                        origin = self._current_global_position()
+                        if origin is None:
+                            level = "danger"
+                            violations.append(
+                                "无法读取当前 GPS 位置，不能核对全球航点是否在围栏内"
+                                "（远程航线请先提高配置项 safety_geofence_m）"
+                            )
+                        else:
+                            distance = _gps_distance_m(
+                                origin[0], origin[1],
+                                float(safe_item.get("lat", 0.0) or 0.0),
+                                float(safe_item.get("lon", 0.0) or 0.0),
+                            )
+                            if distance > self.safety.constraints.max_distance_from_home:
+                                level = "danger"
+                                violations.append(
+                                    f"全球航点距离当前载具 {distance:.0f}m，超出围栏半径 "
+                                    f"{self.safety.constraints.max_distance_from_home:.0f}m"
+                                )
+                        # alt 别名统一成 alt_m：控制器两种都收，不统一的话夹紧值
+                        # 会被别名覆盖。只有真的改动了内容才标记 changed，否则会把
+                        # 一条未修改的航线也重写成"修正版"。
+                        if altitude is not None:
+                            normalized = abs(float(altitude))
+                            if "alt" in safe_item or safe_item.get("alt_m") != normalized:
+                                safe_item.pop("alt", None)
+                                safe_item["alt_m"] = normalized
+                                changed = True
+                    elif "alt_m" in safe_item or "alt" in safe_item:
+                        altitude = abs(
+                            _finite_or_none(safe_item.get("alt_m", safe_item.get("alt"))) or 3.0
+                        )
                         result = self.safety.validate_position(0.0, 0.0, -altitude)
                         merge(result)
                         if result.corrected and "z" in result.corrected:
                             safe_item["alt_m"] = abs(float(result.corrected["z"]))
+                            safe_item.pop("alt", None)
+                            changed = True
+                        elif "alt" in safe_item:
+                            # 别名统一成 alt_m，避免夹紧值被 alt 覆盖。
+                            safe_item["alt_m"] = altitude
+                            safe_item.pop("alt", None)
                             changed = True
                     safe_items.append(safe_item)
                 if changed:
@@ -2606,12 +2829,7 @@ class ToolRuntime:
             "level": level,
             "violations": violations,
             "corrected_params": corrected,
-            "constraints": {
-                "max_altitude": self.safety.constraints.max_altitude,
-                "min_altitude": self.safety.constraints.min_altitude,
-                "max_velocity": self.safety.constraints.max_velocity,
-                "geofence_radius": self.safety.constraints.max_distance_from_home,
-            },
+            "constraints": self._safety_constraints(),
         }
 
     def _public_backend_profile(self) -> dict[str, Any] | None:
@@ -2619,7 +2837,11 @@ class ToolRuntime:
             return None
         profile = self.backend_profile.to_public_dict()
         profile["capabilities"] = self._camera_capabilities(profile.get("capabilities") or {})
-        if self.backend_id == "px4_mavlink" and self._real_vehicle:
+        # 只看"这条链路是不是真机"，不看是哪个后端：以前这里额外要求
+        # backend_id == "px4_mavlink"，而 px4_ros2 的 profile 又写死
+        # real_vehicle=False、连接参数也从不携带该标记，于是真机走 ROS2 网关时
+        # 审批门（依赖 requires_operator_approval）永不生效。
+        if self._real_vehicle:
             capabilities = dict(profile.get("capabilities") or {})
             capabilities.update({
                 "real_vehicle": True,
@@ -3145,6 +3367,11 @@ class ToolRuntime:
 
     def _requires_vehicle_connection(self, name: str) -> bool:
         if name in {"memory_store", "drone_connect", "drone_disconnect"}:
+            return False
+        # 相机类工具的超时/失败是相机链路的问题，不代表飞控链路断开。以前它同样
+        # 命中连接类标记，于是一次 airsim_take_photo 超时就会 disconnect 并重连
+        # 飞控链路——飞机可能正在空中，而且真机上相机往往根本不在飞控链路上。
+        if name in self.CAMERA_SOURCE_TOOLS:
             return False
         return name.startswith("drone_") or name.startswith("airsim_")
 

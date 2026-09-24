@@ -374,6 +374,18 @@ class ToolMissionManager:
             if not upload_result.ok:
                 return upload_result
 
+        # 急停期间不得启航。ToolRuntime.execute 的 blocked_by_supervisor 默认
+        # False，而这条路径以前既不传它也不查急停状态，于是急停后点"启航"仍会
+        # 启动已上传的航线——MAVLink 的 _start_mission_one 还会先自动解锁、再切
+        # MISSION 模式。上传本身是惰性的，所以门放在上传之后、任何启动动作之前。
+        safety_state = self._safety.state() if self._safety is not None else None
+        if safety_state is not None and safety_state.emergency_stop:
+            return ManagerResult(
+                False,
+                "emergency stop is active; release it before starting the mission",
+                {"level": "danger", "mission": self._state.to_dict()},
+            )
+
         if self._state.details.get("execution_mode") == "local_path_fallback":
             waypoints, velocity = self._draft_to_local_path(self._draft)
             if not waypoints:

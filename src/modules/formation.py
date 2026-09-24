@@ -433,12 +433,18 @@ class FormationController:
             self.coverage_indices = {}
             ids = list(self.drone_ids)
         self.stop()
+        # 与 hover_all 同理：失败要留下记录，不能静默吞掉——这条路径在急停和
+        # 任务收尾时都会走，是最需要"确实停下来了"证据的地方。
+        failed: list[str] = []
         for drone_id in ids:
             try:
-                self.controller.hover(vehicle_name=drone_id)
-            except Exception:
-                pass
+                if not self.controller.hover(vehicle_name=drone_id):
+                    failed.append(drone_id)
+            except Exception as exc:
+                failed.append(f"{drone_id}: {exc}")
         self._release_velocity_control(ids)
+        if failed:
+            self._note_event("shutdown_hover_failed", ", ".join(failed))
         self._note_event("shutdown", reason)
         return was_active
 
@@ -669,12 +675,22 @@ class FormationController:
         with self._lock:
             ids = list(self.drone_ids)
             self.mode = "idle"
+        # 失败必须上报：急停路径也走这里，以前每个 hover 都被 except: pass 吞掉
+        # 而返回值永远是 ok，某架无人机没停下来在界面上完全看不出来。
+        failed: list[str] = []
         for drone_id in ids:
             try:
-                self.controller.hover(vehicle_name=drone_id)
-            except Exception:
-                pass
+                if not self.controller.hover(vehicle_name=drone_id):
+                    failed.append(drone_id)
+            except Exception as exc:
+                failed.append(f"{drone_id}: {exc}")
         self._release_velocity_control(ids)
+        if failed:
+            return {
+                "status": "error",
+                "message": f"部分无人机悬停失败: {', '.join(failed)}",
+                "failed": failed,
+            }
         return {"status": "ok", "message": "All drones hover; formation mode idle."}
 
     def land_all(self) -> dict[str, Any]:

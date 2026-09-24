@@ -1170,6 +1170,14 @@ def main() -> None:
     except KeyboardInterrupt:
         pass
     finally:
+        # 先把在跑的任务停下来并把飞机放到悬停再关服务：worker 是 daemon 线程，
+        # 直接退出会在任意点把它们杀掉（可能夹在一条飞控命令中间）。
+        runtime = RUNTIME
+        if runtime is not None:
+            try:
+                runtime.shutdown()
+            except Exception as exc:
+                print(f"runtime shutdown failed: {exc}", flush=True)
         httpd.server_close()
 
 

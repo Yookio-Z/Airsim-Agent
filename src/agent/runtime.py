@@ -231,6 +231,9 @@ AIRSIM_SETTINGS_TEMPLATES: dict[str, dict[str, str]] = {
 #   任务多出 5~10 次模型往返(每次 15~30s),是任务耗时过长的主因。
 # - MOTION_TOOLS: steps that change vehicle state.
 CORRECTION_ATTEMPTS_MAX = 2
+# 取消旗标能打断阻塞式飞行命令的时间窗（秒）。见 _flight_abort_requested：
+# 窗口内算数，窗口外视为残留，避免渗到操作员的下一次手动起飞。
+CANCEL_ABORT_WINDOW_S = 30.0
 OBSERVATION_TOOLS = {
     "airsim_take_photo",
     "inspect_current_frame",
@@ -272,6 +275,25 @@ MOTION_TOOLS = {
     "drone_rotate_to",
     "drone_land",
     "drone_hover",
+}
+# 真机上必须经操作员签字的动作：改变位置、改变飞行模式（AUTO 会启动已上传的
+# 航线）或改写航线的工具。它们的卡片风险是 medium，而审批门只在 high 时开，
+# 所以单靠卡片等级挡不住；drone_disarm 在空中等于坠机，一并纳入。
+# drone_land 与 formation 的飞行动作在 _tool_risk_level 里另有特判。
+_REAL_VEHICLE_APPROVAL_TOOLS = {
+    "drone_fly_to",
+    "drone_move_relative",
+    "drone_fly_path",
+    "drone_fly_velocity",
+    "drone_set_mode",
+    "drone_disarm",
+    "drone_upload_mission",
+    "drone_start_mission",
+    "drone_clear_mission",
+    "drone_dispatch_takeoff",
+    "drone_dispatch_path",
+    "drone_dispatch_land",
+    "drone_dispatch_return_land",
 }
 # Failures that re-running cannot fix: link/connection problems mean the
 # backend itself is unreachable, so a ReAct correction round is pointless.
@@ -557,6 +579,9 @@ def _build_connect_params(connection: dict[str, Any]) -> tuple[str, dict[str, An
         payload = {"url": url}
         if workspace:
             payload["workspace"] = workspace
+        # 真机标记必须贯通到后端：审批门依赖它（requires_operator_approval），
+        # 而这条分支以前从不携带它，等于真机走 ROS2 网关时高危工具零审批。
+        payload["real_vehicle"] = real_vehicle
         return "px4_ros2", payload
 
     # Everything else maps to the PX4 MAVLink backend.
@@ -726,6 +751,9 @@ class RunState:
     final_telemetry: dict[str, Any] = field(default_factory=dict)
     verification: dict[str, Any] = field(default_factory=dict)
     agent_state: dict[str, Any] = field(default_factory=dict)
+    # 后端代际：任务启动时记下，之后每次飞控动作前核对。中途切后端（用户在
+    # Links 面板换链路）会让后续步骤打到另一架飞机上，代际不符即拒绝执行。
+    backend_generation: int = -1
     thought_trace: list[dict[str, Any]] = field(default_factory=list)
     process_trace: list[dict[str, Any]] = field(default_factory=list)
     # ReAct correction rounds already spent after a failed Plan-Execute run.
@@ -824,6 +852,11 @@ class AgentRuntime:
         self._execution_slot = threading.Lock()
         self._execution_thread_id = 0
         self._cancel_requested = threading.Event()
+        # 取消要绑定"取消的是哪一次工作"：全局旗标会被后续提交（哪怕只是一条
+        # chat）清掉，也会残留到下一次手动起飞把命令打断。所以同时记录被取消
+        # 的 run id 和置位时刻，判定一律按 id/时间窗来，而不是读裸旗标。
+        self._cancel_requested_at = 0.0
+        self._cancel_requested_run_id = ""
         self._cancelled_request_ids: set[str] = set()
         # 执行中提交的新指令：作为"补充指令"注入正在跑的循环（steer），而不是
         # 中断任务重来。操作员可以用一句话纠正跑偏的任务，飞机也不会因为中断
@@ -834,7 +867,7 @@ class AgentRuntime:
             self.planner,
             self.memory,
             on_event=self._on_agent_event,
-            should_stop=lambda: self.supervisor.is_emergency_stopped() or self._cancel_requested.is_set(),
+            should_stop=lambda: self.supervisor.is_emergency_stopped() or self._active_run_cancelled(),
             should_pause=self.supervisor.should_pause,
             skills=self.skills,
             execute_tool=self._execute_agent_tool,
@@ -842,14 +875,10 @@ class AgentRuntime:
             steer_provider=self._take_pending_steer,
         )
         # the formation control loop stops on emergency stop / task cancel
-        self.tools.formation_set_stop_provider(
-            lambda: self.supervisor.is_emergency_stopped() or self._cancel_requested.is_set()
-        )
+        self.tools.formation_set_stop_provider(self._flight_abort_requested)
         # single-vehicle blocking flight commands (fly_to / path / takeoff)
         # also preempt on emergency stop / task cancel
-        self.tools.set_flight_stop_provider(
-            lambda: self.supervisor.is_emergency_stopped() or self._cancel_requested.is_set()
-        )
+        self.tools.set_flight_stop_provider(self._flight_abort_requested)
         self._lock = threading.RLock()
         self._events: list[RuntimeEvent] = []
         self._messages: list[ChatMessage] = []
@@ -861,6 +890,9 @@ class AgentRuntime:
         # marking during the (LLM-bound) gap between message creation and
         # self._current being assigned.
         self._pending_run_ids: set[str] = set()
+        # 子 Agent 编号由父级持有，保证同一任务的多个子任务各自拿到唯一的日志名
+        # （<parent>.sub1 / .sub2 ...），不会互相追加到同一个审计文件里。
+        self._sub_agent_counter: list[int] = [0]
         self._thread: threading.Thread | None = None
         self._current_session_id: str = ""
         # 追踪辅助：算法负责把锁定目标保持在画面中央（不经 LLM、不暴露工具）
@@ -938,6 +970,41 @@ class AgentRuntime:
 
             logging.getLogger("runtime").warning("perception_axis_init_failed", extra={"error": str(exc)})
             return None
+
+    def shutdown(self, timeout_s: float = 20.0) -> dict[str, Any]:
+        """进程退出前的收尾：停循环、把飞机放到安全状态、等执行槽释放。
+
+        以前没有任何关闭路径：worker 全是 daemon 线程且从不 join，Ctrl+C 或部署
+        重启会在任意时刻把它们杀掉（可能正好夹在一次飞控命令中间），既不会悬停
+        也不留记录。终态选"保持悬停"而不是降落，与本系统其它中断路径一致——
+        降落是不可逆的，会让操作员失去一架本可继续指挥的飞机。
+        """
+        self._cancel_active_work()
+        try:
+            self._stop_envelope_guard()
+        except Exception:
+            pass
+        try:
+            self._stop_tracking_assist("runtime shutdown")
+        except Exception:
+            pass
+        with self._lock:
+            run = self._current
+        if run is not None and getattr(run, "execute", False):
+            try:
+                self._attempt_hold_position(run, "agent runtime shutdown")
+            except Exception:
+                pass
+        deadline = time.time() + max(0.0, float(timeout_s))
+        while self._execution_slot.locked() and time.time() < deadline:
+            time.sleep(0.2)
+        result = {
+            "ok": True,
+            "slot_released": not self._execution_slot.locked(),
+            "run_id": str(getattr(run, "run_id", "") or ""),
+        }
+        self._append_event("warning", "system", "Agent 运行时正在关闭", result)
+        return result
 
     def shutdown_perception(self) -> None:
         """Stop the perception axis; safe to call multiple times."""
@@ -1065,7 +1132,7 @@ class AgentRuntime:
             if not execution_slot_acquired:
                 busy_error = "旧任务未能及时停止，请稍后重试。"
             else:
-                self._cancel_requested.clear()
+                self._clear_cancel_state()
         elif execute:
             execution_slot_acquired = self._execution_slot.acquire(blocking=False)
             if not execution_slot_acquired:
@@ -1081,7 +1148,13 @@ class AgentRuntime:
             )
             return {"ok": False, "error": busy_error}
 
-        self._cancel_requested.clear()
+        # 只有真正开启新工作的分支才清取消状态。以前这行对所有模式无条件执行，
+        # 而 chat 模式不获取执行槽，于是"停止任务 → 发一条 chat"会把取消旗标
+        # 清掉，正在收尾的 AgentLoop 就再也看不到取消、继续执行飞行动作。
+        if active_mode == "chat":
+            pass
+        elif execute:
+            self._clear_cancel_state()
         with self._lock:
             self._cancelled_request_ids.discard(request_id)
 
@@ -1848,30 +1921,34 @@ class AgentRuntime:
     ) -> None:
         if execute:
             self._execution_thread_id = threading.get_ident()
+        # 这一段（录像会话、RunLog 建目录、遥测快照）都必须在 try 之内：释放
+        # 执行槽的 finally 挂在下面，任何一步在 try 之前抛异常，worker 线程就会
+        # 带着已获取的执行槽死掉，此后每次提交都要等满 60 秒并返回"旧任务未能
+        # 及时停止"，助手消息永远停在运行中，只能重启进程恢复。
         replay_session = None
-        if execute and run_id:
-            replay_session = self._start_replay_session(
-                run_id,
-                {"run_id": run_id, "command": command, "mode": "execute"},
-            )
-        if run_id:
-            with self._lock:
-                self._run_log = RunLog(run_id)
-            tool_runtime = self.tools.status_snapshot()
-            self._run_log.write(
-                "run.start",
-                {
-                    "command": command,
-                    "mode": "execute" if execute else "plan",
-                    "model_id": model_id or "",
-                    "backend": str(tool_runtime.get("backend") or ""),
-                    "attachments": len(attachments or []),
-                },
-            )
-        else:
-            with self._lock:
-                self._run_log = None
         try:
+            if execute and run_id:
+                replay_session = self._start_replay_session(
+                    run_id,
+                    {"run_id": run_id, "command": command, "mode": "execute"},
+                )
+            if run_id:
+                with self._lock:
+                    self._run_log = RunLog(run_id)
+                tool_runtime = self.tools.status_snapshot()
+                self._run_log.write(
+                    "run.start",
+                    {
+                        "command": command,
+                        "mode": "execute" if execute else "plan",
+                        "model_id": model_id or "",
+                        "backend": str(tool_runtime.get("backend") or ""),
+                        "attachments": len(attachments or []),
+                    },
+                )
+            else:
+                with self._lock:
+                    self._run_log = None
             tool_runtime = self.tools.status_snapshot()
             tool_runtime = self._preflight_link_check(command, execute, tool_runtime)
             drone_state = tool_runtime.get("drone") or {}
@@ -2179,17 +2256,30 @@ class AgentRuntime:
         self._publish_run_update(run)
         self._publish("approval_required", {"approval": req.to_dict()})
 
-        # Block until decision or timeout. Poll every 1s so emergency_stop can interrupt.
+        # Block until decision or timeout. Poll every 1s so emergency_stop and
+        # operator cancel can interrupt.
         deadline = req.created_at + req.timeout_seconds
         while True:
+            abort_reason = ""
             if self.supervisor.is_emergency_stopped():
+                abort_reason = "emergency stop during approval"
+                level = "danger"
+                text = "审批期间触发急停，任务取消"
+            elif self._is_run_cancelled(run.run_id):
+                # 等待审批时点停止：以前只查急停和超时，于是审批请求一直挂着，
+                # 操作员（或前端重试）再点"批准"就会把已取消的任务复活并执行
+                # 这个高危飞控动作。
+                abort_reason = "operator cancelled task during approval"
+                level = "warning"
+                text = "审批期间任务被中断，已作废该审批请求"
+            if abort_reason:
                 req.approved = False
                 with self._lock:
                     run.status = "cancelled"
                     run.phase = "cancelled"
-                    run.failure_reason = "emergency stop during approval"
+                    run.failure_reason = abort_reason
                     run.finished_at = time.time()
-                self._append_event("danger", "safety", "审批期间触发急停，任务取消", {"run_id": run.run_id})
+                self._append_event(level, "safety", text, {"run_id": run.run_id})
                 self._cleanup_approval(run.run_id)
                 return False
             remaining = deadline - time.time()
@@ -2207,6 +2297,25 @@ class AgentRuntime:
                 break
 
         approved = bool(req.approved)
+        # 批准之后、真正执行之前再核对一次：取消与急停都可能发生在 wait 返回
+        # 到这里的瞬间，不能把审批当成"绕过取消"的后门。
+        if approved:
+            blocked = self._should_abort_run(run)
+            if blocked:
+                approved = False
+                with self._lock:
+                    run.status = "cancelled"
+                    run.phase = "cancelled"
+                    run.failure_reason = blocked
+                    run.finished_at = time.time()
+                self._append_event(
+                    "warning", "safety",
+                    f"批准到达时任务已被中止（{blocked}），不执行该动作",
+                    {"run_id": run.run_id, "tool": tool},
+                )
+                self._cleanup_approval(run.run_id)
+                self._publish_run_update(run)
+                return False
         with self._lock:
             if approved:
                 run.status = "running"
@@ -2356,7 +2465,6 @@ class AgentRuntime:
                     return True
         return False
 
-    @staticmethod
     @staticmethod
     def _plan_requires_agent_loop(plan: MissionPlan | None) -> bool:
         """Choose Plan-Execute vs ReAct. The planner may declare agent_loop
@@ -2533,10 +2641,9 @@ class AgentRuntime:
             answer_with_llm=False,
             start_telemetry=dict(telemetry or {}),
             agent_state=agent_state,
+            backend_generation=self._backend_generation,
         )
-        with self._lock:
-            self._current = run
-            self._pending_run_ids.discard(run_id)
+        self._register_current_run(run)
         self._start_task_run(run)
         # 飞行包线看门狗必须在两条执行路径上都启动：之前只挂在 Agent Loop
         # 状态回调里，走一次性计划路径时完全没有保护（实测飞机爬到 30m 才被
@@ -3029,10 +3136,56 @@ class AgentRuntime:
             allowed.update({"drone_fly_to", "drone_land"})
         return allowed
 
+    def _append_sub_agent_rows(self, run: RunState, loop: LoopState, sub_run_id: str) -> None:
+        """把子 Agent 的进度作为时间线行附到父任务下，不改写父 run 的任何状态。
+
+        子循环的 decisions/results 属于子任务，父 run 的 loop_state、进度、状态、
+        看门狗都必须保持自己的语义；这里只做可视化，并用已见计数去重（子循环
+        每次都回显完整列表）。
+        """
+        if not isinstance(run.agent_state, dict):
+            return
+        seen = run.agent_state.setdefault("_sub_agent_rows", {})
+        if not isinstance(seen, dict):
+            return
+        counts = seen.get(sub_run_id) or {"decisions": 0, "results": 0}
+        decisions = list(getattr(loop, "decisions", []) or [])
+        results = list(getattr(loop, "results", []) or [])
+        if len(decisions) > int(counts.get("decisions") or 0):
+            counts["decisions"] = len(decisions)
+            decision = decisions[-1]
+            self._append_process(
+                run,
+                f"子任务决策 {len(decisions)}",
+                self._loop_decision_public_text(decision)
+                or str(getattr(decision, "action", "") or "检查子任务是否完成"),
+                status="completed" if getattr(decision, "is_complete", False) else "running",
+                kind="reasoning",
+            )
+        if len(results) > int(counts.get("results") or 0):
+            counts["results"] = len(results)
+            result = results[-1]
+            self._append_process(
+                run,
+                f"子任务动作: {getattr(result, 'tool', '')}",
+                "子任务工具执行完成。" if getattr(result, "ok", False) else "子任务工具执行失败。",
+                status="completed" if getattr(result, "ok", False) else "failed",
+                kind="tool",
+            )
+        seen[sub_run_id] = counts
+
     def _on_agent_loop_state(self, loop: LoopState) -> None:
         with self._lock:
             run = self._current
             if not run or run.run_id != loop.run_id:
+                return
+            sub_run_id = str(getattr(loop, "sub_run_id", "") or "")
+            if sub_run_id:
+                # 子 Agent 的进度回显：只往时间线上补行。以前这里不区分回显，
+                # 子循环的 decisions/results 会整体覆盖父 run 的 loop_state、按
+                # 子循环的 max_steps 重算父进度，还会替父 run 启动包线看门狗。
+                self._append_sub_agent_rows(run, loop, sub_run_id)
+                self._publish_run_update(run)
                 return
             if run.status == "cancelled":
                 self._publish_run_update(run)
@@ -3392,7 +3545,6 @@ class AgentRuntime:
             return message + chr(10) + chr(10) + fallback
         return fallback or message
 
-    @staticmethod
     @staticmethod
     def _verification_body(verification: dict[str, Any] | None) -> str:
         """校验行的正文：结论 + 回读到的状态 + 逐条校验项。
@@ -4001,16 +4153,20 @@ class AgentRuntime:
             return self._cancel_active_work()
         if action == "pause":
             self.supervisor.pause()
-            if self._current and self._current.status == "running":
-                self._current.status = "paused"
-                self._current.phase = "paused"
+            # 与 worker 线程读写同一个 run 对象，字段更新要在锁内（以前无锁，
+            # 会和 _run_plan / _on_agent_loop_state 的写入互相覆盖）。
+            with self._lock:
+                if self._current and self._current.status == "running":
+                    self._current.status = "paused"
+                    self._current.phase = "paused"
             self._append_event("warning", "safety", "任务已暂停")
             return {"ok": True}
         if action == "resume":
             self.supervisor.resume()
-            if self._current and self._current.status == "paused":
-                self._current.status = "running"
-                self._current.phase = "executing"
+            with self._lock:
+                if self._current and self._current.status == "paused":
+                    self._current.status = "running"
+                    self._current.phase = "executing"
             self._append_event("info", "safety", "任务已恢复")
             return {"ok": True}
         if action == "emergency_stop":
@@ -4027,11 +4183,12 @@ class AgentRuntime:
                 "急停已触发，尝试悬停",
                 {**result.to_dict(), "formation_stopped": formation_stopped},
             )
-            if self._current:
-                self._current.status = "blocked"
-                self._current.phase = "blocked"
-                self._current.failure_reason = "emergency stop"
-                self._current.finished_at = time.time()
+            with self._lock:
+                if self._current:
+                    self._current.status = "blocked"
+                    self._current.phase = "blocked"
+                    self._current.failure_reason = "emergency stop"
+                    self._current.finished_at = time.time()
             return {"ok": result.ok, "result": result.to_dict(), "formation_stopped": formation_stopped}
         if action == "reset_emergency":
             self.supervisor.reset_emergency()
@@ -4098,6 +4255,44 @@ class AgentRuntime:
             }
         return None
 
+    def _active_execute_run(self) -> RunState | None:
+        """正在执行的 run（执行槽被占、且当前任务确实处在进行中的状态）。"""
+        # 取属性一律用 getattr：测试与嵌入式用法会用 object.__new__ 造出只带
+        # 部分属性的 runtime，硬取属性会直接抛 AttributeError。
+        slot = getattr(self, "_execution_slot", None)
+        if slot is None or not slot.locked():
+            return None
+        lock = getattr(self, "_lock", None)
+        if lock is None:
+            return None
+        with lock:
+            current = getattr(self, "_current", None)
+            if current is not None and str(getattr(current, "status", "") or "") in {
+                "queued",
+                "running",
+                "paused",
+                "awaiting_approval",
+                "responding",
+            }:
+                return current
+        return None
+
+    def _run_in_progress_error(self, action: str) -> dict[str, Any] | None:
+        """执行中禁止改变链路/会话：返回拒绝结果，否则 None。
+
+        切后端会立刻断开旧控制器，而正在跑的任务没有代际校验，后续的
+        takeoff/fly/land 会落到新链路上（可能是另一架飞机）；切会话则会把
+        运行态从 _current 里抹掉，任务继续飞但界面上已经看不到它。
+        """
+        active = self._active_execute_run()
+        if active is None:
+            return None
+        return {
+            "ok": False,
+            "error": f"有任务正在执行，无法{action}。请先点『停止/打断』结束任务。",
+            "run_id": active.run_id,
+        }
+
     def _take_pending_steer(self) -> list[str]:
         """取出并清空待注入的补充指令（agent loop 每轮开头调用一次）。"""
         with self._lock:
@@ -4136,9 +4331,11 @@ class AgentRuntime:
 
     def _cancel_active_work(self) -> dict[str, Any]:
         self._cancel_requested.set()
+        self._cancel_requested_at = time.time()
         run_to_publish: RunState | None = None
         previous_phase = ""
         cancelled_ids: list[str] = []
+        rejected_approvals: list[str] = []
         with self._lock:
             if self._current and self._current.status in {"queued", "running", "paused", "responding", "awaiting_approval"}:
                 previous_phase = self._current.phase
@@ -4149,6 +4346,7 @@ class AgentRuntime:
                 self._current.progress = 100.0
                 self._current.assistant_message = "任务已中断。"
                 self._cancelled_request_ids.add(self._current.run_id)
+                self._cancel_requested_run_id = self._current.run_id
                 cancelled_ids.append(self._current.run_id)
                 run_to_publish = self._current
             for message in self._messages:
@@ -4163,6 +4361,19 @@ class AgentRuntime:
                     details["cancelled"] = True
                     message.details = details
                     message.updated_at = time.time()
+            # 待批的高危动作必须一起作废：审批等待循环不读取消旗标，若不在这里
+            # 拒绝并唤醒，"停止后再点批准"会把已取消的任务复活并执行飞控动作。
+            for request_id, req in list(self._pending_approvals.items()):
+                if req.run_id in set(cancelled_ids) or not cancelled_ids:
+                    req.approved = False
+                    req.event.set()
+                    rejected_approvals.append(request_id)
+                    self._pending_approvals.pop(request_id, None)
+
+        # 暂停是全局布尔：暂停中取消会让固定序列执行卡在暂停轮询里出不来，
+        # 一直占着执行槽（之后每个任务都要等满 60 秒然后报"旧任务未停止"）。
+        # 取消是终态，解锁暂停；且 pause 不清会渗给下一个任务。
+        self.supervisor.resume()
 
         hover_result = None
         if run_to_publish and run_to_publish.mode == "execute" and previous_phase != "responding":
@@ -4183,13 +4394,82 @@ class AgentRuntime:
             "warning",
             "agent",
             "已发送中断请求",
-            {"run_ids": sorted(set(cancelled_ids)), "hover_result": hover_result.to_dict() if hover_result else None},
+            {
+                "run_ids": sorted(set(cancelled_ids)),
+                "hover_result": hover_result.to_dict() if hover_result else None,
+                "rejected_approvals": rejected_approvals,
+            },
         )
-        return {"ok": True, "cancelled": sorted(set(cancelled_ids)), "hover": hover_result.to_dict() if hover_result else None}
+        return {
+            "ok": True,
+            "cancelled": sorted(set(cancelled_ids)),
+            "hover": hover_result.to_dict() if hover_result else None,
+            "rejected_approvals": rejected_approvals,
+        }
 
     def _is_run_cancelled(self, run_id: str) -> bool:
         with self._lock:
-            return self._cancel_requested.is_set() or run_id in self._cancelled_request_ids
+            if run_id and run_id in self._cancelled_request_ids:
+                return True
+            # 全局旗标只在它确实指向这次工作时才算数：否则上一个任务的取消会
+            # 顺着旗标泄漏给下一个任务（新任务第一步就被判取消）。
+            return bool(
+                self._cancel_requested.is_set()
+                and self._cancel_requested_run_id
+                and self._cancel_requested_run_id == run_id
+            )
+
+    def _clear_cancel_state(self) -> None:
+        """结束一次取消请求：清旗标、时间戳与归属 run。"""
+        self._cancel_requested.clear()
+        self._cancel_requested_at = 0.0
+        self._cancel_requested_run_id = ""
+
+    def _active_run_cancelled(self) -> bool:
+        """当前活跃 run 是否已被取消。
+
+        AgentLoop 的 should_stop 用它，而不是读裸旗标——旗标会被后续提交
+        （比如一条 chat）清掉，那样正在收尾的循环就永远看不到取消了。
+        """
+        with self._lock:
+            current = self._current
+            run_id = str(getattr(current, "run_id", "") or "")
+            if run_id and run_id in self._cancelled_request_ids:
+                return True
+            if not self._cancel_requested.is_set():
+                return False
+            if not run_id:
+                return True
+            return self._cancel_requested_run_id == run_id
+
+    def _flight_abort_requested(self) -> bool:
+        """飞行 stop provider 的判据：是否应当打断正在执行的阻塞式飞行命令。
+
+        急停永远算数。取消只在"刚点下停止"的时间窗内算数：旗标是全局的，
+        没有任务在跑时点停止也会置位，而它以前一直留到下一次任务收尾，于是
+        操作员下一次手动起飞会被立刻打断（实测：飞机明明已经起飞，界面报
+        起飞失败）。时间窗既保留了"打断当前命令"的能力，又不会渗到之后。
+        """
+        if self.supervisor.is_emergency_stopped():
+            return True
+        if not self._cancel_requested.is_set():
+            return False
+        if not self._cancel_requested_at:
+            return False
+        return (time.time() - self._cancel_requested_at) <= CANCEL_ABORT_WINDOW_S
+
+    def _should_abort_run(self, run: RunState) -> str:
+        """返回中止原因，"" 表示继续。
+
+        固定序列执行路径的唯一"要不要停"入口：_run_plan 以前只看 supervisor 的
+        pause/emergency 状态、不看取消，操作员点停止后剩下的步骤照跑，还会把
+        run.status 写回 running、覆盖掉 _cancel_active_work 标注的 cancelled。
+        """
+        if self.supervisor.is_emergency_stopped():
+            return "emergency stop"
+        if self._is_run_cancelled(run.run_id):
+            return "operator cancelled task"
+        return ""
 
     def link_summary(self) -> dict[str, Any]:
         """Single shot of how the Agent is wired to the vehicle.
@@ -4519,6 +4799,11 @@ class AgentRuntime:
                 provided, ``connect_params`` are taken from the stored link
                 definition unless explicitly overridden.
         """
+        # 执行中禁止切换链路（见 _run_in_progress_error）。代际自增必须在拒绝
+        # 判断之后：先自增会把正在跑的任务判成"后端已换代"而被误拒。
+        blocked = self._run_in_progress_error("切换飞行后端")
+        if blocked:
+            return blocked
         with self._lock:
             self._backend_generation += 1
         # Resolve params: explicit overrides > stored link definition > defaults.
@@ -4586,6 +4871,9 @@ class AgentRuntime:
         id would then re-connect instead of disconnecting, so "断开" needs an
         explicit, id-free path.
         """
+        blocked = self._run_in_progress_error("断开当前链路")
+        if blocked:
+            return blocked
         result = self.tools.execute("drone_disconnect", {})
         ok = result.ok
         if ok:
@@ -4734,6 +5022,19 @@ class AgentRuntime:
         runtime = self.tools.status_snapshot()
         profile = runtime.get("backend_profile") or {}
         capabilities = profile.get("capabilities") or {}
+        # 后端代际校验：任务启动后链路若被换过（切后端/重连到别的端点），后续
+        # 飞控动作会打到另一架飞机上。代际不符直接拒绝，不做"尽力而为"。
+        if run is not None and tool in self.tools.CONTROL_TOOLS:
+            expected_generation = int(getattr(run, "backend_generation", -1))
+            with self._lock:
+                current_generation = self._backend_generation
+            if expected_generation >= 0 and expected_generation != current_generation:
+                return self._blocked_tool_result(
+                    tool,
+                    params,
+                    "任务启动后飞行后端已被切换，拒绝在未经确认的链路上执行飞控动作。"
+                    "请停止任务、确认链路后重新下发。",
+                )
         risk_level = self._tool_risk_level(tool, capabilities, run, params)
         requires_approval = bool(capabilities.get("requires_operator_approval"))
         if risk_level == "high" and requires_approval and not approval_already_granted:
@@ -4752,6 +5053,10 @@ class AgentRuntime:
             )
             if not approved:
                 return self._blocked_tool_result(tool, params, run.failure_reason or "operator approval rejected")
+            # 审批期间 run.status 变成 awaiting_approval，包线看门狗会据此退出；
+            # plan-execute 路径没有别的重挂点，所以批准后立刻重启，否则整段任务
+            # 余下部分都在没有连续包线监控的情况下飞行。
+            self._maybe_start_envelope_guard(run)
 
         low_altitude_block = self._low_altitude_motion_guard(tool, params, runtime, capabilities)
         if low_altitude_block:
@@ -4930,6 +5235,10 @@ class AgentRuntime:
             should_pause=self.supervisor.should_pause,
             on_ui_event=self._on_agent_event,
             on_ui_state=self._on_agent_loop_state,
+            # 计数器必须由父级持有：runner 是每次调用新建的，自带计数器会从 0
+            # 重启，同一任务的第二个子任务又会去写 <parent>.sub1.jsonl（seq 重复、
+            # 两次子运行的审计记录交错在同一个文件里）。
+            sub_counter=self._sub_agent_counter,
         )
         report = runner.run(
             parent_run_id,
@@ -5000,7 +5309,15 @@ class AgentRuntime:
         params: dict[str, Any] | None = None,
     ) -> str:
         card = TOOL_CARDS.get(tool)
-        card_risk = str(card.risk if card else "low")
+        if card is not None:
+            card_risk = str(card.risk)
+        elif tool in self.tools.CONTROL_TOOLS:
+            # 缺卡片的飞控工具不能默认成 low——审批门只在 high 时开，缺卡片
+            # 等于高危动作无签字直通。按 fail-safe 判为 high；卡片缺失本身由
+            # tool_cards 契约测试负责补齐。
+            card_risk = "high"
+        else:
+            card_risk = "low"
         if run and run.route_strategy == "direct" and run.plan and any(step.tool == tool for step in run.plan.steps):
             route_risk = {
                 "safe": "low",
@@ -5010,6 +5327,16 @@ class AgentRuntime:
             risk = self._max_risk(route_risk, card_risk)
         else:
             risk = card_risk
+        if capabilities.get("real_vehicle"):
+            # 真机上"改变位置/模式"的动作必须签字：这些工具的卡片风险是
+            # medium，而审批门只在 high 时开，于是模型可以不经确认把飞机挪到
+            # 围栏内任意位置，或切到 AUTO（AUTO 会启动已上传的航线）。降落早已
+            # 特判为 high，这里把同类动作补齐；drone_disarm 在空中等于坠机，
+            # 同样必须签字。
+            if tool in _REAL_VEHICLE_APPROVAL_TOOLS:
+                return "high"
+            if tool == "drone_rotate_to":
+                risk = self._max_risk(risk, "medium")
         if tool == "drone_land" and capabilities.get("real_vehicle"):
             return "high"
         if tool == "formation_command" and capabilities.get("real_vehicle"):
@@ -5403,6 +5730,11 @@ class AgentRuntime:
         return {"ok": True, "session": self._session_public_dict(data)}
 
     def create_session(self, name: str = "") -> dict[str, Any]:
+        # 执行中切会话会把运行态从 _current 里抹掉：任务继续飞，但界面上看不到
+        # 它，暂停/停止也点不到。要求先结束任务。
+        blocked = self._run_in_progress_error("新建对话")
+        if blocked:
+            return blocked
         now = time.time()
         session_id = f"session_{int(now * 1000)}"
         session = {
@@ -5423,6 +5755,9 @@ class AgentRuntime:
         return {"ok": True, "session": session}
 
     def load_session(self, session_id: str) -> dict[str, Any]:
+        blocked = self._run_in_progress_error("切换对话")
+        if blocked:
+            return blocked
         path = self._session_path(session_id)
         if not path.exists():
             return {"ok": False, "error": "session not found"}
@@ -5888,16 +6223,36 @@ class AgentRuntime:
         body: str = "",
         status: str = "completed",
     ) -> None:
-        run.thought_trace.append(
-            {
-                "timestamp": time.time(),
-                "title": title,
-                "body": body,
-                "status": status,
-            }
-        )
+        # 时间线是 UI 线程与 worker 线程共享的可变列表，而 state() 是在锁内序列化
+        # 它的：写入端以前不加锁，等于锁只保护了一半，前端可能读到正在被追加/
+        # 截断的列表。锁是可重入的，已在锁内的调用方不受影响。
+        with self._lock:
+            run.thought_trace.append(
+                {
+                    "timestamp": time.time(),
+                    "title": title,
+                    "body": body,
+                    "status": status,
+                }
+            )
 
     def _append_process(
+        self,
+        run: RunState,
+        title: str,
+        body: str = "",
+        status: str = "completed",
+        tool: str = "",
+        params: dict[str, Any] | None = None,
+        kind: str = "",
+    ) -> None:
+        # 见 _append_thought：时间线写入必须与 state() 的序列化共用同一把锁，
+        # 否则前端可能读到正在被追加/改写的条目。锁可重入，已在锁内的调用方
+        # 不受影响。
+        with self._lock:
+            self._append_process_locked(run, title, body, status, tool, params, kind)
+
+    def _append_process_locked(
         self,
         run: RunState,
         title: str,
@@ -6045,16 +6400,32 @@ class AgentRuntime:
         for index, step in enumerate(run.plan.steps, 1):
             if preapproved and preapproved.get("approved") is False:
                 break
-            while self.supervisor.should_pause() and not self.supervisor.is_emergency_stopped():
+            # 暂停轮询必须能被取消打断：暂停中取消时，_cancel_active_work 会
+            # resume 且这里也会因取消而退出——否则 worker 会永远在 0.2 秒轮询里
+            # 打转并占着执行槽（之后每个任务都要等满 60 秒再报"旧任务未停止"）。
+            while (
+                self.supervisor.should_pause()
+                and not self.supervisor.is_emergency_stopped()
+                and not self._is_run_cancelled(run.run_id)
+            ):
                 run.status = "paused"
                 run.phase = "paused"
                 run.current_step = step.id
                 time.sleep(0.2)
 
-            if self.supervisor.is_emergency_stopped():
-                run.status = "blocked"
-                run.phase = "blocked"
-                run.failure_reason = "emergency stop"
+            abort_reason = self._should_abort_run(run)
+            if abort_reason:
+                run.status = "blocked" if "emergency" in abort_reason else "cancelled"
+                run.phase = run.status
+                run.failure_reason = abort_reason
+                run.finished_at = time.time()
+                self._publish_run_update(run)
+                self._append_event(
+                    "warning" if run.status == "cancelled" else "danger",
+                    "system",
+                    f"固定序列执行已中止：{abort_reason}",
+                    {"run_id": run.run_id, "step": step.id, "completed_steps": index - 1},
+                )
                 break
 
             run.status = "running"
@@ -6173,8 +6544,11 @@ class AgentRuntime:
             message = "already connected"
         elif step.tool == "drone_arm" and bool(drone.get("armed")):
             message = "already armed"
-        elif step.tool == "drone_takeoff" and self._is_takeoff_already_satisfied(drone, step.params):
-            message = "already airborne near requested altitude"
+        elif step.tool == "drone_takeoff":
+            takeoff_note = self._takeoff_skip_note(drone, step.params)
+            if not takeoff_note:
+                return None
+            message = takeoff_note
         else:
             return None
 
@@ -6201,18 +6575,31 @@ class AgentRuntime:
         )
 
     def _is_takeoff_already_satisfied(self, drone: dict[str, Any], params: dict[str, Any]) -> bool:
+        return bool(self._takeoff_skip_note(drone, params))
+
+    def _takeoff_skip_note(self, drone: dict[str, Any], params: dict[str, Any]) -> str:
+        """应跳过起飞步骤时返回说明文本，否则返回 ""。
+
+        比目标高度高出很多时仍然跳过——"爬升到 3m"这条命令作用在已经在 30m 的
+        飞机上行为并不明确，不该拿它当下降用——但把高度偏差写进说明，避免"计划
+        假设 3m、实际 30m"被静默带过（后续步骤都是按计划高度选的参数）。
+        """
         if not isinstance(drone, dict):
-            return False
+            return ""
         altitude = self._vehicle_altitude_m(drone)
         try:
             target = abs(float(params.get("altitude", 3.0) or 3.0))
         except (TypeError, ValueError):
             target = 3.0
         if altitude is None:
-            return bool(drone.get("flying"))
+            return "already flying (altitude unknown)" if drone.get("flying") else ""
         target = max(0.5, target)
         minimum = max(0.5, min(target * 0.85, target - 0.3 if target > 1.0 else target * 0.85))
-        return bool(drone.get("flying")) and altitude >= minimum
+        if not drone.get("flying") or altitude < minimum:
+            return ""
+        if altitude > target + max(1.0, target * 0.35):
+            return f"already airborne at {altitude:.1f}m，计划高度 {target:.1f}m（偏差 {altitude - target:+.1f}m）"
+        return "already airborne near requested altitude"
 
     def _vehicle_altitude_m(self, drone: dict[str, Any]) -> float | None:
         for key in ("altitude_m", "altitude"):
@@ -6789,15 +7176,16 @@ class AgentRuntime:
         """
         if run is None or not getattr(run, "execute", False):
             return
-        try:
-            close_range = self.planner._is_close_range_visual_command(run.command)
-        except Exception:
-            close_range = False
+        close_range = self._envelope_scope_matters(run)
         if not close_range:
             return
         existing = self._envelope_thread
         if existing is not None and existing.is_alive() and self._envelope_run_id == run.run_id:
             return
+        # 换 run 时必须先停掉旧看门狗再启动新的，否则旧线程会一直活着读 _current
+        # （两条线程同时探测、又都可能在越界时下达中止+降落）。
+        if existing is not None and existing.is_alive():
+            self._stop_envelope_guard()
         self._envelope_stop.clear()
         self._envelope_run_id = run.run_id
         self._envelope_thread = threading.Thread(
@@ -6805,7 +7193,71 @@ class AgentRuntime:
         )
         self._envelope_thread.start()
 
-    def _stop_envelope_guard(self) -> None:
+    def _envelope_scope_matters(self, run: RunState) -> bool:
+        """这条任务是否需要连续包线监控。
+
+        以前只对"近距离视觉"措辞的任务武装，于是"飞到北 40 米看一眼"这类任务
+        全程没有任何连续监控（只有一次性 50m/100m 校验）。现在凡是含飞控能力
+        的执行任务都监控，近距离视觉任务沿用更紧的包线。
+        """
+        try:
+            if self.planner._is_close_range_visual_command(run.command):
+                return True
+        except Exception:
+            pass
+        # 任何会真的动飞机的执行任务都应受包线保护。
+        try:
+            runtime = self.tools.status_snapshot()
+            capabilities = (runtime.get("backend_profile") or {}).get("capabilities") or {}
+            return bool(capabilities.get("flight_control"))
+        except Exception:
+            return False
+
+    def _run_owns_current(self, run: RunState | None) -> bool:
+        """这个 run 是否仍是"当前活跃任务"。"""
+        if run is None:
+            return False
+        lock = getattr(self, "_lock", None)
+        if lock is None:
+            return False
+        with lock:
+            current = getattr(self, "_current", None)
+            return current is not None and current.run_id == run.run_id
+
+    def _register_current_run(self, run: RunState) -> bool:
+        """登记当前 run；返回是否拿到所有权。
+
+        计划预览不占执行槽，而这里以前是无条件覆盖 _current 的：操作员先提交
+        预览、再提交执行时，预览返回后会把自己写成"当前任务"，把正在飞行的
+        任务从运行态顶掉，收尾时还会连带关掉那个任务的包线看门狗、清掉它的
+        补充指令与取消请求，之后 `_on_agent_loop_state` 因 run_id 不匹配早退，
+        看门狗再也无法重挂。所以非执行的 run 只有在没有活跃执行任务时才能成为
+        当前任务；执行 run 之间由执行槽互斥，不会重叠。
+        """
+        active = {"queued", "running", "paused", "awaiting_approval", "responding"}
+        with self._lock:
+            current = self._current
+            if (
+                current is not None
+                and current.run_id != run.run_id
+                and str(getattr(current, "mode", "") or "") == "execute"
+                and str(getattr(current, "status", "") or "") in active
+                and str(getattr(run, "mode", "") or "") != "execute"
+            ):
+                return False
+            self._current = run
+            self._pending_run_ids.discard(run.run_id)
+        return True
+
+    def _stop_envelope_guard(self, run_id: str = "") -> None:
+        """停止包线看门狗。
+
+        传入 run_id 时只关"属于该 run"的看门狗：不带归属的调用会把另一个正在
+        飞行的任务的看门狗一起关掉。不传（run_id=""）表示无条件关闭，保留给
+        后端切换/急停这类确实要全关的路径。
+        """
+        if run_id and self._envelope_run_id and self._envelope_run_id != run_id:
+            return
         self._envelope_stop.set()
         thread = self._envelope_thread
         if thread is not None and thread.is_alive():
@@ -6820,7 +7272,14 @@ class AgentRuntime:
         while not self._envelope_stop.is_set():
             with self._lock:
                 current = self._current
-            if current is None or current.run_id != run_id or current.status not in {"running", "paused"}:
+            # awaiting_approval 也是"活着"的状态：等待审批只是暂时不是 running，
+            # 以前这里会被当成终态退出，而 plan-execute 路径没有重挂点，于是
+            # 一次审批之后整段任务就再也没有包线保护了。
+            if (
+                current is None
+                or current.run_id != run_id
+                or current.status not in {"running", "paused", "awaiting_approval"}
+            ):
                 break
             if self.supervisor.is_emergency_stopped():
                 break
@@ -7014,18 +7473,38 @@ class AgentRuntime:
                     pass
 
     def _finalize_task_run(self, run: RunState) -> None:
+        run_id = str(getattr(run, "run_id", "") or "")
+        # 只关掉属于这个 run 的看门狗：不带 run_id 的调用会把另一个正在飞行的
+        # 任务的包线看门狗一起关掉（计划预览与执行任务重叠时实测过）。
         try:
-            self._stop_envelope_guard()
+            self._stop_envelope_guard(run_id)
         except Exception:
             pass
-        with self._lock:
-            # 任务已收尾，没有下一轮循环去消费补充指令了：留着只会泄漏给下一个任务
-            self._pending_steer.clear()
-        # 取消旗标是"当前有取消请求"的瞬时状态：任务都已经收尾就必须清掉，
-        # 否则飞行 stop_provider 会一直读到它——操作员随后点起飞会被
-        # "takeoff interrupted by emergency stop / cancel" 立刻打断
-        # （实测：飞机明明已经起飞，界面却报起飞失败）。
-        self._cancel_requested.clear()
+        # 清共享状态前先确认"当前活跃任务还是不是我"：重叠的预览收尾时清掉的
+        # 会是执行任务的补充指令与取消请求。_current 缺失视为"无人拥有"。
+        lock = getattr(self, "_lock", None)
+        current = None
+        if lock is not None:
+            with lock:
+                current = getattr(self, "_current", None)
+        owns_current = current is None or str(getattr(current, "run_id", "") or "") == run_id
+        if owns_current:
+            with lock:
+                pending_steer = getattr(self, "_pending_steer", None)
+                if pending_steer is not None:
+                    # 任务已收尾，没有下一轮循环去消费补充指令了：留着只会泄漏给下一个任务
+                    pending_steer.clear()
+            # 取消旗标是"当前有取消请求"的瞬时状态：任务都已经收尾就必须清掉，
+            # 否则飞行 stop_provider 会一直读到它——操作员随后点起飞会被
+            # "takeoff interrupted by emergency stop / cancel" 立刻打断
+            # （实测：飞机明明已经起飞，界面却报起飞失败）。
+            clear_cancel = getattr(self, "_clear_cancel_state", None)
+            if callable(clear_cancel):
+                clear_cancel()
+            else:
+                cancel_event = getattr(self, "_cancel_requested", None)
+                if cancel_event is not None:
+                    cancel_event.clear()
         # 收尾终态按"是否危险"分流：
         #   failed  —— 异常收尾（任务失败、位置/链路不可信），受控降落是明确的安全终态；
         #   cancelled / blocked —— 操作员打断或到达步数上限，飞机链路与位置都正常，

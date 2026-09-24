@@ -589,7 +589,42 @@ def test_async_tool_without_task_id_is_rejected() -> None:
     assert "without task_id" in result.data["message"]
 
 
-def test_global_mission_items_with_null_local_coordinates_are_safe() -> None:
+class _GpsController:
+    """Minimal controller stub exposing a GPS fix for geofence checks."""
+
+    def __init__(self, lat: float, lon: float, z: float = -3.0) -> None:
+        self.is_connected = True
+        self._gps = {"lat": lat, "lon": lon}
+        self._z = z
+
+    def get_status(self) -> SimpleNamespace:
+        return SimpleNamespace(
+            position_ned={"x": 0.0, "y": 0.0, "z": self._z},
+            gps=dict(self._gps),
+        )
+
+
+def _global_item(lat: float, lon: float, alt: float = 3.0) -> dict[str, Any]:
+    return {
+        "id": "wp_001",
+        "type": "waypoint",
+        "frame": "global_relative_alt",
+        "lat": lat,
+        "lon": lon,
+        "alt_m": alt,
+        "x": None,
+        "y": None,
+        "z": None,
+    }
+
+
+def test_global_mission_items_with_null_local_coordinates_are_not_read_as_local() -> None:
+    """全球航点的 x/y/z 为 null 时，不能被当成"本地坐标 = 0"去做夹紧。
+
+    没有定位就没法核对围栏，所以结论必须是 blocked；但原因只能是"读不到
+    GPS"，不能出现把 null 读成 (0,0) 的坐标类违规，也不能产出 waypoints_json
+    的夹紧修正——那会把一条全球航线改写成围着原点的一小段本地航点。
+    """
     runtime = ToolRuntime()
     payload = [
         {
@@ -606,6 +641,30 @@ def test_global_mission_items_with_null_local_coordinates_are_safe() -> None:
     ]
 
     safety = runtime.validate("drone_upload_mission", {"waypoints_json": json.dumps(payload)})
+
+    assert safety["level"] == "danger"
+    assert not safety["corrected_params"]
+    assert any("GPS" in item for item in safety["violations"])
+    assert not any("高度不合法" in item for item in safety["violations"])
+
+
+def test_global_mission_item_outside_geofence_is_rejected() -> None:
+    runtime = ToolRuntime()
+    runtime.controller = _GpsController(39.905163, 116.407089)
+    far = _global_item(39.95, 116.407089)  # ~5 km north of the vehicle
+
+    safety = runtime.validate("drone_upload_mission", {"waypoints_json": json.dumps([far])})
+
+    assert safety["level"] == "danger"
+    assert any("围栏" in item for item in safety["violations"])
+
+
+def test_global_mission_item_inside_geofence_is_accepted() -> None:
+    runtime = ToolRuntime()
+    runtime.controller = _GpsController(39.905163, 116.407089)
+    near = _global_item(39.905163 + 0.0002, 116.407089)  # ~22 m north
+
+    safety = runtime.validate("drone_upload_mission", {"waypoints_json": json.dumps([near])})
 
     assert safety["level"] == "safe"
     assert not safety["violations"]
