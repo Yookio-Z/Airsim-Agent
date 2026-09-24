@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import inspect
 import json
+import logging
 import math
 import threading
 import time
@@ -16,6 +17,8 @@ from src.config import config
 from src.modules.formation import FLIGHT_ACTIONS, FormationController
 from src.modules.safety_validator import FlightConstraint, SafetyValidator
 from src.tools.manifest import manifest_metadata, list_tool_manifest
+
+logger = logging.getLogger(__name__)
 
 
 # Output shape checks for the highest-value tools. Schemas carry no `required`
@@ -170,6 +173,45 @@ def _agent_memory_tool_cards() -> list[dict[str, Any]]:
             kind="atomic",
         ).to_dict(),
     ]
+
+
+def parse_no_fly_zones(raw: str | list[Any] | None) -> list[dict[str, float]]:
+    """把配置里的禁飞区解析成 FlightConstraint 需要的圆列表。
+
+    接受 JSON 字符串（便于用 DRONE_SAFETY_NO_FLY_ZONES_JSON 环境变量配置）或
+    已经是列表的形式。非法条目跳过而不是抛异常：安全配置写坏了应该让服务起
+    得来并留下警告，而不是整个地面站启动失败。
+    """
+    if raw is None or raw == "":
+        return []
+    payload: Any = raw
+    if isinstance(raw, str):
+        try:
+            payload = json.loads(raw)
+        except (TypeError, ValueError):
+            logger.warning("no_fly_zones_unparsable", extra={"raw": raw[:200]})
+            return []
+    if isinstance(payload, dict):
+        payload = payload.get("zones") or payload.get("circles") or []
+    if not isinstance(payload, list):
+        logger.warning("no_fly_zones_wrong_shape", extra={"type": type(payload).__name__})
+        return []
+    zones: list[dict[str, float]] = []
+    for index, item in enumerate(payload):
+        if not isinstance(item, dict):
+            continue
+        x = _finite_or_none(item.get("x", 0.0))
+        y = _finite_or_none(item.get("y", 0.0))
+        radius = _finite_or_none(item.get("radius"))
+        if x is None or y is None or radius is None or radius <= 0.0:
+            logger.warning("no_fly_zone_entry_skipped", extra={"index": index, "entry": item})
+            continue
+        zone: dict[str, Any] = {"x": x, "y": y, "radius": radius}
+        name = str(item.get("name") or "").strip()
+        if name:
+            zone["name"] = name
+        zones.append(zone)
+    return zones
 
 
 def _non_finite_params(params: dict[str, Any] | None) -> list[str]:
@@ -333,6 +375,7 @@ class ToolRuntime:
                 min_altitude=float(config.safety_min_altitude_m),
                 max_velocity=float(config.safety_max_velocity_mps),
                 max_distance_from_home=float(config.safety_geofence_m),
+                no_fly_zones=parse_no_fly_zones(config.safety_no_fly_zones_json),
             )
         )
 
@@ -2470,6 +2513,31 @@ class ToolRuntime:
             return None
         return (lat, lon)
 
+    def _no_fly_zone_violations(
+        self,
+        from_pos: tuple[float, float, float] | None,
+        to_pos: tuple[float, float, float],
+    ) -> list[str]:
+        """返回"从当前位置飞到目标点"这段路径上的禁飞区违规。
+
+        validate_position 只看落点，判断不出路径穿不穿过禁飞区。SafetyValidator
+        .validate_move 里的线段-圆相交检测（_segment_crosses_circle）写好了却一直
+        没有生产调用点，这里把它接到真正会横穿一段空间的动作上。
+
+        只取禁飞区相关条目：起点/终点的高度与围栏问题由 validate_position 负责，
+        不在这里重复报告（起点是飞机当前的既成事实，不是这条指令选的）。
+
+        未配置禁飞区时直接返回、不读遥测——否则每个位置指令都要多一次 RPC，
+        而未连接时那次读还会触发数秒的连接尝试。
+        """
+        if not self.safety.constraints.no_fly_zones or from_pos is None:
+            return []
+        try:
+            result = self.safety.validate_move(from_pos, to_pos)
+        except Exception:
+            return []
+        return [item for item in result.violations if "禁飞区" in item]
+
     def _safety_constraints(self) -> dict[str, Any]:
         constraints = self.safety.constraints
         return {
@@ -2531,6 +2599,9 @@ class ToolRuntime:
                 for key in ("x", "y", "z"):
                     if key in result.corrected:
                         corrected[key] = result.corrected[key]
+            for hit in self._no_fly_zone_violations(self._current_position(), (x, y, z)):
+                level = "danger"
+                violations.append(f"飞行路径{hit}")
             velocity = float(params.get("velocity", 2.0))
             vel = self.safety.validate_velocity(velocity, 0.0, 0.0)
             merge(vel)
@@ -2597,6 +2668,14 @@ class ToolRuntime:
                 z = float(pos.get("z", 0.0)) - up_m
                 result = self.safety.validate_position(x, y, z)
                 merge(result)
+                start = (
+                    float(pos.get("x", 0.0)),
+                    float(pos.get("y", 0.0)),
+                    float(pos.get("z", 0.0)),
+                )
+                for hit in self._no_fly_zone_violations(start, (x, y, z)):
+                    level = "danger"
+                    violations.append(f"飞行路径{hit}")
             else:
                 violations.append("relative movement requires a connection and a current position readback")
                 if level == "safe":
@@ -2611,6 +2690,8 @@ class ToolRuntime:
                 waypoints = json.loads(str(params.get("waypoints_json", "[]")))
                 changed = False
                 safe_waypoints = []
+                # 航点是折线，逐段检查是否穿越禁飞区（落点检查看不出穿越）。
+                previous: tuple[float, float, float] | None = self._current_position()
                 for wp in waypoints:
                     x = float(wp.get("x", 0.0))
                     y = float(wp.get("y", 0.0))
@@ -2622,6 +2703,14 @@ class ToolRuntime:
                         y = float(result.corrected.get("y", y))
                         z = float(result.corrected.get("z", z))
                         changed = True
+                    for hit in self._no_fly_zone_violations(previous, (x, y, z)):
+                        level = "danger"
+                        violations.append(f"航线{hit}")
+                    previous = (x, y, z)
+                    for hit in self._no_fly_zone_violations(previous, (x, y, z)):
+                        level = "danger"
+                        violations.append(f"航线{hit}")
+                    previous = (x, y, z)
                     safe_waypoints.append({"x": x, "y": y, "z": z})
                 if changed:
                     corrected["waypoints_json"] = json.dumps(safe_waypoints, ensure_ascii=False)
@@ -2634,6 +2723,8 @@ class ToolRuntime:
                 waypoints = json.loads(str(params.get("waypoints_json", "[]")))
                 changed = False
                 safe_waypoints = []
+                # 航点是折线，逐段检查是否穿越禁飞区（落点检查看不出穿越）。
+                previous: tuple[float, float, float] | None = self._current_position()
                 for wp in waypoints:
                     x = float(wp.get("x", 0.0))
                     y = float(wp.get("y", 0.0))
@@ -2645,6 +2736,14 @@ class ToolRuntime:
                         y = float(result.corrected.get("y", y))
                         z = float(result.corrected.get("z", z))
                         changed = True
+                    for hit in self._no_fly_zone_violations(previous, (x, y, z)):
+                        level = "danger"
+                        violations.append(f"航线{hit}")
+                    previous = (x, y, z)
+                    for hit in self._no_fly_zone_violations(previous, (x, y, z)):
+                        level = "danger"
+                        violations.append(f"航线{hit}")
+                    previous = (x, y, z)
                     safe_waypoints.append({"x": x, "y": y, "z": z})
                 if changed:
                     corrected["waypoints_json"] = json.dumps(safe_waypoints, ensure_ascii=False)
@@ -2674,6 +2773,9 @@ class ToolRuntime:
                     raise ValueError("mission items must be a list")
                 changed = False
                 safe_items = []
+                # 航点任务是一段折线：逐段检查穿越。全球坐标条目算不出 NED 线段，
+                # 遇到它就把 previous 清空（不能跨着它推断下一段）。
+                previous: tuple[float, float, float] | None = self._current_position()
                 for item in raw_items:
                     if not isinstance(item, dict):
                         continue
@@ -2688,6 +2790,10 @@ class ToolRuntime:
                         z = float(safe_item.get("z", -3.0))
                         result = self.safety.validate_position(x, y, z)
                         merge(result)
+                        for hit in self._no_fly_zone_violations(previous, (x, y, z)):
+                            level = "danger"
+                            violations.append(f"航线{hit}")
+                        previous = (x, y, z)
                         if result.corrected:
                             x = float(result.corrected.get("x", x))
                             y = float(result.corrected.get("y", y))
@@ -2695,6 +2801,7 @@ class ToolRuntime:
                             safe_item.update({"x": x, "y": y, "z": z, "alt_m": abs(z)})
                             changed = True
                     elif has_global:
+                        previous = None
                         # 全球坐标航点：以前只处理"含 alt_m"的条目，lat/lon 条目
                         # 既没有 x/y/z 也不含 alt_m 时直接落进 safe_items，一路
                         # 不做任何检查。上传后 drone_start_mission 会把飞机交给

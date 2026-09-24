@@ -60,6 +60,32 @@ class DroneConfig(BaseSettings):
     safety_max_velocity_mps: float = 8.0
     safety_geofence_m: float = 100.0
 
+    # No-fly zones enforced by the safety validator: a JSON array of circles,
+    # [{"x": 30.0, "y": 0.0, "radius": 15.0, "name": "..."}, ...] in NED metres
+    # from the local origin. Until this existed, FlightConstraint.no_fly_zones
+    # was always empty and the segment/circle intersection check in
+    # SafetyValidator could never fire in a real flight.
+    # Only circles are supported for now (the existing geometry is circular);
+    # rectangles would need new intersection maths.
+    safety_no_fly_zones_json: str = ""
+
+    # Continuous flight-envelope watchdog thresholds.
+    # The watchdog samples telemetry every second and, after 3 consecutive
+    # breaches, aborts the run and lands: it exists for the case where the
+    # vehicle drifts or the position estimate diverges WITHOUT any command
+    # being issued (nothing else would notice).
+    # Two profiles, because the two task families have very different envelopes:
+    #   * close-range visual work (identify/track/inspect) flies at 2-3 m in a
+    #     small area — an excursion means loss of control, so its ceiling is
+    #     deliberately tight;
+    #   * general flight uses the same limits as the safety validator, with a
+    #     margin so the watchdog acts as a backstop behind the per-command gate
+    #     rather than duplicating it (the watchdog measures horizontal drift
+    #     from the takeoff point, not from the NED origin).
+    close_range_envelope_altitude_m: float = 8.0
+    close_range_envelope_horizontal_m: float = 70.0
+    envelope_margin_ratio: float = 1.15
+
     # Search defaults.
     search_altitude: float = 15.0
     search_overlap: float = 0.3

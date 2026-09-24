@@ -7179,18 +7179,25 @@ class AgentRuntime:
         return count
 
     def _maybe_start_envelope_guard(self, run: RunState) -> None:
-        """近距离识别/追踪任务启动飞行包线看门狗。
+        """为执行任务启动飞行包线看门狗。
 
-        这类任务的工作包线是 2~3m 定高、小范围机动。若飞机报出远超包线的高度
-        或水平位移（真实失控，或 EKF 位置估计发散时都会这样），就不能再等
-        Agent 慢慢决策——立即中止并降落。历史事故里飞机曾在无人干预下带着
-        错误的估计值飞了好几分钟。
+        历史事故：飞机曾在无人干预下带着错误的估计值飞了好几分钟（真实失控，
+        或 EKF 位置估计发散）。逐条指令的安全校验发现不了这种情况——车上飘着
+        的时候根本没有指令下发——所以需要一个按秒采样的持续兜底：连续 3 次越界
+        就中止任务并降落。
+
+        包线分两档，因为两类任务的工作包线差得很远：
+          * 近距离识别/追踪：2~3m 定高、小范围机动，越界即失控，用紧包线；
+          * 普通飞行任务：用安全包线本身（带余量），作为逐条校验背后的连续兜底。
+        以前只有一个硬编码的 8m/70m，把它套到所有飞行任务上会让任何在 15m
+        （config.search_altitude 的默认值）正常作业的任务被强制降落。
         """
         if run is None or not getattr(run, "execute", False):
             return
-        close_range = self._envelope_scope_matters(run)
-        if not close_range:
+        profile = self._envelope_profile(run)
+        if profile is None:
             return
+        max_alt_m, max_dist_m = profile
         existing = self._envelope_thread
         if existing is not None and existing.is_alive() and self._envelope_run_id == run.run_id:
             return
@@ -7201,29 +7208,40 @@ class AgentRuntime:
         self._envelope_stop.clear()
         self._envelope_run_id = run.run_id
         self._envelope_thread = threading.Thread(
-            target=self._envelope_guard_loop, args=(run.run_id,), daemon=True, name="flight-envelope-guard"
+            target=self._envelope_guard_loop,
+            args=(run.run_id, max_alt_m, max_dist_m),
+            daemon=True,
+            name="flight-envelope-guard",
         )
         self._envelope_thread.start()
 
-    def _envelope_scope_matters(self, run: RunState) -> bool:
-        """这条任务是否需要连续包线监控。
-
-        以前只对"近距离视觉"措辞的任务武装，于是"飞到北 40 米看一眼"这类任务
-        全程没有任何连续监控（只有一次性 50m/100m 校验）。现在凡是含飞控能力
-        的执行任务都监控，近距离视觉任务沿用更紧的包线。
-        """
+    def _envelope_profile(self, run: RunState) -> tuple[float, float] | None:
+        """这条任务该用哪档包线；不需要监控时返回 None。"""
         try:
-            if self.planner._is_close_range_visual_command(run.command):
-                return True
+            close_range = bool(self.planner._is_close_range_visual_command(run.command))
         except Exception:
-            pass
-        # 任何会真的动飞机的执行任务都应受包线保护。
+            close_range = False
+        if close_range:
+            return (
+                float(config.close_range_envelope_altitude_m),
+                float(config.close_range_envelope_horizontal_m),
+            )
+        # 任何会真的动飞机的执行任务都应受连续监控。
         try:
             runtime = self.tools.status_snapshot()
             capabilities = (runtime.get("backend_profile") or {}).get("capabilities") or {}
-            return bool(capabilities.get("flight_control"))
+            if not capabilities.get("flight_control"):
+                return None
         except Exception:
-            return False
+            return None
+        margin = max(1.0, float(config.envelope_margin_ratio))
+        # 水平余量必须留：看门狗量的是"相对起飞点"的位移，而围栏是相对 NED 原点
+        # 的——飞机在离原点 40m 处起飞再向同方向飞 80m，位移 80m 没超、距原点
+        # 已经 120m。余量让看门狗在逐条校验之后才出手，而不是抢在它前面。
+        return (
+            float(config.safety_max_altitude_m) * margin,
+            float(config.safety_geofence_m) * margin,
+        )
 
     def _run_owns_current(self, run: RunState | None) -> bool:
         """这个 run 是否仍是"当前活跃任务"。"""
@@ -7277,8 +7295,9 @@ class AgentRuntime:
         self._envelope_thread = None
         self._envelope_run_id = ""
 
-    def _envelope_guard_loop(self, run_id: str) -> None:
-        max_alt_m, max_dist_m = 8.0, 70.0
+    def _envelope_guard_loop(self, run_id: str, max_alt_m: float, max_dist_m: float) -> None:
+        # 包线由 _envelope_profile 按任务类型与配置给出（以前是这里硬编码的
+        # 8m/70m，套到所有飞行任务上会误伤在 15m 正常作业的任务）。
         breaches = 0
         origin: tuple[float, float] | None = None
         while not self._envelope_stop.is_set():

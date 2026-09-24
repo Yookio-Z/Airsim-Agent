@@ -667,7 +667,8 @@ def test_envelope_guard_stays_armed_while_waiting_for_approval():
     guard._append_event = lambda *a, **k: None
     guard._attempt_hold_position = lambda *a, **k: None
 
-    AgentRuntime._envelope_guard_loop(guard, "run_g")
+    # 包线现在由 _envelope_profile 按任务类型给出，循环只负责采样与判定
+    AgentRuntime._envelope_guard_loop(guard, "run_g", 8.0, 70.0)
 
     assert guard.status_snapshot_calls >= 2, "the guard exited while approval was pending"
 
@@ -852,3 +853,128 @@ def test_gcs_mission_start_proceeds_when_no_emergency_stop():
 
     assert result.ok is True
     assert tools.calls == ["drone_start_mission"]
+
+
+# ---------------------------------------------------------------------------
+# no-fly zones: configured, parsed and actually enforced
+# ---------------------------------------------------------------------------
+
+
+def test_parse_no_fly_zones_accepts_json_and_list_and_skips_garbage():
+    from src.agent.tool_executor import parse_no_fly_zones
+
+    assert parse_no_fly_zones("") == []
+    assert parse_no_fly_zones(None) == []
+    assert parse_no_fly_zones("{not json") == []
+    assert parse_no_fly_zones([{"x": 0, "y": 0, "radius": 5}]) == [
+        {"x": 0.0, "y": 0.0, "radius": 5.0}
+    ]
+    assert parse_no_fly_zones('[{"x": 1, "y": 2, "radius": 3, "name": "tower"}]') == [
+        {"x": 1.0, "y": 2.0, "radius": 3.0, "name": "tower"}
+    ]
+    # invalid entries are skipped, not raised: a broken safety config must not
+    # stop the ground station from starting
+    assert parse_no_fly_zones('[{"x": 1, "y": 2}, {"x": 5, "y": 5, "radius": 0}]') == []
+    assert parse_no_fly_zones('[{"x": "nan", "y": 0, "radius": 5}]') == []
+
+
+def _rt_with_zone(zone: dict, *, z: float = -10.0) -> ToolRuntime:
+    rt = _rt(ToolCollector(), controller=_Controller(z=z))
+    rt.safety = SafetyValidator(
+        FlightConstraint(
+            max_altitude=50.0,
+            min_altitude=0.5,
+            max_velocity=8.0,
+            max_distance_from_home=100.0,
+            no_fly_zones=[zone],
+        )
+    )
+    return rt
+
+
+def test_no_fly_zone_blocks_a_flight_that_crosses_it():
+    """The segment/circle check existed but no production path ever called it,
+    so a zone in the config would have had no effect on a transit."""
+    rt = _rt_with_zone({"x": 20.0, "y": 0.0, "radius": 10.0})
+
+    safety = rt.validate("drone_fly_to", {"x": 40.0, "y": 0.0, "z": -10.0})
+
+    assert safety["level"] == "danger"
+    assert any("禁飞区" in item for item in safety["violations"])
+
+
+def test_no_fly_zone_does_not_block_a_flight_that_goes_around_it():
+    rt = _rt_with_zone({"x": 20.0, "y": 0.0, "radius": 10.0})
+
+    safety = rt.validate("drone_fly_to", {"x": 40.0, "y": 40.0, "z": -10.0})
+
+    assert not any("禁飞区" in item for item in safety["violations"])
+
+
+def test_no_fly_zone_blocks_a_crossing_waypoint_leg():
+    rt = _rt_with_zone({"x": 20.0, "y": 0.0, "radius": 8.0})
+    waypoints = json.dumps([{"x": 40.0, "y": 0.0, "z": -10.0}])
+
+    safety = rt.validate("drone_fly_path", {"waypoints_json": waypoints})
+
+    assert safety["level"] == "danger"
+    assert any("禁飞区" in item for item in safety["violations"])
+
+
+def test_no_zone_configured_costs_nothing_and_never_reads_telemetry():
+    """Without zones the check must return immediately: an extra position
+    readback per command would add an RPC (and a multi-second connect attempt
+    when offline)."""
+    rt = _rt(ToolCollector(), controller=None)
+
+    safety = rt.validate("drone_fly_to", {"x": 40.0, "y": 0.0, "z": -10.0})
+
+    assert safety["level"] == "safe"
+
+
+# ---------------------------------------------------------------------------
+# flight-envelope watchdog profiles
+# ---------------------------------------------------------------------------
+
+
+def _run_for_envelope(command: str, *, flight_control: bool = True) -> RunState:
+    run = RunState(run_id="run_env", command=command, intent="", summary="", execute=True)
+    return run
+
+
+def _envelope_runtime(*, flight_control: bool = True, close_range: bool = False) -> AgentRuntime:
+    runtime = _shell_runtime()
+    runtime.planner = SimpleNamespace(_is_close_range_visual_command=lambda command: close_range)
+    runtime.tools = SimpleNamespace(
+        status_snapshot=lambda: {"backend_profile": {"capabilities": {"flight_control": flight_control}}}
+    )
+    return runtime
+
+
+def test_normal_flight_task_uses_the_safety_envelope_not_the_close_range_one():
+    """Regression guard: the tight 8 m close-range envelope must not be applied
+    to ordinary flight, where a 15 m survey altitude is normal operation — the
+    watchdog lands the aircraft after 3 consecutive breaches."""
+    runtime = _envelope_runtime(close_range=False)
+
+    profile = runtime._envelope_profile(_run_for_envelope("向北飞 40 米并巡检"))
+
+    assert profile is not None
+    max_alt_m, max_dist_m = profile
+    assert max_alt_m > 15.0, "a 15 m survey altitude must not breach the envelope"
+    assert max_alt_m >= 50.0
+    assert max_dist_m >= 100.0
+
+
+def test_close_range_visual_task_keeps_the_tight_envelope():
+    runtime = _envelope_runtime(close_range=True)
+
+    profile = runtime._envelope_profile(_run_for_envelope("靠近那辆车看一眼"))
+
+    assert profile == (8.0, 70.0)
+
+
+def test_envelope_profile_is_none_without_flight_control():
+    runtime = _envelope_runtime(flight_control=False)
+
+    assert runtime._envelope_profile(_run_for_envelope("读取状态")) is None
