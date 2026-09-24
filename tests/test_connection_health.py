@@ -2,7 +2,10 @@ import copy
 import math
 import time
 import struct
+from pathlib import Path
 from types import SimpleNamespace
+
+import pytest
 
 from pymavlink import mavutil
 
@@ -151,7 +154,28 @@ def test_qgc_usb_board_info_detects_px4_fmu_v6u(monkeypatch):
     assert candidates[0].board_name == "PX4 FMU V6U"
 
 
-def test_serial_baud_port_mixup_is_normalized():
+def _qgc_board_db_available() -> bool:
+    """QGC 的 USB VID/PID 板卡数据库在 third_party 里，而那是"仅供研究"的
+    未跟踪检出——新鲜克隆里没有它。依赖它的断言必须显式跳过，而不是在 CI 里
+    红着，也不是被静默改成另一个断言。"""
+    return _QGC_BOARD_INFO_PATH.exists()
+
+
+_QGC_BOARD_INFO_PATH = (
+    Path(__file__).resolve().parents[1]
+    / "third_party"
+    / "qgroundcontrol"
+    / "src"
+    / "Comms"
+    / "USBBoardInfo.json"
+)
+
+
+@pytest.mark.skipif(
+    not _qgc_board_db_available(),
+    reason="third_party/qgroundcontrol USBBoardInfo.json is not present (study-only checkout, not version controlled)",
+)
+def test_qgc_usb_board_info_detects_px4_fmu_v6u(monkeypatch):
     assert normalize_serial_baud("14550") == 115200
 
     backend, params = _build_connect_params({
@@ -248,10 +272,14 @@ def test_px4_backend_keeps_an_explicitly_chosen_sitl_link():
 
 
 def test_auto_link_builds_serial_first_with_udp_fallback(monkeypatch):
+    # The description carries a Pixhawk token on purpose: this test is about the
+    # CANDIDATE ORDER (a detected serial link before the UDP fallback), so it
+    # must not depend on QGC's board database being present — a bare
+    # "USB Serial Device (COM3)" only scores via that database.
     port = SimpleNamespace(
         device="COM3",
         name="COM3",
-        description="USB Serial Device (COM3)",
+        description="PX4 FMU V6U (COM3)",
         hwid="USB VID:PID=1B8C:0036 SER=0",
         vid=7052,
         pid=54,

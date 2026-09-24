@@ -14,6 +14,10 @@ from functools import lru_cache
 from pathlib import Path
 from typing import Any
 
+from ..logging_config import get_logger
+
+logger = get_logger(__name__)
+
 
 PIXHAWK_DEFAULT_BAUD = 115200
 SIK_DEFAULT_BAUD = 57600
@@ -180,11 +184,26 @@ def identify_serial_board(port: Any) -> tuple[str, str, int]:
 
 @lru_cache(maxsize=1)
 def _load_qgc_usb_board_info() -> tuple[list[dict[str, Any]], list[dict[str, Any]], list[dict[str, Any]]]:
+    """Load QGC's USB VID/PID board database.
+
+    The database lives in the study-only `third_party/qgroundcontrol` checkout,
+    which is NOT under version control. A fresh clone therefore has no board
+    names: a Pixhawk whose Windows description is the generic "USB Serial Device
+    (COM3)" scores 0 and is not auto-selected, so serial autodiscovery silently
+    finds nothing and falls back to the SITL UDP endpoint. That is the safe
+    direction to fail (auto-selecting an unidentified COM port could command the
+    wrong device), but it must not be mysterious — hence the warning. The model
+    names themselves are QGC's data, so they are deliberately not vendored here.
+    """
     root = Path(__file__).resolve().parents[2]
     path = root / "third_party" / "qgroundcontrol" / "src" / "Comms" / "USBBoardInfo.json"
     try:
         data = json.loads(path.read_text(encoding="utf-8"))
-    except Exception:
+    except Exception as exc:
+        logger.warning(
+            "qgc_usb_board_info_unavailable",
+            extra={"path": str(path), "error": str(exc)},
+        )
         return [], [], []
     return (
         list(data.get("boardInfo") or []),
