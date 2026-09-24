@@ -14,6 +14,7 @@ from src.agent.loop_types import LoopActionResult, LoopObservation, LoopState
 from src.agent.runtime import AgentRuntime
 from src.agent.tool_executor import ToolCallResult, ToolCollector, ToolRuntime
 from src.modules.safety_validator import FlightConstraint, SafetyValidator
+from _runtime_factories import tool_runtime
 
 
 class _FakeStatus:
@@ -62,20 +63,14 @@ class _FakeController:
 
 
 def _runtime_tools(backend_id: str = "airsim", vehicles: dict | None = None) -> ToolRuntime:
-    rt = object.__new__(ToolRuntime)
-    rt.backend_id = backend_id
-    rt.controller = _FakeController(vehicles)
-    rt.collector = ToolCollector()
-    rt._formation = None
-    rt._formation_stop_provider = None
-    rt.safety = SafetyValidator(
-        FlightConstraint(max_altitude=50.0, min_altitude=0.5, max_velocity=8.0, max_distance_from_home=100.0)
+    # shared shell: see tests/_runtime_factories.py
+    return tool_runtime(
+        backend_id=backend_id,
+        controller=_FakeController(vehicles),
+        collector=ToolCollector(),
+        _formation=None,
+        _formation_stop_provider=None,
     )
-    rt._lock = threading.RLock()
-    rt.available = True
-    rt.ensure_ready = lambda: True  # type: ignore[method-assign]
-    rt._camera_source_enabled = lambda: False  # type: ignore[method-assign]
-    return rt
 
 
 # ---------------------------------------------------------------------------

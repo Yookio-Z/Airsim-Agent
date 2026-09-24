@@ -1,0 +1,117 @@
+name: CI
+
+# Quality gates for a runtime that can command a real aircraft.
+#
+# What is BLOCKING here and what is not — measured, not assumed (2026-09-24,
+# commit 08b2f93):
+#
+#   blocking  : pytest + the coverage gate in .coveragerc, and the two .cjs
+#               front-end suites. These are green today.
+#   advisory  : black --check and mypy. Both are configured in pyproject.toml
+#               but neither passes on the current tree, so promoting them to
+#               blocking today would just produce a permanently red CI that
+#               everyone learns to ignore. What each needs (measured with the
+#               exact commands used below):
+#                 * black: 118 of 140 files would be reformatted. This wants one
+#                   dedicated formatting-only commit, not a mixed one.
+#                 * mypy: 572 errors in 45 files. `disallow_untyped_defs = true`
+#                   is configured but the codebase was never annotated.
+#                   --ignore-missing-imports keeps the output about this repo
+#                   instead of third-party stub gaps (airsim, structlog), and
+#                   --python-version 3.12 is needed because numpy's own stubs
+#                   use `type` statements; the project still supports 3.10+.
+#               They stay in CI so the gap is visible instead of hidden.
+
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  # ---------------------------------------------------------------------------
+  # Primary gate. Runs on Windows on purpose: several cases are timing- and
+  # path-sensitive (heartbeat ageing, preemption latency, process-wide
+  # settings), so a green Linux run would not mean the same thing.
+  # ---------------------------------------------------------------------------
+  tests-windows:
+    name: pytest (windows, blocking)
+    runs-on: windows-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v5
+
+      - name: Sync dependencies
+        # --all-extras so the dev tools (pytest, pytest-cov) are present.
+        run: uv sync --all-extras --frozen
+
+      - name: Run the test suite with the coverage gate
+        # .coveragerc holds `fail_under = 45` over the 12 critical files; it is
+        # enforced by this command rather than by whoever remembers to type it.
+        run: uv run pytest tests/ -q --cov --cov-report=term
+
+  # ---------------------------------------------------------------------------
+  # Front-end logic: the two vm-based .cjs suites. No npm install, no build.
+  # ---------------------------------------------------------------------------
+  frontend:
+    name: node --test (blocking)
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+      - name: Run the .cjs suites
+        run: node --test tests/*.cjs
+
+  # ---------------------------------------------------------------------------
+  # Advisory: see the header comment for what must happen before these can gate.
+  # ---------------------------------------------------------------------------
+  formatting:
+    name: black --check (advisory)
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v5
+      - run: uv sync --all-extras --frozen
+      - name: Check formatting
+        run: uv run black --check src/ tests/ scripts/
+
+  typing:
+    name: mypy (advisory)
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v5
+      - run: uv sync --all-extras --frozen
+      - name: Type check
+        # --ignore-missing-imports / --python-version: see the header comment.
+        run: uv run mypy --python-version 3.12 --ignore-missing-imports src/
+
+  # ---------------------------------------------------------------------------
+  # The same suite on Linux, unverified: nobody has seen it green yet, so it
+  # must not be able to fail the build. Promote it once it has been observed
+  # passing (or once the Windows-only assumptions are documented as such).
+  # ---------------------------------------------------------------------------
+  tests-linux:
+    name: pytest (linux, unverified)
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v5
+      - run: uv sync --all-extras --frozen
+      - run: uv run pytest tests/ -q

@@ -35,6 +35,7 @@ from src.agent.llm import LLMMissionPlanner, LLMUnavailableError, _as_bool, _ext
 from src.agent.loop_types import LoopDecision
 from src.agent.runtime import AgentRuntime, RunState
 from src.agent.tool_executor import ToolCallResult, ToolCollector, ToolRuntime
+from _runtime_factories import agent_runtime, status_controller, tool_runtime
 from src.modules.safety_validator import FlightConstraint, SafetyValidator
 
 # ---------------------------------------------------------------------------
@@ -43,77 +44,13 @@ from src.modules.safety_validator import FlightConstraint, SafetyValidator
 
 
 def _rt(collector: ToolCollector, *, controller: Any = None) -> ToolRuntime:
-    rt = object.__new__(ToolRuntime)
-    rt.backend_id = "fake"
-    rt.collector = collector
-    rt._lock = threading.RLock()
-    rt.safety = SafetyValidator(
-        FlightConstraint(
-            max_altitude=50.0, min_altitude=0.5, max_velocity=8.0, max_distance_from_home=100.0
-        )
-    )
-    rt.ensure_ready = lambda: True  # type: ignore[method-assign]
-    rt._camera_source_enabled = lambda: False  # type: ignore[method-assign]
-    rt.controller = controller
-    rt._last_connect_params = {}
-    rt._real_vehicle = False
-    rt.camera_controller = None
-    rt.backend_profile = None
-    rt.available = True
-    rt.init_error = ""
-    return rt
-
-
-class _Controller:
-    """Minimal connected controller stub with a selectable status payload."""
-
-    def __init__(self, *, armed: bool = True, flying: bool = True, z: float = -3.0, gps: dict | None = None) -> None:
-        self.is_connected = True
-        self._armed = armed
-        self._flying = flying
-        self._z = z
-        self._gps = gps
-
-    def get_status(self, vehicle_name: str = "") -> SimpleNamespace:
-        return SimpleNamespace(
-            position_ned={"x": 0.0, "y": 0.0, "z": self._z},
-            armed=self._armed,
-            flying=self._flying,
-            gps=self._gps,
-        )
+    # shared shell: see tests/_runtime_factories.py
+    return tool_runtime(collector, controller)
 
 
 def _shell_runtime(**attrs: Any) -> AgentRuntime:
-    """AgentRuntime with the attribute surface _run_plan / _execute_agent_tool touch."""
-    base: dict[str, Any] = dict(
-        _lock=threading.RLock(),
-        _execution_slot=threading.Lock(),
-        _execution_thread_id=0,
-        _cancelled_request_ids=set(),
-        _cancel_requested=threading.Event(),
-        _cancel_requested_at=0.0,
-        _cancel_requested_run_id="",
-        _envelope_thread=None,
-        _envelope_run_id="",
-        _envelope_stop=threading.Event(),
-        _tracking_assist=None,
-        _pending_approvals={},
-        _pending_steer=[],
-        _backend_generation=0,
-        _current=None,
-        _messages=[],
-        _subscribers=[],
-        _events=[],
-        _run_log=None,
-        agent_state={},
-        memory=SimpleNamespace(remember_tool_call=lambda *a, **k: None),
-        task_runs=None,
-    )
-    base.update(attrs)
-    runtime = object.__new__(AgentRuntime)
-    for key, value in base.items():
-        setattr(runtime, key, value)
-    return runtime
+    """AgentRuntime shell for _run_plan / _execute_agent_tool tests."""
+    return agent_runtime(**attrs)
 
 
 def _noop_tool(**kwargs) -> str:
@@ -190,7 +127,7 @@ def test_nan_velocity_is_rejected_without_nan_correction():
 def test_nan_tool_param_is_blocked_by_the_dispatcher():
     collector = ToolCollector()
     collector.tools["drone_move_relative"] = _noop_tool
-    rt = _rt(collector, controller=_Controller())
+    rt = _rt(collector, controller=status_controller())
 
     result = rt.execute("drone_move_relative", {"forward_m": float("nan")})
 
@@ -202,7 +139,7 @@ def test_nan_tool_param_is_blocked_by_the_dispatcher():
 def test_nan_string_param_is_blocked_too():
     collector = ToolCollector()
     collector.tools["drone_fly_velocity"] = _noop_tool
-    rt = _rt(collector, controller=_Controller())
+    rt = _rt(collector, controller=status_controller())
 
     result = rt.execute("drone_fly_velocity", {"vx": "nan", "vy": 0.0, "vz": 0.0})
 
@@ -219,7 +156,7 @@ def test_fly_velocity_descent_into_the_ground_is_blocked():
     """5 m/s down for 60 s from 3 m: the instantaneous speed check passes."""
     collector = ToolCollector()
     collector.tools["drone_fly_velocity"] = _noop_tool
-    rt = _rt(collector, controller=_Controller(z=-3.0))
+    rt = _rt(collector, controller=status_controller(z=-3.0))
 
     result = rt.execute("drone_fly_velocity", {"vx": 0.0, "vy": 0.0, "vz": 5.0, "duration": 60.0})
 
@@ -231,7 +168,7 @@ def test_fly_velocity_long_run_into_the_fence_is_blocked():
     """8 m/s for 300 s travels ~2.4 km with a 100 m geofence."""
     collector = ToolCollector()
     collector.tools["drone_fly_velocity"] = _noop_tool
-    rt = _rt(collector, controller=_Controller(z=-3.0))
+    rt = _rt(collector, controller=status_controller(z=-3.0))
 
     result = rt.execute("drone_fly_velocity", {"vx": 8.0, "vy": 0.0, "vz": 0.0, "duration": 300.0})
 
@@ -242,7 +179,7 @@ def test_fly_velocity_long_run_into_the_fence_is_blocked():
 def test_fly_velocity_short_bounded_burst_is_allowed():
     collector = ToolCollector()
     collector.tools["drone_fly_velocity"] = _noop_tool
-    rt = _rt(collector, controller=_Controller(z=-3.0))
+    rt = _rt(collector, controller=status_controller(z=-3.0))
 
     result = rt.execute("drone_fly_velocity", {"vx": 1.0, "vy": 0.0, "vz": 0.0, "duration": 2.0})
 
@@ -268,11 +205,9 @@ def test_fly_velocity_without_position_readback_bounds_the_whole_displacement():
 
 
 def _runtime_stub(**attrs: Any) -> AgentRuntime:
-    runtime = object.__new__(AgentRuntime)
-    runtime.tools = attrs.pop("tools", SimpleNamespace(CONTROL_TOOLS={"drone_fly_to"}, READ_ONLY_TOOLS=set()))
-    for key, value in attrs.items():
-        setattr(runtime, key, value)
-    return runtime
+    # shared shell: every runtime field is initialised by _init_runtime_state(),
+    # so a test only names what it cares about.
+    return agent_runtime(**attrs)
 
 
 def test_real_vehicle_approval_is_not_restricted_to_mavlink_backend():
@@ -879,7 +814,7 @@ def test_parse_no_fly_zones_accepts_json_and_list_and_skips_garbage():
 
 
 def _rt_with_zone(zone: dict, *, z: float = -10.0) -> ToolRuntime:
-    rt = _rt(ToolCollector(), controller=_Controller(z=z))
+    rt = _rt(ToolCollector(), controller=status_controller(z=z))
     rt.safety = SafetyValidator(
         FlightConstraint(
             max_altitude=50.0,

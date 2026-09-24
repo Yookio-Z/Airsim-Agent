@@ -844,6 +844,16 @@ class AgentRuntime:
     """Coordinates planner, tools, memory, and safety supervisor."""
 
     def __init__(self) -> None:
+        """依赖注入 + 启动。
+
+        分成三步是为了让测试能拿到"字段齐全的空壳"，而不是手工注入二三十个属性：
+        ``object.__new__(AgentRuntime)`` 之后调 `_init_runtime_state()`，再只替换
+        自己关心的字段与少量方法。手工工厂的代价是实测过的——运行时新增一个必需
+        字段，就要同时改好几个测试文件的手工属性列表，失败信息还完全指不到原因。
+
+        `_init_runtime_state()` 不依赖任何注入对象、无副作用；`_wire_callbacks()`
+        把方法接到工具层与循环上，必须在字段就绪之后。
+        """
         self._started_at = time.time()
         self.planner = LLMMissionPlanner()
         self.rule_planner = MissionPlanner()
@@ -861,6 +871,28 @@ class AgentRuntime:
         self.task_runs = TaskRunStore()
         self.supervisor = ExecutionSupervisor(default_timeout=30.0)
         self.skills = SkillRegistry(overrides_path=SKILLS_OVERRIDES_PATH)
+        self._init_runtime_state()
+        self._auto_connect_initial_backend_id = self.tools.backend_id
+        self._wire_callbacks()
+        self.gcs = GroundStationServices(
+            self.tools,
+            supervisor=self.supervisor,
+            current_run_provider=lambda: self._current.to_dict() if self._current else None,
+        )
+        self._append_event("info", "system", "AirSim VLA Agent runtime ready")
+        self._load_or_create_default_session()
+        threading.Thread(
+            target=self._auto_connect_from_settings,
+            args=(self._backend_generation, self._auto_connect_initial_backend_id),
+            daemon=True,
+        ).start()
+
+    def _init_runtime_state(self) -> None:
+        """所有可变运行态字段的初值。不依赖注入对象、无副作用。
+
+        测试用 `object.__new__(AgentRuntime)` 之后调它即可得到一个字段完整的
+        空壳（见 tests/_runtime_factories.py）。
+        """
         self._execution_slot = threading.Lock()
         self._execution_thread_id = 0
         self._cancel_requested = threading.Event()
@@ -874,23 +906,6 @@ class AgentRuntime:
         # 中断任务重来。操作员可以用一句话纠正跑偏的任务，飞机也不会因为中断
         # 收尾而被迫降落。
         self._pending_steer: list[str] = []
-        self.agent_loop = AgentLoop(
-            self.tools,
-            self.planner,
-            self.memory,
-            on_event=self._on_agent_event,
-            should_stop=lambda: self.supervisor.is_emergency_stopped() or self._active_run_cancelled(),
-            should_pause=self.supervisor.should_pause,
-            skills=self.skills,
-            execute_tool=self._execute_agent_tool,
-            on_state=self._on_agent_loop_state,
-            steer_provider=self._take_pending_steer,
-        )
-        # the formation control loop stops on emergency stop / task cancel
-        self.tools.formation_set_stop_provider(self._flight_abort_requested)
-        # single-vehicle blocking flight commands (fly_to / path / takeoff)
-        # also preempt on emergency stop / task cancel
-        self.tools.set_flight_stop_provider(self._flight_abort_requested)
         self._lock = threading.RLock()
         self._events: list[RuntimeEvent] = []
         self._messages: list[ChatMessage] = []
@@ -918,7 +933,7 @@ class AgentRuntime:
         self._envelope_thread: threading.Thread | None = None
         self._envelope_run_id: str = ""
         self._backend_generation = 0
-        self._auto_connect_initial_backend_id = self.tools.backend_id
+        self._auto_connect_initial_backend_id = ""
         self._last_visual_frame: dict[str, Any] = {}
         # P5: pending high-risk approvals keyed by run_id
         self._pending_approvals: dict[str, ToolApprovalRequest] = {}
@@ -928,18 +943,26 @@ class AgentRuntime:
         self._active_replay: ReplaySession | None = None
         self._manual_replay: ReplaySession | None = None
         self._replay_lock = threading.Lock()
-        self.gcs = GroundStationServices(
+
+    def _wire_callbacks(self) -> None:
+        """把 runtime 的方法接到工具层与 Agent 循环上（依赖已注入的对象）。"""
+        self.agent_loop = AgentLoop(
             self.tools,
-            supervisor=self.supervisor,
-            current_run_provider=lambda: self._current.to_dict() if self._current else None,
+            self.planner,
+            self.memory,
+            on_event=self._on_agent_event,
+            should_stop=lambda: self.supervisor.is_emergency_stopped() or self._active_run_cancelled(),
+            should_pause=self.supervisor.should_pause,
+            skills=self.skills,
+            execute_tool=self._execute_agent_tool,
+            on_state=self._on_agent_loop_state,
+            steer_provider=self._take_pending_steer,
         )
-        self._append_event("info", "system", "AirSim VLA Agent runtime ready")
-        self._load_or_create_default_session()
-        threading.Thread(
-            target=self._auto_connect_from_settings,
-            args=(self._backend_generation, self._auto_connect_initial_backend_id),
-            daemon=True,
-        ).start()
+        # the formation control loop stops on emergency stop / task cancel
+        self.tools.formation_set_stop_provider(self._flight_abort_requested)
+        # single-vehicle blocking flight commands (fly_to / path / takeoff)
+        # also preempt on emergency stop / task cancel
+        self.tools.set_flight_stop_provider(self._flight_abort_requested)
 
     # ------------------------------------------------------------------
     # Perception axis lifecycle (docs/perception_axis_design.md)

@@ -14,27 +14,13 @@ from src.agent.tool_executor import (
     ToolCallResult,
     ToolRuntime,
 )
+from _runtime_factories import tool_runtime
 from src.modules.safety_validator import FlightConstraint, SafetyValidator
 
 
 def _runtime(collector: ToolCollector) -> ToolRuntime:
-    rt = object.__new__(ToolRuntime)
-    rt.backend_id = "fake"
-    rt.collector = collector
-    rt._lock = threading.RLock()
-    rt.safety = SafetyValidator(
-        FlightConstraint(max_altitude=50.0, min_altitude=0.5, max_velocity=8.0, max_distance_from_home=100.0)
-    )
-    rt.ensure_ready = lambda: True  # type: ignore[method-assign]
-    rt._camera_source_enabled = lambda: False  # type: ignore[method-assign]
-    rt.controller = None
-    rt._last_connect_params = {}
-    rt._real_vehicle = False
-    rt.camera_controller = None
-    rt.backend_profile = None
-    rt.available = True
-    rt.init_error = ""
-    return rt
+    # shared shell: see tests/_runtime_factories.py
+    return tool_runtime(collector)
 
 
 # ---------------------------------------------------------------------------
