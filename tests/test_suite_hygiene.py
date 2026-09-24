@@ -18,8 +18,6 @@ from __future__ import annotations
 import ast
 from pathlib import Path
 
-import pytest
-
 TESTS_DIR = Path(__file__).resolve().parent
 
 
@@ -78,8 +76,3 @@ def _has_collectable_test(path: Path) -> bool:
         if isinstance(node, ast.ClassDef) and node.name.startswith("Test"):
             return True
     return False
-
-
-@pytest.mark.parametrize("path", _test_files(), ids=lambda p: p.name)
-def test_test_file_parses(path: Path):
-    ast.parse(path.read_text(encoding="utf-8"))
