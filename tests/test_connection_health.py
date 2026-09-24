@@ -131,6 +131,30 @@ def test_command_ack_rejection_keeps_mav_result_diagnostic():
     assert "MAV_RESULT_DENIED" in controller.last_error
 
 
+_QGC_BOARD_INFO_PATH = (
+    Path(__file__).resolve().parents[1]
+    / "third_party"
+    / "qgroundcontrol"
+    / "src"
+    / "Comms"
+    / "USBBoardInfo.json"
+)
+
+
+def _qgc_board_db_available() -> bool:
+    """QGC 的 USB VID/PID 板卡数据库在 third_party 里，而那是"仅供研究"的
+    未跟踪检出——新鲜克隆里没有它。依赖它的断言要么显式跳过，要么改用不依赖
+    该数据的方式表达，不能在 CI 里红着，也不能被静默改成另一个断言。"""
+    return _QGC_BOARD_INFO_PATH.exists()
+
+
+@pytest.mark.skipif(
+    not _qgc_board_db_available(),
+    reason=(
+        "third_party/qgroundcontrol USBBoardInfo.json is not present "
+        "(study-only checkout, not version controlled)"
+    ),
+)
 def test_qgc_usb_board_info_detects_px4_fmu_v6u(monkeypatch):
     port = SimpleNamespace(
         device="COM3",
@@ -154,28 +178,7 @@ def test_qgc_usb_board_info_detects_px4_fmu_v6u(monkeypatch):
     assert candidates[0].board_name == "PX4 FMU V6U"
 
 
-def _qgc_board_db_available() -> bool:
-    """QGC 的 USB VID/PID 板卡数据库在 third_party 里，而那是"仅供研究"的
-    未跟踪检出——新鲜克隆里没有它。依赖它的断言必须显式跳过，而不是在 CI 里
-    红着，也不是被静默改成另一个断言。"""
-    return _QGC_BOARD_INFO_PATH.exists()
-
-
-_QGC_BOARD_INFO_PATH = (
-    Path(__file__).resolve().parents[1]
-    / "third_party"
-    / "qgroundcontrol"
-    / "src"
-    / "Comms"
-    / "USBBoardInfo.json"
-)
-
-
-@pytest.mark.skipif(
-    not _qgc_board_db_available(),
-    reason="third_party/qgroundcontrol USBBoardInfo.json is not present (study-only checkout, not version controlled)",
-)
-def test_qgc_usb_board_info_detects_px4_fmu_v6u(monkeypatch):
+def test_serial_baud_port_mixup_is_normalized():
     assert normalize_serial_baud("14550") == 115200
 
     backend, params = _build_connect_params({
