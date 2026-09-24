@@ -290,11 +290,21 @@ def test_mavlink_release_targets_the_requested_vehicle():
 
 
 def test_mavlink_send_velocity_setpoint_fails_when_disconnected():
-    """M4: a dead link must not silently succeed."""
+    """M4: a dead link must not silently succeed.
+
+    A dead link is "no fresh heartbeat", not "the _connected flag is False":
+    is_connected() deliberately re-probes and self-heals when the flag says
+    disconnected but heartbeats keep arriving (the flag goes stale across a
+    process restart while the link is actually alive), so clearing only the
+    flag models "our belief is stale" and the probe rightly corrects it.
+    A stale heartbeat is what an actually dead link looks like.
+    """
     controller = _controller([1, 2])
+    controller._last_heartbeat = time.time() - 30.0
     controller._connected = False
     assert controller.send_velocity_setpoint(1.0, 0.0, 0.0, "all") is False
     assert controller._mavlink.mav.velocity_sets == []
+    assert controller.last_error
 
 
 def test_mavlink_is_velocity_control_active_rejects_stale_heartbeat():

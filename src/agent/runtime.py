@@ -636,6 +636,18 @@ def _build_connect_params(connection: dict[str, Any]) -> tuple[str, dict[str, An
         return "px4_mavlink", connect_params
 
 
+def _connection_is_real_vehicle(connection: dict[str, Any]) -> bool:
+    """这条连接是不是"真机链路"。
+
+    serial 天然是真机（_build_connect_params 也按此标记）；udp/tcp/auto 取决于
+    操作员是否勾了 realVehicle。用于在同后端的候选里优先挑真机链路。
+    """
+    if str(connection.get("type") or "").lower() == "serial":
+        return True
+    params = connection.get("params") or {}
+    return bool(params.get("realVehicle") or params.get("real_vehicle"))
+
+
 def _select_connection_for_backend(
     conn_section: dict[str, Any],
     backend_id: str,
@@ -653,29 +665,29 @@ def _select_connection_for_backend(
         if active_backend == backend_id:
             return active_id, active
 
-    preferred_ids = {
-        "px4_mavlink": ["default_px4_auto", "default_px4_usb", "default_px4"],
-        "airsim": ["default_airsim"],
-        "px4_ros2": ["default_px4_ros2"],
-    }.get(backend_id, [])
-    for preferred_id in preferred_ids:
-        candidate = next((c for c in connections if str(c.get("id") or "") == preferred_id), None)
-        if candidate is not None:
-            try:
-                candidate_backend, _ = _build_connect_params(candidate)
-            except Exception:
-                continue
-            if candidate_backend == backend_id:
-                return str(candidate.get("id") or ""), candidate
-
+    candidates: list[tuple[str, dict[str, Any]]] = []
     for candidate in connections:
         try:
             candidate_backend, _ = _build_connect_params(candidate)
         except Exception:
             continue
         if candidate_backend == backend_id:
-            return str(candidate.get("id") or ""), candidate
-    return "", None
+            candidates.append((str(candidate.get("id") or ""), candidate))
+    if not candidates:
+        return "", None
+    # 同后端有多个候选时优先真机链路：SIM 默认端点是 127.0.0.1 的 SITL，
+    # 真机部署下它要么连到不存在的端口、要么连到本地仿真，而串口或标过
+    # realVehicle 的链路才是操作员真正要飞的那条。
+    # 以前这里写死了一组 preset id（default_px4_auto / default_px4_usb /
+    # default_px4），但没有任何地方创建过这些 id，等于这段偏好从未生效——
+    # 所以改成按连接本身的能力判断，操作员自己加的串口预设也能被优先选中。
+    if backend_id == "px4_mavlink":
+        real_vehicle = next(
+            (item for item in candidates if _connection_is_real_vehicle(item[1])), None
+        )
+        if real_vehicle is not None:
+            return real_vehicle
+    return candidates[0]
 
 
 @dataclass

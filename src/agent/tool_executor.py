@@ -2175,31 +2175,29 @@ class ToolRuntime:
                 safety=safety,
             )
 
-        if (
-            name in self.CAMERA_SOURCE_TOOLS
-            and self.backend_id != "airsim"
-            and not self._camera_source_enabled()
-        ):
-            # 仅在没有独立相机源时拒绝：px4 后端下若配置了 AirSim/RTSP/本机
-            # 相机源，图像工具会注册到独立的相机控制器上（与飞控后端解耦），
-            # 此时允许执行；否则给出明确的替代路径提示。
-            return ToolCallResult(
-                name,
-                params,
-                False,
-                {
-                    "status": "error",
-                    "message": (
-                        f"{name} needs a camera source. On the current "
-                        f"{self.backend_id} backend configure a camera source "
-                        "(AirSim/RTSP/local) or use perception_status and "
-                        "inspect_current_frame for the perception axis stream."
-                    ),
-                },
-                started,
-                time.time(),
-                error_code="BLOCKED",
-            )
+        if name in self.CAMERA_SOURCE_TOOLS and self.backend_id != "airsim":
+            # 拒绝条件看"相机工具是否真的注册成功"，而不是"设置里写了相机源"：
+            # 配置了源但注册失败（源不可达）时，旧条件判为"允许执行"，然后静默
+            # 落到工具查找失败，报出含糊的 unknown tool。这台情况下给出明确的
+            # 相机源提示。_camera_tools_ready() 的注释记录过同一个故障。
+            if not self._camera_tools_ready():
+                return ToolCallResult(
+                    name,
+                    params,
+                    False,
+                    {
+                        "status": "error",
+                        "message": (
+                            f"{name} needs a camera source. On the current "
+                            f"{self.backend_id} backend configure a camera source "
+                            "(AirSim/RTSP/local) or use perception_status and "
+                            "inspect_current_frame for the perception axis stream."
+                        ),
+                    },
+                    started,
+                    time.time(),
+                    error_code="BLOCKED",
+                )
 
         if blocked_by_supervisor and name not in {"drone_hover", "drone_land", "drone_get_status"}:
             return ToolCallResult(

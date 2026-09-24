@@ -116,6 +116,11 @@ class AirSimController(FlightController):
         self._executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="airsim_rpc")
         self._rpc_exec_lock = threading.Lock()
         self._last_connected_check = 0.0
+        # 抢占敏感路径（如 _wait_move_arrival）会在执行期间关掉自动重连：那些
+        # 循环的契约是"外部急停/取消立即 hover 抢占"，而 _ensure_connected 在
+        # 未连接时会发起一次完整 connect（实测 6.0s，连接被拒还会内部重试），
+        # 恰好把操作员按下停止后的等待拉长到 RPC 超时之后。重连交给工具层。
+        self._auto_reconnect = True
         self._rpc_timing = threading.local()
         self._camera_stabilization = CameraStabilization()  # disabled until explicitly configured
         # land 成功后记录落地事实（AirSim 落地后遥测滞后/位置残留，见 get_status）
@@ -532,7 +537,14 @@ class AirSimController(FlightController):
             )
 
     def _ensure_connected(self) -> bool:
-        """如果未连接或连接不健康，自动重连。"""
+        """如果未连接或连接不健康，自动重连。
+
+        `_auto_reconnect` 为 False 时只报告当前状态，不发起连接：抢占敏感的
+        只读循环（见 _wait_move_arrival）不能因为一次数秒的连接尝试而推迟
+        急停抢占。它只影响"主动去连"，不影响已经连上的链路。
+        """
+        if not self._auto_reconnect and not self._connected:
+            return False
         if self.is_connected:
             # The ping probe is an RPC: under the UI's 250ms polling × N
             # requests, pinging on every call piles up pressure on the single
@@ -1404,6 +1416,24 @@ class AirSimController(FlightController):
         deadline = time.time() + max(5.0, timeout)
         tx, ty, tz = target
         slow_since: float | None = None
+        # 本循环期间禁止自动重连（见 _ensure_connected）：读不到遥测就短暂等待，
+        # 绝不能在这里花 6 秒去 connect——那正好是操作员按下停止后等 hover 的时间。
+        previous_auto_reconnect = self._auto_reconnect
+        self._auto_reconnect = False
+        try:
+            return self._wait_move_arrival_loop(name, target, tolerance, deadline, slow_since)
+        finally:
+            self._auto_reconnect = previous_auto_reconnect
+
+    def _wait_move_arrival_loop(
+        self,
+        name: str,
+        target: tuple[float, float, float],
+        tolerance: float,
+        deadline: float,
+        slow_since: float | None,
+    ) -> bool:
+        tx, ty, tz = target
         while time.time() < deadline:
             if self._stop_requested():
                 try:
@@ -1415,10 +1445,10 @@ class AirSimController(FlightController):
             try:
                 status = self.get_status(name).to_dict()
             except Exception:
-                time.sleep(0.5)
+                time.sleep(0.2)
                 continue
             if status.get("connection_error"):
-                time.sleep(0.5)
+                time.sleep(0.2)
                 continue
             pos = status.get("position_ned") if isinstance(status.get("position_ned"), dict) else {}
             vel = status.get("velocity_ned") if isinstance(status.get("velocity_ned"), dict) else {}

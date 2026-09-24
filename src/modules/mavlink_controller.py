@@ -969,13 +969,26 @@ class MavlinkController(FlightController):
                 break
         return ok
 
+    def _link_refusal_reason(self) -> str:
+        """链路不可用时的具体原因；可用时返回 ""。
+
+        必须先判心跳、再判 _connected 标志：is_connected 在心跳过期时会返回
+        False，于是"心跳丢失（last heartbeat 30.0s ago）"这条可操作的原因会被
+        通用的 "MAVLink is not connected" 覆盖——链路越糟、提示越含糊。两者阈值
+        同为 8s，所以旧顺序下只有"多机里某一机掉线"才会显示具体原因，单机断链
+        永远只看到通用提示。
+        """
+        if self._link_is_stale():
+            return self._stale_link_message()
+        if not self.is_connected:
+            return "MAVLink is not connected"
+        return ""
+
     def _arm_one(self) -> bool:
         self._last_action_error = ""
-        if not self.is_connected:
-            self._last_action_error = "MAVLink is not connected"
-            return False
-        if self._link_is_stale():
-            self._last_action_error = self._stale_link_message()
+        reason = self._link_refusal_reason()
+        if reason:
+            self._last_action_error = reason
             return False
         if self._is_armed():
             return True
@@ -1031,11 +1044,9 @@ class MavlinkController(FlightController):
 
     def _disarm_one(self) -> bool:
         self._last_action_error = ""
-        if not self.is_connected:
-            self._last_action_error = "MAVLink is not connected"
-            return False
-        if self._link_is_stale():
-            self._last_action_error = self._stale_link_message()
+        reason = self._link_refusal_reason()
+        if reason:
+            self._last_action_error = reason
             return False
         self._stop_offboard_hold()
         self._mavlink.mav.command_long_send(
@@ -1077,11 +1088,9 @@ class MavlinkController(FlightController):
 
     def _takeoff_one(self, altitude: float = 3.0, vehicle_name: str = "") -> bool:
         self._last_action_error = ""
-        if not self.is_connected:
-            self._last_action_error = "MAVLink is not connected"
-            return False
-        if self._link_is_stale():
-            self._last_action_error = self._stale_link_message()
+        reason = self._link_refusal_reason()
+        if reason:
+            self._last_action_error = reason
             return False
         altitude = max(0.5, abs(float(altitude)))
 

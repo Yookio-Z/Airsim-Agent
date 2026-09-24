@@ -148,14 +148,38 @@ def test_unknown_action_returns_helpful_error():
 
 
 class _FormationTools:
+    """Minimal ToolRuntime stand-in for the formation conflict guard.
+
+    The guard runs before the control gate, but the flight path behind it does
+    take the gate, so the double has to model it — without it the test dies with
+    an AttributeError that says nothing about the behaviour under test.
+    """
+
     CONTROL_TOOLS = {"drone_fly_to", "drone_hover"}
     READ_ONLY_TOOLS = {"drone_get_status"}
 
     def __init__(self) -> None:
         self.active = False
+        self._control_gate = threading.RLock()
+        self.gate_acquires = 0
 
     def formation_active(self) -> bool:
         return self.active
+
+    def acquire_control_gate(self, blocking: bool = False, timeout: float = -1.0) -> bool:
+        if blocking and timeout >= 0:
+            acquired = self._control_gate.acquire(timeout=timeout)
+        else:
+            acquired = self._control_gate.acquire(blocking=blocking)
+        if acquired:
+            self.gate_acquires += 1
+        return acquired
+
+    def release_control_gate(self) -> None:
+        try:
+            self._control_gate.release()
+        except RuntimeError:
+            pass
 
 
 def test_formation_conflict_blocks_single_vehicle_control():

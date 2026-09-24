@@ -164,10 +164,14 @@ def test_serial_baud_port_mixup_is_normalized():
     assert params["real_vehicle"] is True
 
 
-def test_px4_backend_falls_back_to_first_real_vehicle_preset():
-    """With AirSim + USB Serial + ROS2 as the only defaults, a stale ROS2
-    active id is replaced by the first non-AirSim entry (USB Serial) which is
-    the most plausible real-vehicle link."""
+def test_px4_backend_falls_back_to_a_compatible_default_preset():
+    """A stale active id pointing at another backend must be replaced by a
+    px4_mavlink-compatible preset.
+
+    The shipped defaults are AirSim + PX4 SITL UDP + ROS2 (a serial preset is
+    added by the operator when needed), so SITL UDP is the only compatible
+    candidate here.
+    """
     settings = {
         "backend": "px4_mavlink",
         "connections": {
@@ -177,7 +181,70 @@ def test_px4_backend_falls_back_to_first_real_vehicle_preset():
 
     merged = _connection_settings(settings)
 
-    assert merged["active_connection_id"] == "default_px4_usb"
+    assert merged["active_connection_id"] == "default_px4_sitl_udp"
+
+
+def test_px4_backend_prefers_a_real_vehicle_link_over_the_sitl_default():
+    """When both a SITL UDP endpoint and a real-vehicle link exist, the real one
+    wins: the SITL default is 127.0.0.1, which on a real deployment either
+    connects to nothing or to a local simulator instead of the aircraft.
+
+    This used to be expressed as a hard-coded preset-id whitelist
+    (default_px4_auto / default_px4_usb) that nothing ever created, so the
+    preference never had any effect; an operator-added serial preset must win.
+    """
+    settings = {
+        "backend": "px4_mavlink",
+        "connections": {
+            "active_connection_id": "default_px4_ros2",
+            "connections": [
+                {
+                    "id": "default_px4_sitl_udp",
+                    "name": "PX4 SITL UDP",
+                    "type": "udp",
+                    "params": {"host": "127.0.0.1", "portNumber": "14550"},
+                },
+                {
+                    "id": "my_usb_link",
+                    "name": "Pixhawk USB",
+                    "type": "serial",
+                    "params": {"port": "COM7", "baud": "115200"},
+                },
+            ],
+        },
+    }
+
+    merged = _connection_settings(settings)
+
+    assert merged["active_connection_id"] == "my_usb_link"
+
+
+def test_px4_backend_keeps_an_explicitly_chosen_sitl_link():
+    """The real-vehicle preference must not override an explicit choice."""
+    settings = {
+        "backend": "px4_mavlink",
+        "connections": {
+            "active_connection_id": "default_px4_sitl_udp",
+            "connections": [
+                {
+                    "id": "default_px4_sitl_udp",
+                    "name": "PX4 SITL UDP",
+                    "type": "udp",
+                    "params": {"host": "127.0.0.1", "portNumber": "14550"},
+                },
+                {
+                    "id": "my_usb_link",
+                    "name": "Pixhawk USB",
+                    "type": "serial",
+                    "params": {"port": "COM7", "baud": "115200"},
+                },
+            ],
+        },
+    }
+
+    merged = _connection_settings(settings)
+
+    assert merged["active_connection_id"] == "default_px4_sitl_udp"
 
 
 def test_auto_link_builds_serial_first_with_udp_fallback(monkeypatch):
@@ -226,6 +293,11 @@ def test_autopilot_version_decoder_matches_qgc_byte_layout():
 
 
 def test_param_value_cache_decodes_bytewise_int32():
+    # 16_777_217 = 2**24 + 1 is the smallest int32 that float32 cannot represent
+    # exactly, so a plain int(float_field) would come out as 16_777_216. Decoding
+    # a value like 1 would pass either way and prove nothing.
+    raw_int = 16_777_217
+
     class _ParamValue:
         def get_type(self):
             return "PARAM_VALUE"
@@ -239,7 +311,7 @@ def test_param_value_cache_decodes_bytewise_int32():
         def to_dict(self):
             return {
                 "param_id": "COM_ARM_WO_GPS\x00\x00",
-                "param_value": struct.unpack("<f", struct.pack("<i", 1))[0],
+                "param_value": struct.unpack("<f", struct.pack("<i", raw_int))[0],
                 "param_type": mavutil.mavlink.MAV_PARAM_TYPE_INT32,
                 "param_count": 1,
                 "param_index": 0,
@@ -251,6 +323,10 @@ def test_param_value_cache_decodes_bytewise_int32():
 
     controller = MavlinkController()
     controller._connected = True
+    # is_connected() requires a fresh heartbeat: the _connected flag alone is
+    # treated as a stale belief and gets re-probed, which is what this test
+    # used to trip over (the parameter snapshot then reported "disconnected").
+    controller._last_heartbeat = time.time()
     controller._mavlink = _Link()
     controller._handle_message(_ParamValue())
 
@@ -260,7 +336,8 @@ def test_param_value_cache_decodes_bytewise_int32():
     assert status["ready"] is True
     assert status["received_count"] == 1
     assert params["parameters"][0]["name"] == "COM_ARM_WO_GPS"
-    assert params["parameters"][0]["value"] == 1
+    # exact int32 round-trip: no float32 truncation, null padding stripped
+    assert params["parameters"][0]["value"] == raw_int
     assert params["parameters"][0]["type_name"] == "MAV_PARAM_TYPE_INT32"
 
 

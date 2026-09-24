@@ -39,12 +39,22 @@ def test_px4_backend_camera_capabilities_are_not_merged():
 
 
 def test_px4_backend_refuses_camera_execution():
+    """A px4 runtime whose camera tools never registered must refuse with a
+    camera-source error, not fall through to a vague "unknown tool".
+
+    The refusal is keyed on whether the camera tools actually registered
+    (_camera_tools_ready), not on whether a source is configured in settings:
+    a configured-but-unreachable source used to pass the gate and then fail as
+    UNKNOWN_TOOL, which tells the operator nothing about the real cause.
+    """
     rt = _px4_runtime()
     result = rt.execute("airsim_take_photo", {}, dry_run=False, blocked_by_supervisor=False)
     assert result.ok is False
     assert result.error_code == "BLOCKED"
     payload = json.loads(result.data["message"]) if isinstance(result.data, str) else result.data
-    assert "airsim backend" in str(payload)
+    message = str(payload)
+    assert "needs a camera source" in message
+    assert "perception_status" in message, "the message must point at the working alternative"
 
 
 def test_airsim_backend_still_lists_camera_tools():
