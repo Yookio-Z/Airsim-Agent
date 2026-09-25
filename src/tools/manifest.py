@@ -146,6 +146,13 @@ TOOL_MANIFEST: dict[str, ToolManifestEntry] = {
         notes="vehicle_name: 空=默认机, all=全部, 或具体载具名; Low-level command; skills should bound duration and speed.",
     ),
     "drone_rotate_to": _atomic("drone_rotate_to", "core", "vehicle_command", ("flight_control",), notes="vehicle_name: 空=默认机, all=全部, 或具体载具名"),
+    "drone_release_yaw": _atomic(
+        "drone_release_yaw",
+        "core",
+        "vehicle_command",
+        ("flight_control",),
+        notes="把机头控制权交还遥控器，Agent 停止下发转向；人工接管前先调用，否则 Agent 会在下个航点把机头拽回去。不改飞控参数。vehicle_name: 空=默认机, all=全部, 或具体载具名",
+    ),
     "drone_set_mode": _atomic("drone_set_mode", "core", "mode", ("mode_control",)),
 
     # Mission management surface. These are atomic service calls, but high-risk.

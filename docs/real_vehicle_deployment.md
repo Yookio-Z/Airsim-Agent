@@ -124,7 +124,8 @@ gst-launch-1.0 nvarguscamerasrc ! 'video/x-raw(memory:NVMM),width=1920,height=10
 |---|---|---|---|
 | `drone_arm/disarm/takeoff/land/fly_to/...` | ✓ | ✓ | PX4 协议通用 |
 | `drone_get_status` | ✓ | ✓ | 遥测通用 |
-| `drone_rotate_to` | ✓ | ✓ | 含本次修复的 hdg 单位/yaw 速度掩码 |
+| `drone_rotate_to` | ✓ | ✓ | 含 hdg 单位/yaw 速度掩码；锁步 PX4 下改走 MAVLink 偏航通道 |
+| `drone_release_yaw` | ✓ | ✓ | 人工接管前交还机头控制；不改飞控参数 |
 | `perception_status` | ✓ | ✓ | 自动跟随感知轴帧源(AirSim/RTSP/USB) |
 | `inspect_current_frame` | ✓ | ✓ | 同上 + fallback 直连帧源 |
 | `airsim_take_photo` | 限定 airsim | ✗ 真机 | 真机改用 `perception_status` 取最后一帧 |
@@ -132,6 +133,35 @@ gst-launch-1.0 nvarguscamerasrc ! 'video/x-raw(memory:NVMM),width=1920,height=10
 | `airsim_vlm_*` | 别名 → inspect | ✓ | 别名自动转发,真机也工作 |
 
 **结论: 飞行/感知/视觉 三大类工具在真机下都能正常工作**。airsim 命名的工具在前端 UI 上可见、但 LLM manifest 明确标注 backend 限制(已经在 `tools/manifest.py` 维护)。
+
+## 4.1 真机上的机头朝向（必读）
+
+Agent 现在默认让机头**朝向下一航点**（`DRONE_YAW_MODE=face_waypoint`），这是 PX4
+`MPC_YAW_MODE=0` 和 ArduPilot `WP_YAW_BEHAVIOR=2` 的默认语义——两家飞控都不是
+"固定机头"。改动前本项目在移动 setpoint 上把 `YAW_IGNORE` 写死，等于选了那个
+非默认档位，仿真和真机会一致地锁死机头。
+
+三件真机上必须知道的事：
+
+1. **人工接管前先交还机头**。Agent 每个航点都会把机头对准目标，操作员若以为朝向
+   仍在自己手上会判断失误。切手动前调 `drone_release_yaw`，它停止下发偏航并
+   断开偏航链路。PX4 侧建议同时开 `MPC_AUTO_NUDGING` bit 0：手动偏航会**闩锁到
+   模式切换**，不会每飞过一个航点就被自动转回去。配这一项要连带把
+   `MAN_OVERRIDE_SPD` 设为 -1，否则摇杆切模式退出的行为会被一起关掉。
+2. **机头物理固定的机型**（喷洒、某些工业吊舱）设 `DRONE_YAW_MODE=hold`，等价于
+   PX4 `MPC_YAW_MODE=5`（1.16 才加入）或 ArduPilot `WP_YAW_BEHAVIOR=0`。这种机型
+   还应按 ArduPilot 的做法关掉飞行员偏航覆盖（`AUTO_OPTIONS` / `RTL_OPTIONS`
+   bit 2），免得任何意外把机体转过来。
+3. **转向一律串行，不与移动并发**。锁步模式下 AirSim 的移动本身就是转发给 PX4 的
+   setpoint，再叠一条 OFFBOARD 流就是两个控制器抢同一架飞机。所以实现是"先转正
+   再走"，机头在航段内不再微调——需要边飞边转的场合（目标跟踪）依赖固定频率
+   setpoint 流，见 `target_tracking_plan` 的 T2.3。
+
+偏航角速度上限 45°/s（`DRONE_YAW_MAX_RATE_DPS`，对齐 PX4 `MPC_YAWRAUTO_MAX` 的
+保守侧），判定容差 12°（`DRONE_YAW_TOLERANCE_DEG`，对齐 `MIS_YAW_ERR`）。
+
+**不代做的事**：本项目不会去改 `MPC_AUTO_NUDGING` 这类飞控参数。真机上擅自改参数
+属于高风险动作，应由操作者在地面站确认后自行设置。
 
 ## 5. 待你提供以提供精确配置
 

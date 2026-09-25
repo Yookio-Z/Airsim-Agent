@@ -24,6 +24,7 @@ from .mavlink_autodiscovery import (
     discover_serial_mavlink_candidates,
     normalize_serial_baud,
 )
+from .px4_yaw_link import bearing_to_deg, heading_error_deg
 from ..config import config
 from ..logging_config import get_logger
 
@@ -1415,6 +1416,57 @@ class MavlinkController(FlightController):
                 break
         return ok
 
+    def _current_heading_deg(self) -> float | None:
+        """当前航向（度），飞控没报就返回 None。
+
+        GLOBAL_POSITION_INT.hdg 是厘度，65535 是"未知"哨兵。**0 不是未知**——
+        它是合法的正北方位，把它当成"没数据"会让一架朝北的飞机表现得像没有
+        航向反馈，转向伺服于是直接放弃。
+        """
+        gps = self._telemetry.get("GLOBAL_POSITION_INT", {}) or {}
+        raw = gps.get("hdg")
+        if raw is None:
+            return None
+        try:
+            value = float(raw)
+        except (TypeError, ValueError):
+            return None
+        if value < 0.0 or value >= 65535.0:
+            return None
+        return value % 360.0
+
+    def _face_waypoint_before_move(self, x: float, y: float) -> None:
+        """移动前把机头转向目标方位，对齐 PX4 的 MPC_YAW_MODE=0 语义。
+
+        PX4 与 ArduPilot 的多旋翼默认都是"朝向下一航点"，不是保持机头；本项目
+        原先的 setpoint 掩码把 YAW_IGNORE 写死，等于默认选了"固定机头"这个
+        非默认档位。航线是逐点飞行(move_to_position per waypoint)，所以每个航
+        点都会走到这里，逐点转向的行为与 PX4 原生任务一致。
+
+        失败不阻断移动：转正是锦上添花，飞不到才是硬失败。
+        """
+        if (config.yaw_mode or "face_waypoint").strip().lower() != "face_waypoint":
+            return
+        try:
+            cur_north = float(self._position.get("x", 0.0) or 0.0)
+            cur_east = float(self._position.get("y", 0.0) or 0.0)
+            # NED：x 是北、y 是东。bearing_to_deg 收的是 (东, 北)。
+            delta_east = y - cur_east
+            delta_north = x - cur_north
+            # 目标就在正上方，没有朝向可言，别去转。
+            if math.hypot(delta_east, delta_north) < 0.5:
+                return
+            target_bearing = bearing_to_deg(delta_east, delta_north)
+            current = self._current_heading_deg()
+            # 没有航向反馈就别盲转，转错了比不转更难收拾。
+            if current is None:
+                return
+            if abs(heading_error_deg(current, target_bearing)) <= config.yaw_tolerance_deg:
+                return
+            self.rotate_to_heading(target_bearing, timeout=20.0)
+        except Exception as exc:
+            logger.debug("face-waypoint pre-rotation skipped: %s", exc)
+
     def _move_to_position_one(
         self,
         x: float,
@@ -1428,6 +1480,10 @@ class MavlinkController(FlightController):
             return False
         target = {"x": float(x), "y": float(y), "z": float(z)}
         velocity = max(0.2, min(abs(float(velocity)), self._max_velocity))
+
+        # 先转正机头再走。必须串行：rotate_to_heading 自己会进/出 OFFBOARD，
+        # 与随后的位置 setpoint 流并发就是两个控制源抢同一架飞机。
+        self._face_waypoint_before_move(float(x), float(y))
 
         if not self._prime_offboard_position(target):
             self._stop_offboard_hold()
@@ -3063,6 +3119,26 @@ class MavlinkController(FlightController):
         if succeeded and canonical != "OFFBOARD":
             self._stop_offboard_hold()
         return succeeded
+
+    def release_yaw_control(self) -> bool:
+        """把机头交还给遥控器：停止本进程的一切偏航下发。
+
+        真机上 Agent 与遥控器争抢机头是真实冲突——Agent 每到一个航点就会把
+        机头拽回去，操作员却以为自己还掌握着朝向。PX4 对此有 MPC_AUTO_NUDGING
+        bit 0（手动偏航闩锁到模式切换），ArduPilot 默认允许飞行员覆盖、下个航
+        点再收回。
+
+        这里只做这一侧让位：**不改飞控参数**。真机上擅自改 MPC_AUTO_NUDGING
+        之类属于高风险动作，应由操作者在地面站确认后自行设置。
+        """
+        try:
+            # 归零偏航角速度并把车留在当前位置，避免收手时飞机还在转。
+            self._send_yaw_rate_setpoint(0.0)
+            self._finish_offboard_position_hold(dict(self._position))
+        except Exception as exc:
+            logger.warning("release_yaw_control: %s", exc)
+            return False
+        return True
 
     def rotate_to_heading(self, heading_deg: float, timeout: float = 30.0, vehicle_name: str = "") -> bool:
         if not self.is_connected:

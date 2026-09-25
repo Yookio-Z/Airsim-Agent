@@ -171,14 +171,45 @@
 
 **目标**：追踪中目标始终保持在画面内（当前 `_velocity_toward` 完全不管朝向）。
 
-**具体改动**：
-1. `TrackingSkill` 增加方位保持环：目标像素误差 → yaw 角速率（P 控制即可）；
-2. `airsim_controller` 确认/补充 yaw 速率控制与非阻塞接口；
-3. 云台俯仰按目标距离/高度差自适应（若仿真机型有云台）。
+**状态**：**第 1~2 项已完成**（偏航通道与机头朝向语义），第 3 项待做。
+
+已完成的部分：
+
+1. `px4_yaw_link.py`（新增）：独立 MAVLink 偏航伺服。锁步模式下 AirSim 不接管
+   姿态，`rotateToYawAsync` 是空操作，所以偏航改由 settings.json 的
+   `ControlPortLocal` 走 MAVLink 下发。进 OFFBOARD 保持位置、推偏航角速度至收敛、
+   恢复原模式，只管偏航不管位置/速度。
+2. `airsim_controller.rotate_to_heading`：`PX4Multirotor` 下不再直接拒绝，转发到
+   上述 MAVLink 通道。
+3. 机头朝向语义对齐主流飞控：默认 `yaw_mode=face_waypoint`，等价于 PX4
+   `MPC_YAW_MODE=0`（朝向下一航点）和 ArduPilot `WP_YAW_BEHAVIOR=2`。移动前若
+   机头与目标方位夹角超过 `yaw_tolerance_deg`（12°，对齐 PX4 `MIS_YAW_ERR`）就先
+   转正。可用 `DRONE_YAW_MODE=hold` 退回"固定机头"（PX4 `MPC_YAW_MODE=5` /
+   ArduPilot `WP_YAW_BEHAVIOR=0`），机头物理固定的机型用这一档。
+4. `drone_release_yaw`（新增工具）：把机头交还遥控器并停止下发偏航。真机上人工
+   接管前先调用，否则 Agent 会在下个航点把机头拽回去。**不改飞控参数**——
+   `MPC_AUTO_NUDGING` 之类应由操作者在地面站自行设置。
+
+**为什么是"先转再走"而不是边飞边转**：锁步模式下 AirSim 的移动指令本身就是转发给
+PX4 的 setpoint，再叠一条 OFFBOARD 流就是两个控制器抢同一架飞机。串行转正是这个
+约束下唯一安全的做法。真正的边飞边转需要固定频率 setpoint 流，属于 T2.3。
+
+**已知限制**：AirSim 的 `move_on_path` 一次飞完整条路径，中途无法安全改转向，所以
+只对正**首**航点方位——直线航线时首末同向等于全程对准，多段折线只保证起飞腿。
+MAVLink 后端天然逐点飞行，不受此限。
+
+**仍待做**：
+
+5. `TrackingSkill` 方位保持环：目标像素误差 → yaw 角速率（P 控制即可）。注意现有
+   `_center_target` / 追踪伺服已经是"读当前航向 → 算目标航向 → 调
+   `rotate_to_heading`"的串行结构，偏航通道打通后可直接复用，缺的是把像素误差到
+   航向的换算收敛做稳。
+6. 云台俯仰按目标距离/高度差自适应（若仿真机型有云台）。
 
 **完成标准**：S3 场景下视场保持率 ≥ 90%。
 
-**涉及文件**：`src/autonomy/skills/tracking_skill.py`、`src/modules/airsim_controller.py`
+**涉及文件**：`src/modules/px4_yaw_link.py`、`src/modules/airsim_controller.py`、
+`src/modules/mavlink_controller.py`、`src/autonomy/skills/tracking_skill.py`
 
 **依赖**：T2.1
 

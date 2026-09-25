@@ -762,6 +762,41 @@ def register_core_tools(
         return fmt_result(payload)
 
     @mcp.tool()
+    def drone_release_yaw(vehicle_name: str = "") -> str:
+        """把机头控制权交还给遥控器，Agent 停止下发任何转向指令。
+
+        真机上人工接管时先调用这个：否则 Agent 会在下一个航点把机头拽回去，
+        而操作员以为朝向仍在自己手上。不会改动飞控参数——MPC_AUTO_NUDGING
+        之类需要操作者在地面站自行设置。"""
+        releaser = getattr(controller, "release_yaw_control", None)
+        if not callable(releaser):
+            return fmt_result({
+                "status": "error",
+                "backend": controller.backend_name,
+                "message": "当前后端不支持交还机头控制",
+            })
+
+        def _release(name: str) -> bool:
+            # 两个后端的 release_yaw_control 都是进程级的：偏航链路只有一条，
+            # 多机时逐机调用也只是重复关闭同一件事，所以按机循环只是为了让
+            # 返回的 vehicles 列表和其余控制工具保持同一形状。
+            try:
+                return bool(releaser())
+            except Exception:
+                return False
+
+        ok, targets = _run_for_vehicles(vehicle_name, _release)
+        payload = {
+            "status": "ok" if ok else "error",
+            "backend": controller.backend_name,
+            "message": "机头控制已交还遥控器，Agent 不再下发转向"
+            if ok else "交还机头控制失败",
+            "vehicles": targets,
+        }
+        payload.update(status_payload())
+        return fmt_result(payload)
+
+    @mcp.tool()
     def drone_rotate_to(heading_deg: float, vehicle_name: str = "") -> str:
         """Rotate to an absolute heading in degrees. 0 is north (default vehicle; "all" for every vehicle)."""
         target_heading = float(heading_deg) % 360.0

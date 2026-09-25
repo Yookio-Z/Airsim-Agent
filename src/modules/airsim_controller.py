@@ -1,11 +1,17 @@
 """
 AirSimController - 基于 AirSim RPC 的飞行控制实现
-纯仿真模式，不需要 PX4 / MAVLink
+
+多数情况下是纯仿真（AirSim 自己接管物理），但 settings.json 把 VehicleType
+声明成 PX4Multirotor 时，AirSim 里跑的是与仿真器锁步的 PX4 SITL，姿态归 PX4
+管。此时偏航不能走 AirSim 的 rotateToYawAsync（那是个空操作），必须经由
+settings.json 的 ControlPortLocal 走 MAVLink 下发，见 px4_yaw_link。
 
 线程安全设计：
   - _rpc_exec_lock: 全局 RPC 执行锁，确保同一时间只有一个 AirSim RPC 调用在执行
   - capture_image: 使用独立线程 + join(timeout) 模式，避免 executor 阻塞
   - 飞行命令: 使用 Async().join() 在 executor 中等待完成，不再用 time.sleep() 估算
+  - 偏航: 串行执行，绝不与移动指令并发（锁步模式下两个控制器同时下发会让 PX4
+    收到互相打架的 setpoint）
 """
 
 from __future__ import annotations
@@ -23,6 +29,8 @@ import airsim
 
 from .flight_controller import FlightController, DroneStatus, ConnectionInfo
 from .camera_stabilization import CameraStabilization
+from .px4_yaw_link import Px4YawLink, bearing_to_deg, heading_error_deg
+from ..config import config
 from ..logging_config import get_logger
 
 logger = get_logger(__name__)
@@ -108,6 +116,10 @@ class AirSimController(FlightController):
         self._ue_offset_samples: list[tuple[float, float]] = []
         # 每机返航点与派发航线跟踪使用类级存储（跨重连保留），见类定义处。
         self._origin_geopoint: tuple[float, float, float] | None = self._load_origin_geopoint()
+        # PX4 锁步模式下的偏航通道。AirSim 不接管姿态，偏航要走 settings.json
+        # 里 ControlPortLocal 暴露的 MAVLink 端点；按需创建，不常驻。
+        self._yaw_link: "Px4YawLink | None" = None
+        self._yaw_link_endpoint: str = ""
         self.last_error = ""
 
         # msgpackrpc.Client is thread-affine in practice: creating it in one
@@ -566,6 +578,8 @@ class AirSimController(FlightController):
             return False
 
     def disconnect(self) -> None:
+        # 断开时必须收掉偏航链路，否则会漏掉一条指向 PX4 的 MAVLink 连接。
+        self._close_yaw_link()
         if not self.is_connected:
             return
         for v in list(self._armed):
@@ -1290,6 +1304,41 @@ class AirSimController(FlightController):
             logger.error(f"hover failed: {e}")
             return False
 
+    # ------------------------------------------------------------------
+    # 机头朝向策略
+    # ------------------------------------------------------------------
+    def _face_waypoint_before_move(
+        self, x: float, y: float, vehicle_name: str = ""
+    ) -> None:
+        """移动前把机头转向目标方位，对齐 PX4 的 MPC_YAW_MODE=0 语义。
+
+        为什么是「先转再走」而不是边飞边转：锁步模式下 AirSim 的移动指令本身
+        就是转发给 PX4 的 setpoint，转向若与其并发就是两个控制器抢同一架飞机。
+        串行转正是这个约束下唯一安全的做法。真正的边飞边转需要固定频率的
+        setpoint 流（见 target_tracking_plan 的 T2.3），不在这里做。
+
+        失败不阻断移动：转正是锦上添花，飞不到才是硬失败。
+        """
+        if (config.yaw_mode or "face_waypoint").strip().lower() != "face_waypoint":
+            return
+        try:
+            pos = self.get_status(vehicle_name).to_dict().get("position_ned") or {}
+            cur_north = float(pos.get("x", 0.0) or 0.0)
+            cur_east = float(pos.get("y", 0.0) or 0.0)
+            # NED：x 是北、y 是东。bearing_to_deg 收的是 (东, 北)。
+            delta_east = y - cur_east
+            delta_north = x - cur_north
+            # 已经压在目标正上方就没有朝向可言，别去转。
+            if math.hypot(delta_east, delta_north) < 0.5:
+                return
+            target_bearing = bearing_to_deg(delta_east, delta_north)
+            current = self.get_heading(vehicle_name)
+            if abs(heading_error_deg(current, target_bearing)) <= config.yaw_tolerance_deg:
+                return
+            self.rotate_to_heading(target_bearing, vehicle_name=vehicle_name)
+        except Exception as exc:
+            logger.debug("face-waypoint pre-rotation skipped: %s", exc)
+
     def move_to_position(self, x: float, y: float, z: float, velocity: float = 2.0, vehicle_name: str = "") -> bool:
         self.last_error = ""
         if not self._ensure_connected():
@@ -1304,6 +1353,7 @@ class AirSimController(FlightController):
             # 任务停摆未到位时重发指令
             flight_timeout = max(45, dist / 0.8 + 30.0)
             for name in names:
+                self._face_waypoint_before_move(x, y, name)
                 arrived = False
                 for attempt in range(3):
                     self._rpc(
@@ -1364,6 +1414,19 @@ class AirSimController(FlightController):
                 float(final_wp.get("z", 0.0)),
             )
             for name in names:
+                # moveOnPathAsync 一次飞完整条路径，中途无法安全地改转向（并发下
+                # 发指令会和锁步 setpoint 打架），所以只对正**首**航点方位。直线
+                # 航线时首末同向，等于全程对准；多段折线只保证起飞腿。逐点重瞄
+                # 需要固定频率 setpoint 流，见 target_tracking_plan 的 T2.3。
+                # MAVLink 后端天然逐点飞行(move_to_position per waypoint)，那边
+                # 不受这个限制。
+                if waypoints:
+                    first_wp = waypoints[0]
+                    self._face_waypoint_before_move(
+                        float(first_wp.get("x", 0) or 0),
+                        float(first_wp.get("y", 0) or 0),
+                        name,
+                    )
                 current_path = [dict(wp) for wp in waypoints]
                 arrived = False
                 for attempt in range(3):
@@ -2035,8 +2098,9 @@ class AirSimController(FlightController):
             self.last_error = "AirSim not connected"
             return False
         if self._uses_external_px4_controller(vehicle_name):
-            self.last_error = "AirSim settings use PX4Multirotor; use PX4 MAVLink or PX4 ROS2 mode for yaw control."
-            return False
+            # 锁步 PX4：姿态归 PX4 管，AirSim 的 rotateToYawAsync 是空操作。
+            # 改走 settings.json 里 ControlPortLocal 暴露的 MAVLink 端点。
+            return self._rotate_via_px4(heading_deg, timeout=timeout)
         try:
             names = self._resolve_vehicles(vehicle_name)
             for name in names:
@@ -2050,6 +2114,105 @@ class AirSimController(FlightController):
         except Exception as e:
             logger.error(f"rotate_to_heading failed: {e}")
             return False
+
+    # ------------------------------------------------------------------
+    # 偏航：锁步 PX4 的 MAVLink 通道
+    # ------------------------------------------------------------------
+    def _px4_mavlink_endpoint(self) -> str:
+        """settings.json 里 PX4 暴露给外部控制器的 MAVLink 端点。
+
+        AirSim 的 PX4Multirotor 把 ControlPortLocal 定为 PX4 侧监听的端口，
+        ControlPortRemote 为外部控制器的远端口。锁步运行时两者都在本机，所以
+        连 ControlPortLocal。取不到就用 PX4 SITL 的 GCS 默认端口 14540。
+        """
+        override = os.environ.get("AIRSIM_PX4_YAW_ENDPOINT", "").strip()
+        if override:
+            return override
+        port = 14540
+        path = self._airsim_settings_path()
+        if path is not None and path.exists():
+            try:
+                data = json.loads(path.read_text(encoding="utf-8"))
+                vehicles = data.get("Vehicles")
+                if isinstance(vehicles, dict):
+                    for spec in vehicles.values():
+                        if not isinstance(spec, dict):
+                            continue
+                        raw = spec.get("ControlPortLocal", 0) or 0
+                        try:
+                            candidate = int(raw)
+                        except (TypeError, ValueError):
+                            continue
+                        if 1024 < candidate < 65536:
+                            port = candidate
+                            break
+            except Exception:
+                pass
+        return f"udp:127.0.0.1:{port}"
+
+    def _get_yaw_link(self) -> "Px4YawLink | None":
+        """按需建立偏航链路；端点变了就重建，避免握着失效连接不放。"""
+        endpoint = self._px4_mavlink_endpoint()
+        if not endpoint:
+            return None
+        if self._yaw_link is not None and self._yaw_link_endpoint == endpoint:
+            return self._yaw_link
+        self._close_yaw_link()
+        self._yaw_link = Px4YawLink(
+            endpoint,
+            setpoint_hz=config.offboard_setpoint_hz,
+            tolerance_deg=config.yaw_tolerance_deg,
+            max_rate_dps=config.yaw_max_rate_dps,
+        )
+        self._yaw_link_endpoint = endpoint
+        return self._yaw_link
+
+    def _close_yaw_link(self) -> None:
+        if self._yaw_link is not None:
+            try:
+                self._yaw_link.close()
+            except Exception:
+                pass
+        self._yaw_link = None
+        self._yaw_link_endpoint = ""
+
+    def _rotate_via_px4(self, heading_deg: float, timeout: float = 30.0) -> bool:
+        """经 MAVLink 驱动锁步 PX4 转向。
+
+        必须与移动指令串行：锁步模式下 AirSim 的 RPC 移动本身就是转发给 PX4
+        的 setpoint，再叠一条 OFFBOARD 流就是两个控制器抢同一架飞机。
+        """
+        link = self._get_yaw_link()
+        if link is None:
+            self.last_error = "无法解析 AirSim 内 PX4 的 MAVLink 端点"
+            return False
+        try:
+            ok = link.rotate_to(heading_deg, timeout=timeout)
+        except Exception as exc:
+            self.last_error = f"PX4 偏航通道异常: {exc}"
+            logger.error("rotate_via_px4 failed: %s", exc)
+            # 链路状态存疑，丢掉它让下次重新握手
+            self._close_yaw_link()
+            return False
+        if not ok:
+            self.last_error = f"PX4 未能在 {timeout:.0f}s 内转到 {heading_deg:.1f}°"
+        return ok
+
+    def release_yaw_control(self) -> bool:
+        """把机头交还给遥控器，并关掉偏航链路。
+
+        真机上 Agent 和遥控器同时想控制机头是真实冲突：Agent 下一个航点就会
+        把机头拽回去，操作员却以为自己还掌握着朝向。两套飞控对此都有专门
+        机制——PX4 是 MPC_AUTO_NUDGING bit 0（闩锁到模式切换），ArduPilot 是
+        AUTO_OPTIONS / RTL_OPTIONS 的 "Ignore Pilot Yaw" 反向用法。
+
+        本函数做的是这一侧的让位：停止下发偏航并断开链路，之后 PX4 按自己的
+        参数决定是否继续自动转。**它不会去改飞控参数**——真机上擅自改
+        MPC_AUTO_NUDGING 这类参数属于高风险动作，应该由操作者在地面站确认后
+        自己做。
+        """
+        self._close_yaw_link()
+        return True
 
     def get_heading(self, vehicle_name: str = "") -> float:
         if not self._ensure_connected():

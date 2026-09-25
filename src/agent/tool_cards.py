@@ -287,6 +287,17 @@ TOOL_CARDS: dict[str, ToolCard] = {
         not_for="Building square/rectangle/orbit/circle/grid paths. Use drone_fly_path for path geometry.",
         risk="low",
     ),
+    "drone_release_yaw": ToolCard(
+        name="drone_release_yaw",
+        purpose="把机头控制权交还给遥控器，Agent 停止下发任何转向指令。",
+        when_to_use="人工准备接管、或操作员要求放开机头时。真机上先调用，否则 Agent 会在下个航点把机头拽回去，操作员却以为朝向仍在自己手上。",
+        inputs={"vehicle_name": "目标载具：空=默认机，all=全部，或具体载具名"},
+        outputs="交还结果。",
+        required_capabilities=["flight_control"],
+        preconditions=[],
+        not_for="不要用它来转动飞机。转向用 drone_rotate_to。本工具只交还控制权，不改变机头朝向。",
+        risk="low",
+    ),
     "drone_set_mode": ToolCard(
         name="drone_set_mode",
         purpose="Set flight mode, especially for PX4/MAVLink.",

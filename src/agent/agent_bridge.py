@@ -1105,6 +1105,7 @@ class AgentBridgeMixin:
             "drone_start_mission": "Start mission",
             "drone_get_mission_progress": "Read mission progress",
             "drone_rotate_to": "Rotate heading",
+            "drone_release_yaw": "Release heading control to RC",
             "drone_set_mode": "Set flight mode",
             "airsim_take_photo": "Capture image",
             "airsim_get_sensors": "Read sensors",

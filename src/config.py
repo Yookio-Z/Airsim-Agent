@@ -49,6 +49,30 @@ class DroneConfig(BaseSettings):
     offboard_setpoint_hz: float = 15.0
     heartbeat_hz: float = 2.0
 
+    # 偏航（机头朝向）策略。取值对齐两套主流飞控的既有语义，避免在这个项目里
+    # 另造一套概念——仿真和真机的表现必须一致，否则虚实映射就失去意义。
+    #   face_waypoint —— 飞向下一航点前先转正机头。等于 PX4 的
+    #                    MPC_YAW_MODE=0（towards waypoint），也是 ArduPilot
+    #                    多旋翼 WP_YAW_BEHAVIOR=2 的默认语义。两家的默认值
+    #                    都是这一档，不是"固定机头"。
+    #   hold          —— 保持当前机头不转。等于 PX4 的 MPC_YAW_MODE=5
+    #                    （1.16 才加的植保机特例）/ ArduPilot
+    #                    WP_YAW_BEHAVIOR=0。真机上机头物理固定、或需要人工
+    #                    接管偏航时用这一档。
+    #   course        —— 对齐瞬时航迹方向。等于 ArduPilot
+    #                    WP_YAW_BEHAVIOR=3。**不是** PX4 航点任务的默认
+    #                    语义：PX4 的 along_trajectory 在纯航点任务下留了
+    #                    TODO 交给子类实现，所以仿真和真机会对不上。留这一档
+    #                    仅为与 ArduPilot 对齐，默认不用。
+    yaw_mode: str = "face_waypoint"
+    # 转正判据：机头与目标方位夹角小于此值就不再转，避免在目标正上方来回抖。
+    # PX4 的 MIS_YAW_ERR 默认 12°，这里与之对齐。
+    yaw_tolerance_deg: float = 12.0
+    # 自主模式下机头角速度上限。PX4 的 MPC_YAWRAUTO_MAX 是 45~60 deg/s，
+    # 取 45 是保守侧。真机上限速很重要：机头突然甩动会改变视觉伺服和
+    # 遥控器操作员的空间参照。
+    yaw_max_rate_dps: float = 45.0
+
     # Flight safety envelope (SafetyValidator / FlightConstraint).
     # These were hard-coded in ToolRuntime.__init__, which meant the declared
     # limits could not be matched to a deployment (e.g. a long-range survey
