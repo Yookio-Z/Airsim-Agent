@@ -293,6 +293,7 @@ function activeFlightRuntime() {
 
 function approvalCommandForTool(tool, params = {}) {
   if (tool === "drone_arm") return "解锁无人机";
+  if (tool === "drone_disarm") return "上锁（锁定电机）";
   if (tool === "drone_takeoff") return `起飞到 ${Number(params.altitude || 3)} 米并悬停`;
   if (tool === "drone_land") return "降落无人机";
   return "";
@@ -310,6 +311,19 @@ async function invokeFlightTool(tool, params = {}) {
       danger: true,
     });
     if (!approved) throw new Error("操作已取消");
+  }
+  // 空中上锁会切断动力：AirSim 的 armDisarm(False) 会让飞机失去升力，PX4 会拒绝
+  // 非强制的空中上锁，但不能指望后端一定拒绝。工具栏上"解锁/上锁"是同一个按钮，
+  // 误点一下就是掉机，所以只要飞机在空中就再确认一次。
+  if (tool === "drone_disarm" && runtime.drone?.flying) {
+    const altitude = Math.abs(Number(runtime.drone?.position_ned?.z || 0));
+    const confirmed = await confirmDialog({
+      title: "飞机正在空中",
+      message: `当前高度约 ${altitude.toFixed(1)} 米。空中上锁会切断动力输出，飞机将失去升力。确认上锁？`,
+      confirmLabel: "确认上锁",
+      danger: true,
+    });
+    if (!confirmed) throw new Error("操作已取消");
   }
   return post("/api/tool", {
     tool,

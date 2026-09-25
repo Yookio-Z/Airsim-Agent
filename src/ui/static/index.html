@@ -39,14 +39,25 @@
 
           <!-- 左侧浮动工具栏 -->
           <div class="map-toolbar" role="toolbar" aria-label="飞行控制">
-            <button class="tool-btn" data-tool="drone_arm" title="解锁 (Arm)">⏻</button>
+            <!-- 解锁/上锁是同一个按钮的两个方向：data-tool 是"当前未解锁"时点击
+                 执行的动作，data-tool-armed 是"已解锁"时点击执行的动作。执行哪个
+                 由实时遥测的 drone.armed 决定（ui-main.js 派发、ui-map.js 刷新
+                 按钮状态），样式也随该状态切换（.tool-btn.is-armed）。 -->
+            <button class="tool-btn" data-tool="drone_arm" data-tool-armed="drone_disarm"
+                    data-testid="control-arm-toggle" title="解锁 (Arm)" aria-pressed="false">⏻</button>
             <button class="tool-btn" data-tool="drone_takeoff" data-params='{"altitude":3}' title="起飞 (Takeoff)">↑</button>
             <button class="tool-btn" data-control="hover" title="悬停 (Hold)">Ⅱ</button>
             <button class="tool-btn" data-control="land" title="降落 (Land)">⌄</button>
             <button class="tool-btn" data-control="return_home" data-testid="control-return-home" title="返航(Return home)">
               <svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.1" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M3 11.5 12 4l9 7.5"/><path d="M5.5 10.5V20h13v-9.5"/><path d="M9 20v-5.5h6V20"/></svg>
             </button>
-            <button class="tool-btn danger" data-control="emergency_stop" title="紧急停止 (Stop)">!</button>
+            <!-- 急停是闩锁的：按下后 supervisor 会锁住所有飞行指令（仅悬停/降落/读状态
+                 放行），而这个按钮同时是解除入口——data-control 是未闩锁时的动作，
+                 data-control-latched 是已闩锁时的动作，样式随状态切换
+                 （.tool-btn.is-latched）。 -->
+            <button class="tool-btn danger" data-control="emergency_stop"
+                    data-control-latched="reset_emergency" data-testid="control-estop"
+                    title="紧急停止 (Stop)" aria-pressed="false">!</button>
           </div>
 
           <section id="cameraViewer" class="camera-viewer" aria-label="无人机摄像头视频流" data-state="idle" hidden>

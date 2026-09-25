@@ -646,8 +646,25 @@ class VehicleMixin:
                     self._current.finished_at = time.time()
             return {"ok": result.ok, "result": result.to_dict(), "formation_stopped": formation_stopped}
         if action == "reset_emergency":
+            # "仅在地面状态"是 supervisor.reset_emergency 的文档约定，但那边只清
+            # 标志位、没有这个检查。空中解除急停会让飞控指令重新放行，而飞机此刻
+            # 只是在悬停——先落地再解除是更安全的顺序。
+            # 只有"确知在空中"才拒绝：读不到遥测时放行，否则链路一断操作员就被
+            # 永久锁在急停状态里出不来。
+            flying = (self.tools.status_snapshot().get("drone") or {}).get("flying")
+            if flying is True:
+                return {
+                    "ok": False,
+                    "error": "飞机还在空中，请先降落再解除急停。",
+                    "flying": True,
+                }
             self.supervisor.reset_emergency()
-            self._append_event("info", "safety", "急停状态已复位")
+            self._append_event(
+                "warning",
+                "safety",
+                "急停状态已复位，飞行指令重新放行",
+                {"flying": flying},
+            )
             return {"ok": True}
         if action == "hover":
             results = []

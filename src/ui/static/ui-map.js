@@ -865,7 +865,19 @@ function missionDefaults() {
 async function invokeFlightControl(action) {
   const normalized = String(action || "").toLowerCase();
   const targets = controlTargetList();
-  requireLiveFlightLink();
+  // 解除急停清的是本地闩锁标志，不需要链路：链路正好断了的时候也必须能解除，
+  // 否则操作员会被永久锁在急停状态里。其余控制指令照旧要求链路在线。
+  if (normalized === "reset_emergency") {
+    const confirmed = await confirmDialog({
+      title: "解除急停",
+      message: "解除后飞控指令将重新放行（Agent 任务与工具栏按钮都可再次下发）。请确认飞机已落地并处于安全状态。",
+      confirmLabel: "解除急停",
+      danger: true,
+    });
+    if (!confirmed) throw new Error("操作已取消");
+  } else {
+    requireLiveFlightLink();
+  }
   const result = await post("/api/control", {
     action: normalized,
     vehicles: targets,
@@ -1157,6 +1169,29 @@ function updateFlightControlButtons(toolRuntime = {}) {
     : "飞控未连接，请检查连接设置";
   const contract = toolRuntime.operation_contract || {};
   document.querySelectorAll(".map-toolbar button").forEach((button) => {
+    // 解锁/上锁按钮：文案、样式与"这次点击会执行哪个动作"都跟随实时解锁状态。
+    // 必须在 baseTitle 记忆之前算，否则标题会永远停在初始的"解锁 (Arm)"。
+    if (button.dataset.toolArmed) {
+      const armed = Boolean(toolRuntime.drone?.armed);
+      button.classList.toggle("is-armed", armed);
+      button.setAttribute("aria-pressed", armed ? "true" : "false");
+      button.dataset.baseTitle = armed ? "上锁 (Disarm)" : "解锁 (Arm)";
+    }
+    // 急停按钮：闩锁后变成"解除急停"入口。它不跟随链路状态禁用——解除清的是本地
+    // 闩锁标志，链路断了也应当能解除（后端只在确知飞机在空中时才拒绝）。
+    // 注意 title 两个方向都要写：这个按钮的 needsLink 为 false，下面的通用分支
+    // 不会替它更新标题，只写闩锁分支会把"解除急停…"留在按钮上。
+    if (button.dataset.controlLatched) {
+      const latched = Boolean(latestState?.supervisor?.emergency_stop);
+      button.classList.toggle("is-latched", latched);
+      button.setAttribute("aria-pressed", latched ? "true" : "false");
+      button.dataset.baseTitle = latched ? "解除急停 (Release stop)" : "紧急停止 (Stop)";
+      button.disabled = false;
+      button.title = latched
+        ? button.dataset.baseTitle + " · 已触发，飞控指令被锁住"
+        : button.dataset.baseTitle;
+      return;
+    }
     if (!button.dataset.baseTitle) button.dataset.baseTitle = button.title || "飞行控制";
     const tool = button.dataset.tool || "";
     const control = button.dataset.control || "";

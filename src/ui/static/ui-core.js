@@ -584,6 +584,27 @@ function clamp(value, min, max) {
   return Math.max(min, Math.min(max, value));
 }
 
+// 解锁/上锁共用一个工具栏按钮：这个函数决定这次点击该发哪个工具。
+// data-tool 是未解锁时的动作，data-tool-armed 是已解锁时的动作；方向由实时遥测的
+// armed 决定，而不是按钮上的本地标志位——Agent、遥控器或地面站面板改了状态之后，
+// 按钮必须跟着飞机走，否则点下去就是反的。
+// 急停按钮同样是一个按钮两个方向：data-control 是未闩锁时的动作（触发急停），
+// data-control-latched 是已闩锁时的动作（解除急停）。方向由后端 supervisor 的
+// 闩锁状态决定，所以界面永远和飞控的真实状态一致。
+function controlActionFor(button, latched) {
+  const base = String((button && button.dataset && button.dataset.control) || "");
+  const alt = String((button && button.dataset && button.dataset.controlLatched) || "");
+  if (!base) return "";
+  return latched && alt ? alt : base;
+}
+
+function armToggleToolFor(button, armed) {
+  const base = String((button && button.dataset && button.dataset.tool) || "");
+  const alt = String((button && button.dataset && button.dataset.toolArmed) || "");
+  if (!base) return "";
+  return armed && alt ? alt : base;
+}
+
 function line(ctx, x1, y1, x2, y2) {
   ctx.beginPath();
   ctx.moveTo(x1, y1);

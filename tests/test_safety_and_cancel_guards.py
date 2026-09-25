@@ -35,6 +35,7 @@ from src.agent.llm import LLMMissionPlanner, LLMUnavailableError, _as_bool, _ext
 from src.agent.loop_types import LoopDecision
 from src.agent.runtime import AgentRuntime, RunState
 from src.agent.tool_executor import ToolCallResult, ToolCollector, ToolRuntime
+from src.agent.backends import create_builtin_backend_registry
 from _runtime_factories import agent_runtime, status_controller, tool_runtime
 from src.modules.safety_validator import FlightConstraint, SafetyValidator
 
@@ -1175,3 +1176,247 @@ def test_close_range_ceiling_covers_the_altitude_the_plan_itself_asked_for():
     assert climbing[0] > 15.0, f"the planned 15 m climb must fit: {climbing}"
     assert waypoint[0] > 20.0, f"the planned 20 m leg must fit: {waypoint}"
     assert climbing[2] is True and waypoint[2] is True
+
+
+# ---------------------------------------------------------------------------
+# emergency stop: release path
+# ---------------------------------------------------------------------------
+
+
+def _estop_runtime(*, flying, latched: bool = True):
+    runtime = agent_runtime()
+    runtime.tools = SimpleNamespace(
+        backend_id="fake",
+        status_snapshot=lambda: {"drone": {"flying": flying} if flying is not None else {}},
+        execute=lambda *a, **kw: None,
+    )
+    released: list[bool] = []
+
+    def _reset() -> None:
+        released.append(True)
+        runtime.supervisor.emergency_stop = lambda: None
+
+    runtime.supervisor = SimpleNamespace(
+        is_emergency_stopped=lambda: latched,
+        should_pause=lambda: latched,
+        reset_emergency=_reset,
+    )
+    runtime._append_event = lambda *a, **kw: None
+    return runtime, released
+
+
+def test_release_emergency_stop_is_refused_while_airborne():
+    """`supervisor.reset_emergency` documents "ground state only" but only clears
+    the flag. Releasing in the air re-arms every flight command while the
+    aircraft is merely hovering, so the ground-first order is enforced here."""
+    runtime, released = _estop_runtime(flying=True)
+
+    result = AgentRuntime.control(runtime, "reset_emergency")
+
+    assert result["ok"] is False
+    assert "先降落" in result["error"]
+    assert released == [], "the latch must stay set while flying"
+
+
+def test_release_emergency_stop_works_on_the_ground():
+    runtime, released = _estop_runtime(flying=False)
+
+    result = AgentRuntime.control(runtime, "reset_emergency")
+
+    assert result["ok"] is True
+    assert released == [True]
+
+
+def test_release_emergency_stop_works_when_telemetry_is_unavailable():
+    """Only a positive "airborne" reading blocks the release: with no telemetry a
+    refusal would trap the operator in the latched state forever."""
+    runtime, released = _estop_runtime(flying=None)
+
+    result = AgentRuntime.control(runtime, "reset_emergency")
+
+    assert result["ok"] is True
+    assert released == [True]
+
+
+# ---------------------------------------------------------------------------
+# emergency stop must hold against an in-flight Agent task
+# ---------------------------------------------------------------------------
+
+
+class _RecordingController:
+    """Controller stub that records every command it is asked to execute."""
+
+    def __init__(self) -> None:
+        self.calls: list[str] = []
+        self.is_connected = True
+
+    backend_name = "recording"
+
+    def list_vehicles(self) -> list[str]:
+        return ["d0"]
+
+    def get_status(self, vehicle_name: str = ""):
+        return SimpleNamespace(
+            position_ned={"x": 0.0, "y": 0.0, "z": -5.0},
+            velocity_ned={"vx": 0.0, "vy": 0.0, "vz": 0.0},
+            attitude_rad={"roll": 0.0, "pitch": 0.0, "yaw": 0.0},
+            armed=True,
+            flying=True,
+            mode="OFFBOARD",
+            gps=None,
+            extra={},
+        )
+
+    def _record(self, name: str) -> bool:
+        self.calls.append(name)
+        return True
+
+    def arm(self, vehicle_name: str = "") -> bool:
+        return self._record("arm")
+
+    def disarm(self, vehicle_name: str = "") -> bool:
+        return self._record("disarm")
+
+    def takeoff(self, altitude: float = 3.0, vehicle_name: str = "") -> bool:
+        return self._record("takeoff")
+
+    def land(self, vehicle_name: str = "") -> bool:
+        return self._record("land")
+
+    def hover(self, vehicle_name: str = "") -> bool:
+        return self._record("hover")
+
+    def move_to_position(self, x, y, z, velocity=2.0, vehicle_name="") -> bool:
+        return self._record("move_to_position")
+
+    def move_by_velocity(self, vx, vy, vz, duration=0.0, vehicle_name="") -> bool:
+        return self._record("move_by_velocity")
+
+    def move_on_path(self, waypoints, velocity=2.0, vehicle_name="") -> bool:
+        return self._record("move_on_path")
+
+    def rotate_to(self, yaw_deg: float, vehicle_name: str = "") -> bool:
+        return self._record("rotate_to")
+
+    def set_mode(self, mode: str, vehicle_name: str = "") -> bool:
+        return self._record("set_mode")
+
+    def upload_mission(self, items, vehicle_name: str = "") -> bool:
+        return self._record("upload_mission")
+
+    def start_mission(self, vehicle_name: str = "") -> bool:
+        return self._record("start_mission")
+
+
+def _recording_runtime():
+    """ToolRuntime shell whose collector/controller stay ours, so every command
+    that actually executes is recorded. (A real ToolRuntime would replace both on
+    ensure_ready, which would make the "nothing reached the controller"
+    assertion vacuous.)"""
+    from src.tools.core import register_core_tools
+
+    controller = _RecordingController()
+    collector = ToolCollector()
+    register_core_tools(collector, controller, lambda data: data)
+    rt = tool_runtime(collector, controller)
+    rt.backend_id = "airsim"
+    rt.backend_registry = create_builtin_backend_registry()
+    rt.backend_profile = rt.backend_registry.require("airsim")
+    rt.formation_active = lambda: False
+    rt.available = True
+    return rt, controller
+
+
+def _full_runtime():
+    """A real ToolRuntime: needed when the code under test reads telemetry."""
+    from src.agent.tool_executor import ToolRuntime
+
+    rt = ToolRuntime(backend_id="airsim", camera_settings_provider=lambda: {"source": "airsim"})
+    rt.controller = _RecordingController()
+    rt.available = True
+    return rt
+
+
+def test_emergency_stop_latch_keeps_every_flight_command_away_from_the_controller():
+    """The invariant that makes the e-stop safe for an in-flight Agent task: while
+    the latch is set, no flight command reaches the controller, whatever the
+    Agent loop is doing. hover/land/status stay allowed so the operator can still
+    bring the aircraft down."""
+    rt, controller = _recording_runtime()
+
+    # Control experiment first: the same setup MUST reach the controller when the
+    # latch is not set, otherwise the empty call list below would prove nothing.
+    rt.execute("drone_fly_to", {"x": 10.0, "y": 0.0, "z": -5.0}, dry_run=False)
+    assert "move_to_position" in controller.calls, "the recording controller is not wired up"
+    controller.calls.clear()
+
+    attempts = {
+        "drone_arm": {},
+        "drone_takeoff": {"altitude": 5.0},
+        "drone_fly_to": {"x": 10.0, "y": 0.0, "z": -5.0},
+        "drone_move_relative": {"forward_m": 5.0},
+        "drone_rotate_to": {"yaw_deg": 90.0},
+        "drone_set_mode": {"mode": "OFFBOARD"},
+        "drone_fly_velocity": {"vx": 1.0, "vy": 0.0, "vz": 0.0, "duration": 1.0},
+        "drone_upload_mission": {"waypoints_json": "[]"},
+        "drone_start_mission": {},
+        "drone_fly_path": {"waypoints_json": '[{"x": 5, "y": 0, "z": -5}]'},
+    }
+    results = {}
+    for tool, params in attempts.items():
+        result = rt.execute(tool, params, dry_run=False, blocked_by_supervisor=True)
+        results[tool] = result.error_code
+
+    assert all(code == "BLOCKED" for code in results.values()), results
+    assert controller.calls == [], f"a flight command reached the controller: {controller.calls}"
+
+    # The escape hatches must still be admitted, or the operator cannot bring the
+    # aircraft down while the stop is latched.
+    for allowed in ("drone_hover", "drone_land", "drone_get_status"):
+        result = rt.execute(allowed, {}, dry_run=False, blocked_by_supervisor=True)
+        assert result.error_code != "BLOCKED", (allowed, result.error_code)
+
+
+def test_agent_loop_stops_and_never_flies_after_the_estop_latch():
+    """A task that is mid-loop when the operator hits the e-stop must stop, and
+    must not execute a flight action it decided before the latch."""
+    from src.agent.agent_loop import AgentLoop
+
+    latch = {"stopped": False}
+    executed: list[str] = []
+    calls = {"n": 0}
+
+    class _Planner:
+        last_reasoning = ""
+
+        def decide_next_step(self, **kwargs):
+            calls["n"] += 1
+            # The operator hits the e-stop while the model is "thinking" on the
+            # SECOND round trip: that decision must not be executed. The first
+            # action legitimately ran (the latch did not exist yet).
+            if calls["n"] == 2:
+                latch["stopped"] = True
+                return LoopDecision(action="drone_move_relative", params={"forward_m": 5.0})
+            return LoopDecision(action="drone_fly_to", params={"x": 5.0, "y": 0.0, "z": -5.0})
+
+    rt = _full_runtime()
+    loop = AgentLoop(
+        rt,
+        _Planner(),
+        SimpleNamespace(snapshot=lambda: {}, remember_tool_call=lambda *a, **k: None),
+        should_stop=lambda: latch["stopped"],
+        execute_tool=lambda name, params, dry_run=False: (
+            executed.append(name)
+            or rt.execute(name, params, dry_run=dry_run, blocked_by_supervisor=latch["stopped"])
+        ),
+    )
+
+    state = loop.run(run_id="run_estop", command="飞到北边 5 米", capabilities={}, tool_cards=[], max_steps=6)
+
+    assert state.status == "blocked", state.status
+    assert "emergency stop" in state.failure_reason
+    assert calls["n"] == 2, "the loop should stop right after the round trip that saw the latch"
+    assert executed == ["drone_fly_to"], (
+        "only the pre-latch action may run; the action decided in the round trip that "
+        f"saw the latch must be dropped, got {executed}"
+    )

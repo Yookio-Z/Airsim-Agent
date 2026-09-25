@@ -554,7 +554,12 @@ class AgentBridgeMixin:
                 return self._blocked_tool_result(
                     tool,
                     params,
-                    "high-risk real-vehicle tools must be submitted through Execute mode and approved",
+                    (
+                        "真机上的高危动作不能从工具栏直接下发：请在 Execute 模式下提交该指令，"
+                        "由操作员审批后执行。"
+                        "（high-risk real-vehicle tools must be submitted through Execute "
+                        "mode and approved）"
+                    ),
                 )
             approved = self._await_tool_approval(
                 run,

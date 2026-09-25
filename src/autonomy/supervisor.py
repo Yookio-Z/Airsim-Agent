@@ -94,14 +94,24 @@ class ExecutionSupervisor:
         self._notify_state_change()
     
     def emergency_stop(self) -> None:
-        """急停：立即触发 RTL"""
+        """闩锁急停标志。
+
+        这里只置位，不发任何飞控指令——旧 docstring 写的"立即触发 RTL"与实现
+        不符。真正让飞机停下来的动作在 `AgentRuntime.control("emergency_stop")`：
+        悬停 + 停编队/看门狗；随后靠这个标志把后续飞控指令全部拦下（执行器只放行
+        悬停/降落/读状态）。
+        """
         with self._lock:
             self._emergency_stop = True
         logger.warning("supervisor_emergency_stop")
         self._notify_state_change()
-    
+
     def reset_emergency(self) -> None:
-        """复位急停（仅在地面状态）"""
+        """复位急停。
+
+        这个类只负责清标志位，不检查飞机是否在地面；"仅在地面状态"的约束由调用方
+        执行（`AgentRuntime.control("reset_emergency")` 在确知飞机在空中时会拒绝）。
+        """
         with self._lock:
             self._emergency_stop = False
         logger.info("supervisor_reset_emergency")

@@ -365,19 +365,27 @@ document.addEventListener("click", async (event) => {
   }
 
   if (button.dataset.control) {
-    await runButton(button, () => invokeFlightControl(button.dataset.control), "控制指令已执行");
+    // 急停按钮：已闩锁时这次点击是解除急停（见 ui-core.js 的 controlActionFor）。
+    // 闩锁状态来自后端 supervisor，而不是按钮上的本地标志位。
+    const latched = Boolean(latestState?.supervisor?.emergency_stop);
+    const action = controlActionFor(button, latched);
+    await runButton(button, () => invokeFlightControl(action), "控制指令已执行");
     return;
   }
 
   if (button.dataset.tool) {
-    const tool = button.dataset.tool;
+    // 解锁/上锁共用一个按钮：带 data-tool-armed 的按钮按实时解锁状态决定这次
+    // 点击执行哪个方向。状态取自遥测而不是按钮上的本地标志位——否则在别处
+    // （Agent、遥控器、地面站面板）改变了状态，按钮就会和飞机不一致。
+    const armedNow = Boolean(latestState?.tool_runtime?.drone?.armed);
+    const tool = armToggleToolFor(button, armedNow);
     const params = parseParams(button.dataset.params);
     const targets = controlTargetList();
     await runButton(
       button,
       async () => {
-        // 多选(或未选=全部)时:解锁/起飞逐台下发;起飞用非阻塞派发,多机同时升空
-        if (targets.length > 1 && (tool === "drone_takeoff" || tool === "drone_arm")) {
+        // 多选(或未选=全部)时:解锁/上锁/起飞逐台下发;起飞用非阻塞派发,多机同时升空
+        if (targets.length > 1 && (tool === "drone_takeoff" || tool === "drone_arm" || tool === "drone_disarm")) {
           let last = null;
           for (const name of targets) {
             if (tool === "drone_takeoff") {
