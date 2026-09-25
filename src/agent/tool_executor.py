@@ -3144,11 +3144,35 @@ class ToolRuntime:
                 "flight_tasks": flight_tasks,
                 "perception": self._perception_health(),
                 "operation_contract": self._operation_contract(drone_status),
+                "map_origin": self._map_origin(),
             }
             self._last_status_snapshot = snapshot
             return dict(snapshot)
         finally:
             self._lock.release()
+
+    def _map_origin(self) -> dict[str, float] | None:
+        """NED 原点经纬度（仅 AirSim 有），供 UI 地图对齐场景所在城市。
+
+        优先问已连接的 controller；没连上仿真器时回退到 backend profile 的
+        提供者，这样地图在链路建立之前就落在正确的城市。
+        """
+        getter = getattr(self.controller, "map_origin", None)
+        if callable(getter):
+            try:
+                origin = getter()
+            except Exception:
+                origin = None
+            if isinstance(origin, dict):
+                return origin
+        provider = getattr(self.backend_profile, "map_origin_provider", None)
+        if not callable(provider):
+            return None
+        try:
+            origin = provider()
+        except Exception:
+            return None
+        return origin if isinstance(origin, dict) else None
 
     def _vehicles_status(self, connected: bool) -> list[dict[str, Any]]:
         """Per-vehicle compact status for multi-vehicle backends (AirSim).

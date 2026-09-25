@@ -305,10 +305,35 @@ const MAP_LAYERS = {
   },
 };
 
-// 与 AirSim settings.json 的 OriginGeopoint 对齐（北京天安门）
-// AirSim 无人机的 NED 坐标基于此原点，GPS↔NED 转换必须用同一原点
-const AIRSIM_HOME_LAT = 39.9042;
-const AIRSIM_HOME_LON = 116.4074;
+// 地图原点：AirSim 的 NED 坐标基于 settings.json 的 OriginGeopoint，GPS↔NED
+// 换算必须和后端用同一个原点，否则同一架飞机会算出两套坐标。仿真场景挪到别的
+// 城市时，这个原点也跟着换——所以它从遥测包 (/api/telemetry → tool_runtime
+// .map_origin) 动态取，这里的北京值只是后端还没连上时的兜底。
+const DEFAULT_MAP_ORIGIN = { lat: 39.9042, lon: 116.4074, alt: 50 };
+let mapOrigin = { ...DEFAULT_MAP_ORIGIN };
+
+function applyMapOrigin(origin) {
+  if (!origin || typeof origin !== "object") return false;
+  const lat = Number(origin.lat);
+  const lon = Number(origin.lon);
+  // 0/0 是 AirSim 那边判无效用的哨兵值，别把它当成真原点
+  if (!Number.isFinite(lat) || !Number.isFinite(lon)) return false;
+  if (Math.abs(lat) < 0.001 || Math.abs(lon) < 0.001) return false;
+  const alt = Number(origin.alt);
+  const next = {
+    lat,
+    lon,
+    alt: Number.isFinite(alt) ? alt : mapOrigin.alt,
+  };
+  // 只在真的变了时返回 true：遥测每 250ms 来一帧，返回值被用来决定要不要
+  // 重新对中地图，每帧都"变了"会一直 jumpTo。
+  const changed = next.lat !== mapOrigin.lat || next.lon !== mapOrigin.lon;
+  mapOrigin = next;
+  return changed;
+}
+
+function mapOriginLat() { return mapOrigin.lat; }
+function mapOriginLon() { return mapOrigin.lon; }
 const EARTH_RADIUS_M = 6371000.0;
 
 const DEFAULT_MODELS = [

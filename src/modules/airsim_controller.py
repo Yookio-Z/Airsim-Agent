@@ -679,6 +679,19 @@ class AirSimController(FlightController):
                 continue
         return result
 
+    def map_origin(self) -> dict[str, float] | None:
+        """NED 原点经纬度，供 UI 地图对齐仿真场景所在位置。
+
+        仿真场景挪到别的城市时（改 settings.json 的 OriginGeopoint），地图初始
+        中心、home 标记和前端 NED↔GPS 换算都要跟着换到同一个原点，否则同一架
+        飞机会在后端和前端算出两套坐标。
+        """
+        origin = self._origin_geopoint
+        if origin is None:
+            return None
+        lat, lon, alt = origin
+        return {"lat": lat, "lon": lon, "alt": alt}
+
     def _load_origin_geopoint(self) -> tuple[float, float, float] | None:
         """读取 settings.json 的 OriginGeopoint（NED 原点经纬度），用于 GPS↔NED 换算。"""
         path = self._airsim_settings_path()

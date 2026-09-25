@@ -162,7 +162,7 @@ function initMissionMap() {
         { id: "tiles", type: "raster", source: "tiles", minzoom: 0, maxzoom: cfg.maxZoom },
       ],
     },
-    center: [AIRSIM_HOME_LON, AIRSIM_HOME_LAT],
+    center: [mapOriginLon(), mapOriginLat()],
     zoom: 15,
     attributionControl: false,
     dragRotate: false,
@@ -321,7 +321,7 @@ function initMissionMap() {
     homeEl.className = "wp-home-icon";
     homeEl.innerHTML = '<div class="wp-home-badge">H</div>';
     homeMarker = new maplibregl.Marker({ element: homeEl, anchor: "center" })
-      .setLngLat([AIRSIM_HOME_LON, AIRSIM_HOME_LAT])
+      .setLngLat([mapOriginLon(), mapOriginLat()])
       .addTo(maplibreMap);
 
     drawMissionPath();
@@ -902,8 +902,8 @@ function buildLocalMissionItems(route = missionWaypoints) {
   const droneHome = currentDroneGeo(drone);
   const hasTakeoff = route.some((wp) => wp.type === "takeoff");
   if (!drone.flying && !hasTakeoff) {
-    const takeoffLat = droneHome?.lat ?? route[0]?.lat ?? AIRSIM_HOME_LAT;
-    const takeoffLon = droneHome?.lon ?? route[0]?.lon ?? AIRSIM_HOME_LON;
+    const takeoffLat = droneHome?.lat ?? route[0]?.lat ?? mapOriginLat();
+    const takeoffLon = droneHome?.lon ?? route[0]?.lon ?? mapOriginLon();
     items.push({
       id: "local_takeoff",
       type: "takeoff",
@@ -1333,6 +1333,17 @@ function updateMapView(state) {
   scheduleProfileRedraw();
 
   const runtime = state.tool_runtime || {};
+  // 仿真场景挪到别的城市时（AirSim settings.json 的 OriginGeopoint），NED↔GPS
+  // 的换算基准跟着换，地图初始中心和 H 标记也跟着换。已经因遥测定位过、或者
+  // 用户自己拖动过地图，就不再抢视角。
+  if (applyMapOrigin(runtime.map_origin)) {
+    if (homeMarker && !homeGpsPosition(drone, runtime, state)) {
+      homeMarker.setLngLat([mapOriginLon(), mapOriginLat()]);
+    }
+    if (!mapCenteredOnFirstVehicle && !maplibreMap._userPanned) {
+      maplibreMap.jumpTo({ center: [mapOriginLon(), mapOriginLat()] });
+    }
+  }
   const drone = runtime.drone || {};
   const backendName = backendDisplayName(runtime);
   const linked = Boolean(runtime.connected) && !runtime.stale_connection;
@@ -1658,7 +1669,7 @@ function returnHomeGeo(drone, runtime = latestState?.tool_runtime || {}) {
     return returnHomeGps;
   }
   if (isRealVehicleRuntime(runtime)) return null;
-  returnHomeGps = { lat: AIRSIM_HOME_LAT, lon: AIRSIM_HOME_LON, alt_m: 0, source: "AirSim origin", backend };
+  returnHomeGps = { lat: mapOriginLat(), lon: mapOriginLon(), alt_m: 0, source: "AirSim origin", backend };
   return returnHomeGps;
 }
 
@@ -1761,21 +1772,23 @@ function missionRouteKey(points) {
 }
 
 function nedToGps(northM, eastM, downM) {
+  const lat0 = mapOriginLat();
   const dLat = northM / EARTH_RADIUS_M * (180 / Math.PI);
-  const dLon = eastM / (EARTH_RADIUS_M * Math.cos(AIRSIM_HOME_LAT * Math.PI / 180)) * (180 / Math.PI);
+  const dLon = eastM / (EARTH_RADIUS_M * Math.cos(lat0 * Math.PI / 180)) * (180 / Math.PI);
   return {
-    lat: AIRSIM_HOME_LAT + dLat,
-    lon: AIRSIM_HOME_LON + dLon,
+    lat: lat0 + dLat,
+    lon: mapOriginLon() + dLon,
     alt: -downM,
   };
 }
 
 // GPS → NED 反向转换
 function gpsToNed(lat, lon, downM) {
-  const dLat = (lat - AIRSIM_HOME_LAT) * Math.PI / 180;
-  const dLon = (lon - AIRSIM_HOME_LON) * Math.PI / 180;
+  const lat0 = mapOriginLat();
+  const dLat = (lat - lat0) * Math.PI / 180;
+  const dLon = (lon - mapOriginLon()) * Math.PI / 180;
   const northM = dLat * EARTH_RADIUS_M;
-  const eastM = dLon * EARTH_RADIUS_M * Math.cos(AIRSIM_HOME_LAT * Math.PI / 180);
+  const eastM = dLon * EARTH_RADIUS_M * Math.cos(lat0 * Math.PI / 180);
   return { x: northM, y: eastM, z: downM };
 }
 

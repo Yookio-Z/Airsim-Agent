@@ -64,6 +64,7 @@ class BackendCapabilities:
 
 
 ControllerFactory = Callable[[], FlightController]
+MapOriginProvider = Callable[[], dict[str, float] | None]
 
 
 @dataclass(frozen=True)
@@ -80,6 +81,9 @@ class BackendProfile:
     control_path: str = ""
     requires_ros_gateway: bool = False
     agent_settings: dict[str, Any] = field(default_factory=dict)
+    # NED 原点经纬度：仿真后端用它告诉 UI 地图场景所在城市。刻意不要求链路已
+    # 连接——没连上仿真器时地图也该落在正确的城市，而不是默认的北京。
+    map_origin_provider: MapOriginProvider | None = None
 
     def create_controller(self) -> FlightController:
         return self.controller_factory()
@@ -145,6 +149,39 @@ def _create_airsim_controller() -> FlightController:
     return AirSimController()
 
 
+def read_airsim_origin_geopoint() -> dict[str, float] | None:
+    """从 AirSim settings.json 读 OriginGeopoint，不导入 airsim 包。
+
+    刻意独立于 AirSimController：UI 要在仿真器还没起来时就知道地图该落在哪个
+    城市，而 airsim 控制器模块顶层就 import airsim，没装仿真环境时导入即失败。
+    """
+    from pathlib import Path
+
+    explicit = os.environ.get("AIRSIM_SETTINGS_PATH")
+    if explicit:
+        path = Path(explicit)
+    else:
+        home = Path(os.environ.get("USERPROFILE") or str(Path.home()))
+        path = home / "Documents" / "AirSim" / "settings.json"
+    try:
+        import json
+
+        origin = json.loads(path.read_text(encoding="utf-8")).get("OriginGeopoint")
+        if not isinstance(origin, dict):
+            return None
+        lat = float(origin.get("Latitude"))
+        lon = float(origin.get("Longitude"))
+    except Exception:
+        return None
+    if abs(lat) < 0.001 or abs(lon) < 0.001:
+        return None
+    try:
+        alt = float(origin.get("Altitude", 0.0) or 0.0)
+    except (TypeError, ValueError):
+        alt = 0.0
+    return {"lat": lat, "lon": lon, "alt": alt}
+
+
 def _create_px4_mavlink_controller() -> FlightController:
     from src.modules.mavlink_controller import MavlinkController
 
@@ -182,6 +219,7 @@ def create_builtin_backend_registry() -> BackendRegistry:
             description="AirSim RPC simulation backend with flight and perception tools.",
             controller_factory=_create_airsim_controller,
             default_connect_params={"ip": "127.0.0.1", "port": 41452},
+            map_origin_provider=read_airsim_origin_geopoint,
             mode="airsim",
             control_path="AirSim RPC",
             requires_ros_gateway=False,
