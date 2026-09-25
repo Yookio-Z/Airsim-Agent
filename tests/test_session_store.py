@@ -10,6 +10,7 @@ import time
 from pathlib import Path
 
 from src.agent import runtime as runtime_module
+from src.agent import session_store as session_store_module
 from src.agent.runtime import (
     AgentRuntime,
     _trim_session_message,
@@ -19,7 +20,8 @@ from src.agent.runtime import (
 
 
 def _bare_runtime(tmp_path, monkeypatch):
-    monkeypatch.setattr(runtime_module, "SESSIONS_DIR", tmp_path)
+    # patch where the name is looked up (session files moved to their own module)
+    monkeypatch.setattr(session_store_module, "SESSIONS_DIR", tmp_path)
     runtime = AgentRuntime.__new__(AgentRuntime)
     runtime._session_meta_cache = {}
     return runtime
@@ -112,13 +114,13 @@ def test_list_sessions_caches_until_file_changes(tmp_path, monkeypatch):
     _write_session(tmp_path, "session_s1", [{"id": "a"}])
 
     calls = {"n": 0}
-    original = runtime_module.read_session_file
+    original = session_store_module.read_session_file
 
     def counting_read(path):
         calls["n"] += 1
         return original(path)
 
-    monkeypatch.setattr(runtime_module, "read_session_file", counting_read)
+    monkeypatch.setattr(session_store_module, "read_session_file", counting_read)
 
     first = runtime.list_sessions()
     second = runtime.list_sessions()

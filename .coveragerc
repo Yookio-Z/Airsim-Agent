@@ -12,6 +12,21 @@ include =
     src/agent/run_log.py
     src/agent/sub_agent.py
     src/agent/memory.py
+    # split out of runtime.py: same code, same gate. Leaving them out would let
+    # the coverage number rise simply by moving code into unmeasured files.
+    src/agent/run_state.py
+    src/agent/settings_store.py
+    src/agent/session_store.py
+    src/agent/guardians.py
+    src/agent/replay_api.py
+    src/agent/gcs_api.py
+    src/agent/approval_gate.py
+    src/agent/events.py
+    src/agent/session_api.py
+    src/agent/cancellation.py
+    src/agent/vehicle_api.py
+    src/agent/execution.py
+    src/agent/agent_bridge.py
     src/modules/formation.py
     src/modules/mavlink_controller.py
     src/modules/airsim_controller.py

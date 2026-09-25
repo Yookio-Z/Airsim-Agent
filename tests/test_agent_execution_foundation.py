@@ -1080,12 +1080,16 @@ def test_fast_final_report_includes_flight_chain_and_image_result() -> None:
 
 
 def test_attachment_store_persists_metadata_without_session_base64() -> None:
-    import src.agent.runtime as runtime_module
+    # Patch where the name is looked up: the attachment helpers live in
+    # session_api and read settings_store.attachments_dir(), so rebinding
+    # src.agent.runtime.ATTACHMENTS_DIR would leave them writing into the real
+    # src/data/attachments directory.
+    from src.agent import settings_store as settings_store_module
 
     data_url = "data:image/png;base64," + base64.b64encode(b"small-image").decode("ascii")
     with tempfile.TemporaryDirectory() as directory:
-        previous = runtime_module.ATTACHMENTS_DIR
-        runtime_module.ATTACHMENTS_DIR = Path(directory)
+        previous = settings_store_module.ATTACHMENTS_DIR
+        settings_store_module.ATTACHMENTS_DIR = Path(directory)
         try:
             runtime = AgentRuntime.__new__(AgentRuntime)
             stored = runtime._store_attachments([{"name": "test.png", "mime_type": "image/png", "data_url": data_url}])
@@ -1094,7 +1098,7 @@ def test_attachment_store_persists_metadata_without_session_base64() -> None:
             hydrated = runtime._hydrate_attachments(stored)
             assert hydrated[0]["data_url"] == data_url
         finally:
-            runtime_module.ATTACHMENTS_DIR = previous
+            settings_store_module.ATTACHMENTS_DIR = previous
 
 
 def test_recent_context_excludes_current_user_behind_placeholder() -> None:

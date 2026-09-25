@@ -48,14 +48,24 @@ jobs:
       - name: Install uv
         uses: astral-sh/setup-uv@v5
 
+      - name: Pin the interpreter
+        # The gate must be reproducible: requires-python is >=3.10, and one test
+        # was interpreter-sensitive (a fixture used `time.time() - 8.0` against a
+        # `age > 8.0` check; on 3.12/Windows time.time() is quantised to ~15.6 ms
+        # so the age came out as exactly 8.0 and the link was judged healthy).
+        # That fixture is fixed, but 3.13 is the version this suite is verified
+        # on, so the blocking job pins it. Widen deliberately after a green run.
+        run: uv python install 3.13
+
       - name: Sync dependencies
         # --all-extras so the dev tools (pytest, pytest-cov) are present.
-        run: uv sync --all-extras --frozen
+        run: uv sync --all-extras --frozen --python 3.13
 
       - name: Run the test suite with the coverage gate
-        # .coveragerc holds `fail_under = 45` over the 12 critical files; it is
-        # enforced by this command rather than by whoever remembers to type it.
-        run: uv run pytest tests/ -q --cov --cov-report=term
+        # .coveragerc holds `fail_under = 45` over the critical files (the agent
+        # core, the split-out runtime modules, control loops, backends, safety);
+        # it is enforced by this command rather than by whoever remembers to type it.
+        run: uv run --python 3.13 pytest tests/ -q --cov --cov-report=term
 
   # ---------------------------------------------------------------------------
   # Front-end logic: the two vm-based .cjs suites. No npm install, no build.

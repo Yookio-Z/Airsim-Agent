@@ -895,10 +895,11 @@ def test_normal_flight_task_uses_the_safety_envelope_not_the_close_range_one():
     profile = runtime._envelope_profile(_run_for_envelope("向北飞 40 米并巡检"))
 
     assert profile is not None
-    max_alt_m, max_dist_m = profile
+    max_alt_m, max_dist_m, from_takeoff = profile
     assert max_alt_m > 15.0, "a 15 m survey altitude must not breach the envelope"
     assert max_alt_m >= 50.0
     assert max_dist_m >= 100.0
+    assert from_takeoff is False, "ordinary flight must be measured from the fence origin"
 
 
 def test_close_range_visual_task_keeps_the_tight_envelope():
@@ -906,10 +907,271 @@ def test_close_range_visual_task_keeps_the_tight_envelope():
 
     profile = runtime._envelope_profile(_run_for_envelope("靠近那辆车看一眼"))
 
-    assert profile == (8.0, 70.0)
+    assert profile == (8.0, 70.0, True), "close-range work is measured from the takeoff point"
 
 
 def test_envelope_profile_is_none_without_flight_control():
     runtime = _envelope_runtime(flight_control=False)
 
     assert runtime._envelope_profile(_run_for_envelope("读取状态")) is None
+
+
+# ---------------------------------------------------------------------------
+# regressions found by an independent audit of the first round of fixes
+# ---------------------------------------------------------------------------
+
+
+def test_configured_no_fly_zone_reaches_the_validator(monkeypatch):
+    """The config -> FlightConstraint plumbing must be covered end to end.
+
+    Every other zone test builds SafetyValidator by hand, so a rename or typo in
+    the config key would silently disable the whole feature with a green suite
+    (and the dataclass default max_velocity is 10.0 against the config's 8.0, so
+    broken wiring would also be silently looser).
+    """
+    from src.agent.tool_executor import ToolRuntime
+    from src import config as config_module
+
+    # the setting lives on the DroneConfig instance (src.config.config), not on
+    # the module
+    monkeypatch.setattr(
+        config_module.config,
+        "safety_no_fly_zones_json",
+        '[{"x": 20.0, "y": 0.0, "radius": 8.0, "name": "tower"}]',
+    )
+    rt = ToolRuntime(backend_id="px4_mavlink")
+
+    zones = rt.safety.constraints.no_fly_zones
+    assert zones, "configured zones must reach FlightConstraint"
+    assert zones[0]["radius"] == 8.0
+    assert rt.safety.constraints.max_velocity == float(config_module.config.safety_max_velocity_mps)
+    assert rt.safety.constraints.max_altitude == float(config_module.config.safety_max_altitude_m)
+
+
+def test_mission_item_with_both_coordinate_systems_is_validated_as_global():
+    """The uploader prefers lat/lon when both are present (mavlink_controller
+    checks `lat is None or lon is None` before falling back to x/y/z), so the
+    validator must use the same precedence. It used to check x/y/z first, which
+    let an item fly to a lat/lon far outside the fence while the validated point
+    sat at home. MissionItem.to_dict() emits all six keys, so this is realistic.
+    """
+    rt = _rt(ToolCollector(), controller=status_controller(gps={"lat": 39.905163, "lon": 116.407089}))
+    item = {"x": 0.0, "y": 0.0, "z": -10.0, "lat": 39.95, "lon": 116.407089, "alt_m": 10.0}
+
+    safety = rt.validate("drone_upload_mission", {"waypoints_json": json.dumps([item])})
+
+    assert safety["level"] == "danger"
+    assert any("超出围栏" in v for v in safety["violations"])
+    assert any("以 lat/lon 为准" in v for v in safety["violations"])
+
+
+def test_mission_item_with_both_systems_nearby_stays_safe_but_says_so():
+    rt = _rt(ToolCollector(), controller=status_controller(gps={"lat": 39.905163, "lon": 116.407089}))
+    item = {"x": 0.0, "y": 0.0, "z": -10.0, "lat": 39.9054, "lon": 116.407089, "alt_m": 10.0}
+
+    safety = rt.validate("drone_upload_mission", {"waypoints_json": json.dumps([item])})
+
+    assert safety["level"] == "safe"
+    assert any("以 lat/lon 为准" in v for v in safety["violations"])
+
+
+def test_non_finite_global_coordinates_are_rejected():
+    """`float(value or 0.0)` does not sanitise NaN (NaN is truthy) and every
+    distance comparison against NaN is False, so a NaN lat/lon used to pass."""
+    rt = _rt(ToolCollector(), controller=status_controller(gps={"lat": 39.9, "lon": 116.4}))
+
+    for lat, lon in ((float("nan"), float("nan")), ("nan", "nan"), (float("inf"), 116.4)):
+        safety = rt.validate(
+            "drone_upload_mission",
+            {"waypoints_json": json.dumps([{"lat": lat, "lon": lon, "alt_m": 10.0}])},
+        )
+        assert safety["level"] == "danger", (lat, lon, safety)
+        assert safety["violations"], (lat, lon)
+
+
+def test_coverage_area_over_a_no_fly_zone_is_rejected():
+    """Corner checks alone let a 100x100 m swath swallow a zone: all four
+    corners can sit outside it while the aircraft flies straight over."""
+    rt = _rt(ToolCollector(), controller=status_controller())
+    rt.safety.constraints.no_fly_zones = [{"x": 20.0, "y": 0.0, "radius": 10.0}]
+
+    over = rt.validate(
+        "formation_command",
+        {
+            "action": "coverage_plan",
+            "area_shape": "rectangle",
+            "area_x": 20.0,
+            "area_y": 0.0,
+            "area_width": 100.0,
+            "area_height": 100.0,
+            "area_altitude": 10.0,
+        },
+    )
+    away = rt.validate(
+        "formation_command",
+        {
+            "action": "coverage_plan",
+            "area_shape": "rectangle",
+            "area_x": -60.0,
+            "area_y": 0.0,
+            "area_width": 10.0,
+            "area_height": 10.0,
+            "area_altitude": 10.0,
+        },
+    )
+
+    assert over["level"] == "danger"
+    assert any("覆盖区域与禁飞区相交" in v for v in over["violations"])
+    assert away["level"] == "safe"
+
+
+def test_zone_leg_check_warns_instead_of_silently_skipping_without_telemetry():
+    """With zones configured and no position readback the first leg cannot be
+    checked. Returning no violations is indistinguishable from "the check
+    passed" — the same blind spot the wiring was meant to close."""
+    rt = _rt(ToolCollector(), controller=None)
+    rt.safety.constraints.no_fly_zones = [{"x": 20.0, "y": 0.0, "radius": 8.0}]
+
+    safety = rt.validate(
+        "drone_fly_path", {"waypoints_json": json.dumps([{"x": 40.0, "y": 0.0, "z": -10.0}])}
+    )
+
+    assert safety["level"] == "warning"
+    assert any("禁飞区穿越检查已跳过" in v for v in safety["violations"])
+
+
+def test_business_timeouts_are_not_treated_as_link_loss():
+    """A landing timeout or a rejected request is not a dead link. Treating it as
+    one tears down and reconnects the flight link mid-mission."""
+    rt = _rt(ToolCollector())
+
+    for message in (
+        "降落超时未确认: PX4（未上锁，避免空中切电机）",
+        "请求被拒绝",
+        "operation timeout after 30s",
+    ):
+        assert rt._is_connection_error({"message": message}) is False, message
+    for message in ("MAVLink is not connected", "无法连接飞控", "连接被拒绝", "connection refused"):
+        assert rt._is_connection_error({"message": message}) is True, message
+
+
+# ---------------------------------------------------------------------------
+# envelope watchdog: the horizontal basis must match the fence
+# ---------------------------------------------------------------------------
+
+
+def _drive_guard(
+    profile: tuple[float, float, bool],
+    drone: dict | list[dict],
+    budget_s: float = 5.0,
+):
+    """Run the real guard loop against a telemetry feed.
+
+    The feed may be a list of frames: the takeoff-relative profile anchors its
+    origin on the first airborne sample, so a test for that basis has to feed the
+    takeoff point first and then the far position.
+    """
+    runtime = agent_runtime()
+    runtime._current = SimpleNamespace(run_id="run_g", status="running")
+    runtime.supervisor = SimpleNamespace(is_emergency_stopped=lambda: False)
+    landed: list[str] = []
+    events: list[str] = []
+    frames = drone if isinstance(drone, list) else [drone]
+    state = {"i": 0}
+
+    def snapshot() -> dict:
+        index = min(state["i"], len(frames) - 1)
+        state["i"] += 1
+        return {"drone": frames[index]}
+
+    runtime.tools = SimpleNamespace(
+        status_snapshot=snapshot,
+        execute=lambda name, params=None, **kw: landed.append(name) or SimpleNamespace(ok=True),
+    )
+    runtime._append_event = lambda level, src, msg, data=None, **kw: events.append(msg)
+    runtime._cancel_active_work = lambda: None
+    runtime._lock = threading.RLock()
+    max_alt, max_dist, from_takeoff = profile
+    stopper = threading.Timer(budget_s, runtime._envelope_stop.set)
+    stopper.start()
+    try:
+        runtime._envelope_guard_loop("run_g", max_alt, max_dist, from_takeoff)
+    finally:
+        stopper.cancel()
+    return landed, events
+
+
+def test_legal_flight_is_not_force_landed_by_the_origin_basis_watchdog():
+    """A flight that never leaves the geofence must not be aborted: measuring
+    displacement from the takeoff point made a legal 95 m-from-origin leg look
+    like a 115 m excursion and force-landed a healthy aircraft with a bogus
+    "position estimate diverged" diagnosis."""
+    at_takeoff = {"flying": True, "position_ned": {"x": 20.0, "y": 0.0, "z": -10.0}}
+    # -99 m from the origin: inside the 100 m fence, but 119 m from the (20,0)
+    # takeoff point — outside the 115 m bound a takeoff-relative check would use.
+    # The values are chosen so the two bases give opposite verdicts.
+    at_fence_edge = {"flying": True, "position_ned": {"x": -99.0, "y": 0.0, "z": -10.0}}
+    landed, events = _drive_guard((57.5, 115.0, False), [at_takeoff, at_takeoff, at_fence_edge])
+
+    assert landed == [], f"a legal flight was aborted: {landed}"
+    assert not any("包线" in e for e in events)
+
+
+def test_watchdog_still_lands_a_genuine_excursion_from_the_origin():
+    landed, events = _drive_guard(
+        (57.5, 115.0, False), {"flying": True, "position_ned": {"x": -130.0, "y": 0.0, "z": -10.0}}
+    )
+
+    assert landed, "an excursion past the fence must still be caught"
+    assert any("包线" in e for e in events)
+
+
+def test_close_range_profile_still_measures_from_the_takeoff_point():
+    """The tight profile is about small-area manoeuvring, so its basis stays
+    takeoff-relative: 140 m of travel is an excursion even inside the fence."""
+    at_takeoff = {"flying": True, "position_ned": {"x": 0.0, "y": 0.0, "z": -3.0}}
+    far = {"flying": True, "position_ned": {"x": 140.0, "y": 0.0, "z": -3.0}}
+    landed, _ = _drive_guard((8.0, 70.0, True), [at_takeoff, at_takeoff, far])
+
+    assert landed, "the close-range envelope must still fire on a 140 m excursion"
+
+
+def _profile_runtime(*, close_range: bool, flight_control: bool = True):
+    runtime = agent_runtime()
+    runtime.planner = SimpleNamespace(_is_close_range_visual_command=lambda command: close_range)
+    runtime.tools = SimpleNamespace(
+        status_snapshot=lambda: {"backend_profile": {"capabilities": {"flight_control": flight_control}}}
+    )
+    return runtime
+
+
+def _profile_run(steps) -> RunState:
+    from src.agent.planner import MissionPlan, MissionStep
+
+    return RunState(
+        run_id="run_env",
+        command="靠近目标确认",
+        intent="",
+        summary="",
+        execute=True,
+        plan=MissionPlan(
+            run_id="run_env", command="c", intent="i", summary="s",
+            steps=[MissionStep(id=f"s{i}", label="t", tool=t, params=p) for i, (t, p) in enumerate(steps, 1)],
+        ),
+    )
+
+
+def test_close_range_ceiling_covers_the_altitude_the_plan_itself_asked_for():
+    """The watchdog must catch uncommanded excursions, not the climb the plan
+    wrote down: a close-range task whose plan says up_m=15 would otherwise be
+    force-landed after 3 s with a bogus "position estimate diverged" report."""
+    runtime = _profile_runtime(close_range=True)
+
+    tight = runtime._envelope_profile(_profile_run([("drone_takeoff", {"altitude": 3.0})]))
+    climbing = runtime._envelope_profile(_profile_run([("drone_move_relative", {"up_m": 15.0})]))
+    waypoint = runtime._envelope_profile(_profile_run([("drone_fly_to", {"x": 1.0, "y": 0.0, "z": -20.0})]))
+
+    assert tight == (8.0, 70.0, True), "a 3 m plan keeps the tight 8 m ceiling"
+    assert climbing[0] > 15.0, f"the planned 15 m climb must fit: {climbing}"
+    assert waypoint[0] > 20.0, f"the planned 20 m leg must fit: {waypoint}"
+    assert climbing[2] is True and waypoint[2] is True

@@ -324,10 +324,14 @@ class ToolRuntime:
         "no backend",
         "broken pipe",
         "refused",
-        "\u8d85\u65f6",
+        # 中文侧只保留"链路级"标记：通用的 超时 / 拒绝 会把业务超时（例如
+        # "降落超时未确认"）也判成断链，进而对飞行链路做一次 disconnect + 重连。
+        # 英文侧同理——曾用 "timeout"/"rpc"/"airsim" 这类宽词，一次相机超时就会
+        # 重连飞控链路。改窄之后两端行为一致（见 tests 里的标记用例）。
+        "\u65e0\u6cd5\u8fde\u63a5",
         "\u8fde\u63a5\u5931\u8d25",
         "\u672a\u8fde\u63a5",
-        "\u62d2\u7edd",
+        "\u8fde\u63a5\u88ab\u62d2",
     )
     CAMERA_SOURCE_TOOLS = {"airsim_take_photo", "airsim_get_depth_map"}
 
@@ -2530,13 +2534,51 @@ class ToolRuntime:
         未配置禁飞区时直接返回、不读遥测——否则每个位置指令都要多一次 RPC，
         而未连接时那次读还会触发数秒的连接尝试。
         """
-        if not self.safety.constraints.no_fly_zones or from_pos is None:
-            return []
+        return self._leg_zone_check(from_pos, to_pos)[0]
+
+    def _leg_zone_check(
+        self,
+        from_pos: tuple[float, float, float] | None,
+        to_pos: tuple[float, float, float],
+    ) -> tuple[list[str], str]:
+        """(带前缀的违规列表, 该段判定的级别)。
+
+        配了禁飞区却读不到当前位置时，这一段是无法校验的：不能静默放行（那和
+        没接线的旧状态一样），也不该直接判 danger（会拦住合法的离线规划），
+        所以给一条 warning，让操作员知道"这一段没查过"。
+        """
+        if not self.safety.constraints.no_fly_zones:
+            return [], "safe"
+        if from_pos is None:
+            return (
+                [
+                    "无法读取当前位置，本段航线的禁飞区穿越检查已跳过"
+                    "（连接或遥测恢复后重新下发可完成校验）"
+                ],
+                "warning",
+            )
         try:
             result = self.safety.validate_move(from_pos, to_pos)
         except Exception:
-            return []
-        return [item for item in result.violations if "禁飞区" in item]
+            return [], "safe"
+        hits = [item for item in result.violations if "禁飞区" in item]
+        return ([f"航线{item}" for item in hits], "danger" if hits else "safe")
+
+    def _apply_leg_zone_check(
+        self,
+        from_pos: tuple[float, float, float] | None,
+        to_pos: tuple[float, float, float],
+        violations: list[str],
+        level: str,
+    ) -> str:
+        """把一段航线的禁飞区结论并进 (violations, level)。"""
+        hits, leg_level = self._leg_zone_check(from_pos, to_pos)
+        violations.extend(hits)
+        if leg_level == "danger":
+            return "danger"
+        if leg_level == "warning" and level == "safe":
+            return "warning"
+        return level
 
     def _safety_constraints(self) -> dict[str, Any]:
         constraints = self.safety.constraints
@@ -2599,9 +2641,7 @@ class ToolRuntime:
                 for key in ("x", "y", "z"):
                     if key in result.corrected:
                         corrected[key] = result.corrected[key]
-            for hit in self._no_fly_zone_violations(self._current_position(), (x, y, z)):
-                level = "danger"
-                violations.append(f"飞行路径{hit}")
+            level = self._apply_leg_zone_check(self._current_position(), (x, y, z), violations, level)
             velocity = float(params.get("velocity", 2.0))
             vel = self.safety.validate_velocity(velocity, 0.0, 0.0)
             merge(vel)
@@ -2673,9 +2713,7 @@ class ToolRuntime:
                     float(pos.get("y", 0.0)),
                     float(pos.get("z", 0.0)),
                 )
-                for hit in self._no_fly_zone_violations(start, (x, y, z)):
-                    level = "danger"
-                    violations.append(f"飞行路径{hit}")
+                level = self._apply_leg_zone_check(start, (x, y, z), violations, level)
             else:
                 violations.append("relative movement requires a connection and a current position readback")
                 if level == "safe":
@@ -2703,13 +2741,7 @@ class ToolRuntime:
                         y = float(result.corrected.get("y", y))
                         z = float(result.corrected.get("z", z))
                         changed = True
-                    for hit in self._no_fly_zone_violations(previous, (x, y, z)):
-                        level = "danger"
-                        violations.append(f"航线{hit}")
-                    previous = (x, y, z)
-                    for hit in self._no_fly_zone_violations(previous, (x, y, z)):
-                        level = "danger"
-                        violations.append(f"航线{hit}")
+                    level = self._apply_leg_zone_check(previous, (x, y, z), violations, level)
                     previous = (x, y, z)
                     safe_waypoints.append({"x": x, "y": y, "z": z})
                 if changed:
@@ -2736,13 +2768,7 @@ class ToolRuntime:
                         y = float(result.corrected.get("y", y))
                         z = float(result.corrected.get("z", z))
                         changed = True
-                    for hit in self._no_fly_zone_violations(previous, (x, y, z)):
-                        level = "danger"
-                        violations.append(f"航线{hit}")
-                    previous = (x, y, z)
-                    for hit in self._no_fly_zone_violations(previous, (x, y, z)):
-                        level = "danger"
-                        violations.append(f"航线{hit}")
+                    level = self._apply_leg_zone_check(previous, (x, y, z), violations, level)
                     previous = (x, y, z)
                     safe_waypoints.append({"x": x, "y": y, "z": z})
                 if changed:
@@ -2780,19 +2806,40 @@ class ToolRuntime:
                     if not isinstance(item, dict):
                         continue
                     safe_item = dict(item)
-                    has_local = all(safe_item.get(axis) is not None for axis in ("x", "y", "z"))
+                    # 优先级必须与上传器一致：mavlink_controller 的归一化先看
+                    # lat/lon，只有它们缺失时才用 x/y/z。以前这里先判 x/y/z，
+                    # 于是一个同时带两种坐标的条目（MissionItem.to_dict() 就会
+                    # 输出全部六个键）会被按"家附近那个本地点"校验，而自驾仪
+                    # 实际飞的是 lat/lon —— 围栏检查被整个绕过。
                     has_global = (
-                        safe_item.get("lat") is not None and safe_item.get("lon") is not None
+                        _finite_or_none(safe_item.get("lat")) is not None
+                        and _finite_or_none(safe_item.get("lon")) is not None
                     )
-                    if has_local:
+                    lat_raw = safe_item.get("lat")
+                    lon_raw = safe_item.get("lon")
+                    latlon_present = lat_raw is not None and lon_raw is not None
+                    if latlon_present and not has_global:
+                        # 有 lat/lon 但不是有限数值：上传器会拿它当地理坐标用，
+                        # 距离比较对 NaN 恒为 False，于是"检查通过"。必须拒绝。
+                        level = "danger"
+                        violations.append(
+                            f"全球航点坐标非法: lat={lat_raw!r} lon={lon_raw!r} "
+                            "（必须是有限数值）"
+                        )
+                    has_local = all(safe_item.get(axis) is not None for axis in ("x", "y", "z"))
+                    if latlon_present:
+                        if has_local:
+                            violations.append(
+                                "该航点同时带 lat/lon 与 x/y/z，上传器以 lat/lon 为准"
+                                "（x/y/z 被忽略）"
+                            )
+                    if has_local and not latlon_present:
                         x = float(safe_item.get("x", 0.0))
                         y = float(safe_item.get("y", 0.0))
                         z = float(safe_item.get("z", -3.0))
                         result = self.safety.validate_position(x, y, z)
                         merge(result)
-                        for hit in self._no_fly_zone_violations(previous, (x, y, z)):
-                            level = "danger"
-                            violations.append(f"航线{hit}")
+                        level = self._apply_leg_zone_check(previous, (x, y, z), violations, level)
                         previous = (x, y, z)
                         if result.corrected:
                             x = float(result.corrected.get("x", x))
@@ -2800,7 +2847,7 @@ class ToolRuntime:
                             z = float(result.corrected.get("z", z))
                             safe_item.update({"x": x, "y": y, "z": z, "alt_m": abs(z)})
                             changed = True
-                    elif has_global:
+                    elif latlon_present:
                         previous = None
                         # 全球坐标航点：以前只处理"含 alt_m"的条目，lat/lon 条目
                         # 既没有 x/y/z 也不含 alt_m 时直接落进 safe_items，一路
@@ -2818,18 +2865,20 @@ class ToolRuntime:
                         result = self.safety.validate_position(0.0, 0.0, -abs(altitude or 3.0))
                         merge(result)
                         origin = self._current_global_position()
+                        lat_value = _finite_or_none(lat_raw)
+                        lon_value = _finite_or_none(lon_raw)
                         if origin is None:
                             level = "danger"
                             violations.append(
                                 "无法读取当前 GPS 位置，不能核对全球航点是否在围栏内"
                                 "（远程航线请先提高配置项 safety_geofence_m）"
                             )
+                        elif lat_value is None or lon_value is None:
+                            # 上面已经记了一条"坐标非法"的 danger；这里不再算距离
+                            # ——对 NaN 的距离比较恒为 False，算了也只会"通过"。
+                            pass
                         else:
-                            distance = _gps_distance_m(
-                                origin[0], origin[1],
-                                float(safe_item.get("lat", 0.0) or 0.0),
-                                float(safe_item.get("lon", 0.0) or 0.0),
-                            )
+                            distance = _gps_distance_m(origin[0], origin[1], lat_value, lon_value)
                             if distance > self.safety.constraints.max_distance_from_home:
                                 level = "danger"
                                 violations.append(
@@ -2923,6 +2972,27 @@ class ToolRuntime:
                 merge(result)
                 if result.corrected and "z" in result.corrected:
                     corrected["area_altitude"] = abs(float(result.corrected["z"]))
+                # 禁飞区：四条角点不够——100x100 的区域可以把一个禁飞区整个罩在
+                # 里面而四个角都在区外，覆盖任务会直接飞过去。按"区域外接圆与
+                # 禁飞区圆相交"判定（保守：宁可报危险也不放过）。
+                if self.safety.constraints.no_fly_zones:
+                    if shape == "circle":
+                        area_extent = abs(float(params.get("area_radius", 25.0)))
+                    else:
+                        half_w = abs(float(params.get("area_width", 100.0))) / 2.0
+                        half_h = abs(float(params.get("area_height", 100.0))) / 2.0
+                        area_extent = math.hypot(half_w, half_h)
+                    for zone in self.safety.constraints.no_fly_zones:
+                        zone_x = float(zone.get("x", 0.0))
+                        zone_y = float(zone.get("y", 0.0))
+                        zone_r = float(zone.get("radius", 0.0))
+                        gap = math.hypot(area_x - zone_x, area_y - zone_y)
+                        if gap <= zone_r + area_extent:
+                            level = "danger"
+                            violations.append(
+                                f"覆盖区域与禁飞区相交: 区域中心距禁飞区中心 {gap:.0f}m，"
+                                f"禁飞区半径 {zone_r:.0f}m + 区域外接半径 {area_extent:.0f}m"
+                            )
             elif action == "coverage_start" and "coverage_speed" in params:
                 speed = float(params.get("coverage_speed", 3.0))
                 vel = self.safety.validate_velocity(speed, 0.0, 0.0)

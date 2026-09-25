@@ -107,22 +107,24 @@ def test_camera_settings_normalizes_transport() -> None:
 
 
 def test_perception_rtsp_config_prefers_camera_panel(monkeypatch) -> None:
-    from src.agent import runtime as runtime_module
+    # camera settings + this reader now live in settings_store; patch the name
+    # where it is looked up
+    from src.agent import settings_store
 
     monkeypatch.setattr(
-        runtime_module,
+        settings_store,
         "_camera_settings",
         lambda settings=None: {"source": "rtsp", "url": "rtsp://panel/stream", "transport": "udp"},
     )
-    assert runtime_module._perception_rtsp_config() == ("rtsp://panel/stream", "udp")
+    assert settings_store._perception_rtsp_config() == ("rtsp://panel/stream", "udp")
 
     # 面板没选 RTSP 时返回空，让感知轴回落到 .env 的配置
     monkeypatch.setattr(
-        runtime_module,
+        settings_store,
         "_camera_settings",
         lambda settings=None: {"source": "airsim", "url": "rtsp://panel/stream", "transport": "tcp"},
     )
-    assert runtime_module._perception_rtsp_config() == ("", "")
+    assert settings_store._perception_rtsp_config() == ("", "")
 
 
 def test_perception_axis_prefers_provider_over_env(monkeypatch) -> None:

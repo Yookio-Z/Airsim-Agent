@@ -10,6 +10,7 @@ import pytest
 from pymavlink import mavutil
 
 from src.agent import runtime as runtime_module
+from src.agent import settings_store
 from src.agent.runtime import _build_connect_params, _connection_settings
 from src.agent.tool_executor import ToolCollector, ToolRuntime
 from src.modules.flight_controller import DroneStatus
@@ -94,7 +95,10 @@ def test_mavlink_arm_reports_stale_heartbeat_reason():
     controller = MavlinkController()
     controller._connected = True
     controller._mavlink = object()
-    controller._last_heartbeat = time.time() - 8.0
+    # 30 s, not exactly 8.0: the staleness test is age > 8.0 and time.time() is
+    # quantised (~15.6 ms on Windows/py3.12), so "- 8.0" can land on exactly
+    # 8.0 and be judged healthy. That made the assertion interpreter-dependent.
+    controller._last_heartbeat = time.time() - 30.0
 
     assert controller.arm() is False
     assert "heartbeat is lost" in controller.last_error
@@ -324,9 +328,12 @@ def test_autopilot_version_decoder_matches_qgc_byte_layout():
 
 
 def test_param_value_cache_decodes_bytewise_int32():
-    # 16_777_217 = 2**24 + 1 is the smallest int32 that float32 cannot represent
-    # exactly, so a plain int(float_field) would come out as 16_777_216. Decoding
-    # a value like 1 would pass either way and prove nothing.
+    # 16_777_217 = 2**24 + 1 is the smallest int32 float32 cannot represent
+    # exactly, so a naive int(float_field) comes out as 16_777_216 while the
+    # bytewise path returns the exact value. (A value like 1 is also caught by
+    # int(round(...)) — bytewise int32 1 is a denormal float ~1.4e-45 that rounds
+    # to 0 — so the small value does discriminate too; this one additionally
+    # pins the precision the round() step must not lose.)
     raw_int = 16_777_217
 
     class _ParamValue:
@@ -790,9 +797,13 @@ _WSL_LINK = {
 
 
 def _runtime_with_stored_settings(monkeypatch, stored):
-    monkeypatch.setattr(runtime_module, "_load_settings", lambda: copy.deepcopy(stored))
+    # settings live in their own module now: patch the loader where it is looked
+    # up. Runtime methods call settings_store._load_settings, so this one seam
+    # covers both the runtime's own reads and the link resolution inside
+    # settings_store (which previously needed two different patch targets).
+    monkeypatch.setattr(settings_store, "_load_settings", lambda: copy.deepcopy(stored))
     monkeypatch.setattr(
-        runtime_module,
+        settings_store,
         "_save_settings",
         lambda data: stored.clear() or stored.update(copy.deepcopy(data)),
     )
