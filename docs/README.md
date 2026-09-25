@@ -15,6 +15,7 @@
 
 | 文档 | 作用 |
 |---|---|
+| [`code_review_and_roadmap.md`](code_review_and_roadmap.md) | 2026-09 外部代码评审：现状评估、已识别问题和分阶段改进路线 |
 | [`agent_architecture.md`](agent_architecture.md) | 智能地面站、Backend、Mission 和 Agent 的总体架构背景 |
 | [`qgc_settings_blueprint.md`](qgc_settings_blueprint.md) | QGroundControl 风格设置、车辆配置和参数页面设计 |
 | [`project_structure.md`](project_structure.md) | 仓库目录与代码归属说明 |
