@@ -92,8 +92,14 @@ def register_core_tools(
 
         AirSim example: drone_connect(ip="127.0.0.1", port=41452)
         MAVLink example: drone_connect(url="udp:127.0.0.1:14550")
+
+        real_vehicle=true 会打开真机审批门：改变位置/模式/解锁的动作必须人工
+        确认。接真机时务必显式传 true——它决定这套门是否生效。
         """
         kwargs: dict = {}
+        # real_vehicle 两条路径都要带。只在 url 分支传的话，调用方用 ip/port
+        # 连真机时标志会丢掉，审批门静默失效。
+        kwargs["real_vehicle"] = bool(real_vehicle)
         if url:
             kwargs["url"] = url
             if fallback_url:
@@ -102,7 +108,6 @@ def register_core_tools(
                 kwargs["remote_host"] = remote_host
             if remote_port:
                 kwargs["remote_port"] = int(remote_port)
-            kwargs["real_vehicle"] = bool(real_vehicle)
         else:
             kwargs["ip"] = ip
             kwargs["port"] = port

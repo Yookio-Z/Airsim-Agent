@@ -1909,6 +1909,38 @@ class MavlinkController(FlightController):
             extra=extra,
         )
 
+    def home_position_ned(self) -> dict[str, float] | None:
+        """飞控 home 在 NED 里的位置（米），围栏要以它为圆心。
+
+        MAVLink 的 HOME_POSITION 是经纬度，而安全围栏在 NED 米制下判定，两者
+        必须换算到同一参考系。参考点是同一帧里的当前 NED + 当前 GPS：把
+        "当前 GPS → home GPS" 的地理位移直接叠加到当前 NED 上，就得到 home
+        在 EKF 本地系里的位置。
+
+        没有 GPS 定位时返回 None——宁可没有围栏圆心，也不要拿 EKF 原点冒充
+        home，那会让围栏在真机上偏出实际作业区。
+        """
+        with self._lock:
+            home = dict(self._telemetry.get("HOME_POSITION", {}) or {})
+            position = dict(self._position)
+            gps = dict(self._telemetry.get("GLOBAL_POSITION_INT", {}) or {})
+        home_lat = _optional_float(home.get("latitude"))
+        home_lon = _optional_float(home.get("longitude"))
+        cur_lat = _optional_float(gps.get("lat"))
+        cur_lon = _optional_float(gps.get("lon"))
+        if None in (home_lat, home_lon, cur_lat, cur_lon):
+            return None
+        if abs(home_lat) < 0.001 or abs(home_lon) < 0.001:
+            return None
+        if abs(cur_lat) < 0.001 or abs(cur_lon) < 0.001:
+            return None
+        north, east = _gps_offset_m(cur_lat, cur_lon, home_lat, home_lon)
+        return {
+            "x": round(float(position.get("x", 0.0) or 0.0) + north, 3),
+            "y": round(float(position.get("y", 0.0) or 0.0) + east, 3),
+            "z": 0.0,
+        }
+
     def get_connection_info(self) -> dict[str, Any]:
         """Return the active MAVLink endpoint and target metadata."""
         with self._lock:

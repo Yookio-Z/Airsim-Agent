@@ -62,6 +62,17 @@ AIRSIM_SETTINGS_TEMPLATES: dict[str, dict[str, str]] = {
     },
 }
 
+# 随安装包出厂的连接预设 id。它们不代表操作员的意图：回退选链路时，真机偏好
+# 只对操作员自己添加的连接生效，免得新装机器在 active id 失效时静默连上真机。
+_BUILTIN_CONNECTION_IDS = frozenset({
+    "default_airsim",
+    "default_px4_sitl_udp",
+    "default_px4_ros2",
+    "default_real_serial",
+    "default_real_udp",
+})
+
+
 def _default_connection_settings() -> dict[str, Any]:
     """Return factory defaults matching the UI's QGC Links panel."""
     return {
@@ -76,7 +87,6 @@ def _default_connection_settings() -> dict[str, Any]:
             },
             {
                 # PX4 SITL over UDP (local SITL or Jetson-shared MAVLink bridge).
-                # User can add serial/TCP/auto presets manually when needed.
                 "id": "default_px4_sitl_udp",
                 "name": "PX4 SITL UDP",
                 "type": "udp",
@@ -85,6 +95,31 @@ def _default_connection_settings() -> dict[str, Any]:
                     "portNumber": "14550",
                     "remotePort": "18570",
                     "realVehicle": False,
+                },
+            },
+            {
+                # 真机预设。realVehicle=True 会强制打开审批门：改变位置/模式/
+                # 解锁的动作必须人工确认。serial 类型本身就判定为真机，这里仍
+                # 显式写明，免得日后有人复制模板时漏掉这个开关。
+                "id": "default_real_serial",
+                "name": "真机 · 数传串口 (Serial)",
+                "type": "serial",
+                "params": {
+                    "port": "COM3",
+                    "portNumber": "115200",
+                    "realVehicle": True,
+                },
+            },
+            {
+                "id": "default_real_udp",
+                "name": "真机 · 数传 UDP",
+                "type": "udp",
+                "params": {
+                    "host": "192.168.1.10",
+                    "portNumber": "14550",
+                    # 远端口只在本机/机载 SITL 场景填；接真机数传留空
+                    "remotePort": "",
+                    "realVehicle": True,
                 },
             },
             {
@@ -418,13 +453,26 @@ def _select_connection_for_backend(
     # 同后端有多个候选时优先真机链路：SIM 默认端点是 127.0.0.1 的 SITL，
     # 真机部署下它要么连到不存在的端口、要么连到本地仿真，而串口或标过
     # realVehicle 的链路才是操作员真正要飞的那条。
-    # 以前这里写死了一组 preset id（default_px4_auto / default_px4_usb /
-    # default_px4），但没有任何地方创建过这些 id，等于这段偏好从未生效——
-    # 所以改成按连接本身的能力判断，操作员自己加的串口预设也能被优先选中。
+    # 回退只在"操作员选的 active id 失效"时发生，即操作员此刻**没有**明确
+    # 指定连哪条。真机链路要赢过 SITL 默认，但只限操作员**自己添加**的那些：
+    # 内置预设是给新装机器兜底的，静默选中内置真机串口意味着开机就连上一架
+    # 真机。区分依据是下面这个 id 集合——它随内置预设一起改，且不会像往
+    # 连接字典里塞字段那样被 UI 保存时抹掉。
     if backend_id == "px4_mavlink":
-        real_vehicle = next(
-            (item for item in candidates if _connection_is_real_vehicle(item[1])), None
+        operator_real = next(
+            (
+                item for item in candidates
+                if item[0] not in _BUILTIN_CONNECTION_IDS
+                and _connection_is_real_vehicle(item[1])
+            ),
+            None,
         )
-        if real_vehicle is not None:
-            return real_vehicle
+        if operator_real is not None:
+            return operator_real
+        simulation = next(
+            (item for item in candidates if not _connection_is_real_vehicle(item[1])),
+            None,
+        )
+        if simulation is not None:
+            return simulation
     return candidates[0]

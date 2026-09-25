@@ -15,7 +15,7 @@ from .backends import BackendProfile, BackendRegistry, create_builtin_backend_re
 from .llm_protocol import validate_json_schema
 from src.config import config
 from src.modules.formation import FLIGHT_ACTIONS, FormationController
-from src.modules.safety_validator import FlightConstraint, SafetyValidator
+from src.modules.safety_validator import FlightConstraint, SafetyValidator, ValidationResult
 from src.tools.manifest import manifest_metadata, list_tool_manifest
 
 logger = logging.getLogger(__name__)
@@ -2143,7 +2143,7 @@ class ToolRuntime:
         fallback_url: str = "",
         remote_host: str = "",
         remote_port: int = 0,
-        real_vehicle: bool = False,
+        real_vehicle: bool | None = None,
     ) -> ToolCallResult:
         with self._lock:
             self.reset_connection()
@@ -2158,7 +2158,6 @@ class ToolRuntime:
                         params["remote_host"] = remote_host
                     if remote_port:
                         params["remote_port"] = int(remote_port)
-                    params["real_vehicle"] = bool(real_vehicle)
                 elif self._last_connect_params:
                     params = dict(self._last_connect_params)
             else:
@@ -2169,8 +2168,17 @@ class ToolRuntime:
                     })
                 elif self._last_connect_params:
                     params = dict(self._last_connect_params)
+            # real_vehicle 必须始终落在 params 里。原实现只在传了 url 的分支
+            # 写入，其余路径（无参重连、只给 ip/port）会退回 default_connect_params
+            # 里的缺省 False——真机上这等于**悄悄关掉审批门**，模型从此可以不
+            # 经确认直接挪飞机。调用方没显式说明时沿用当前值，而不是清零。
+            if real_vehicle is None:
+                resolved = bool(params.get("real_vehicle", self._real_vehicle))
+            else:
+                resolved = bool(real_vehicle)
+            params["real_vehicle"] = resolved
             self._last_connect_params = dict(params)
-            self._real_vehicle = bool(params.get("real_vehicle", False))
+            self._real_vehicle = resolved
             return self.execute(
                 "drone_connect",
                 params,
@@ -2617,7 +2625,23 @@ class ToolRuntime:
                 "constraints": self._safety_constraints(),
             }
 
-        if name == "drone_takeoff":
+        if name == "drone_disarm":
+            # 空中解锁等于掉机。审批门只能让人点"确认"，拦不住模型误判状态；
+            # 真正的兜底得看飞机自己是不是在地上。落地判定不确定时按"不安全"
+            # 处理——宁可多要一次确认，也不要在 20m 高空解锁。
+            airborne = self._is_vehicle_airborne()
+            if airborne is not False:
+                merge(ValidationResult(
+                    is_safe=False,
+                    violations=[
+                        "真机空中禁止解锁：解锁会导致自由落体"
+                        + ("" if airborne is None else f"（当前高度 {airborne:.1f}m）")
+                        + "。请先降落，确认 landed 后再解锁。"
+                    ],
+                    level="danger",
+                ))
+
+        elif name == "drone_takeoff":
             altitude = abs(float(params.get("altitude", 3.0)))
             result = self.safety.validate_position(0.0, 0.0, -altitude)
             merge(result)
@@ -3121,6 +3145,8 @@ class ToolRuntime:
                         stale_connection = True
                         connected = False
             vehicles_status = self._vehicles_status(connected)
+            # 围栏圆心必须跟着飞控的真实 home 走，否则真机上围的是 EKF 原点。
+            self._sync_geofence_home()
             # 已派发航线（fire-and-forget）的完成跟踪，供 UI 提示"飞行结束"
             flight_tasks: dict[str, Any] = {}
             update_tasks = getattr(self.controller, "update_flight_task_progress", None)
@@ -3173,6 +3199,86 @@ class ToolRuntime:
         except Exception:
             return None
         return origin if isinstance(origin, dict) else None
+
+    def _is_vehicle_airborne(self) -> bool | None:
+        """飞机是否在空中。
+
+        True=在空中, False=确认在地面, None=**判不出来**（无遥测或字段缺失）。
+        返回 None 而不是猜 False，是因为"判不出来就当安全"正好把守卫变成装饰。
+        高度和 landed_state 两路独立信号交叉判断：只信 armed 会漏掉
+        "已解锁但仍停在地上"和"解锁状态丢失但实际在飞"两种情况。
+        """
+        controller = self.controller
+        if controller is None:
+            return None
+        try:
+            status = controller.get_status()
+        except Exception:
+            return None
+        data = status.to_dict() if hasattr(status, "to_dict") else {}
+        if not isinstance(data, dict) or not data:
+            return None
+
+        # 明确的落地状态最可信，飞控自己说 landed 就认
+        landed = data.get("landed_state")
+        if isinstance(landed, str) and landed.strip().lower() in {"landed", "on_ground", "ground"}:
+            return False
+        if isinstance(landed, int) and landed == 2:  # MAV_LANDED_STATE_LANDED
+            return False
+
+        pos = data.get("position_ned") or {}
+        try:
+            altitude = abs(float(pos.get("z", 0.0) or 0.0))
+        except (TypeError, ValueError):
+            altitude = None
+        if altitude is not None and altitude > 0.5:
+            return True
+
+        # 高度贴着地，但飞行标志还亮着——正在起降途中。此时解锁同样危险
+        #（下一条指令就可能拉起来），所以按 fail-safe 判成空中。
+        flying = data.get("flying")
+        if flying is True:
+            return True
+
+        if altitude is not None:
+            return False
+        return None
+
+    def _sync_geofence_home(self) -> None:
+        """把飞控的真实 home 喂给安全约束，让围栏以 home 为圆心。
+
+        FlightConstraint.home_position 原本固定在 (0,0)——那是 EKF 本地原点，不
+        是操作员的家。仿真里两者常常重合，看不出问题；真机上 home 往往离 EKF
+        原点几百米，于是"离 home 100m"的围栏实际上圈在另一个地方，飞机飞出
+        作业区也不会报警。
+
+        取不到 home 时保持原值不动：宁可沿用上一次的有效圆心，也不要退回
+        EKF 原点假装一切正常。
+        """
+        controller = self.controller
+        if controller is None:
+            return
+        for name in ("home_position_ned", "home_position"):
+            getter = getattr(controller, name, None)
+            if not callable(getter):
+                continue
+            try:
+                home = getter()
+            except Exception:
+                continue
+            if not isinstance(home, dict):
+                continue
+            try:
+                x = float(home.get("x", 0.0) or 0.0)
+                y = float(home.get("y", 0.0) or 0.0)
+            except (TypeError, ValueError):
+                continue
+            if not (math.isfinite(x) and math.isfinite(y)):
+                continue
+            current = self.safety.constraints.home_position
+            if (x, y) != tuple(current):
+                self.safety.constraints.home_position = (x, y)
+            return
 
     def _vehicles_status(self, connected: bool) -> list[dict[str, Any]]:
         """Per-vehicle compact status for multi-vehicle backends (AirSim).

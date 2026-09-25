@@ -128,11 +128,15 @@ gst-launch-1.0 nvarguscamerasrc ! 'video/x-raw(memory:NVMM),width=1920,height=10
 | `drone_release_yaw` | ✓ | ✓ | 人工接管前交还机头控制；不改飞控参数 |
 | `perception_status` | ✓ | ✓ | 自动跟随感知轴帧源(AirSim/RTSP/USB) |
 | `inspect_current_frame` | ✓ | ✓ | 同上 + fallback 直连帧源 |
-| `airsim_take_photo` | 限定 airsim | ✗ 真机 | 真机改用 `perception_status` 取最后一帧 |
-| `airsim_get_depth_map` | 限定 airsim | ✗ 真机 | 真机用单目估算(在 roadmap) |
-| `airsim_vlm_*` | 别名 → inspect | ✓ | 别名自动转发,真机也工作 |
+| `airsim_take_photo` | ✓ | ✓* | *需开启感知轴(`DRONE_PERCEPTION_ENABLED=true`)且帧源为 RTSP/USB；未开感知轴时真机上该工具不注册 |
+| `airsim_get_depth_map` | ✓ | ✗ 真机 | 深度仅 AirSim 有；真机需单目估算(在 roadmap) |
+| `drone_approach_target` | ✓ | ✓ | 视觉伺服抵近，真机上**已纳入签字集**（会实际移动飞机） |
+| `formation_command` 多机编队 | ✓ | ✗ 真机 | `px4_mavlink` 声明 `multi_vehicle=False` |
+| `obstacle_avoidance` 类 | ✓ | ✗ 真机 | 能力位为 False，真实航路无避障 |
 
-**结论: 飞行/感知/视觉 三大类工具在真机下都能正常工作**。airsim 命名的工具在前端 UI 上可见、但 LLM manifest 明确标注 backend 限制(已经在 `tools/manifest.py` 维护)。
+**结论: 飞行工具在真机下可用且受审批门保护；视觉类需要先开感知轴，深度与避障真机没有**。
+
+注意：`code_review_and_roadmap.md` 早前版本列过一条 "`airsim_vlm_*` 别名自动转发"，**代码中不存在这个别名**（全库 0 处引用），已从本表移除。真机取画面统一走 `inspect_current_frame` / `perception_status`。
 
 ## 4.1 真机上的机头朝向（必读）
 

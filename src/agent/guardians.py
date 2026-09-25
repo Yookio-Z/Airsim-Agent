@@ -211,16 +211,74 @@ class GuardiansMixin:
                     self._cancel_active_work()
                 except Exception:
                     pass
-                try:
-                    self.tools.execute("drone_land", {}, dry_run=False, blocked_by_supervisor=False)
-                except Exception:
-                    pass
+                # 降落结果必须如实上报。链路断了、飞控拒收、模式切不过去——降落
+                # 都会失败，而原实现 try/except pass 之后照样把状态标成"已降落"。
+                # 真机上操作员据此以为飞机已经安全落地，代价可能是下一飞。
+                landed, land_error = self._attempt_emergency_land()
+                if landed:
+                    self._append_event(
+                        "danger", "system",
+                        "飞行包线保护触发：已执行紧急降落，任务中止。",
+                        {
+                            "altitude_m": round(alt, 2),
+                            "distance_m": round(dist, 1),
+                            "distance_basis": "takeoff" if from_takeoff else "origin",
+                            "run_id": run_id,
+                            "landed": True,
+                        },
+                    )
+                else:
+                    self._append_event(
+                        "danger", "system",
+                        f"飞行包线保护触发且**紧急降落未成功**：{land_error}。"
+                        "飞机可能仍在空中，请立即人工接管（切手动 / 切 RTL / 断电按预案）。",
+                        {
+                            "altitude_m": round(alt, 2),
+                            "distance_m": round(dist, 1),
+                            "distance_basis": "takeoff" if from_takeoff else "origin",
+                            "run_id": run_id,
+                            "landed": False,
+                            "land_error": land_error,
+                        },
+                    )
                 with self._lock:
                     if self._current is not None and self._current.run_id == run_id:
                         self._current.status = "failed"
-                        self._current.failure_reason = "飞行包线保护触发：超出安全高度/范围，已中止并降落"
+                        self._current.failure_reason = (
+                            "飞行包线保护触发：超出安全高度/范围，已中止并降落"
+                            if landed
+                            else f"飞行包线保护触发且降落失败：{land_error}。需人工接管。"
+                        )
                 break
             time.sleep(1.0)
+
+    def _attempt_emergency_land(self) -> tuple[bool, str]:
+        """执行紧急降落，返回 (是否成功, 失败原因)。
+
+        不吞异常：包线保护触发时"降落失败"和"降落成功"是两个完全不同的处置
+        前提，调用方必须能区分。
+        """
+        try:
+            result = self.tools.execute(
+                "drone_land", {}, dry_run=False, blocked_by_supervisor=False
+            )
+        except Exception as exc:
+            return False, f"降落指令抛出异常: {exc}"
+        if result is None:
+            return False, "降落工具没有返回结果，无法确认是否已落地"
+        ok = getattr(result, "ok", None)
+        if ok is None and isinstance(result, dict):
+            ok = result.get("ok", result.get("status") in {"ok", "success"})
+        if ok is None:
+            ok = getattr(result, "success", None)
+        if ok:
+            return True, ""
+        message = (
+            result.get("message") or result.get("error")
+            if isinstance(result, dict)
+            else getattr(result, "message", "") or getattr(result, "error", "")
+        )
+        return False, str(message or "降落指令未确认成功")
 
     def _maybe_start_tracking_assist(self, run: RunState) -> None:
         """任务带追踪意图且已看到目标时，启动算法级居中伺服线程。

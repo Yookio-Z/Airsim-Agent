@@ -250,6 +250,41 @@ def test_px4_backend_prefers_a_real_vehicle_link_over_the_sitl_default():
     assert merged["active_connection_id"] == "my_usb_link"
 
 
+def test_px4_backend_never_auto_selects_a_builtin_real_vehicle_link():
+    """A stale active id must not silently connect to a built-in real-vehicle link.
+
+    The shipped defaults include a real-vehicle serial preset for convenience.
+    If the fallback preferred it, a fresh install whose active id happened to
+    be stale would open a real aircraft on startup — the operator never asked
+    for that. Operator-added real links still win (see the test above); only
+    the built-ins are excluded from the preference.
+    """
+    settings = {
+        "backend": "px4_mavlink",
+        "connections": {
+            "active_connection_id": "default_px4_ros2",
+            "connections": [
+                {
+                    "id": "default_px4_sitl_udp",
+                    "name": "PX4 SITL UDP",
+                    "type": "udp",
+                    "params": {"host": "127.0.0.1", "portNumber": "14550"},
+                },
+                {
+                    "id": "default_real_serial",
+                    "name": "真机 · 数传串口 (Serial)",
+                    "type": "serial",
+                    "params": {"port": "COM3", "portNumber": "115200", "realVehicle": True},
+                },
+            ],
+        },
+    }
+
+    merged = _connection_settings(settings)
+
+    assert merged["active_connection_id"] == "default_px4_sitl_udp"
+
+
 def test_px4_backend_keeps_an_explicitly_chosen_sitl_link():
     """The real-vehicle preference must not override an explicit choice."""
     settings = {
