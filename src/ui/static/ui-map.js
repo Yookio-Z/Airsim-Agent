@@ -1259,7 +1259,13 @@ function renderMissionMetrics(drone) {
   const att = drone.attitude_rad || {};
   const tiltDeg = Math.sqrt(Math.pow(Number(att.roll || 0), 2) + Math.pow(Number(att.pitch || 0), 2)) * (180 / Math.PI);
 
-  if (els.metricHeading) els.metricHeading.textContent = `${fmt(drone.heading_deg || 0)}°`;
+  // heading_deg 为 null 表示飞控没上报航向（MAVLink 的 65535 哨兵）。显示 "--"
+  // 而不是 0°——0 会被误读成"机头朝正北"，那是编造出来的读数。
+  if (els.metricHeading) {
+    els.metricHeading.textContent = Number.isFinite(Number(drone.heading_deg))
+      ? `${fmt(drone.heading_deg)}°`
+      : "--";
+  }
   if (els.metricAltDiff) els.metricAltDiff.textContent = missionWaypoints.length && hasReliableVehicleMapPosition(drone, toolRuntime) ? formatSigned(altDiff, "m") : "--";
   if (els.metricBearing) els.metricBearing.textContent = bearing != null ? `${fmt(bearing)}°` : "--";
   if (els.metricDistPrev) els.metricDistPrev.textContent = distPrev != null ? formatDistance(distPrev) : "--";

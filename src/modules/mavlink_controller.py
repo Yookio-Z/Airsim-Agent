@@ -602,7 +602,10 @@ class MavlinkController(FlightController):
             msg_dict["vy"] = float(msg_dict.get("vy", 0) or 0) / 100.0
             msg_dict["vz"] = float(msg_dict.get("vz", 0) or 0) / 100.0
             raw_hdg = float(msg_dict.get("hdg", 0) or 0)
-            msg_dict["hdg"] = 0.0 if raw_hdg >= 65535 else raw_hdg / 100.0
+            # 65535 是"航向未知"哨兵。原先压成 0.0，等于把"没上报"说成"机头
+            # 朝正北"——两者从此不可区分，机头朝向和转向伺服都会基于这个谎值
+            # 做判断。保留 None 让下游能拒绝盲转。
+            msg_dict["hdg"] = None if raw_hdg >= 65535 else raw_hdg / 100.0
             self._update_position_from_global(msg_dict, sysid=sysid)
 
         elif msg_type == "VFR_HUD":
@@ -1841,7 +1844,9 @@ class MavlinkController(FlightController):
         except (TypeError, ValueError):
             battery_voltage = None
         extra = {
-            "heading_deg": round(float(gps.get("hdg", 0.0) or 0.0), 1),
+            # hdg 可能是 None（飞控未上报航向）。宁可给 None 让界面显示 "--"，
+            # 也不要填 0——0 会被读成"机头朝正北"。
+            "heading_deg": _optional_float(gps.get("hdg")),
             "heartbeat_age_s": round(heartbeat_age, 2) if math.isfinite(heartbeat_age) else None,
             # 心跳容忍度放宽到 8s：AirSim HIL 跨机链路上，跑视觉/推理任务时
             # 主机负载高会让心跳间隔拉到数秒，5s 阈值会把"慢"误判成"断"，
@@ -3192,7 +3197,13 @@ class MavlinkController(FlightController):
                 return False
             self.update_telemetry(timeout=0.05)
             gps = self._telemetry.get("GLOBAL_POSITION_INT", {})
-            current = float(gps.get("hdg", 0.0) or 0.0)
+            current = _optional_float(gps.get("hdg"))
+            if current is None:
+                # 飞控没报航向：无法判断转到哪了。盲转会一直转，停在这里比
+                # 转错方向安全。
+                self._send_yaw_rate_setpoint(0.0)
+                self._finish_offboard_position_hold(dict(self._position))
+                return False
             # MAVLink GLOBAL_POSITION_INT.hdg is centi-degrees (0..35999);
             # normalize to degrees before computing the turn error.
             if current > 360.0:
