@@ -203,7 +203,6 @@ let missionWaypoints = [];
 let missionPlans = {};
 // 当前规划目标机（"" = 未选择/单机默认）。由左上角无人机 chips 点击切换。
 let missionTargetVehicle = "";
-let missionFence = [];
 let mapZoom = 1;
 let noticeTimer = null;
 let mapTransform = { cx: 0, cy: 0, scale: 1 };
@@ -274,7 +273,6 @@ let selectedWaypointIndex = -1;
 let lastMissionProgress = null;
 let currentLayerKey = "satellite";
 let wpDragging = false;
-let fenceDrawingMode = false;
 // 高度剖面图交互：最近一次绘制的几何用于命中测试，拖拽时冻结 Y 轴范围避免抖动
 let missionProfileView = null;
 let missionProfileDrag = null;

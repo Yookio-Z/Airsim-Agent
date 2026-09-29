@@ -155,7 +155,6 @@ function initMissionMap() {
         "path-source": { type: "geojson", data: { type: "FeatureCollection", features: [] } },
         "vehicle-track-source": { type: "geojson", data: { type: "FeatureCollection", features: [] } },
         "active-leg-source": { type: "geojson", data: { type: "FeatureCollection", features: [] } },
-        "fence-source": { type: "geojson", data: { type: "FeatureCollection", features: [] } },
         "plan-source": { type: "geojson", data: { type: "FeatureCollection", features: [] } },
       },
       layers: [
@@ -267,27 +266,8 @@ function initMissionMap() {
       },
     });
 
-    // 地理围栏图层（半透明红色填充 + 虚线边框）
-    maplibreMap.addLayer({
-      id: "fence-fill",
-      type: "fill",
-      source: "fence-source",
-      paint: {
-        "fill-color": "#ff5b6e",
-        "fill-opacity": 0.15,
-      },
-    });
-    maplibreMap.addLayer({
-      id: "fence-line",
-      type: "line",
-      source: "fence-source",
-      paint: {
-        "line-color": "#ff5b6e",
-        "line-width": 2,
-        "line-dasharray": [4, 3],
-        "line-opacity": 0.85,
-      },
-    });
+    // 地图上没有画围栏的功能：真正的护栏是后端安全围栏
+    // （safety_geofence_m 圆形距离圈 + 禁飞区穿越检查），不走地图绘制。
 
     // 多机规划航线层：每机一条彩色航线（当前目标机高亮，其余半透明）
     // 插在 wp-halo 之下：航线线在航点图标下面
@@ -331,14 +311,8 @@ function initMissionMap() {
   // 地图缩放/移动时刷新剖面图比例尺（比例尺反映当前 zoom 下的地面距离）
   maplibreMap.on("zoom", () => drawMissionProfile());
 
-  // 点击航点：queryRenderedFeatures 命中则选中；围栏模式下添加围栏顶点
+  // 点击航点：queryRenderedFeatures 命中则选中，否则在地图上添加新航点
   maplibreMap.on("click", (e) => {
-    if (fenceDrawingMode) {
-      missionFence.push({ lat: round6(e.lngLat.lat), lon: round6(e.lngLat.lng) });
-      drawFence();
-      showNotice(`围栏顶点 ${missionFence.length}`, "success");
-      return;
-    }
     const feats = maplibreMap.queryRenderedFeatures(e.point, { layers: ["wp-icon", "wp-halo"] });
     if (feats.length) {
       const seq = Number(feats[0].properties.seq);
@@ -1021,12 +995,10 @@ async function deployAndStartMission() {
 function clearLocalMissionDraft() {
   missionWaypoints = [];
   missionPlans = {};
-  missionFence = [];
   selectedWaypointIndex = -1;
   markMissionEdited();
   renderWaypoints();
   drawMissionPath();
-  drawFence();
   updateMissionTargetBadge();
 }
 
@@ -1614,33 +1586,6 @@ function drawMissionPath() {
   }
   drawMissionProfile();
   refreshActiveLegFromCurrentPosition();
-}
-
-function drawFence() {
-  if (!maplibreMap) return;
-  const fenceSource = maplibreMap.getSource("fence-source");
-  if (!fenceSource) return;
-
-  if (missionFence.length < 2) {
-    setSourceData(fenceSource, { type: "FeatureCollection", features: [] });
-    return;
-  }
-
-  const coords = missionFence.map((p) => [p.lon, p.lat]);
-  if (missionFence.length >= 3) coords.push(coords[0]);
-
-  setSourceData(fenceSource, {
-    type: "FeatureCollection",
-    features: [
-      {
-        type: "Feature",
-        geometry: {
-          type: missionFence.length >= 3 ? "Polygon" : "LineString",
-          coordinates: missionFence.length >= 3 ? [coords] : coords,
-        },
-      },
-    ],
-  });
 }
 
 
@@ -2449,23 +2394,6 @@ function drawMapTexture(ctx, width, height) {
   ctx.restore();
 }
 
-function drawGeofence(ctx, cx, cy, scale) {
-  ctx.strokeStyle = "rgba(237,244,255,0.16)";
-  ctx.lineWidth = 2;
-  ctx.beginPath();
-  ctx.arc(cx, cy, 100 * scale, 0, Math.PI * 2);
-  ctx.stroke();
-
-  ctx.strokeStyle = "rgba(85,223,244,0.55)";
-  ctx.lineWidth = 1;
-  line(ctx, cx - 16, cy, cx + 16, cy);
-  line(ctx, cx, cy - 16, cx, cy + 16);
-
-  ctx.fillStyle = "rgba(85,223,244,0.75)";
-  ctx.font = "12px Segoe UI, sans-serif";
-  ctx.fillText("HOME", cx + 10, cy - 10);
-}
-
 function drawPath(ctx, points, cx, cy, scale, color, numbered) {
   if (!points.length) return;
 
@@ -2923,32 +2851,10 @@ function syncWaypointActionLabels() {
 async function handleWaypointAction(action, button) {
   if (action === "clear") {
     missionWaypoints = [];
-    missionFence = [];
     selectedWaypointIndex = -1;
     renderWaypoints();
     drawMissionPath();
-    drawFence();
-    showNotice("Local waypoints and fence cleared.", "success");
-    return;
-  }
-
-  if (action === "fence") {
-    fenceDrawingMode = !fenceDrawingMode;
-    if (button) {
-      button.classList.toggle("active", fenceDrawingMode);
-      button.textContent = fenceDrawingMode ? "Finish fence" : "Fence";
-    }
-    if (fenceDrawingMode) {
-      missionFence = [];
-      drawFence();
-      showNotice("Fence drawing enabled. Click the map to add vertices.", "success");
-    } else if (missionFence.length < 3) {
-      missionFence = [];
-      drawFence();
-      showNotice("Fence needs at least three vertices; discarded.", "error");
-    } else {
-      showNotice(`Fence saved with ${missionFence.length} vertices.`, "success");
-    }
+    showNotice("Local waypoints cleared.", "success");
     return;
   }
 
