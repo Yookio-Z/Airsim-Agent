@@ -218,7 +218,7 @@ def create_builtin_backend_registry() -> BackendRegistry:
             name="AirSim",
             description="AirSim RPC simulation backend with flight and perception tools.",
             controller_factory=_create_airsim_controller,
-            default_connect_params={"ip": "127.0.0.1", "port": 41452},
+            default_connect_params={"ip": "127.0.0.1", "port": config.airsim_port},
             map_origin_provider=read_airsim_origin_geopoint,
             mode="airsim",
             control_path="AirSim RPC",

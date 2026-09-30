@@ -585,14 +585,14 @@ class ToolRuntime:
             merged["depth_perception"] = bool(axis_enabled and source == "airsim")
             if axis_enabled and source == "airsim":
                 merged["camera_host"] = settings.get("host", "127.0.0.1")
-                merged["camera_port"] = settings.get("port", 41452)
+                merged["camera_port"] = settings.get("port", config.airsim_port)
             return merged
         if source == "airsim":
             merged["image_capture"] = True
             merged["depth_perception"] = True
             merged["camera_source"] = "airsim"
             merged["camera_host"] = settings.get("host", "127.0.0.1")
-            merged["camera_port"] = settings.get("port", 41452)
+            merged["camera_port"] = settings.get("port", config.airsim_port)
             merged["image_capture_via"] = "airsim_camera_source"
         elif source == "rtsp":
             merged["image_capture"] = True
@@ -649,9 +649,9 @@ class ToolRuntime:
 
         host = str(settings.get("host") or "127.0.0.1")
         try:
-            port = int(settings.get("port") or 41452)
+            port = int(settings.get("port") or config.airsim_port)
         except (TypeError, ValueError):
-            port = 41452
+            port = config.airsim_port
         key = f"airsim:{host}:{port}"
 
         if self.camera_key != key:
@@ -1132,9 +1132,9 @@ class ToolRuntime:
         else:
             host = str(raw.get("host") or settings.get("host") or "127.0.0.1")
             try:
-                port = int(raw.get("port") or settings.get("port") or 41452)
+                port = int(raw.get("port") or settings.get("port") or config.airsim_port)
             except (TypeError, ValueError):
-                port = 41452
+                port = config.airsim_port
             key = f"airsim:{host}:{port}"
 
         cache = getattr(self, "_preview_controllers", None)
@@ -2164,7 +2164,7 @@ class ToolRuntime:
                 if ip is not None or port is not None:
                     params.update({
                         "ip": ip or params.get("ip", "127.0.0.1"),
-                        "port": int(port or params.get("port", 41452)),
+                        "port": int(port or params.get("port", config.airsim_port)),
                     })
                 elif self._last_connect_params:
                     params = dict(self._last_connect_params)

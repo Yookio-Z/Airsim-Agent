@@ -83,7 +83,7 @@ def _default_connection_settings() -> dict[str, Any]:
                 "id": "default_airsim",
                 "name": "AirSim Local",
                 "type": "airsim",
-                "params": {"host": "127.0.0.1", "portNumber": "41452"},
+                "params": {"host": "127.0.0.1", "portNumber": str(config.airsim_port)},
             },
             {
                 # PX4 SITL over UDP (local SITL or Jetson-shared MAVLink bridge).
@@ -139,7 +139,7 @@ def _default_camera_settings() -> dict[str, Any]:
     return {
         "source": "airsim",
         "host": "127.0.0.1",
-        "port": 41452,
+        "port": config.airsim_port,
         "url": "",
         # RTSP 传输协议：真机走 WiFi/图传时 UDP 丢包会表现为花屏或卡死，
         # 因此默认 TCP（OpenCV 自己的默认是 UDP）。见 frame_source._open_rtsp_capture。
@@ -341,7 +341,7 @@ def _build_connect_params(connection: dict[str, Any]) -> tuple[str, dict[str, An
 
     if conn_type == "airsim":
         ip = str(params.get("host") or params.get("ip") or "127.0.0.1").strip()
-        port = int(params.get("portNumber") or params.get("port") or "41452")
+        port = int(params.get("portNumber") or params.get("port") or str(config.airsim_port))
         return "airsim", {"ip": ip, "port": port}
 
     if conn_type in {"px4_ros2", "ros2", "ros", "px4_ros"}:

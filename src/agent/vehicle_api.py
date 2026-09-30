@@ -19,6 +19,7 @@ from .settings_store import (
 )
 from pathlib import Path
 from src.modules.mavlink_autodiscovery import discover_serial_mavlink_candidates
+from src.config import config
 from typing import Any
 import math
 import os
@@ -1068,7 +1069,7 @@ class VehicleMixin:
             pass
 
         ip = str(resolved_params.get("ip", "127.0.0.1"))
-        port = int(resolved_params.get("port", 41452))
+        port = int(resolved_params.get("port", config.airsim_port))
         url = str(resolved_params.get("url", ""))
         fallback_url = str(resolved_params.get("fallback_url", ""))
         remote_host = str(resolved_params.get("remote_host", ""))

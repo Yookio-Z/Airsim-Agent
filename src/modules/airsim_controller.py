@@ -100,9 +100,12 @@ class AirSimController(FlightController):
     _ground_z_kin: float | None = None
     _ground_z_kin_samples: list[float] = []
 
-    def __init__(self, ip: str = "127.0.0.1", port: int = 41452) -> None:
+    def __init__(self, ip: str = "127.0.0.1", port: int | None = None) -> None:
+        # 端口缺省跟随 config.airsim_port（与 AirSim settings.json 的
+        # ApiServerPort 保持同步）。写死旧值 41452 的时代，只要仿真器用
+        # 默认的 41451，所有抓图都会无提示地超时。
         self._ip = ip
-        self._port = port
+        self._port = int(port if port is not None else config.airsim_port)
         self._client: Optional[airsim.MultirotorClient] = None
         self._connected = False
         self._vehicles: list[str] = []
