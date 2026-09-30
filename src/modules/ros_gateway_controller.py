@@ -10,6 +10,10 @@ from src.agent.ros_provider_bridge import RosProviderBridgeClient, RosProviderBr
 from src.agent.workflow_ports import ProviderResult
 from src.config import config
 from src.modules.flight_controller import ConnectionInfo, DroneStatus, FlightController
+from src.modules.px4_yaw_link import bearing_to_deg, heading_error_deg
+from ..logging_config import get_logger
+
+logger = get_logger(__name__)
 
 
 class RosGatewayController(FlightController):
@@ -147,6 +151,38 @@ class RosGatewayController(FlightController):
     def hover(self, vehicle_name: str = "") -> bool:
         return self._run_all(vehicle_name, lambda client: client.px4_hold({}))
 
+    def _face_waypoint_before_move(self, x: float, y: float, vehicle_name: str = "") -> None:
+        """移动前把机头转向目标方位，对齐 PX4 的 MPC_YAW_MODE=0 语义。
+
+        px4_local_setpoint 不带航向字段，网关侧保持当前机头——与另外两个后端
+        修复前的"锁死机头"问题同源。转向走 px4_rotate_to（网关的
+        rotate_to_heading 原语），必须与移动串行。
+        """
+        if (config.yaw_mode or "face_waypoint").strip().lower() != "face_waypoint":
+            return
+        try:
+            status = self.get_status(vehicle_name).to_dict()
+            pos = status.get("position_ned") or {}
+            cur_north = float(pos.get("x", 0.0) or 0.0)
+            cur_east = float(pos.get("y", 0.0) or 0.0)
+            # NED：x 是北、y 是东。bearing_to_deg 收的是 (东, 北)。
+            delta_east = y - cur_east
+            delta_north = x - cur_north
+            # 目标就在正上方，没有朝向可言，别去转。
+            if math.hypot(delta_east, delta_north) < 0.5:
+                return
+            target_bearing = bearing_to_deg(delta_east, delta_north)
+            current = status.get("heading_deg")
+            current = float(current) if isinstance(current, (int, float)) else None
+            # 没有航向反馈就别盲转，转错了比不转更难收拾。
+            if current is None:
+                return
+            if abs(heading_error_deg(current, target_bearing)) <= config.yaw_tolerance_deg:
+                return
+            self.rotate_to_heading(target_bearing, timeout=20.0, vehicle_name=vehicle_name)
+        except Exception as exc:
+            logger.debug("face-waypoint pre-rotation skipped: %s", exc)
+
     def move_to_position(
         self,
         x: float,
@@ -157,6 +193,8 @@ class RosGatewayController(FlightController):
     ) -> bool:
         target = {"x": float(x), "y": float(y), "z": float(z)}
         speed = max(0.1, float(velocity))
+        # 先转正机头再走（yaw_mode=face_waypoint 时），与另外两个后端一致
+        self._face_waypoint_before_move(float(x), float(y), vehicle_name)
         timeout_sec = 45.0
         try:
             current = self.get_status().position_ned or {}
@@ -199,6 +237,15 @@ class RosGatewayController(FlightController):
         ))
 
     def move_on_path(self, waypoints: list[dict], velocity: float = 2.0, vehicle_name: str = "") -> bool:
+        # px4_path 一次飞完整条路径，中途无法安全改转向，只对正首航点方位
+        # （与 airsim 的 moveOnPathAsync 同一限制；多段折线只保证起飞腿）。
+        if waypoints:
+            first = waypoints[0]
+            self._face_waypoint_before_move(
+                float(first.get("x", 0) or 0),
+                float(first.get("y", 0) or 0),
+                vehicle_name,
+            )
         return self._run_all(vehicle_name, lambda client: self._ok(
             client.px4_path(
                 {

@@ -328,3 +328,66 @@ def test_airsim_endpoint_env_override_wins(monkeypatch):
     monkeypatch.setenv("AIRSIM_PX4_YAW_ENDPOINT", "tcp:127.0.0.1:5790")
     controller = AirSimController.__new__(AirSimController)
     assert controller._px4_mavlink_endpoint() == "tcp:127.0.0.1:5790"
+
+
+# ----------------------------------------------------------------------
+# ROS2 gateway: the third backend needs the same pre-rotation
+# ----------------------------------------------------------------------
+def _ros_controller():
+    from src.modules.ros_gateway_controller import RosGatewayController
+
+    controller = RosGatewayController.__new__(RosGatewayController)
+    return controller
+
+
+def _ros_status(x: float, y: float, heading_deg):
+    from src.modules.flight_controller import DroneStatus
+
+    return DroneStatus(
+        position_ned={"x": x, "y": y, "z": -5.0},
+        extra={"heading_deg": heading_deg},
+    )
+
+
+def test_ros_backend_has_no_pre_rotation_when_heading_is_unknown():
+    """Without heading feedback the gateway must not steer blind either."""
+    controller = _ros_controller()
+    controller.get_status = lambda vehicle_name="": _ros_status(0.0, 0.0, None)  # type: ignore[method-assign]
+    called: list[float] = []
+    controller.rotate_to_heading = lambda h, timeout=0.0, vehicle_name="": called.append(h) or True  # type: ignore[method-assign]
+    controller._face_waypoint_before_move(50.0, 0.0)
+    assert called == []
+
+
+def test_ros_backend_rotates_toward_the_target():
+    """Due east from the origin is bearing 90; the gateway must be asked for it."""
+    controller = _ros_controller()
+    controller.get_status = lambda vehicle_name="": _ros_status(0.0, 0.0, 0.0)  # type: ignore[method-assign]
+    called: list[float] = []
+    controller.rotate_to_heading = lambda h, timeout=0.0, vehicle_name="": called.append(h) or True  # type: ignore[method-assign]
+
+    controller._face_waypoint_before_move(0.0, 50.0)   # due east
+    assert called and called[0] == pytest.approx(90.0, abs=1e-6)
+
+    called.clear()
+    controller._face_waypoint_before_move(-50.0, 0.0)  # due south
+    assert called and called[0] == pytest.approx(180.0, abs=1e-6)
+
+
+def test_ros_backend_hold_mode_never_rotates(monkeypatch):
+    monkeypatch.setattr(config, "yaw_mode", "hold")
+    controller = _ros_controller()
+    controller.get_status = lambda vehicle_name="": _ros_status(0.0, 0.0, 0.0)  # type: ignore[method-assign]
+    called: list[float] = []
+    controller.rotate_to_heading = lambda h, timeout=0.0, vehicle_name="": called.append(h) or True  # type: ignore[method-assign]
+    controller._face_waypoint_before_move(0.0, -50.0)
+    assert called == []
+
+
+def test_ros_backend_skips_rotation_when_already_aligned():
+    controller = _ros_controller()
+    controller.get_status = lambda vehicle_name="": _ros_status(0.0, 0.0, 0.0)  # type: ignore[method-assign]
+    called: list[float] = []
+    controller.rotate_to_heading = lambda h, timeout=0.0, vehicle_name="": called.append(h) or True  # type: ignore[method-assign]
+    controller._face_waypoint_before_move(50.0, 0.0)  # due north, already facing it
+    assert called == []
