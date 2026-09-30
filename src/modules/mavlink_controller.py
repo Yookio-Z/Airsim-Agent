@@ -4497,7 +4497,14 @@ def _mission_type_for_command(command: int) -> str:
 
 
 def _mission_params_for_command(command: int, item: dict[str, Any]) -> tuple[float, float, float, float]:
-    yaw = _optional_float(item.get("yaw_deg")) or 0.0
+    # param4 是航点的绝对航向。MAVLink 约定 **NaN 表示"未指定"**，PX4 收到 NaN
+    # 才会按 MPC_YAW_MODE（默认 0 = 朝向下一航点）决定机头；发数字则是"在这个
+    # 航点转向这个绝对航向"。航点面板根本没有 yaw 字段，原先缺省成 0.0 等于
+    # 命令每个航点都面向正北——整条航线机头被钉死在 0°，这正是"机头朝向一直
+    # 一个角度"的根因。未指定必须发 NaN，把机头决定权还给飞控。
+    yaw = _optional_float(item.get("yaw_deg"))
+    if yaw is None:
+        yaw = float("nan")
     if command == mavutil.mavlink.MAV_CMD_NAV_WAYPOINT:
         return (
             max(0.0, float(item.get("hold_s", 0.0) or 0.0)),

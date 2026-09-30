@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import base64
+import math
 import threading
 import time
 import tempfile
@@ -693,7 +694,9 @@ def test_mavlink_mission_first_item_is_marked_current() -> None:
 
     assert fake_mav.calls
     assert fake_mav.calls[0][5] == 1
-    assert fake_mav.calls[0][10] == 0.0
+    # param4 是航向：未指定时必须是 NaN（交给 MPC_YAW_MODE），发 0.0 等于
+    # 命令每个航点面向正北，整条航线机头就被钉死了。
+    assert math.isnan(fake_mav.calls[0][10])
 
 
 def test_mavlink_ignores_mission_ack_not_targeted_to_gcs() -> None:
