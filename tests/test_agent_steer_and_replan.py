@@ -325,7 +325,7 @@ def test_perception_stall_ignores_fresh_frames_and_non_visual_tasks():
     from src.agent.agent_loop import AgentLoop
 
     loop = object.__new__(AgentLoop)
-    visual_state = SimpleNamespace(results=[SimpleNamespace(tool="airsim_detect_objects")])
+    visual_state = SimpleNamespace(results=[SimpleNamespace(tool="inspect_current_frame")])
 
     fresh = SimpleNamespace(world_state={"perception": {"enabled": True, "capture_age_s": 1.2}})
     assert loop._perception_stall(fresh, visual_state) == ""

@@ -50,6 +50,8 @@ height — then stop and switch to looking:
   lateral = `Z × (x − 0.5) × 2`); the step size **comes from the measured distance**
   (capped at 12 m, and at one third of the remaining distance while the target is still
   small) — never a fixed number of metres. Keep the 2 m stand-off.
+  **数字的权威定义在 `visual-approach` 的 "Camera geometry" 块**（站离 2 m、单步上限 12 m、
+  1/3 规则、90° 相机常数）；这里只引用，不重复定义，避免两处慢慢漂开。
 
 ## Rule 2 — keep the target in frame at all times
 

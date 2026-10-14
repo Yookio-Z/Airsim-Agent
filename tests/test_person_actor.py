@@ -140,8 +140,20 @@ def test_velocity_duration_expires_and_stops() -> None:
     client = FakePersonClient()
     with _actor(client) as actor:
         actor.move_velocity(1.0, 0.0, duration=0.4)
-        time.sleep(0.9)
+        # 等"时长到期"（mode 转 idle），再等位置稳定——到期与真正停住之间可能还有
+        # 一小段滑行。固定睡固定时长在负载高的机器上会读到还在滑动的状态（偶发假红）。
+        deadline = time.monotonic() + 4.0
         state = actor.state(fresh=True)
+        while time.monotonic() < deadline and state.mode != "idle":
+            time.sleep(0.05)
+            state = actor.state(fresh=True)
+        prev = (state.x, state.y)
+        while time.monotonic() < deadline:
+            time.sleep(0.2)
+            state = actor.state(fresh=True)
+            if math.hypot(state.x - prev[0], state.y - prev[1]) < 0.02:
+                break
+            prev = (state.x, state.y)
         frozen = (state.x, state.y)
         time.sleep(0.4)
         later = actor.state(fresh=True)

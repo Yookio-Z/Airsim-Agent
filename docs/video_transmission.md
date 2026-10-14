@@ -1,5 +1,10 @@
 # 视频回传与图传方案
 
+> **现状提示（2026-10-14）**：本文写于"目标检测仍在"的时期。产品已放弃 YOLO，
+> 感知路线改为「视觉模型给语义 + 深度给距离 + 位姿投影给坐标」，检测类工具与
+> `drone_approach_target` 已删除。**现状以 [`agent_tool_skill_inventory.md`](agent_tool_skill_inventory.md)
+> 顶部的说明为准**；下文出现的检测环节请按此替换阅读。
+
 > 状态：已实现 RTSP 拉流 + JPEG 轮询预览；WebRTC 低延迟路线为 roadmap
 > 更新日期：2026-08-13
 

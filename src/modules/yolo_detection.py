@@ -1,9 +1,19 @@
-"""Shared YOLO and AirSim projection helpers.
+"""【休眠能力】共享的 YOLO 推理辅助函数——产品已不使用。
 
-This module keeps reusable perception code out of legacy workflow tool files.
-Search, tracking, patrol, and formation strategy should live in skills or
-provider-backed services, while these helpers remain single-frame perception
-building blocks.
+产品决议（2026-10-13）：**放弃目标检测**，感知路线改为"视觉模型给语义 + 深度给距离"
+（见 docs/agent_tool_skill_inventory.md 顶部的现状说明、docs/vision_depth_fusion.md）。
+
+因此本模块现在**没有任何生产调用方**：
+
+- 没有注册任何检测工具（`perception_start` / `airsim_detect_objects` 已删除）；
+- 感知轴的检测线程默认不启动，且没有任何入口能启动它（`PerceptionAxis.start(detect=False)`
+  是运行时唯一的启动调用，见 src/agent/runtime.py）；
+- `drone_approach_target` 等依赖检测锁定的工具已删除。
+
+保留它的唯一理由是"将来若要恢复检测能力"，可以少写一遍。若确定不再需要，
+删除本文件 + `models/*.pt` + 感知轴里的检测线程即可（见 models/README.md）。
+
+（原文档串）Shared YOLO and AirSim projection helpers.
 """
 
 from __future__ import annotations

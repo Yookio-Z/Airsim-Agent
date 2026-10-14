@@ -20,7 +20,9 @@ class BackendCapabilities:
     gps: bool = False
     image_capture: bool = False
     depth_perception: bool = False
-    object_detection: bool = False
+    # 注意：这里**没有** object_detection —— 产品已放弃目标检测（2026-10-13 决议）。
+    # "能不能搜/盯"由 target_search / target_tracking 表达，语义由视觉模型提供，
+    # 不再隐含"有检测器"。旧键若被重新加回来，会让人以为检测还在。
     target_search: bool = False
     target_tracking: bool = False
     obstacle_avoidance: bool = False
@@ -44,7 +46,6 @@ class BackendCapabilities:
             "gps": self.gps,
             "image_capture": self.image_capture,
             "depth_perception": self.depth_perception,
-            "object_detection": self.object_detection,
             "target_search": self.target_search,
             "target_tracking": self.target_tracking,
             "obstacle_avoidance": self.obstacle_avoidance,
@@ -235,7 +236,6 @@ def create_builtin_backend_registry() -> BackendRegistry:
                 gps=False,
                 image_capture=True,
                 depth_perception=True,
-                object_detection=True,
                 target_search=True,
                 target_tracking=True,
                 obstacle_avoidance=True,
@@ -267,7 +267,6 @@ def create_builtin_backend_registry() -> BackendRegistry:
                 gps=True,
                 image_capture=False,
                 depth_perception=False,
-                object_detection=False,
                 target_search=False,
                 target_tracking=False,
                 obstacle_avoidance=False,
@@ -300,7 +299,6 @@ def create_builtin_backend_registry() -> BackendRegistry:
                 gps=True,
                 image_capture=False,
                 depth_perception=True,
-                object_detection=False,
                 target_search=False,
                 target_tracking=False,
                 obstacle_avoidance=True,

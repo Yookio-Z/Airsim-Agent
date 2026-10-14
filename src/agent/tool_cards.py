@@ -407,6 +407,9 @@ TOOL_CARDS: dict[str, ToolCard] = {
         risk="low",
         notes=["Movement remains a separate atomic flight command after validation."],
     ),
+    # ↓ 以下 airsim_* 是**遗留条目**：这些名字从未（或不再）在运行时注册，因此
+    # `cards_for_capabilities` 按已注册工具名过滤时永远取不到它们——模型看不到，
+    # 也不会被调用。保留只为读得懂历史 run 日志与旧审批记录。别照着它们补实现。
     "airsim_search_target": ToolCard(
         name="airsim_search_target",
         purpose="Run an AirSim visual target search mission.",

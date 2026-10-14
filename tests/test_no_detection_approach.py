@@ -276,3 +276,31 @@ def test_detection_tool_names_are_gone_from_the_public_surface():
     assert "airsim_locate_point" in TOOL_CARDS
     assert "airsim_locate_point" in TOOL_MANIFEST
     assert "airsim_locate_point" in ToolRuntime.READ_ONLY_TOOLS
+
+
+def test_detection_path_is_dormant_and_unreachable():
+    """检测代码保留为"休眠能力"，但必须**无法被启动**——防止哪天被顺手接回来。
+
+    三个契约：轴启动默认不检测、运行时只以 detect=False 启动、能力表不再宣称检测。
+    """
+    import inspect
+    from pathlib import Path
+
+    from src.agent.backends import create_builtin_backend_registry
+    from src.modules.perception_axis import PerceptionAxis
+
+    # 1) 轴自身的默认参数就是"不检测"
+    signature = inspect.signature(PerceptionAxis.start)
+    assert signature.parameters["detect"].default is False
+
+    # 2) 运行时唯一的启动调用是 detect=False，且不碰检测启动入口（源码级契约）
+    runtime_src = (
+        Path(__file__).resolve().parents[1] / "src" / "agent" / "runtime.py"
+    ).read_text(encoding="utf-8")
+    assert "axis.start(detect=False)" in runtime_src
+    assert "start_detection" not in runtime_src
+
+    # 3) 能力表不再宣称 object_detection（旧键会让人以为检测还在）
+    registry = create_builtin_backend_registry()
+    for item in registry.list_public():
+        assert "object_detection" not in (item.get("capabilities") or {}), item.get("id")

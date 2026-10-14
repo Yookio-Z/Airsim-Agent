@@ -230,7 +230,11 @@ class LocalPerceptionEngine:
         return True
 
     def start_detection(self) -> bool:
-        """按需启动 YOLO 检测线程（模型在线程内惰性加载）；画面不受影响。"""
+        """【休眠能力】按需启动 YOLO 检测线程；产品已无任何调用方。
+
+        保留仅为将来可能的复用：产品决议放弃目标检测后，运行时只调用
+        ``start(detect=False)``，工具面也没有任何入口能走到这里。
+        """
         if not self._running:
             return False
         self._detect_enabled = True
@@ -1148,7 +1152,7 @@ class PerceptionAxis:
         return ok
 
     def start_detection(self) -> bool:
-        """按需开启检测（画面已在跑时只加载 YOLO 并启动检测线程）。"""
+        """【休眠能力】转发给引擎的检测启动；产品已无调用方（见上）。"""
         starter = getattr(self._engine, "start_detection", None)
         return bool(starter()) if callable(starter) else False
 

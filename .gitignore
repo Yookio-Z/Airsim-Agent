@@ -13,7 +13,7 @@ __pycache__/
 # Captured simulator images are served locally and can be regenerated.
 captures/
 
-# Downloadable model weights (re-fetch via ultralytics).
+# 旧目标检测权重（产品已移除 YOLO；见 models/README.md）。*.pt 一律不入库。
 *.pt
 
 # Runtime state, logs and caches (may contain local API keys / credentials).

@@ -1,5 +1,10 @@
 # Intelligent Ground Control Station Architecture Roadmap
 
+> **现状提示（2026-10-14）**：本文写于"目标检测仍在"的时期。产品已放弃 YOLO，
+> 感知路线改为「视觉模型给语义 + 深度给距离 + 位姿投影给坐标」，检测类工具与
+> `drone_approach_target` 已删除。**现状以 [`agent_tool_skill_inventory.md`](agent_tool_skill_inventory.md)
+> 顶部的说明为准**；下文出现的检测环节请按此替换阅读。
+
 > 文档状态：总体架构背景文档。当前系统状态、阶段优先级和 Jetson/边侧 Agent 路线以 [`system_upgrade_plan.md`](system_upgrade_plan.md) 为准。
 
 本文档保留产品方向、GCS 分层和 Backend 抽象的长期设计；其中早期 Phase 编号是历史路线，不应覆盖当前主线方案。

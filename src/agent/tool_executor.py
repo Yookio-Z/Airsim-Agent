@@ -288,6 +288,9 @@ class ToolRuntime:
         "drone_arm",
         "drone_disarm",
         "drone_takeoff",
+        # drone_dispatch_* 是**操作员/GCS 的异步（fire-and-forget）路径**：地面站的
+        # 编队/多机任务用它并行派发。它们刻意**没有卡片**，因此不进模型面（模型侧用
+        # drone_takeoff / drone_fly_path / drone_land）。别为了"对称"给它们补卡片。
         "drone_dispatch_takeoff",
         "drone_land",
         "drone_hover",
@@ -411,7 +414,9 @@ class ToolRuntime:
             #   - 其他后端（px4_mavlink/px4_ros2）：用设置里选定的相机源
             #     （AirSim 仿真 / RTSP 图传 / 本机相机）自己的工具集并入。
             # 这样无论飞控走哪条链路，LLM 拿到的拍照工具都从当前相机源取图。
-            if merged_capabilities.get("image_capture") or merged_capabilities.get("object_detection"):
+            # 只有"有相机源"才注册图像工具。旧写法还 OR 了 object_detection，
+            # 那是检测时代的能力键，已随 YOLO 一起移除（见 backends.py 的说明）。
+            if merged_capabilities.get("image_capture"):
                 try:
                     if self.backend_id == "airsim":
                         from src.tools.perception import register_perception_tools
@@ -632,7 +637,6 @@ class ToolRuntime:
             merged["camera_source"] = source
             merged["image_capture_via"] = "perception_axis" if axis_enabled else "none"
             merged["image_capture"] = axis_enabled
-            merged["object_detection"] = axis_enabled
             merged["target_search"] = axis_enabled
             merged["target_tracking"] = axis_enabled
             # 深度图依赖 AirSim 仿真相机通道；真机形态下由机载感知提供，

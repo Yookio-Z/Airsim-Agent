@@ -896,6 +896,8 @@ function humanToolLabel(tool, label = "") {
     inspect_current_frame: "分析当前画面",
     airsim_get_sensors: "读取传感器",
     airsim_get_depth_map: "读取深度图",
+    // 以下几项只是**历史运行记录**的显示名（老 run 日志里出现过这些工具名，
+    // 回放时要能翻译成人话）。它们不是当前模型可用的工具，别照着这里补工具。
     airsim_search_target: "搜索目标",
     airsim_approach_target: "接近目标",
     airsim_track_object: "跟踪目标",

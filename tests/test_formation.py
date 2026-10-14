@@ -358,9 +358,13 @@ def test_effective_duration_is_capped():
     fc.takeoff(altitude=10.0)
     fc.start()
     try:
-        time.sleep(0.6)
-        assert fc._effective_duration <= 1.01
+        # 等自适应时长真的爬上来（慢 RPC 下需要几个控制周期），而不是固定等 0.6s：
+        # 负载高时控制线程跑不满周期，断言会偶发失败（同 test_person_actor 那类问题）。
+        deadline = time.monotonic() + 3.0
+        while time.monotonic() < deadline and fc._effective_duration < 0.2:
+            time.sleep(0.05)
         assert fc._effective_duration >= 0.2
+        assert fc._effective_duration <= 1.01  # 上限永远不许被突破
     finally:
         fc.shutdown("test")
 

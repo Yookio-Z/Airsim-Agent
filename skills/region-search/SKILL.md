@@ -26,7 +26,8 @@ The Agent decides and flies; the camera and depth tools are read-only.
 for the whole search/confirm/follow phase (never below 1.8 m, never above 3.5 m). Flying
 higher over-angles the view, the target shrinks to a handful of pixels, and the vision
 model stops resolving it. Take off to 3 m for these tasks — not the generic 5 m / 8 m
-cruise altitude.
+cruise altitude. **站离/步长/相机常数的权威定义在 `visual-approach` 的 "Camera geometry" 块**，
+本技能只引用这组数字。
 
 **Do not assume a target position.** Every mission starts from "the target is probably not
 in frame". Never assume from conversation memory or a previous run that the target is

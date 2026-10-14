@@ -1,5 +1,10 @@
 # UAV Agent Harness Design
 
+> **现状提示（2026-10-14）**：本文写于"目标检测仍在"的时期。产品已放弃 YOLO，
+> 感知路线改为「视觉模型给语义 + 深度给距离 + 位姿投影给坐标」，检测类工具与
+> `drone_approach_target` 已删除。**现状以 [`agent_tool_skill_inventory.md`](agent_tool_skill_inventory.md)
+> 顶部的说明为准**；下文出现的检测环节请按此替换阅读。
+
 > 文档状态：Agent Runtime、Skill、Provider、安全和验证原则。当前实现状态及仿真优先的后续任务以 [`system_upgrade_plan.md`](system_upgrade_plan.md) 为准。
 
 This document explains the intended Agent architecture for the PX4/AirSim/ROS

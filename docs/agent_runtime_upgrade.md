@@ -1,5 +1,10 @@
 # Agent 运行时升级（对照 pi 的 runtime loop）
 
+> **现状提示（2026-10-14）**：本文写于"目标检测仍在"的时期。产品已放弃 YOLO，
+> 感知路线改为「视觉模型给语义 + 深度给距离 + 位姿投影给坐标」，检测类工具与
+> `drone_approach_target` 已删除。**现状以 [`agent_tool_skill_inventory.md`](agent_tool_skill_inventory.md)
+> 顶部的说明为准**；下文出现的检测环节请按此替换阅读。
+
 > 状态：设计稿
 > 目的：把"执行为什么出问题"讲清楚，并给出可分批上线的升级路线
 > 参照实现：`C:\Users\26494\Desktop\pi`（Pi Agent Harness，TypeScript）——`packages/agent/src/agent-loop.ts` 与 `harness/runtime/*`

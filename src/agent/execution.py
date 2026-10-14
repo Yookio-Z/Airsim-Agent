@@ -2145,16 +2145,10 @@ class ExecutionMixin:
             })
 
         wants_track = any(k in lower for k in ["track", "follow", "追踪", "跟踪", "跟随"])
-        tracking_steps = [step for step in steps if step.tool == "airsim_track_object"]
-        if wants_track or tracking_steps:
-            tracking_statuses = {
-                str(value).strip().lower()
-                for step in tracking_steps
-                for value in self._collect_field_values(step.result, "status")
-            }
-            # 本架构没有独立追踪工具：追踪 = 感知轴持续锁定目标 + Agent 完成
-            # 多次"检测/确认/抵近"循环。旧判据只认不存在的 airsim_track_object，
-            # 会把成功的追踪任务硬判失败（假失败）。
+        if wants_track:
+            # 本架构没有独立追踪工具（旧判据认的 airsim_track_object 从未注册过，
+            # drone_approach_target 也已删除）：追踪 = 识别到目标 + Agent 完成
+            # 视觉确认/定位循环。只认旧工具名会把成功的追踪任务硬判失败（假失败）。
             track_loop_tools = {"inspect_current_frame", "airsim_take_photo",
                                 "airsim_locate_point"}
             loop_ok_steps = [
@@ -2175,16 +2169,13 @@ class ExecutionMixin:
             # 本任务只要跑过一次视觉确认且目标被确认，就算追踪达成：持续盯梢是
             # 操作员/感知轴的事，不需要 Agent 再堆很多重复的看图步骤。
             detected_any = any(self._result_confirms_target(step.result) for step in steps)
-            tracking_ok = (
-                bool(tracking_steps) and "completed" in tracking_statuses
-                and not bool(tracking_statuses & {"failed", "cancelled", "canceled", "error", "blocked"})
-            ) or (len(loop_ok_steps) >= 1 and (locked or confirmed or detected_any))
+            tracking_ok = len(loop_ok_steps) >= 1 and (locked or confirmed or detected_any)
             checks.append({
                 "name": "tracking_outcome",
                 "ok": tracking_ok,
                 "severity": "hard",
                 "expected": "追踪任务完成（目标被检出并锁定/确认）",
-                "actual": sorted(tracking_statuses) or [
+                "actual": [
                     f"track_loop_steps={len(loop_ok_steps)}", f"locked={locked}",
                     f"confirmed={confirmed}", f"detected={detected_any}",
                 ],
