@@ -318,6 +318,16 @@ class AgentRequestHandler(BaseHTTPRequestHandler):
                 return
             self._send_json(RUNTIME.capture_camera_frame(params))
             return
+
+        if path == "/api/perception/view":
+            # 相机面板切相机/图像类型时走这里：把"看哪一路"变成感知轴的显式
+            # 动作，而不是让面板另开一条取流各看各的。
+            camera_name = str(payload.get("camera_name") or "").strip()
+            if not camera_name:
+                self._send_json({"ok": False, "error": "camera_name required"}, HTTPStatus.BAD_REQUEST)
+                return
+            self._send_json(RUNTIME.perception_set_view(camera_name))
+            return
         if path == "/api/backend":
             backend_id = str(payload.get("backend", ""))
             connect_params = payload.get("connect_params")

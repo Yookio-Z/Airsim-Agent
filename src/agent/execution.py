@@ -1825,6 +1825,30 @@ class ExecutionMixin:
                 break
         return count
 
+    @staticmethod
+    def _result_confirms_target(result: Any) -> bool:
+        """这条工具结果是不是"视觉模型确认看到了目标"。
+
+        检测（YOLO）已从产品中移除：确认证据不再是 detections/targets/primary，
+        而是 inspect_current_frame 的 answer（target_found=true 或非空的
+        target_candidates）。旧的检测字段继续兼容读取，回放旧运行记录时判据才
+        不会失真。
+        """
+        if not isinstance(result, dict):
+            return False
+        for scope in (result, result.get("snapshot") if isinstance(result.get("snapshot"), dict) else {}):
+            answer = scope.get("answer") if isinstance(scope.get("answer"), dict) else scope
+            if bool(answer.get("target_found")) is True:
+                return True
+            candidates = answer.get("target_candidates")
+            if isinstance(candidates, list) and candidates:
+                return True
+            for key in ("primary", "targets", "detections"):
+                value = scope.get(key)
+                if isinstance(value, (dict, list)) and value:
+                    return True
+        return False
+
     def _finalize_task_run(self, run: RunState) -> None:
         run_id = str(getattr(run, "run_id", "") or "")
         # 只关掉属于这个 run 的看门狗：不带 run_id 的调用会把另一个正在飞行的
@@ -2089,8 +2113,8 @@ class ExecutionMixin:
 
         wants_search = any(k in lower for k in ["search", "find", "locate", "搜索", "寻找", "查找", "目标"])
         search_steps = [step for step in steps if step.tool in {
-            "skill:search", "airsim_search_target", "inspect_current_frame",
-            "airsim_detect_objects", "airsim_take_photo", "perception_status",
+            "inspect_current_frame", "airsim_take_photo", "perception_status",
+            "airsim_locate_point",
         }]
         if wants_search or search_steps:
             search_statuses = {
@@ -2101,18 +2125,11 @@ class ExecutionMixin:
             found_markers = {"candidate_found", "target_found", "found", "locked",
                              "target_confirmed", "confirmed", "image_analyzed"}
             failed_markers = {"not_found", "target_not_confirmed", "failed", "cancelled", "canceled", "error", "blocked"}
-            # 真实检出优先于文案状态：只要任一搜索步骤的结果里带了
-            # detections/targets/primary（含 perception_status.snapshot），
-            # 就认为目标确实被检出，而不是只看 status 字段是不是特定词。
-            detected_target = False
-            for step in search_steps:
-                res = step.result
-                if not isinstance(res, dict):
-                    continue
-                snap = res.get("snapshot") if isinstance(res.get("snapshot"), dict) else res
-                if snap.get("primary") or snap.get("targets") or res.get("detections"):
-                    detected_target = True
-                    break
+            # 真实确认优先于文案状态：视觉模型的 answer（target_found /
+            # target_candidates）说看到了，才算"确实找到"，不看 status 用词。
+            detected_target = any(
+                self._result_confirms_target(step.result) for step in search_steps
+            )
             search_ok = (
                 bool(search_steps)
                 and bool(search_statuses & (found_markers | {"completed", "ok"}))
@@ -2138,36 +2155,26 @@ class ExecutionMixin:
             # 本架构没有独立追踪工具：追踪 = 感知轴持续锁定目标 + Agent 完成
             # 多次"检测/确认/抵近"循环。旧判据只认不存在的 airsim_track_object，
             # 会把成功的追踪任务硬判失败（假失败）。
-            track_loop_tools = {"airsim_detect_objects", "inspect_current_frame",
-                                "airsim_take_photo"}
+            track_loop_tools = {"inspect_current_frame", "airsim_take_photo",
+                                "airsim_locate_point"}
             loop_ok_steps = [
                 step for step in steps
                 if step.tool in track_loop_tools and str(getattr(step, "status", "")) == "completed"
             ]
-            # 目标是否仍被感知轴锁定（从最后一次 perception_status 结果取）
-            locked = False
-            for step in reversed(steps):
-                if step.tool != "perception_status" or not isinstance(step.result, dict):
-                    continue
-                snap = step.result.get("snapshot") if isinstance(step.result.get("snapshot"), dict) else step.result
-                if snap.get("primary") or snap.get("targets"):
-                    locked = True
-                break
+            # "还在盯着目标"的证据来自最近一次视觉确认（检测锁定已随 YOLO 移除）。
+            locked = any(
+                self._result_confirms_target(step.result)
+                for step in reversed(steps)
+                if step.tool == "inspect_current_frame"
+            )
             confirmed = any(
                 str(value).strip().lower() in {"target_confirmed", "confirmed", "locked"}
                 for step in steps
                 for value in self._collect_field_values(step.result, "status")
             )
-            # 本任务只要跑过一次视觉/检测步骤且目标处于锁定/确认状态，就算追踪
-            # 达成：感知轴本身负责持续锁定，不需要 Agent 再堆很多重复检测步骤。
-            detected_any = False
-            for step in steps:
-                res = step.result
-                if isinstance(res, dict):
-                    snap = res.get("snapshot") if isinstance(res.get("snapshot"), dict) else res
-                    if snap.get("primary") or snap.get("targets") or res.get("detections"):
-                        detected_any = True
-                        break
+            # 本任务只要跑过一次视觉确认且目标被确认，就算追踪达成：持续盯梢是
+            # 操作员/感知轴的事，不需要 Agent 再堆很多重复的看图步骤。
+            detected_any = any(self._result_confirms_target(step.result) for step in steps)
             tracking_ok = (
                 bool(tracking_steps) and "completed" in tracking_statuses
                 and not bool(tracking_statuses & {"failed", "cancelled", "canceled", "error", "blocked"})

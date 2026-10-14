@@ -786,8 +786,9 @@ class VehicleMixin:
         except Exception as exc:
             summary["perception"] = {"error": str(exc)}
         try:
-            llm = self.application_settings().get("agent", {}) or {}
-            summary["available"]["vlm"] = bool(llm.get("auto_select_multimodal_model", True))
+            # 图像能力就是"当前模型自己的能力"，不另设开关：规划和看图用同一个
+            # 模型，所以这个位直接问模型能不能收图。
+            summary["available"]["vlm"] = bool(self.planner.supports_multimodal(self._active_model_id() or None))
         except Exception:
             pass
         # Plain-language hint based on what is actually live
@@ -1226,6 +1227,28 @@ class VehicleMixin:
     def camera_preview_frame(self, params: dict[str, Any] | None = None) -> tuple[bool, bytes, str, dict[str, Any]]:
         """Return one lightweight camera preview frame for the frontend."""
         return self.tools.capture_camera_preview(params or {})
+
+    def perception_set_view(self, camera_name: str) -> dict[str, Any]:
+        """相机面板要求感知轴换一路相机（操作员入口，不是 Agent 工具）。
+
+        面板是操作员的直接入口，所以取景以面板为准（与 RTSP 取流同一套规则：
+        面板优先、.env 兜底）。换的是感知轴本身，不是这条预览请求——否则面板
+        和 Agent 会各看一路，而两边都以为在看同一路。
+
+        刻意不暴露成 Agent 工具：取景属于操作员。让模型自己切走画面，等于系统
+        背着操作员改他正在看的东西（与"系统偷偷替他换模型"是同一类错误）。
+        """
+        axis = getattr(self, "perception_axis", None)
+        setter = getattr(axis, "set_view", None)
+        if not callable(setter):
+            return {"ok": False, "error": "perception axis unavailable"}
+        try:
+            result = setter(camera_name)
+        except Exception as exc:
+            return {"ok": False, "error": str(exc)}
+        if not result.get("ok"):
+            result.setdefault("error", result.get("message") or "取景切换失败")
+        return result
 
     def _safety_snapshot(self) -> dict[str, Any]:
         constraints = self.tools.safety.constraints

@@ -66,6 +66,67 @@ class TaskRunStore:
             self._write_record_unlocked(record)
             self._upsert_index_unlocked(record)
 
+    def mark_running_as_interrupted(
+        self,
+        keep_run_ids: set[str] | None = None,
+        grace_sec: float = 45.0,
+    ) -> int:
+        """把残留的"运行中"记录标成 interrupted，返回改动条数。
+
+        进程崩溃/被关掉时，最后一条 run 记录会永远停在 running/executing：界面
+        一直转圈，操作员分不清"还在跑"和"早就没了"。这里做**记录层**的崩溃恢复：
+        只改状态与说明，绝不重放任何动作——飞行指令是非幂等的，重放一次起飞/降落
+        是事故（这一点与 Pi Harness 的"会话可恢复"刻意不同，见
+        docs/loop_context_design.md §2）。
+
+        两道保护，缺一不可：
+        - ``keep_run_ids``：调用方把本进程在途/活跃的 run_id 传进来；
+        - ``grace_sec``：**记录更新时间**新于宽限期的视为"可能仍在飞"——另一个进程
+          里真在跑的任务其记录会被持续更新，不能因为"我这边刚启动"就把它标死
+          （本地跑测试、或第二个 server 实例都会构造 runtime）。
+        幂等：只处理状态在 live 集合里的记录。
+        """
+        live_statuses = {"running", "queued", "planned", "awaiting_approval"}
+        keep = {str(item) for item in (keep_run_ids or set()) if item}
+        changed = 0
+        now = time.time()
+        with self._lock:
+            for item in list(self._index.get("runs") or []):
+                run_id = str((item or {}).get("run_id") or "")
+                status = str((item or {}).get("status") or "").lower()
+                if not run_id or run_id in keep or status not in live_statuses:
+                    continue
+                if now - float((item or {}).get("updated_at") or 0.0) < max(0.0, float(grace_sec)):
+                    continue
+                record = self._read_record_unlocked(run_id)
+                if not record:
+                    continue
+                if now - float(record.get("updated_at") or 0.0) < max(0.0, float(grace_sec)):
+                    continue
+                record["status"] = "interrupted"
+                record["phase"] = "interrupted"
+                record["failure_reason"] = "任务进程已中断（服务重启或崩溃），未执行任何自动恢复。"
+                record["finished_at"] = record.get("finished_at") or now
+                record["updated_at"] = now
+                record["counters"] = self._counters(record)
+                self._write_record_unlocked(record)
+                self._upsert_index_unlocked(record)
+                changed += 1
+        return changed
+
+    def maybe_recover_interrupted(
+        self,
+        keep_run_ids: set[str] | None = None,
+        min_interval_sec: float = 20.0,
+    ) -> int:
+        """节流版的残留清扫：UI 轮询路径调用它，真正的扫描最多每 20s 一次。"""
+        now = time.time()
+        with self._lock:
+            if now - float(getattr(self, "_last_recovery_ts", 0.0)) < max(1.0, float(min_interval_sec)):
+                return 0
+            self._last_recovery_ts = now
+        return self.mark_running_as_interrupted(keep_run_ids=keep_run_ids)
+
     def record_event(self, event: dict[str, Any], default_run_id: str = "") -> None:
         data = event.get("data") if isinstance(event.get("data"), dict) else {}
         run_id = str(data.get("run_id") or default_run_id or "")
@@ -110,6 +171,10 @@ class TaskRunStore:
             self._upsert_index_unlocked(record)
 
     def snapshot(self, limit: int = 12) -> dict[str, Any]:
+        # UI 读列表前先做一次低频复扫：崩溃重启后那条记录的 updated_at 还很新
+        # （宽限期保护），启动时那一次清扫会跳过它；没有复扫它就会永远停在
+        # "运行中"，界面一直转圈。复扫有节流（默认 20s 一次），不会压在轮询路径上。
+        self.maybe_recover_interrupted()
         with self._lock:
             recent = list(self._index.get("runs", []))[:limit]
             total = int(self._index.get("total_runs", len(self._index.get("runs", []))))

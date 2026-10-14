@@ -189,26 +189,6 @@ TOOL_CARDS: dict[str, ToolCard] = {
         not_for="Geometric paths such as square/rectangle/orbit/circle/grid. Use drone_fly_path with explicit local NED waypoints instead.",
         risk="medium",
     ),
-    "drone_approach_target": ToolCard(
-        name="drone_approach_target",
-        purpose="Make one bounded forward step toward the currently centered/locked visual target.",
-        when_to_use=(
-            "确认目标且目标已在画面中央、需要靠近看细节时使用（视觉伺服式抵近）。"
-            "够近的判据是目标在画面里的大小，不是固定距离：目标高度占到画面 "
-            "min_fill（默认 25%）即认为能辨认特征，直接返回 reached。"
-            "目标未居中或感知无目标会拒绝执行；每次抵近后重新检测/确认再决定下一步。"
-        ),
-        inputs={
-            "min_fill": "目标高度占画面比例达到多少算够近，默认 0.25（越小越靠近）",
-            "step_m": "单步最大前进距离（米），限制 1~12，默认 12",
-            "standoff_m": "可选的绝对距离下限（米），0 = 不启用",
-        },
-        outputs="Approach step result with target_fill, estimated distance_m, target track_id, pixel offset ex, and new NED position.",
-        required_capabilities=["flight_control", "object_detection"],
-        preconditions=["connected", "target detected and horizontally centered"],
-        not_for="Blind movement when no target is locked, or approaching without re-checking afterwards.",
-        risk="medium",
-    ),
     "drone_fly_velocity": ToolCard(
         name="drone_fly_velocity",
         purpose="Command NED velocity for a duration or one control update.",
@@ -314,13 +294,17 @@ TOOL_CARDS: dict[str, ToolCard] = {
         purpose="Capture a camera image (saves to disk and returns image data).",
         when_to_use=(
             "只用于保存证据帧或操作员明确要求拍照。若要判断画面里有什么/目标是否存在或颜色，"
-            "请改用 airsim_detect_objects（结构化检测，首选）或 inspect_current_frame（视觉模型读图）；"
-            "纯文本推理循环无法直接阅读图像数据，反复拍照不会得到结论。"
+            "请改用 inspect_current_frame（把画面交给视觉模型读，纯文本循环无法直接阅读图像数据）。"
         ),
-        inputs={"camera_name": "Camera id", "image_type": "scene/depth/segmentation/infrared", "verify_target_class": "optional class"},
-        outputs="Image path/base64 and optional visual verification result.",
+        inputs={
+            "camera_name": "Camera id",
+            "image_type": "scene/depth/segmentation/infrared",
+            "auto_save": "是否保存到 captures 目录，默认 true",
+        },
+        outputs="Image path/base64（只取画面，不做任何识别）。",
         required_capabilities=["image_capture"],
         preconditions=["A camera source is configured and connected"],
+        not_for="别用它判断画面里有没有目标/是什么颜色——那是 inspect_current_frame（视觉模型）的工作。",
         cost="medium",
         risk="low",
     ),
@@ -334,27 +318,55 @@ TOOL_CARDS: dict[str, ToolCard] = {
     ),
     "airsim_get_depth_map": ToolCard(
         name="airsim_get_depth_map",
-        purpose="Read AirSim depth data for distance or obstacle reasoning.",
-        when_to_use="Before visual approach, obstacle reasoning, or depth-based verification.",
-        inputs={"camera_name": "Camera id", "query_points": "optional pixel points x,y;x,y"},
-        outputs="Depth summary and optional query distances.",
+        purpose="Read metric depth at one or more image points — the ruler of this system (there is no object detection).",
+        when_to_use=(
+            "把视觉模型给的位置变成米：先 inspect_current_frame 拿到目标的归一化点，"
+            "再用本工具读那一点的距离，然后才决定这一步走多远。也可以在同一目标附近"
+            "多取几个点做中位数（单像素深度容易落在物体边缘）：query_points=\"0.55,0.34;0.545,0.345;0.555,0.335\"。"
+            "前向移动之前尤其要先读一次——没有可信距离就不要移动。"
+        ),
+        inputs={
+            "camera_name": "相机ID，默认 \"0\"",
+            "query_points": (
+                "要测距的点，格式 \"x,y;x,y\"。**用归一化坐标 0~1**（视觉模型 bbox_hint 的 x/y 就是它）。"
+                "整数像素只有在你知道**深度图**分辨率时才用：深度图与彩色图分辨率不同，"
+                "把彩色图像素直接传进来不会报错，却会读到另一个位置，得到一个看起来正常的错误距离。"
+            ),
+            "return_vis": "是否附带深度可视化图 base64，默认 false",
+            "vehicle_name": "无人机名称，留空=默认机",
+        },
+        outputs="image_size(深度图分辨率) + 每个点的 distance_m；多点时另给 distance_median_m；天空/无命中会标 plausible=false。",
         required_capabilities=["depth_perception"],
         preconditions=["AirSim backend connected"],
-        cost="medium",
-    ),
-    "airsim_detect_objects": ToolCard(
-        name="airsim_detect_objects",
-        purpose="Run single-frame object detection and return structured results (class/confidence/bbox).",
-        when_to_use=(
-            "首选的目标确认方式：判断画面里有没有某类目标（car/person/truck 等）时直接调用，"
-            "返回结构化结果无需读图。检测到目标后：若任务不需要颜色/型号等语义属性，直接进入追踪；"
-            "若需要语义属性，再用视觉模型确认一次。"
-        ),
-        inputs={"target_class": "optional class such as car/person/truck", "confidence": "minimum confidence"},
-        outputs="Detected objects with class names and confidence scores.",
-        required_capabilities=["object_detection"],
-        preconditions=["A camera source / perception stream is available"],
+        not_for="不要用它去猜目标位置——点必须来自视觉模型或按画面量取；点错了得到的是那个点的距离。",
         cost="low",
+    ),
+    "airsim_locate_point": ToolCard(
+        name="airsim_locate_point",
+        purpose="Turn a NORMALISED image point into a metric distance and a world position (NED) using the depth image and the drone pose.",
+        when_to_use=(
+            "视觉模型给了目标位置（answer.target_candidates[].bbox_hint 的 x/y，归一化 0~1）之后，"
+            "用本工具把它变成可执行的量：距离（米）和世界坐标（NED）。需要朝目标飞（drone_fly_to）、"
+            "要记住目标位置、或要把目标与别处的坐标作比较时用它。只做单步相对靠近时可以直接用"
+            "airsim_get_depth_map 读距离，不必先算世界坐标。"
+        ),
+        inputs={
+            "x": "归一化横向坐标 0~1（0=最左，1=最右），来自视觉模型或按画面比例量取",
+            "y": "归一化纵向坐标 0~1（0=最上，1=最下）",
+            "w": "视觉模型给的归一化宽度（bbox_hint.w）。**建议传**：传了会做框内/框外深度交叉验证，并给出米制尺寸",
+            "h": "视觉模型给的归一化高度（bbox_hint.h）",
+            "vehicle_name": "无人机名称，留空=默认机",
+        },
+        outputs=(
+            "world_pos {x,y,z}(NED 米)、distance_m、depth_m、有效性与失败原因；传了 w/h 时另有 "
+            "surface_check（框内外深度对比：same_surface=画的是一整片连续表面、可能不是目标；"
+            "object_in_front=像独立物体）与 metric_size（按深度换算的米制尺寸，用于量级把关）。"
+        ),
+        required_capabilities=["depth_perception"],
+        preconditions=["AirSim 已连接", "该点上有有效深度（天空/过远处会返回 invalid）"],
+        not_for="目标点不确定时不要用它硬算坐标——点错位置得到的是那个位置的坐标，不是目标的。",
+        cost="low",
+        risk="low",
     ),
     "provider_bridge_health": ToolCard(
         name="provider_bridge_health",
@@ -474,47 +486,27 @@ TOOL_CARDS: dict[str, ToolCard] = {
         name="inspect_current_frame",
         purpose="Use the configured multimodal model to visually analyze the drone's current camera frame and answer a free-form question about it.",
         when_to_use=(
-            "涉及当前画面的语义判断时使用（画面里有什么、目标是什么颜色/类型、场景描述）。"
-            "这是昂贵的视觉模型调用：同一位置只调用一次；若回答因目标太远/太小而不确定，"
-            "不要重复调用，应当先抵近（drone_move_relative 向前或 drone_fly_to 靠近）再重新检测；"
-            "简单的是否存在某类目标优先用 airsim_detect_objects（结构化、低成本）。"
+            "涉及当前画面的语义判断时使用（画面里有什么、目标是什么颜色/类型/朝向、有没有<某个东西>）。"
+            "这是昂贵的视觉模型调用：同一位置只调用一次；回答含糊意味着距离或角度不对，"
+            "应当先靠近（drone_move_relative 向前）或转向（drone_rotate_to）再看，不要重复问。"
+            "回答里的 target_candidates[].bbox_hint {x,y,w,h} 是归一化的粗值：距离交给 "
+            "airsim_get_depth_map、世界坐标交给 airsim_locate_point，不要把它当精确测量。"
         ),
         inputs={"question": "natural language question about the current frame"},
-        outputs="Model answer text plus the YOLO detections on that frame.",
+        outputs="Model answer (summary, candidates with rough normalised bbox_hint, navigation hint).",
         required_capabilities=[],
         cost="high",
         risk="low",
     ),
     "perception_status": ToolCard(
         name="perception_status",
-        purpose="Read the perception axis state: health, detected targets, and recent perception events.",
+        purpose="Read camera/frame health: is the perception axis online, fps, how stale the frame is, and which view it is using.",
         when_to_use=(
-            "只读：查看感知服务是否在线、当前锁定/检测到哪些目标、最近的目标出现/丢失事件。"
-            "注意它**不做检测动作**——要主动识别画面里的目标必须调用 airsim_detect_objects，"
-            "perception_status 只读取后台持续检测的快照，不能替代检测。"
+            "只读：判断相机链路是否正常（`capture_age_s` 持续增大 = 画面不再更新，此时任何基于画面的"
+            "判断都不可信）；以及确认感知轴在看哪一路画面（view）。不含目标检测信息。"
         ),
-        inputs={"include_snapshot": "include current detection snapshot (default true)", "include_events": "include recent events (default true)", "limit": "event count limit"},
-        outputs="Perception health {online, fps, error} plus target snapshot and target_found/target_lost events.",
-        required_capabilities=[],
-        cost="low",
-        risk="low",
-    ),
-    "perception_start": ToolCard(
-        name="perception_start",
-        purpose="Start (or ensure) the background target-detection service and optionally set the target class.",
-        when_to_use="需要目标检测/跟踪但感知服务未在线时调用（后台持续检测 + 跟踪保持，Agent 只读结果）。也可用于切换检测类别。",
-        inputs={"target_class": "optional class such as car/person/truck"},
-        outputs="Service health plus started/online flags.",
-        required_capabilities=[],
-        cost="low",
-        risk="low",
-    ),
-    "perception_stop": ToolCard(
-        name="perception_stop",
-        purpose="Stop the background target-detection service.",
-        when_to_use="操作员要求停止检测/释放算力时调用。",
-        inputs={},
-        outputs="Confirmation that detection stopped.",
+        inputs={"include_events": "include recent camera/link events (default true)", "limit": "event count limit"},
+        outputs="Camera health {online, fps, capture_age_s, view, frame size} plus recent events.",
         required_capabilities=[],
         cost="low",
         risk="low",

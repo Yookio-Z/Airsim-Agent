@@ -346,7 +346,6 @@ FLIGHT_TOOL_CONSTRAINTS: dict[str, dict[str, dict[str, Any]]] = {
     "airsim_take_photo": {
         "image_type": {"type": "string", "enum": ["scene", "depth", "segmentation"]},
         "auto_save": {"type": "boolean"},
-        "verify_target_class": {"type": "string"},
     },
     "airsim_get_depth_map": {
         "camera_name": {"type": "string"},

@@ -30,20 +30,74 @@ class EventsMixin:
     """Runtime methods for this domain; assembled into AgentRuntime in runtime.py."""
 
 
-    def _close_pending_reasoning(self, run: RunState, action: str = "") -> None:
+    def _close_pending_reasoning(
+        self,
+        run: RunState,
+        action: str = "",
+        params: dict[str, Any] | None = None,
+    ) -> None:
+        """收尾本轮"等待模型回复"的占位行。
+
+        模型没给正文时**不删行、也不编思考**：改成一行"模型决策"，
+        正文是它实际做过的选择（工具名 + 参数）——这是模型真实输出的一部分，
+        操作员本来就应该看得到（实测反馈："只要请求了模型就一定会收到信息，
+        为什么不能显示"）。参数是模型自己算出来的数值，不是我们补的话术。
+        """
         with self._lock:
             for item in reversed(run.process_trace):
-                if item.get("kind") == "reasoning" and item.get("status") == "running":
+                if item.get("kind") in {"reasoning", "pending", "decision"} and item.get("status") == "running":
                     item["status"] = "completed"
                     body = str(item.get("body") or "").strip()
-                    if not body or body in self._PENDING_REASONING_PLACEHOLDERS:
-                        item["body"] = (
-                            f"本轮模型未输出思考文本，直接调用 {action}。" if action else "本轮模型未输出思考文本。"
-                        )
+                    if item.get("kind") == "pending" or not body or body in self._PENDING_REASONING_PLACEHOLDERS:
+                        decision_line = self._decision_line(action, params)
+                        if decision_line:
+                            item["kind"] = "decision"
+                            item["title"] = "模型决策"
+                            item["body"] = decision_line
+                        else:
+                            run.process_trace.remove(item)
+                    elif item.get("kind") == "pending":
+                        run.process_trace.remove(item)
                     break
+
+    @staticmethod
+    def _decision_line(action: str, params: dict[str, Any] | None) -> str:
+        """把一次工具调用写成一行可读的决策：调用 drone_move_relative(forward_m=3.0)。"""
+        name = str(action or "").strip()
+        if not name:
+            return ""
+        shown = params if isinstance(params, dict) else {}
+        if shown:
+            try:
+                import json as _json
+
+                rendered = _json.dumps(shown, ensure_ascii=False, default=str)
+            except Exception:
+                rendered = str(shown)
+            return f"调用 {name}({rendered[:200]})"
+        return f"调用 {name}"
 
     def _on_agent_event(self, level: str, source: str, message: str, data: dict[str, Any]) -> None:
         self._append_event(level, source, message, data)
+        # 运行时的"交回模型 / 偏离计划 / 目标还远不收敛"这类决定必须出现在操作员
+        # 真正读的那条时间线上，而不是只躺在事件流水面板里：看不到这一行，操作员
+        # 只会觉得"Agent 没按计划走、也不说为什么"。
+        if str((data or {}).get("kind") or "") == "replan" and self._current is not None:
+            run = self._current
+            with self._lock:
+                run.process_trace.append({
+                    "timestamp": time.time(),
+                    # 标题用操作员看得懂的话，不用内部术语。"运行时守卫"这种说法
+                    # 操作员反馈过"这是个啥"，界面上也已经把这一类的标签统一成
+                    # "系统自动处理"。
+                    "title": "系统自动处理",
+                    "body": self._compact_process_text(str(message or "")),
+                    "status": "completed",
+                    "tool": "",
+                    "params": {},
+                    "kind": "guard",
+                })
+                run.process_trace = run.process_trace[-80:]
         # ReAct 每步决策的推理（reasoning_content）追加进当前消息的
         # reasoning_text——前端思考块一个折叠块看全程思考
         if source == "model_reasoning" and self._current is not None:
@@ -79,7 +133,7 @@ class EventsMixin:
                 last_item = run.process_trace[-1] if run.process_trace else None
                 same_round = bool(
                     last_item is not None
-                    and last_item.get("kind") == "reasoning"
+                    and last_item.get("kind") in {"reasoning", "pending"}
                     and last_item.get("status") == "running"
                 )
                 prev_round = str(run.agent_state.get("_round_reasoning") or "") if same_round else ""
@@ -87,6 +141,11 @@ class EventsMixin:
                 run.agent_state["_round_reasoning"] = round_text[:6000]
                 round_body = self._strip_plan_json_draft(round_text) or message
                 if same_round:
+                    # 真实思考文本到了：把"等待模型回复"的占位行升格成模型思考行。
+                    # 占位行本身不写任何编造文本（操作员明确要求过），所以升格要
+                    # 同时换掉 kind 与标题，否则占位符会一直显示成"等待模型回复"。
+                    last_item["kind"] = "reasoning"
+                    last_item["title"] = "模型思考"
                     last_item["body"] = self._compact_process_text(round_body)
                     last_item["timestamp"] = time.time()
                 else:
@@ -848,14 +907,18 @@ class EventsMixin:
         同名工具重复出现或走批量执行时可能漏配）。
         """
         terminal_ok = run.status in {"completed", "planned"}
+        drop: list[dict[str, Any]] = []
         for item in run.process_trace:
             if item.get("status") == "running":
                 item["status"] = "completed" if terminal_ok else "failed"
                 body = str(item.get("body") or "").strip()
-                if not body:
+                if item.get("kind") in {"pending", "reasoning"} and (
+                    not body or body in self._PENDING_REASONING_PLACEHOLDERS
+                ):
+                    # 占位/等待行只是进行中的指示器；这一轮没有任何真实思考文本时
+                    # 直接摘掉，不留"模型思考"的空壳。
+                    drop.append(item)
+                elif not body:
                     item["body"] = "已结束"
-                elif item.get("kind") == "reasoning" and body in self._PENDING_REASONING_PLACEHOLDERS:
-                    # 循环在"结果回来、模型刚准备想下一步"这一拍收敛时，占位行
-                    # 来不及被决策收尾，会以"正在选择下一步动作"的样子留在
-                    # 时间线上冒充思考内容。
-                    item["body"] = "本轮模型未输出思考文本。"
+        for item in drop:
+            run.process_trace.remove(item)

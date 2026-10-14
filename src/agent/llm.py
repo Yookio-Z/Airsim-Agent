@@ -787,6 +787,102 @@ def _finite_float(value: Any) -> float | None:
     return number if math.isfinite(number) else None
 
 
+def _unit_or_none(value: Any) -> float | None:
+    """归一化尺寸字段（bbox_hint 的 w/h）：0~1 之外或非数字一律当"没给"。
+
+    视觉模型回的尺寸是粗值，但"粗"不等于"可以随便"：负数、百分比写法、超界
+    的值都是解析错误而不是"大目标"，直接丢掉比传下去安全。
+    """
+    number = _finite_float(value)
+    if number is None or number <= 0.0:
+        return None
+    return round(min(1.0, number), 3)
+
+
+# 轨迹摘要保留的步数上限（一行一步，最老的先丢）。见 _steps_digest。
+_STEPS_DIGEST_LIMIT = 24
+
+# 摘要里值得留的"关键数值"字段：距离 / 坐标 / 成败 / 状态。其余（图片、逐点深度
+# 数组、原始结构）对"下一步做什么"没有价值。
+_DIGEST_VALUE_KEYS = (
+    "distance_median_m",
+    "depth_m",
+    "world_pos",
+    "target_found",
+    "status",
+    "message",
+    "reached",
+)
+
+
+def _steps_digest(results: list[Any], limit: int = _STEPS_DIGEST_LIMIT) -> list[str]:
+    """把已执行的每一步压成一行：`序号. 工具 ok (参数; 关键数值)`。
+
+    循环模型每轮都要知道"前面做过什么"，而完整结果会随步数线性膨胀。这里只留
+    工具名、成败、至多两个入参和两个关键数值；图片与大字结构一律不进摘要（最近
+    几步的完整形状由 ``_compact_loop_result`` 单独负责）。这是 Pi Harness 的
+    "压缩成摘要而不是丢掉历史"在无 LLM 条件下的确定性版本。
+
+    ``limit`` 由调用方按上下文压力给（见 ``_compact_loop_state`` 的 tight 模式）。
+    """
+    lines: list[str] = []
+    for index, row in enumerate(results or [], 1):
+        if not isinstance(row, dict):
+            continue
+        tool = str(row.get("tool") or "?")
+        ok = "ok" if row.get("ok") else "FAIL"
+        data = row.get("data") if isinstance(row.get("data"), dict) else {}
+        bits: list[str] = []
+        params = row.get("params") if isinstance(row.get("params"), dict) else {}
+        if params:
+            shown = {key: params[key] for key in list(params)[:2]}
+            bits.append(f"params={json.dumps(shown, ensure_ascii=False, default=str)[:44]}")
+        for key in _DIGEST_VALUE_KEYS:
+            value = data.get(key)
+            if value in (None, "", [], {}):
+                continue
+            text = json.dumps(value, ensure_ascii=False, default=str)
+            bits.append(f"{key}={text[:44]}")
+            if len(bits) >= 3:
+                break
+        lines.append(f"{index}. {tool} {ok}" + (f" ({'; '.join(bits)})" if bits else ""))
+    return lines[-max(1, int(limit)):]
+
+
+# 上下文吃紧时的收紧档：摘要行数与完整结果条数都减半再减半。
+_STEPS_DIGEST_TIGHT_LIMIT = 8
+_RECENT_RESULTS_DEFAULT = 3
+_RECENT_RESULTS_TIGHT = 1
+
+# 上下文压力阈值：上一轮 provider 报的用量超过窗口这个比例，就切到收紧档，
+# 并让运行层发一条可见事件（Pi 的 shouldCompact 的确定性版本：只压缩，不调模型）。
+_CONTEXT_PRESSURE_RATIO = 0.7
+
+# "任务类型"过滤的安全边界：这些工具与链路/安全/基本机动有关，任何任务都保留。
+# 其余工具只在"被技能声明或被实际用过"时才进提示词（见 _relevant_tool_cards）。
+_ALWAYS_AVAILABLE_TOOLS = {
+    "drone_connect",
+    "drone_get_status",
+    "drone_arm",
+    "drone_takeoff",
+    "drone_land",
+    "drone_hover",
+    "drone_move_relative",
+    "drone_rotate_to",
+    "drone_fly_to",
+    "drone_fly_path",
+    "drone_fly_velocity",
+    "drone_release_yaw",
+    "airsim_take_photo",
+    "airsim_get_depth_map",
+    "airsim_locate_point",
+    "inspect_current_frame",
+    "perception_status",
+    "memory_recall",
+    "memory_remember",
+}
+
+
 def _extract_json(text: str) -> str:
     """从模型回复里取出 JSON 主体。
 
@@ -1010,7 +1106,15 @@ class OpenAIClient:
         # 推理模型的思考内容（DeepSeek reasoning_content）透出到 client 属性，
         # 供流式回退路径也能把思考归档进前端思考块
         message = ((response.get("choices") or [{}])[0].get("message")) or {}
-        self.last_reasoning = str(message.get("reasoning_content") or "")
+        # 推理内容在不同网关下的字段名不一样：DeepSeek 风格是 reasoning_content，
+        # 另一些是 reasoning / thinking。只认一个名字的后果是"模型明明想了，界面
+        # 一片空白"（实测反馈）。三个都读。
+        self.last_reasoning = str(
+            message.get("reasoning_content")
+            or message.get("reasoning")
+            or message.get("thinking")
+            or ""
+        )
         content = self._first_content(response)
         if not content:
             raise RuntimeError("LLM returned empty content")
@@ -1059,7 +1163,15 @@ class OpenAIClient:
         # DeepSeek-style reasoning models return chain-of-thought alongside
         # tool calls; surface it so the agent loop can show the decision
         # rationale in the operator's event stream
-        self.last_reasoning = str(message.get("reasoning_content") or "")
+        # 推理内容在不同网关下的字段名不一样：DeepSeek 风格是 reasoning_content，
+        # 另一些是 reasoning / thinking。只认一个名字的后果是"模型明明想了，界面
+        # 一片空白"（实测反馈）。三个都读。
+        self.last_reasoning = str(
+            message.get("reasoning_content")
+            or message.get("reasoning")
+            or message.get("thinking")
+            or ""
+        )
         tool_calls: list[dict[str, Any]] = []
         for call in message.get("tool_calls") or []:
             if not isinstance(call, dict):
@@ -1420,8 +1532,22 @@ class LLMUnavailableError(RuntimeError):
     """Raised when an interactive chat request cannot reach the selected model."""
 
 
+class LLMEmptyResponseError(LLMUnavailableError):
+    """模型返回了空回复：既没有内容，也没有工具调用。
+
+    单独成一个类型，是为了让调用方**重试**它：这类空回复多为瞬时（内容过滤、
+    首 token 前截断、服务端抖动），和"key 没配 / 模型不存在"这类持久故障不同。
+    实测教训：一次空回复在没有重试的情况下直接把一次已经起飞的悬停任务送进了
+    失败流程并降落。
+    """
+
+
 class LLMMissionPlanner:
     """LLM-first planner with rule-based fallback and per-request model selection."""
+
+    # 空回复（既无内容也无工具调用）的重试次数，见 _native_decision 与
+    # LLMEmptyResponseError。
+    _NATIVE_EMPTY_RETRIES = 2
 
     def __init__(self, config: LLMConfig | None = None, registry: ModelRegistry | None = None) -> None:
         self.registry = registry or ModelRegistry()
@@ -1430,6 +1556,9 @@ class LLMMissionPlanner:
         self.last_error = ""
         self.last_usage: dict[str, Any] = {}
         self.token_meter = TokenMeter()
+        # 上下文压力（上一轮实测 prompt 用量超窗口阈值）：非空时说明本轮已切到
+        # 收紧档，运行层据此发一条可见事件，见 _context_pressure()。
+        self.last_context_pressure: dict[str, Any] | None = None
 
     def reload_config(self) -> None:
         self.registry = ModelRegistry()
@@ -1768,16 +1897,34 @@ class LLMMissionPlanner:
 
         prompt = system_prompt or self._loop_decision_system_prompt()
         images = self._image_attachments(attachments)
+        # 原生工具调用模式：工具名/描述/参数 schema 已经由 API 的 tools 参数下发，
+        # 再塞一份完整的 available_tool_cards（实测 ~5.8k tokens/轮）是纯重复。
+        # 这符合"能力声明只发一次、历史才需要压缩"的原则（借 Pi Harness 的上下文
+        # 设计）。JSON 模式下 tools 参数不可用，仍需要精简过的卡片。
+        native = self._config_native_tools(config)
+        # 上下文压力（上一轮实测用量）+ 按任务类型收窄的提示词卡片。
+        # 注意 allowed_tools 仍是**全量**卡片算出来的（见上方注释）：收窄只影响
+        # 菜单，不影响"模型叫得出名字就允许执行"。
+        tight, pressure = self._context_pressure(config)
+        self.last_context_pressure = pressure or None
+        prompt_cards = self._relevant_tool_cards(tool_cards, loop_state)
         sections = [
             {"key": "operator_command", "value": command, "priority": "command"},
             {"key": "output_schema", "value": json.dumps(self._loop_decision_schema_hint(), ensure_ascii=False, default=str), "priority": "command"},
             {"key": "observation", "value": self._dumps_safe(self._compact_observation(observation)), "priority": "observation"},
             {"key": "backend_capabilities", "value": self._dumps_safe(capabilities or {}), "priority": "observation"},
-            {"key": "loop_state", "value": self._dumps_safe(self._compact_loop_state(loop_state)), "priority": "recent"},
-            {"key": "available_tool_cards", "value": self._dumps_safe(self._compact_tool_cards(tool_cards)), "priority": "tool_cards"},
-            {"key": "skill_guidance", "value": json.dumps(self._compact_skill_guidance(skill_guidance or []), ensure_ascii=False, default=str), "priority": "guidance"},
-            {"key": "memory_snapshot", "value": json.dumps(self._compact_memory(memory), ensure_ascii=False, default=str), "priority": "memory"},
+            {"key": "loop_state", "value": self._dumps_safe(self._compact_loop_state(loop_state, tight=tight)), "priority": "recent"},
         ]
+        if not native:
+            sections.append(
+                {"key": "available_tool_cards", "value": self._dumps_safe(self._compact_tool_cards(prompt_cards)), "priority": "tool_cards"}
+            )
+        sections.extend(
+            [
+                {"key": "skill_guidance", "value": json.dumps(self._compact_skill_guidance(skill_guidance or []), ensure_ascii=False, default=str), "priority": "guidance"},
+                {"key": "memory_snapshot", "value": json.dumps(self._compact_memory(memory), ensure_ascii=False, default=str), "priority": "memory"},
+            ]
+        )
         if conversation_context:
             sections.append(
                 {
@@ -1814,8 +1961,7 @@ class LLMMissionPlanner:
                 decision.reflection = f"LLM fallback: {message}"
             return decision
 
-        native = self._config_native_tools(config)
-        openai_tools = self._loop_tool_schemas(tool_cards, tools) if native else []
+        openai_tools = self._loop_tool_schemas(prompt_cards, tools) if native else []
         if native and openai_tools:
             try:
                 decision = self._native_decision(config, build_messages(1.0), openai_tools, allowed_tools)
@@ -1953,13 +2099,24 @@ class LLMMissionPlanner:
             tools_payload = openai_tools_to_anthropic(openai_tools)
         else:
             tools_payload = openai_tools
-        tool_calls, text, usage = client.chat_tools(messages, tools_payload)
-        # surface the model's decision rationale (reasoning_content) for the
-        # operator's event stream
-        self.last_reasoning = str(getattr(client, "last_reasoning", "") or "")
-        self.last_error = ""
-        self.last_usage = usage
-        return self._decision_from_tool_calls(tool_calls, text, allowed_tools)
+        # 空回复重试：模型偶发"既无内容也无工具调用"（内容过滤/首 token 截断/抖动）。
+        # 一次就判失败会把已经起飞的任务直接推进失败流程——重试两次再放弃。
+        for attempt in range(self._NATIVE_EMPTY_RETRIES + 1):
+            tool_calls, text, usage = client.chat_tools(messages, tools_payload)
+            # surface the model's decision rationale (reasoning_content) for the
+            # operator's event stream
+            self.last_reasoning = str(getattr(client, "last_reasoning", "") or "")
+            self.last_usage = usage
+            try:
+                decision = self._decision_from_tool_calls(tool_calls, text, allowed_tools)
+            except LLMEmptyResponseError:
+                if attempt >= self._NATIVE_EMPTY_RETRIES:
+                    raise
+                self.last_error = f"empty response, retry {attempt + 1}/{self._NATIVE_EMPTY_RETRIES}"
+                continue
+            self.last_error = ""
+            return decision
+        raise LLMEmptyResponseError("native tool-calling model returned an empty response (no content, no tool calls)")
 
     def _decision_from_tool_calls(
         self,
@@ -1979,9 +2136,11 @@ class LLMMissionPlanner:
             # 而一个动作都没执行过。有文字说明才接受隐式完成。
             summary = (text or "").strip()
             if not summary:
-                raise LLMUnavailableError(
-                    "native tool-calling model returned an empty response "
-                    "(no content, no tool calls)"
+                raise LLMEmptyResponseError(
+                    "模型返回了空回复（没有内容、也没有工具调用），已自动重试仍为空。"
+                    "这通常是内容过滤、首 token 前截断或模型服务抖动——请重试；"
+                    "若持续出现，检查该模型服务是否可用。"
+                    " [native tool-calling model returned an empty response (no content, no tool calls)]"
                 )
             return LoopDecision(action="", reason=summary, is_complete=True)
         decisions: list[LoopDecision] = []
@@ -2029,15 +2188,17 @@ class LLMMissionPlanner:
         context: dict[str, Any] | None = None,
         model_id: str | None = None,
     ) -> dict[str, Any]:
-        """Use the selected multimodal model to verify a target in one image."""
+        """Use the configured model to verify a target in one image.
+
+        与规划同一个模型：调用方传当前任务的 model_id，不能留空去回落默认值。
+        """
         config = self._resolve_config(model_id)
         if not self._enabled(config):
             message = self._chat_unavailable_message(config, "missing_api_key")
             self.last_error = message
             raise LLMUnavailableError(message)
         if not self._config_supports_multimodal(config):
-            model_name = str(config.get("name") or config.get("model") or config.get("id") or "当前模型")
-            message = f"模型不可用：{model_name} 未启用多模态能力，无法进行图像目标确认。"
+            message = self._multimodal_required_message(config, "进行图像目标确认")
             self.last_error = message
             raise LLMUnavailableError(message)
 
@@ -2051,7 +2212,7 @@ class LLMMissionPlanner:
                 "target_label": "short label for the observed target or empty",
                 "evidence": ["short visible evidence from the image"],
                 "relative_direction": "center/left/right/top/bottom/top-left/top-right/bottom-left/bottom-right/unknown",
-                "bbox_hint": {"x": "rough 0..1 center x or null", "y": "rough 0..1 center y or null"},
+                "bbox_hint": {"x": "rough 0..1 center x or null", "y": "rough 0..1 center y or null", "w": "rough 0..1 object width or null", "h": "rough 0..1 object height or null"},
                 "recommended_next_action": "continue_search|approach|hold|reposition|insufficient_image",
                 "summary_zh": "one concise Chinese sentence for the operator",
             },
@@ -2063,6 +2224,8 @@ class LLMMissionPlanner:
                     "你是无人机视觉任务的多模态目标确认器。"
                     "只根据图片和给定上下文判断目标是否可见，不要编造传感器数据或飞控状态。"
                     "如果目标只是可能存在但不清楚，target_found=false 或 confidence<0.6。"
+                    "bbox_hint 的 x/y（目标中心）与 w/h（目标宽高占画面的比例）都要给出，"
+                    "归一化 0~1、粗估即可——它们会被用来算距离和朝向，缺失会让后续动作无法执行。"
                     "返回 JSON only。"
                 ),
             },
@@ -2096,15 +2259,17 @@ class LLMMissionPlanner:
         context: dict[str, Any] | None = None,
         model_id: str | None = None,
     ) -> dict[str, Any]:
-        """Use the selected multimodal model for open-ended image understanding."""
+        """Use the configured model for open-ended image understanding.
+
+        规划与看图共用同一个模型：调用方必须传当前任务的 model_id。
+        """
         config = self._resolve_config(model_id)
         if not self._enabled(config):
             message = self._chat_unavailable_message(config, "missing_api_key")
             self.last_error = message
             raise LLMUnavailableError(message)
         if not self._config_supports_multimodal(config):
-            model_name = str(config.get("name") or config.get("model") or config.get("id") or "current model")
-            message = f"模型不可用：{model_name} 未启用多模态能力，无法分析图像。"
+            message = self._multimodal_required_message(config, "分析图像")
             self.last_error = message
             raise LLMUnavailableError(message)
 
@@ -2120,7 +2285,7 @@ class LLMMissionPlanner:
                         "label": "candidate object label",
                         "confidence": "number 0..1",
                         "relative_direction": "center/left/right/top/bottom/top-left/top-right/bottom-left/bottom-right/unknown",
-                        "bbox_hint": {"x": "rough 0..1 center x or null", "y": "rough 0..1 center y or null"},
+                        "bbox_hint": {"x": "rough 0..1 center x or null", "y": "rough 0..1 center y or null", "w": "rough 0..1 object width or null", "h": "rough 0..1 object height or null"},
                         "evidence": "short visible evidence",
                     }
                 ],
@@ -2138,7 +2303,10 @@ class LLMMissionPlanner:
                     "Return ONE JSON object with these exact top-level keys: "
                     "summary_zh, visible_objects, target_candidates, navigation_hint, safety_notes. "
                     "Do NOT echo the request payload and do NOT wrap the answer in output_schema/context; "
-                    "put your Chinese operator-facing answer directly in summary_zh. Return JSON only."
+                    "put your Chinese operator-facing answer directly in summary_zh. "
+                    "For every target candidate give bbox_hint x/y (centre) AND w/h (object width/height as a "
+                    "fraction of the frame), normalised 0..1 — rough is fine, they are used to compute distance "
+                    "and heading, and a missing size makes the next move impossible to size. Return JSON only."
                 ),
             },
             {
@@ -2554,12 +2722,16 @@ class LLMMissionPlanner:
                 "such as takeoff -> waypoints -> land."
             ),
             "keep_reacting": (
-                "true only when the task has no natural stopping point after the "
-                "listed steps — continuous tracking, shadowing, or keeping a "
-                "target locked until the operator says otherwise. One-shot tasks "
-                "(take a photo, fly to a point, inspect and report, approach and "
-                "confirm) are false: the runtime should converge once the steps "
-                "are done."
+                "true when the task has no natural stopping point after the listed "
+                "steps — continuous tracking, shadowing, keeping a target locked "
+                "until the operator says otherwise, OR when the operator's stopping "
+                "condition is a QUALITY judged from fresh observations rather than "
+                "a step count (\"直到满意\", \"够近为止\", \"看清楚为止\", \"一直盯着\", "
+                "\"反复检查直到...\"). In that case list the first cycle of steps and "
+                "set keep_reacting=true: the model keeps observing and acting until it "
+                "judges the condition met, then reports. One-shot tasks (take a photo, "
+                "fly to a point, inspect once and report, a single approach-and-confirm "
+                "pass) are false: the runtime should converge once the steps are done."
             ),
             "steps": [
                 {
@@ -2569,7 +2741,7 @@ class LLMMissionPlanner:
                     "params": {"name": "value"},
                     "needs_observation": (
                         "true when this step's result must be observed before "
-                        "the next step can be chosen (photo/VLM/detect steps)"
+                        "the next step can be chosen (photo/VLM steps)"
                     ),
                 }
             ],
@@ -2581,10 +2753,43 @@ class LLMMissionPlanner:
             "At each step, choose exactly one next tool action, or mark the task complete after the latest observation proves the goal is handled. "
             "CORRECTION DISCIPLINE: when entering a correction loop, FIRST read the current vehicle status (drone_get_status) and verify from the observation whether the goal action actually failed — never blindly repeat an action that the previous step already reported as completed (e.g. landing completed means the vehicle is on the ground; calling land again is wrong). If the observation shows the goal is already satisfied, mark is_complete=true instead of re-executing. "
             "NEVER declare is_complete=true while any planned motion step (takeoff/hover/move/fly/land/rotate) is still failed or unexecuted from a previous attempt: you must first successfully re-execute that action (fixing its cause first, e.g. climb to the safe altitude before a blocked horizontal move), or prove with fresh drone_get_status telemetry that the target state is genuinely reached. Declaring the task complete while a goal motion is still missing is a hard error and the run will be marked failed. "
-            "You may additionally batch up to 2 independent read-only tool calls (drone_get_status, drone_list_vehicles, drone_get_mission_progress, airsim_take_photo, airsim_get_sensors, airsim_get_depth_map, inspect_current_frame) "
+            "You may additionally batch up to 2 independent read-only tool calls (drone_get_status, drone_list_vehicles, drone_get_mission_progress, airsim_take_photo, airsim_get_sensors, airsim_get_depth_map, airsim_locate_point, inspect_current_frame, perception_status) "
             "in the 'actions' array (JSON mode) or as extra tool calls (native mode). "
             "Never place flight-control tools (arm, disarm, takeoff, land, hover, fly, move, rotate, set_mode, mission upload/start) in that batch — one flight tool per turn. "
-            "Use only available_tool_cards. Do not call unavailable tools. "
+            "TOOL SELECTION — pick by what you already know, not by habit. There is NO object detection in this system: semantics come from the "
+            "vision model, metric distance from the depth image. To go to something you can see: (1) inspect_current_frame once — read the "
+            "normalised point (and rough size) of the target from answer.target_candidates[].bbox_hint; (2) airsim_get_depth_map at that point "
+            "for the metric distance (when you also need the target's world position, use airsim_locate_point and PASS the "
+            "rough w/h — it cross-checks the box against the depth image: same_surface means you drew a continuous surface, "
+            "not an object, so do not fly there); (3) drone_rotate_to to centre it if |x-0.5| > 0.15 (Δheading ≈ (x-0.5)×90°); (4) drone_move_relative for ONE "
+            "step SIZED FROM THAT DISTANCE — forward ≈ Z×0.97 − 2 m standoff, capped at 12 m and at one third of the remaining distance while the "
+            "target is still small in frame; never a fixed number of metres — then re-check (distance drops as you close in, so the step shrinks by "
+            "itself; stop at the standoff). Use airsim_locate_point when you need the target's absolute NED position (to drone_fly_to it, or "
+            "to remember where it is); local NED coordinate already known → drone_fly_to; only the heading matters → drone_rotate_to; a waypoint "
+            "sequence → drone_fly_path; keep 2-3 m altitude for close-range work. Before ANY forward move toward a target, read depth again: a "
+            "missing or implausible depth reading means do not move. "
+            "NEVER drone_fly_to a coordinate you derived from a single depth point on a small target: that point is often the "
+            "GROUND or the background in front of it (measured: a 9-degrees-down ray hit the road 30 m away, not the car) — flying "
+            "there overshoots the target and it leaves the frame. Close in with bounded drone_move_relative steps and re-check; if you "
+            "do use drone_fly_to, stop SHORT of the target (>= 2 m standoff) and keep it in frame. After losing the target, turn back "
+            "toward its last known position before looking again. "
+            "STOPPING CRITERION for approach tasks: you are done closing in once the target's normalised height h ≥ 0.25 "
+            "(a quarter of the frame) or the depth says ≤ ~2 m standoff — then drone_hover and report. Do NOT keep creeping "
+            "closer: the runtime refuses further approach steps after that, and a target that fills the whole frame is no longer "
+            "usable for identification. "
+            "PROVENANCE: your own position/heading/attitude come from the flight controller telemetry, not from vision — use them "
+            "freely. A target's world_pos from airsim_locate_point is an ESTIMATE (one depth ray + your pose), not a sensor fix: "
+            "treat it as approximate, never fly straight at it, and always keep visual confirmation as the authority. "
+            "NEVER repeat a call that was just refused with a precondition error — the error text names what to fix; do that instead. "
+            "Never treat a single vision-model answer as a measurement: its point is rough and its size is ±30%; one look per position, and if the "
+            "answer is vague, move or turn rather than asking again. "
+            "STOPPING CRITERION IS PART OF THE PLAN: in goal.success_criteria declare the machine-checkable criterion "
+            "the runtime should stop at, with numbers. Examples: \"靠近后悬停\" → {\"metric\": \"target_fill\", \"min_fill\": 0.25} "
+            "or {\"metric\": \"target_distance\", \"max_m\": 3.0}; \"降落在 H 点上\" → {\"metric\": \"position_reached\", \"x\": …, \"y\": …, "
+            "\"z\": -3.0, \"tolerance\": 0.5} plus {\"metric\": \"landed\"}; 定点悬停 → {\"metric\": \"flying_at\", \"altitude\": 3.0}. "
+            "If you declare nothing, the runtime falls back to a task-type default (approach tasks: target fills ≥25% of the "
+            "frame). Declaring it is how the operator gets a criterion that matches THIS task. "
+            "Use only the tools provided to you (the native tool list, or available_tool_cards in JSON mode). Do not call unavailable tools. "
             "Parse the operator's full instruction yourself, including multi-step Chinese or English commands. Do not rely on keyword routing. "
             "Never bypass safety, never invent telemetry, and do not perform low-level continuous control. "
             "skill_guidance is a CATALOG of skills: each entry has a name and a description saying what it covers and when to use it. It teaches how to work; a catalog entry is not itself an action. "
@@ -2700,7 +2905,17 @@ class LLMMissionPlanner:
             decision.parallel_actions = [item.to_dict() for item in extras]
         return decision
 
-    def _compact_loop_state(self, loop_state: dict[str, Any]) -> dict[str, Any]:
+    def _compact_loop_state(self, loop_state: dict[str, Any], tight: bool = False) -> dict[str, Any]:
+        # 工具结果里可能带着整张图的 base64（拍照 1.2MB ≈ 30 万 token）。以前这里
+        # 只做"深度上限"的安全拷贝，不做图片裁剪，于是 loop_state 一节把整份预算
+        # 吃光：ContextBudget 截断后，available_tool_cards / skill_guidance /
+        # memory_snapshot 全变成 "[omitted]"——恰好是模型必须选下一步动作的那一轮。
+        # 观察一节（_compact_observation）早就有这个裁剪，这里补齐同一套。
+        #
+        # ``tight``：上下文压力档（上一轮用量超过窗口 70%）。摘要与完整结果的条数
+        # 同时收缩——这是"自动压缩"的确定性版本，见 _context_pressure()。
+        digest_limit = _STEPS_DIGEST_TIGHT_LIMIT if tight else _STEPS_DIGEST_LIMIT
+        recent_limit = _RECENT_RESULTS_TIGHT if tight else _RECENT_RESULTS_DEFAULT
         return {
             "run_id": loop_state.get("run_id", ""),
             "status": loop_state.get("status", ""),
@@ -2709,10 +2924,89 @@ class LLMMissionPlanner:
             # world_state/感知快照等），直接交给 json.dumps 会抛
             # "Circular reference detected" 把整个 run 打断。这里先做有深度
             # 上限的安全拷贝再放进提示词。
-            "recent_decisions": self._safe_payload((loop_state.get("decisions") or [])[-5:]),
-            "recent_results": self._safe_payload((loop_state.get("results") or [])[-5:]),
+            "recent_decisions": self._safe_payload((loop_state.get("decisions") or [])[-4:]),
+            # 轨迹摘要：每步一行（工具、成败、一个关键数值），最老的先丢。
+            # 借 Pi Harness 的做法——历史不该被"丢掉"或原样重发，而是压缩成摘要：
+            # 循环到第 20 步时模型仍需要知道前面做过什么，但不需要每步的完整返回。
+            "steps_digest": _steps_digest(loop_state.get("results") or [], limit=digest_limit),
+            "recent_results": [
+                self._compact_loop_result(row) for row in (loop_state.get("results") or [])[-recent_limit:]
+            ],
             "failure_reason": loop_state.get("failure_reason", ""),
         }
+
+    def _context_pressure(self, config: dict[str, Any]) -> tuple[bool, dict[str, Any]]:
+        """上下文压力 → (是否收紧, 说明)。
+
+        用的是 **provider 报的**上一轮 prompt 用量，而不是我们自己估的"这次要发多少"：
+        报的值包含我们看不到的部分（工具 schema、服务端包装），更接近真相——这正是
+        Pi Harness 的 estimateContextTokens 思路（usage + 尾部估算）。
+        超过窗口 ``_CONTEXT_PRESSURE_RATIO`` 时切收紧档：摘要与完整结果条数同时收缩，
+        并把这件事交给运行层发事件（压缩必须是可见的，否则下次又变成"莫名其妙变慢"）。
+        """
+        try:
+            window = int(self._context_budget(config).context_window)
+        except Exception:
+            window = 64000
+        used = int((self.last_usage or {}).get("prompt_tokens") or 0)
+        if window <= 0 or used <= 0:
+            return False, {}
+        ratio = used / window
+        if ratio < _CONTEXT_PRESSURE_RATIO:
+            return False, {}
+        return True, {"prompt_tokens": used, "context_window": window, "ratio": round(ratio, 2)}
+
+    def _relevant_tool_cards(
+        self,
+        cards: list[dict[str, Any]],
+        loop_state: dict[str, Any],
+    ) -> list[dict[str, Any]]:
+        """按"任务类型"收窄进提示词的工具卡片（保守版）。
+
+        任务类型的信号是**被激活过的技能**：技能声明了自己的 `subtools`，那就是这类
+        任务需要的工具集。规则：
+
+        - 链路/安全/基本机动/基本感知（`_ALWAYS_AVAILABLE_TOOLS`）任何任务都保留；
+        - 被实际用过的工具必须保留（否则模型会"忘了自己刚用过什么"）；
+        - 已激活技能的 `subtools` 全部保留；
+        - 没有技能激活时**不过滤**（任务类型未知，宁可多发也不藏工具）。
+
+        注意：这里只收窄**提示词与 API tools 菜单**。决策白名单（allowed_tools）仍按
+        全量卡片算，所以即使某个工具没进菜单、模型仍然叫得出名字，也不会被误判成
+        "不可用工具"而拒绝执行。
+        """
+        if not cards:
+            return cards
+        activated = {
+            str(row.get("tool"))
+            for row in (loop_state.get("results") or [])
+            if isinstance(row, dict) and str(row.get("tool") or "").startswith("skill:")
+        }
+        if not activated:
+            return cards
+        keep = set(_ALWAYS_AVAILABLE_TOOLS)
+        for row in loop_state.get("results") or []:
+            if isinstance(row, dict) and row.get("tool"):
+                keep.add(str(row["tool"]))
+        for card in cards:
+            name = str(card.get("name") or "")
+            if name in activated:
+                keep.update(str(item) for item in (card.get("subtools") or []) if item)
+        filtered = [card for card in cards if str(card.get("name") or "") in keep]
+        # 防御：过滤后太小说明判断有误，宁可不收窄
+        if len(filtered) < 5:
+            return cards
+        return filtered
+
+    def _compact_loop_result(self, row: Any) -> Any:
+        """循环结果一行：裁掉图片负载，其余保持可读（参数/返回/成败）。"""
+        safe = self._safe_payload(row, limit=8)
+        if isinstance(safe, dict) and isinstance(safe.get("data"), dict):
+            try:
+                safe["data"] = self._trim_data(safe["data"])
+            except Exception:
+                safe["data"] = {"summary": "[unserializable tool result]"}
+        return safe
 
     @staticmethod
     def _safe_payload(value: Any, limit: int = 12) -> Any:
@@ -2909,10 +3203,29 @@ class LLMMissionPlanner:
         if wants_track and "skill:track_object" in allowed_tools and not self._loop_has_action(loop_state, "skill:track_object"):
             return LoopDecision("skill:track_object", {"target_class": target}, "Track the requested target class through the skill layer.")
         if wants_photo and "airsim_take_photo" in allowed_tools and not self._loop_has_action(loop_state, "airsim_take_photo"):
-            params: dict[str, Any] = {}
-            if target:
-                params["verify_target_class"] = target
-            return LoopDecision("airsim_take_photo", params, "Capture a visual frame for verification.")
+            return LoopDecision(
+                "airsim_take_photo",
+                {"image_type": "scene"},
+                "Capture a visual frame for the vision model.",
+            )
+        # 拍完就要看：确定性兜底也必须走"把画面交给视觉模型"这条路（以前这里靠
+        # 拍照自带的 YOLO 验证，检测已移除）。
+        if (
+            "inspect_current_frame" in allowed_tools
+            and self._loop_has_action(loop_state, "airsim_take_photo")
+            and not self._loop_has_action(loop_state, "inspect_current_frame")
+            and (target or wants_search or wants_track)
+        ):
+            return LoopDecision(
+                "inspect_current_frame",
+                {
+                    "question": (
+                        f"画面里有没有{target or '目标'}？它在画面的什么位置"
+                        "（归一化坐标 x,y），大概多大（归一化宽高 w,h）？"
+                    )
+                },
+                "Ask the vision model where the target is in the current frame.",
+            )
 
         return LoopDecision(
             action="",
@@ -2984,19 +3297,15 @@ class LLMMissionPlanner:
                 {
                     "name": card.get("name", ""),
                     "purpose": card.get("purpose", ""),
-                    "when_to_use": card.get("when_to_use", ""),
+                    # 只保留"怎么选、怎么调"需要的字段。outputs / failure_policy /
+                    # verification / subtools / execution_mode 等对"选哪个工具"没有
+                    # 决策价值，实测它们占了卡片体积的一半以上；工具返回什么，
+                    # 结果里就能看到。
+                    "when_to_use": str(card.get("when_to_use", ""))[:280],
                     "inputs": card.get("inputs", {}),
-                    "outputs": card.get("outputs", ""),
                     "preconditions": card.get("preconditions", []),
-                    "required_capabilities": card.get("required_capabilities", []),
-                    "subtools": card.get("subtools", []),
-                    "failure_policy": card.get("failure_policy", ""),
-                    "verification": card.get("verification", ""),
-                    "not_for": card.get("not_for", ""),
-                    "cost": card.get("cost", ""),
-                    "risk": card.get("risk", ""),
+                    "not_for": str(card.get("not_for", ""))[:160],
                     "kind": card.get("kind", "atomic"),
-                    "execution_mode": card.get("execution_mode", "immediate"),
                 }
             )
         return keep[:40]
@@ -3031,15 +3340,32 @@ class LLMMissionPlanner:
         return keep[:20]
 
     def _compact_memory(self, memory: dict[str, Any]) -> dict[str, Any]:
+        """每轮注入的记忆：只给"这次决策用得上"的，不给档案。
+
+        借 Pi Harness 的上下文原则：能力与当前观察永不裁剪，历史与记忆都必须有界。
+        这里原先每轮注入 5.6k tokens（guidance 全量 + 各类列表各 5 条 + facts/
+        lessons 原文），而循环到第 N 步时真正有用的只有三件事：这类工具/技能以前
+        表现如何、最近踩过什么坑、上次做到哪。
+        原始 facts/lessons 是自然语言档案：既长又容易过期（旧记录里还写着"用目标
+        检测确认"），不再逐轮注入——需要细节时由模型调 memory_recall 按需取。
+        """
+        guidance = memory.get("guidance") if isinstance(memory.get("guidance"), dict) else {}
+        missions = [item for item in (memory.get("missions") or [])[:3]]
         return {
-            "session": memory.get("session", {}),
-            "recent_missions": memory.get("missions", [])[:5],
-            "lessons": memory.get("lessons", [])[:5],
-            "risk_events": memory.get("risk_events", [])[:5],
-            "skill_candidates": memory.get("skill_candidates", [])[:5],
-            "facts": memory.get("facts", [])[:5],
-            "recent_runs": memory.get("runs", [])[:3],
-            "guidance": memory.get("guidance", {}),
+            "session": self._safe_payload(memory.get("session") or {}, limit=4),
+            "recent_missions": [
+                {
+                    "summary": str((item.get("summary") if isinstance(item, dict) else item) or "")[:120],
+                    "status": str((item.get("status") if isinstance(item, dict) else "") or "")[:16],
+                }
+                for item in missions
+            ],
+            "guidance": {
+                "preferred_tools": list(guidance.get("preferred_tools") or [])[:3],
+                "caution_tools": list(guidance.get("caution_tools") or [])[:3],
+                "preferred_skills": list(guidance.get("preferred_skills") or [])[:2],
+                "recent_risk_events": list(guidance.get("recent_risk_events") or [])[:2],
+            },
         }
 
     def _chat_unavailable_message(self, config: dict[str, Any] | None, reason: str) -> str:
@@ -3050,6 +3376,22 @@ class LLMMissionPlanner:
         if reason == "missing_api_key":
             return f"模型不可用：{model_name} 未配置或未启用 API Key。请检查模型设置或切换到可用模型。"
         return f"模型不可用：{model_name} 调用失败。{reason}"
+
+    @staticmethod
+    def _multimodal_required_message(config: dict[str, Any] | None, action: str) -> str:
+        """配的模型看不了图时的说明。
+
+        这里必须点明"规划与看图是同一个模型"：否则用户会去找一个并不存在的
+        "视觉模型"设置项，而真正要改的是他正在用的那个模型。
+        """
+        model_name = "未选择模型"
+        if config:
+            model_name = str(config.get("name") or config.get("model") or config.get("id") or "当前模型")
+        return (
+            f"模型不可用：{model_name} 不支持图像输入，无法{action}。"
+            "规划与看图共用同一个模型，系统不会另选一个视觉模型——"
+            "请把当前模型换成支持图像的模型，或在模型设置里为它开启图像输入能力。"
+        )
 
     def _sanitize_model_error(self, reason: str) -> str:
         text = str(reason or "").strip()
@@ -3287,6 +3629,8 @@ class LLMMissionPlanner:
             "bbox_hint": {
                 "x": bbox.get("x"),
                 "y": bbox.get("y"),
+                "w": _unit_or_none(bbox.get("w")),
+                "h": _unit_or_none(bbox.get("h")),
             },
             "recommended_next_action": action,
             "summary_zh": summary,
@@ -3336,7 +3680,12 @@ class LLMMissionPlanner:
                 "label": str(item.get("label") or "")[:80],
                 "confidence": round(confidence, 3),
                 "relative_direction": str(item.get("relative_direction") or "unknown"),
-                "bbox_hint": {"x": bbox.get("x"), "y": bbox.get("y")},
+                "bbox_hint": {
+                    "x": bbox.get("x"),
+                    "y": bbox.get("y"),
+                    "w": _unit_or_none(bbox.get("w")),
+                    "h": _unit_or_none(bbox.get("h")),
+                },
                 "evidence": str(item.get("evidence") or "")[:220],
             })
         safety_notes = payload.get("safety_notes") or []
@@ -3624,6 +3973,10 @@ class LLMMissionPlanner:
 
     VERIFY_METRICS = {
         "target_confirmed",
+        # 近距任务的停止判据（可机械评估）：目标占画面比例 / 距离。放在这里意味着
+        # "到位标准由任务声明"，而不是由运行时对某一种任务写死一个常数。
+        "target_fill",
+        "target_distance",
         "position_reached",
         "flying_at",
         "landed",
@@ -3670,8 +4023,29 @@ class LLMMissionPlanner:
                         cleaned["tolerance"] = float(item.get("tolerance") or 1.0)
                     except (TypeError, ValueError):
                         continue
+                elif metric == "target_fill":
+                    try:
+                        cleaned["min_fill"] = max(0.05, min(0.9, float(item.get("min_fill") or 0.25)))
+                    except (TypeError, ValueError):
+                        cleaned["min_fill"] = 0.25
+                elif metric == "target_distance":
+                    try:
+                        cleaned["max_m"] = max(0.5, min(50.0, abs(float(item.get("max_m") or 3.0))))
+                    except (TypeError, ValueError):
+                        cleaned["max_m"] = 3.0
                 elif metric == "target_confirmed":
                     cleaned["target"] = str(item.get("target") or "")
+                # required（默认 true）：必需判据未满足就不接受完成；可选判据只记录、
+                # 不当闸门（文献里的 typed criteria：required 是任务自己写的）。
+                cleaned["required"] = bool(item.get("required", True))
+                if metric in {"target_fill", "target_distance", "position_reached", "flying_at"}:
+                    # 判据要"持续成立"多少秒才算数（默认 0 = 单次成立即可）。
+                    # 这是文献里的 hold_for：防抖——既防一次噪声读数让我们提前收工，
+                    # 也防"满足/不满足"来回跳导致收尾判定反复。
+                    try:
+                        cleaned["hold_s"] = max(0.0, min(30.0, float(item.get("hold_s") or 0.0)))
+                    except (TypeError, ValueError):
+                        cleaned["hold_s"] = 0.0
                 criteria.append(cleaned)
         return {
             "objective": str(raw_goal.get("objective") or command)[:200],
@@ -3755,11 +4129,11 @@ class LLMMissionPlanner:
             if not explicit_landing:
                 normalized = [step for step in normalized if step.tool != "drone_land"]
 
-        normalized = self._ensure_detection_steps(command, normalized, known_tools)
+        normalized = self._plan_visual_guidance(command, normalized, known_tools)
 
         memory_steps = [s for s in normalized if s.tool == "memory_store"]
         normalized = [s for s in normalized if s.tool != "memory_store"]
-        visual_tools = {"airsim_take_photo", "airsim_detect_objects"}
+        visual_tools = {"airsim_take_photo"}
         wants_open_image_analysis = self._command_has_any(
             command,
             ["what", "describe", "scene", "see", "look", "有什么", "看到", "看看", "画面", "照片", "图像内容"],
@@ -3808,53 +4182,63 @@ class LLMMissionPlanner:
         return any(word in lower for word in words)
 
     def _is_close_range_visual_command(self, command: str) -> bool:
-        """目标识别/搜索/追踪类任务 → 定高 2~3m（前视相机工作高度）。"""
+        """近距视觉任务（搜索/识别/靠近某个看得见的东西）→ 定高 2~3m。
+
+        判据分两路，刻意不误伤纯坐标飞行：
+        - 意图：同时有 ``visual`` 与 ``visual_approach``——"飞向画面里那辆浅蓝色
+          汽车"、"靠近那辆白车"都会命中。单独的 ``visual_approach`` **不够**：
+          "飞到坐标 (10, 0, -5)" 也会命中它，而那是长距离绝对坐标任务。
+        - 关键词兜底（原判据）：搜索/识别/跟踪/目标类的中英文说法。
+        """
+        text = command or ""
+        try:
+            intents = extract_intents(text)
+            if intents.get("visual") and intents.get("visual_approach"):
+                return True
+        except Exception:
+            pass
         return self._command_has_any(
-            command or "",
+            text,
             [
                 "track", "follow", "search", "find", "detect", "target",
                 "跟踪", "追踪", "跟随", "锁定", "搜索", "寻找", "识别", "检测", "目标",
             ],
         )
 
-    def _ensure_detection_steps(
+    def _plan_visual_guidance(
         self,
         command: str,
         steps: list[MissionStep],
         known_tools: set[str],
     ) -> list[MissionStep]:
-        """识别/追踪任务必须包含一次真正的检测调用。
+        """识别/靠近类任务里，保证计划至少有一次"把画面交给视觉模型"的步骤。
 
-        规划器有时会把只读的 `perception_status` 当成"检测"，导致计划飞完却
-        从未调用探测器（验证判失败、也没有可跟踪的锁定）。这里做确定性补齐：
-        在同一任务里，只要会起飞且带识别/追踪意图，就保证有
-        `perception_start`（如可用）→ `airsim_detect_objects`，
-        插在视觉确认/降落之前。
+        以前这里做的是"确定性补齐检测步骤"：往计划里插 perception_start +
+        airsim_detect_objects。检测（YOLO）已从产品中移除，语义只能来自视觉
+        模型——所以现在补齐的是 inspect_current_frame：没有它，计划会飞完却
+        从未真正看过目标，后面的靠近没有任何依据。
         """
-        if "airsim_detect_objects" not in known_tools:
+        if "inspect_current_frame" not in known_tools:
             return steps
         if not self._is_close_range_visual_command(command):
             return steps
-        if not any(step.tool == "drone_takeoff" for step in steps):
+        if any(step.tool == "inspect_current_frame" for step in steps):
             return steps
-        if any(step.tool == "airsim_detect_objects" for step in steps):
-            return steps
-        target_class = self._command_target_class(command) or "car"
-        injected: list[MissionStep] = []
-        if "perception_start" in known_tools and not any(step.tool == "perception_start" for step in steps):
-            injected.append(
-                MissionStep("s00", "启动感知服务", "perception_start",
-                            {"target_class": target_class}, "perception")
+        target = self._command_target_class(command) or "目标"
+        injected = [
+            MissionStep(
+                "s00",
+                f"视觉确认目标({target})",
+                "inspect_current_frame",
+                {"question": f"画面里有没有{target}？它在画面的什么位置（归一化坐标 x,y），大致多大（归一化宽高 w,h）？"},
+                "perception",
+                needs_observation=True,
             )
-        injected.append(
-            MissionStep("s00", f"检测目标({target_class})", "airsim_detect_objects",
-                        {"target_class": target_class, "confidence": 0.25}, "perception")
-        )
-        # 插在第一个视觉确认步骤之前；否则插在降落之前；再否则插在末尾只读回读之前。
-        visual_first = {"inspect_current_frame"}
+        ]
+        # 插在第一个机动步骤之前；否则插在降落之前；再否则插在末尾只读回读之前。
         insert_at = len(steps)
         for index, step in enumerate(steps):
-            if step.tool in visual_first or step.tool == "drone_land":
+            if step.tool in {"drone_move_relative", "drone_fly_to", "drone_land"}:
                 insert_at = index
                 break
         else:
@@ -3899,6 +4283,10 @@ class LLMMissionPlanner:
         wants_track = intents["track"]
         wants_land = intents["land"] or intents["return_home"]
         wants_takeoff = intents["takeoff"]
+        # 看得见的东西 + 要飞过去 = 必须量距离。以前这里只看 photo/search，于是
+        # "飞向画面里那辆浅蓝色汽车"这条指令的深度步骤被静默删掉——模型既没有
+        # 米制距离，也就无从推算该走多远。
+        wants_visual_approach = bool(intents.get("visual") and intents.get("visual_approach"))
         wants_disarm = has_any(["disarm", "锁定电机", "锁电机"])
         wants_disconnect = has_any(["disconnect", "断开"])
 
@@ -3909,13 +4297,14 @@ class LLMMissionPlanner:
                 continue
             if tool == "airsim_take_photo" and not wants_photo:
                 continue
-            if tool in {"airsim_detect_objects", "airsim_get_depth_map"} and not (wants_photo or wants_search):
+            if tool == "airsim_get_depth_map" and not (wants_photo or wants_search or wants_visual_approach):
                 continue
             if tool == "airsim_search_target":
                 continue
             if tool == "skill:search" and not wants_search:
                 continue
-            if tool in {"airsim_track_object", "airsim_approach_target"}:
+            if tool in {"airsim_track_object", "airsim_approach_target", "drone_approach_target",
+                        "airsim_detect_objects", "perception_start", "perception_stop"}:
                 continue
             if tool == "drone_land" and not wants_land:
                 continue

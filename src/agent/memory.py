@@ -379,9 +379,20 @@ class AgentMemory:
 
     def guidance(self) -> dict[str, Any]:
         """Turn raw memories into small actionable hints for routing and planning."""
+        # 已从产品中删除的工具不再参与"优先使用/当心"两类建议：旧记录里可能还留着
+        # 检测类工具（airsim_detect_objects / perception_start…），而系统提示会照它
+        # 建议模型"优先使用"——模型一调用就撞上"该工具当前不可用"，白费一轮。
+        try:
+            from src.tools.manifest import TOOL_MANIFEST as _KNOWN_TOOLS
+
+            known_tools: set[str] = set(_KNOWN_TOOLS)
+        except Exception:
+            known_tools = set()
         preferred_tools: list[dict[str, Any]] = []
         caution_tools: list[dict[str, Any]] = []
         for tool, stats in (self._data.get("tool_stats") or {}).items():
+            if known_tools and tool not in known_tools:
+                continue
             calls = int(stats.get("calls") or 0)
             if calls < 3:
                 continue

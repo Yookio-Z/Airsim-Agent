@@ -174,9 +174,15 @@ def test_axis_disabled_engine_none():
     assert axis.enabled is False
     assert axis.start() is True  # no-op for disabled axis
     assert axis.is_online() is False
-    # frame_width/height are always present (0 until a frame arrives) so
-    # consumers never have to guess whether the key exists.
-    assert axis.snapshot() == {"targets": [], "primary": None, "timestamp": 0.0, "frame_width": 0, "frame_height": 0}
+    # frame_width/height are always present (0 until a frame arrives) and so is
+    # view, so consumers never have to guess whether the key exists.
+    snap = axis.snapshot()
+    assert snap["targets"] == []
+    assert snap["primary"] is None
+    assert snap["timestamp"] == 0.0
+    assert snap["frame_width"] == 0
+    assert snap["frame_height"] == 0
+    assert snap["view"]["camera_name"] == ""
     assert axis.pop_events() == []
     assert axis.health()["online"] is False
 
@@ -219,11 +225,14 @@ def test_perception_status_tool_registration_and_output():
 
     import json
 
-    payload = json.loads(collector.tools["perception_status"](include_snapshot=True, include_events=True, limit=5))
+    payload = json.loads(collector.tools["perception_status"](include_events=True, limit=5))
     assert payload["status"] == "ok"
-    assert payload["health"]["online"] is False
-    assert payload["snapshot"]["primary"] is None
+    # 相机健康（检测随 YOLO 一起移除，这里不再有目标快照/检测字段）
+    assert payload["online"] is False
+    assert payload["error"] == "no sim"
     assert payload["events"][0]["type"] == "target_lost"
+    assert "snapshot" not in payload
+    assert "detections" not in payload
 
 
 def test_perception_status_tool_with_null_axis():
@@ -304,6 +313,44 @@ def test_preview_uses_axis_cache_first():
     assert float(meta.get("frame_timestamp") or 0.0) > 0
 
 
+def test_preview_uses_axis_cache_without_detect_param():
+    """不传 detect 也必须走轴的缓存——预览的性能路径不能挂在请求参数上。
+
+    这是帧率的护栏。实测过的回归：前端一旦不再传 `detect=1`（检测移除后它失去
+    意义），预览就退回"每次直连抓帧"，与轴的采集线程抢单线程 RPC，出图率和面板
+    FPS 一起塌到 ~1 FPS。检测已不在产品里，缓存路径与"标注"无关，所以判据只能
+    是行为：默认请求的這一帧就必须来自轴缓存。
+    """
+    import numpy as np
+    from src.agent.tool_executor import ToolRuntime
+    from src.modules.perception_axis import LocalPerceptionEngine, PerceptionAxis
+
+    engine = LocalPerceptionEngine(
+        frame_source=StubFrameSource(),
+        update_fps=50.0,
+        health_timeout_sec=5.0,
+    )
+    # 生产姿势：只出画面，不加载检测
+    assert engine.start(detect=False) is True
+    axis = PerceptionAxis(profile=None)
+    axis._engine = engine  # noqa: SLF001 -- test wiring
+    rt = ToolRuntime(backend_id="px4_mavlink", camera_settings_provider=lambda: {"source": "airsim"}, perception_axis=axis)
+    deadline = time.time() + 5.0
+    ok = False
+    meta: dict = {}
+    while time.time() < deadline:
+        ok, body, mime, meta = rt.capture_camera_preview({"source": "airsim"})  # 不带 detect
+        if ok:
+            break
+        time.sleep(0.05)
+    engine.stop()
+    assert ok is True, meta
+    assert body.startswith(b"\xff\xd8")
+    assert meta.get("vehicle") == "perception-axis", meta
+    assert meta.get("preview_cached") is True, meta
+    assert "fps" in meta, meta
+
+
 def test_inspect_current_frame_with_vlm_stub():
     """inspect_current_frame feeds the cached frame to the vision model."""
     import numpy as np
@@ -352,4 +399,6 @@ def test_inspect_current_frame_without_vlm():
     fmt = lambda data: __import__("json").dumps(data, ensure_ascii=False)  # noqa: E731
     register_perception_axis_tools(collector, None, fmt, vlm=None)
     out = collector.tools["inspect_current_frame"]("画面里有什么？")
-    assert "多模态" in out
+    # 提示必须指向"去配一个支持图像的模型"：规划与看图共用同一个模型，
+    # 系统里没有另一个视觉模型可供切换。
+    assert "支持图像" in out

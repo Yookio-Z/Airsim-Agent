@@ -258,7 +258,6 @@ def test_search_skill_uses_atomic_visual_tools_not_legacy_search() -> None:
         "drone_takeoff",
         "drone_rotate_to",
         "airsim_take_photo",
-        "airsim_detect_objects",
         "inspect_current_frame",
     ])
     calls: list[str] = []
@@ -269,8 +268,9 @@ def test_search_skill_uses_atomic_visual_tools_not_legacy_search() -> None:
             return _result(tool, True, {"status": "ok", "armed": False, "flying": False})
         if tool == "airsim_take_photo":
             return _result(tool, True, {"status": "ok", "image_base64": "abc"})
-        if tool == "airsim_detect_objects":
-            return _result(tool, True, {"status": "ok", "detections": [{"class_name": "car", "confidence": 0.91}]})
+        if tool == "inspect_current_frame":
+            # 检测已移除：扫视的"找到了"证据来自视觉模型的 answer
+            return _result(tool, True, {"status": "ok", "answer": {"target_found": True, "target_candidates": [{"label": "car", "confidence": 0.9}]}})
         return _result(tool, True, {"status": "ok"})
 
     result = registry.execute(
@@ -282,8 +282,8 @@ def test_search_skill_uses_atomic_visual_tools_not_legacy_search() -> None:
 
     assert result.ok is True
     assert result.data["target_found"] is True
-    assert result.data["provider"] == "airsim_detect_objects"
+    assert result.data["provider"] == "inspect_current_frame"
     assert "airsim_search_target" not in calls
     assert calls[:4] == ["drone_connect", "drone_get_status", "drone_arm", "drone_takeoff"]
     assert "airsim_take_photo" in calls
-    assert "airsim_detect_objects" in calls
+    assert "inspect_current_frame" in calls

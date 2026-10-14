@@ -83,9 +83,9 @@ def test_airsim_atomic_tools_are_documented() -> None:
     # AirSimController, so they cannot register against a stub. Their names
     # are the documented contract of the airsim backend surface.
     airsim_atomics = {
-        "airsim_detect_objects",
         "airsim_get_depth_map",
         "airsim_get_sensors",
+        "airsim_locate_point",
         "airsim_take_photo",
         "airsim_task_cancel",
         "airsim_task_status",
@@ -104,9 +104,9 @@ def test_every_atomic_manifest_entry_has_a_registration_source() -> None:
     """
     neutral = _register_all_neutral_tools()
     airsim_atomics = {
-        "airsim_detect_objects",
         "airsim_get_depth_map",
         "airsim_get_sensors",
+        "airsim_locate_point",
         "airsim_take_photo",
         "airsim_task_cancel",
         "airsim_task_status",

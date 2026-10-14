@@ -896,7 +896,6 @@ function humanToolLabel(tool, label = "") {
     inspect_current_frame: "分析当前画面",
     airsim_get_sensors: "读取传感器",
     airsim_get_depth_map: "读取深度图",
-    airsim_detect_objects: "识别画面目标",
     airsim_search_target: "搜索目标",
     airsim_approach_target: "接近目标",
     airsim_track_object: "跟踪目标",
@@ -1373,6 +1372,15 @@ function nodeCategory(item) {
   if (kind === "plan_step" || kind === "tool") return "tool";
   if (kind === "verify") return "verify";
   if (kind === "memory") return "memory";
+  // 运行时守卫注入的决定：不是模型的思考（它以前会落到 reasoning，于是操作员
+  // 看到"模型一直说要抵近"，而那句话其实是守卫写的）。
+  if (kind === "guard") return "guard";
+  // 等待模型回复的占位行：不是思考内容，单独一类（它没有正文，也不该被
+  // 读成"模型想了什么"）。
+  if (kind === "pending") return "pending";
+  // 模型只回了工具调用、没有正文时的那一行：显示"模型决策"（它实际选的工具与
+  // 参数），不冒充思考，也不隐藏——操作员要求看到模型返回的内容。
+  if (kind === "decision") return "decision";
   if (kind === "system" || kind === "plan") return "system";
   return "reasoning";
 }
@@ -1409,6 +1417,9 @@ function categoryLabel(cat) {
   if (cat === "skill") return "技能调用";
   if (cat === "verify") return "校验";
   if (cat === "memory") return "记忆";
+  if (cat === "guard") return "系统自动处理";
+  if (cat === "pending") return "等待模型回复";
+  if (cat === "decision") return "模型决策";
   if (cat === "system") return "系统";
   return "模型思考";
 }
@@ -1470,7 +1481,12 @@ function detailSection(parent, heading, text) {
 // （工具/技能/校验行不再看摘要长短：参数与返回本来就在这一行之外，见各自节点函数。）
 function textNeedsDetail(text) {
   const value = String(text || "");
-  return value.length > 90 || value.includes("\n");
+  // 预览是 CSS 单行省略（nowrap + ellipsis）：面板不宽时 90 字根本放不下，而旧
+  // 阈值只在 >90 字或换行时才给展开器——于是中等长度的文本显示成…却点不开，
+  // 操作员看不到全文（实测反馈）。判据只回答一个问题：现在显示的是不是全部。
+  if (value.includes("\n")) return true;
+  const preview = firstThinkLine(value);
+  return value.trim().length > preview.length || preview.length >= 40;
 }
 
 // 工具/技能/校验：默认压缩成一行（超出省略），整行可点开看完整参数与返回；
@@ -1483,14 +1499,14 @@ function toolLineNode(item) {
   const nameText = cat === "skill" && rawTool ? rawTool.replace(/^skill:/, "") : (rawTool || label);
   const paramsText = item.params && Object.keys(item.params).length ? compactJson(item.params, 2000) : "";
   const resultText = humanThoughtBody(item.body || "", item.tool || "");
-  const kindLabel = cat === "skill" ? "技能调用" : cat === "verify" ? "校验" : "工具调用";
+  const kindLabel = cat === "skill" ? "技能调用" : cat === "verify" ? "校验" : cat === "guard" ? "系统自动处理" : "工具调用";
 
   // 一行摘要：图标 + 标题 + 工具名 + 结果（优先）/参数（次要）
   const row = document.createElement("div");
   row.className = `tl-one-line ${status} cat-${cat}`;
   const icon = document.createElement("i");
   icon.className = "tl-node-icon";
-  icon.textContent = cat === "skill" ? "🧩" : cat === "verify" ? "📋" : "🛠";
+  icon.textContent = cat === "skill" ? "🧩" : cat === "verify" ? "📋" : cat === "guard" ? "🛡" : "🛠";
   icon.setAttribute("aria-hidden", "true");
   row.appendChild(icon);
   const kind = document.createElement("span");
@@ -1626,15 +1642,19 @@ function timelineThinkNode(item) {
   node.className = `tl-node tl-reasoning${isRunning ? " running" : ""}`;
   const row = document.createElement("div");
   row.className = "tl-think-head";
+  // 等待模型回复的占位行单独标注：它没有正文（模型只回了工具调用），不能显示成
+  // "模型思考"——操作员反馈过"点开是空的/看不到内容"。
+  const pending = nodeCategory(item) === "pending";
+  const decision = nodeCategory(item) === "decision";
   const icon = document.createElement("i");
   icon.className = "tl-node-icon";
-  icon.textContent = "🧠";
+  icon.textContent = pending ? "⏳" : (decision ? "🧭" : "🧠");
   icon.setAttribute("aria-hidden", "true");
   row.appendChild(icon);
   // 标签：restyle 时被漏掉，操作员只能看到图标 + 裸正文，认不出这是哪一类行
   const kind = document.createElement("span");
   kind.className = "tl-node-label";
-  kind.textContent = "模型思考";
+  kind.textContent = pending ? "等待模型回复" : (decision ? "模型决策" : "模型思考");
   row.appendChild(kind);
   if (titleText) {
     const title = document.createElement("span");
@@ -1644,7 +1664,7 @@ function timelineThinkNode(item) {
   }
   const preview = document.createElement("span");
   preview.className = "tl-think-preview"; // 单行省略：CSS nowrap + ellipsis
-  const previewText = firstThinkLine(text) || (isRunning ? "思考中…" : "（无内容）");
+  const previewText = firstThinkLine(text) || (pending ? "模型正在选择下一步…" : (isRunning ? "思考中…" : "（无内容）"));
   preview.textContent = previewText;
   row.appendChild(preview);
   // 运行指示符：独立元素（不是预览的 ::after），缩略成省略号时也不会被裁掉；
@@ -1661,7 +1681,7 @@ function timelineThinkNode(item) {
   const full = document.createElement("pre");
   full.className = "tl-think-full";
   full.textContent = text;
-  const detailNodes = isRunning || textNeedsDetail(text) ? [full] : [];
+  const detailNodes = (!pending && (isRunning || textNeedsDetail(text))) ? [full] : [];
   node.appendChild(expandableRow(row, detailNodes, `模型思考：${previewText}（展开查看全文）`));
   return node;
 }
@@ -1816,7 +1836,7 @@ function updateAgentTurn(entry, message, run, llm) {
       // 思考行用 ui-chat.js 自己的渲染（图标紧跟正文、展开内联）：ui-composer.js
       // 里的旧 reasoningNode 是"标题行 + 单独一行点击展开全文"，样式已被替换。
       // 运行态由条目自身的 status 决定，不再传"是否活跃行"。
-      if (cat === "reasoning") node = timelineThinkNode(item);
+      if (cat === "reasoning" || cat === "pending" || cat === "decision") node = timelineThinkNode(item);
       else if (cat === "skill") node = skillNode(item);
       else if (cat === "system") node = systemNode(item);
       else node = toolLineNode(item);
@@ -2261,7 +2281,10 @@ function renderAgentThoughts(message, run, active) {
 
 function normalizeProcessKind(item) {
   const explicit = String(item?.kind || "").trim().toLowerCase();
-  if (["reasoning", "tool", "skill", "verify", "memory", "system", "plan", "plan_step"].includes(explicit)) {
+  // 这个白名单必须和后端产出的 kind 对齐。以前漏了 "guard"，于是"运行时守卫"的
+  // 行落到下面的兜底被归成 "reasoning"，渲染出来就是"模型思考"——操作员看到的
+  // 是"模型一直在说要先观察"，而那句话是运行时写的，根本不是模型思考。
+  if (["reasoning", "tool", "skill", "verify", "memory", "system", "plan", "plan_step", "guard", "pending", "decision"].includes(explicit)) {
     return explicit;
   }
   const title = String(item?.title || "").toLowerCase();

@@ -272,6 +272,8 @@ class AxisDetector:
         # 已锁定后降低检出阈值：飞行中常有运动模糊/小目标，阈值过高会频繁
         # 漏检导致锁定闪断。锁定期间用更低阈值，让 ByteTrack 与保持层接得住。
         self._locked_until = 0.0
+        # 实测推理设备，第一次推理成功后才填（见 _note_inference_device）
+        self._inference_device = ""
 
     @staticmethod
     def _select_kind(canonical: str, model: str = "") -> str:
@@ -295,8 +297,24 @@ class AxisDetector:
             "target": self.canonical,
             "tracker": self.tracker,
             "imgsz": self.imgsz,
+            # 推理设备要报出来：换成 CPU-only 的 torch 时单帧从 37ms 变成 513ms，
+            # 检测率掉到 0.0~0.7/s 并把采集一起拖抖，而这件事在别处完全看不出来
+            # ——只表现为"识别好像不动了"。设备名一行就能定位。
+            #
+            # 只能报"实测跑过的那台设备"：ultralytics 的模型对象在第一次推理之前
+            # 一直是 cpu，读它会给出"device: cpu"这种假信息，正好把人带偏。
+            "device": self._inference_device,
             "track_error": self._track_error,
         }
+
+    def _note_inference_device(self) -> None:
+        """记下这次推理实际用的设备（推理返回后 model.device 才是真的）。
+
+        第一次推理之前 ultralytics 报的是 cpu——那是初始值，不是实际执行设备；
+        把它当成事实报出去，会让人以为 GPU 没生效。
+        """
+        device = getattr(self._model, "device", None)
+        self._inference_device = str(device) if device is not None else ""
 
     def _iter_boxes(self, result: Any) -> list[dict[str, Any]]:
         boxes = getattr(result, "boxes", None)
@@ -341,6 +359,7 @@ class AxisDetector:
         frame = _to_three_channel(frame)
         with self._lock:
             results = self._model.predict(frame, verbose=False, conf=self.confidence, imgsz=self.imgsz)
+        self._note_inference_device()
         return self._iter_boxes(results[0]) if results else []
 
     def track(self, frame: Any) -> list[dict[str, Any]]:
@@ -361,6 +380,7 @@ class AxisDetector:
                 results = self._model.track(
                     frame, persist=True, tracker=self.tracker, verbose=False, conf=conf, imgsz=self.imgsz
                 )
+            self._note_inference_device()
             self._track_error = ""
             dets = self._iter_boxes(results[0]) if results else []
             if dets:

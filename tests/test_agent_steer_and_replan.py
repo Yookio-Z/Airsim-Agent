@@ -1,12 +1,15 @@
 """执行中补充指令（steer）与计划步骤偏离重试。
 
-实测回归：一条"靠近那辆车并确认特征"的任务，抵近步骤因为"那一刻画面里没有
-锁定目标"被判为偏离计划后整步被永久跳过，循环原地回读检测直到被打断；操作员
-随后发的纠正指令又因为旧任务未及时停止而被直接拒绝。这里锁住两条修复：
+实测回归：一条"靠近那辆车并确认特征"的任务，确认步骤因为"那一刻视觉模型没能
+确认目标"被判为偏离计划后整步被永久跳过，循环原地回读直到被打断；操作员随后
+发的纠正指令又因为旧任务未及时停止而被直接拒绝。这里锁住两条修复：
 
 1. 计划步骤首次偏离只是转一轮 ReAct 纠错，游标保留，下一轮回到该步骤重试，
    连续偏离到上限才跳过；
 2. 执行中提交的新指令作为补充指令并入当前循环，而不是取消任务重来。
+
+注意偏离的判据已经**不含检测锁定**（YOLO 已从产品中移除）：现在只有"视觉确认
+未通过"才会让计划步骤偏离。
 """
 
 from __future__ import annotations
@@ -22,29 +25,19 @@ from src.agent.runtime import AgentRuntime
 from src.agent.tool_executor import ToolCallResult
 
 
-class _FakeAxis:
-    """perception_axis：primary 为 None 表示画面里还没有锁定目标。"""
-
-    enabled = True
-
-    def __init__(self) -> None:
-        self.primary = None
-
-    def snapshot(self) -> dict:
-        return {"primary": self.primary}
-
-
 class _FakeTools:
     def __init__(self) -> None:
         self.calls: list[tuple[str, dict]] = []
-        self.perception_axis = _FakeAxis()
         self.drone = {"flying": True, "position_ned": {"x": 0.0, "y": 0.0, "z": -3.0}}
 
     def status_snapshot(self) -> dict:
         return {"backend": "fake", "connected": True, "drone": dict(self.drone)}
 
     def list_tools(self) -> list[dict]:
-        return [{"name": name} for name in ("airsim_detect_objects", "drone_approach_target", "drone_get_status")]
+        return [
+            {"name": name}
+            for name in ("inspect_current_frame", "airsim_get_depth_map", "drone_move_relative", "drone_get_status")
+        ]
 
     def execute(self, name, params, dry_run=False, blocked_by_supervisor=False):
         self.calls.append((name, dict(params or {})))
@@ -52,13 +45,49 @@ class _FakeTools:
         return ToolCallResult(name, dict(params or {}), True, {"status": "ok", "tool": name}, started, time.time())
 
 
-class _LockingTools(_FakeTools):
-    """检测成功即认为目标已锁定（模拟"先搜索、再抵近"的真实序列）。"""
+def _visual_result(name: str, params: dict, found: bool) -> ToolCallResult:
+    """inspect_current_frame 的结果：found 决定视觉确认是否通过。
+
+    确认时给一个"已经够近"的尺寸（h=0.30 ≥ 技能的 0.25 阈值），这样"目标还很远
+    就不判收敛"那道门不会介入——本文件的用例测的是偏离/重试机制本身。
+    """
+    answer = {
+        "target_found": found,
+        "confidence": 0.9 if found else 0.2,
+        "target_candidates": (
+            [{"label": "car", "confidence": 0.9, "bbox_hint": {"x": 0.5, "y": 0.55, "w": 0.35, "h": 0.30}}]
+            if found
+            else []
+        ),
+    }
+    now = time.time()
+    return ToolCallResult(
+        name,
+        dict(params or {}),
+        True,
+        {
+            "status": "ok",
+            "tool": name,
+            "question": str((params or {}).get("question") or ""),
+            "answer": answer,
+        },
+        now,
+        now,
+    )
+
+
+class _VisualTools(_FakeTools):
+    """视觉确认结果可控：第一次看得见、之后看不见（或反之）。"""
+
+    def __init__(self, seen: list[bool]) -> None:
+        super().__init__()
+        self._seen = list(seen)
 
     def execute(self, name, params, dry_run=False, blocked_by_supervisor=False):
         result = super().execute(name, params, dry_run, blocked_by_supervisor)
-        if name == "airsim_detect_objects":
-            self.perception_axis.primary = {"track_id": 7}
+        if name == "inspect_current_frame":
+            found = self._seen.pop(0) if self._seen else False
+            result = _visual_result(name, params or {}, found)
         return result
 
 
@@ -106,34 +135,68 @@ def _run_loop(tmp_path, tools, planner, plan, **loop_kwargs):
 
 
 def test_planned_step_is_retried_after_a_deviation(tmp_path):
-    """抵近步骤第一次因"画面没有锁定目标"偏离时不能被永久跳过。"""
-    tools = _LockingTools()
-    planner = _RecordingPlanner([LoopDecision(action="airsim_detect_objects", params={}, reason="先搜索目标")])
-    plan = _plan([MissionStep(id="s1", label="靠近目标", tool="drone_approach_target")])
-    state = _run_loop(tmp_path, tools, planner, plan)
+    """确认步骤第一次因"视觉没确认到目标"偏离时不能被永久跳过。
 
+    偏离判据取"上一条同工具结果未通过确认"：第一次偏离只交回模型纠错一轮，
+    游标保留，下一轮回到该步骤重新判断——所以后续步骤照常执行。
+    """
+    events: list[str] = []
+    tools = _VisualTools(seen=[False, True])  # 计划首步失败；模型重看时成功
+    planner = _RecordingPlanner(
+        [
+            # 第一次偏离后的纠错：再看一眼（成功）
+            LoopDecision("inspect_current_frame", {}, "换个角度再确认一次"),
+            # 视觉观察之后的运动参数必须由模型给出（不能执行计划里猜的参数）
+            LoopDecision("drone_move_relative", {"forward_m": 1.0}, "深度换算后走一步"),
+        ]
+    )
+    plan = _plan([
+        MissionStep(id="s1", label="确认目标", tool="inspect_current_frame"),
+        MissionStep(id="s2", label="再次确认", tool="inspect_current_frame"),
+        MissionStep(id="s3", label="靠近一点", tool="drone_move_relative", params={"forward_m": 1.0}),
+    ])
+    state = _run_loop(
+        tmp_path, tools, planner, plan,
+        on_event=lambda level, source, message, data: events.append(str(message)),
+    )
+
+    joined = " ".join(events)
     executed = [name for name, _ in tools.calls]
-    assert "airsim_detect_objects" in executed
-    assert "drone_approach_target" in executed, executed
+    assert "与计划不符" in joined, events
+    assert "跳过这一步" not in joined, events  # 没有触发跳过
+    assert "drone_move_relative" in executed, executed  # 偏离纠正后计划继续推进
+    assert "交给模型重新决定" in joined, events  # 观察→运动的交接可见
     assert state.status == "completed"
 
 
 def test_repeated_deviation_eventually_skips_the_step(tmp_path):
-    """同一步骤持续偏离（目标始终没锁定）时跳过该步，避免死循环。"""
-    tools = _FakeTools()  # primary 始终为 None
+    """同一步骤持续偏离（视觉始终没确认）时跳过该步，避免死循环。"""
+    events: list[str] = []
+    tools = _VisualTools(seen=[])  # 之后始终看不见
     planner = _RecordingPlanner(
         [
-            LoopDecision(action="airsim_detect_objects", params={}, reason="再搜索"),
-            LoopDecision(action="airsim_detect_objects", params={}, reason="再搜索"),
-            LoopDecision(action="", reason="无法靠近", is_complete=True),
+            # 第一轮纠错：读深度（不是计划里的步骤，因此不会让计划"收敛"）
+            LoopDecision(action="airsim_get_depth_map", params={}, reason="先看看还有多远"),
+            LoopDecision(action="drone_move_relative", params={"forward_m": 1.0}, reason="再靠近"),
+            LoopDecision(action="", reason="无法确认目标", is_complete=True),
         ]
     )
-    plan = _plan([MissionStep(id="s1", label="靠近目标", tool="drone_approach_target")])
-    state = _run_loop(tmp_path, tools, planner, plan)
+    plan = _plan([
+        MissionStep(id="s1", label="确认目标", tool="inspect_current_frame"),
+        MissionStep(id="s2", label="再次确认", tool="inspect_current_frame"),
+        MissionStep(id="s3", label="靠近一点", tool="drone_move_relative", params={"forward_m": 1.0}),
+    ])
+    state = _run_loop(
+        tmp_path, tools, planner, plan,
+        on_event=lambda level, source, message, data: events.append(str(message)),
+    )
 
+    joined = " ".join(events)
     executed = [name for name, _ in tools.calls]
-    assert "drone_approach_target" not in executed
-    assert executed.count("airsim_detect_objects") == 2
+    assert "跳过这一步" in joined, events
+    assert executed.count("inspect_current_frame") == 1, executed  # 只跑过第一步；第二步被跳过
+    assert "airsim_get_depth_map" in executed, executed  # 第一次偏离交回模型纠错
+    assert "drone_move_relative" in executed, executed  # 跳过之后计划继续推进
     assert state.status == "completed"
 
 
@@ -225,11 +288,11 @@ def test_synthetic_tool_call_label_is_not_shown_as_reasoning():
     synthetic = LoopDecision(action="perception_status", params={}, reason="Call perception_status", is_complete=False)
     assert AgentRuntime._loop_decision_public_text(synthetic) == ""
 
-    real = LoopDecision(action="drone_approach_target", params={}, reason="先靠近目标再确认特征", is_complete=False)
+    real = LoopDecision(action="drone_move_relative", params={"forward_m": 1.0}, reason="先靠近目标再确认特征", is_complete=False)
     assert AgentRuntime._loop_decision_public_text(real) == "先靠近目标再确认特征"
 
-    mixed = LoopDecision(action="x", params={}, reason="先搜索\nCall airsim_detect_objects", is_complete=False)
-    assert AgentRuntime._loop_decision_public_text(mixed) == "先搜索\nCall airsim_detect_objects"
+    mixed = LoopDecision(action="x", params={}, reason="先搜索\nCall inspect_current_frame", is_complete=False)
+    assert AgentRuntime._loop_decision_public_text(mixed) == "先搜索\nCall inspect_current_frame"
 
 
 def test_decision_text_drops_a_raw_decision_json_blob():
@@ -253,7 +316,7 @@ def test_perception_stall_blocks_tasks_that_used_the_camera():
 
     loop = object.__new__(AgentLoop)
     observation = SimpleNamespace(world_state={"perception": {"enabled": True, "capture_age_s": 25.0}})
-    state = SimpleNamespace(results=[SimpleNamespace(tool="airsim_detect_objects")])
+    state = SimpleNamespace(results=[SimpleNamespace(tool="inspect_current_frame")])
     reason = loop._perception_stall(observation, state)
     assert "秒没有更新" in reason
 

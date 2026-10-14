@@ -276,14 +276,12 @@ class ToolRuntime:
         "airsim_take_photo",
         "airsim_get_sensors",
         "airsim_get_depth_map",
-        "airsim_detect_objects",
+        "airsim_locate_point",
         "inspect_current_frame",
         "provider_bridge_health",
         "provider_obstacle_summary",
         "provider_validate_motion",
         "perception_status",
-        "perception_start",
-        "perception_stop",
     }
 
     CONTROL_TOOLS = {
@@ -296,7 +294,6 @@ class ToolRuntime:
         "drone_fly_to",
         "drone_fly_velocity",
         "drone_move_relative",
-        "drone_approach_target",
         "drone_fly_path",
         "drone_dispatch_path",
         "drone_dispatch_land",
@@ -356,6 +353,9 @@ class ToolRuntime:
         self.camera_key = ""
         self.camera_error = ""
         self._camera_lock = threading.RLock()
+        # 预览编码记忆：同一帧只编码一次。面板在缓存路径下 100ms 轮询一次、
+        # 感知轴只出 5Hz，实测一半以上请求拿到的是同一帧却各自重编码。
+        self._preview_encode_cache: dict[str, Any] | None = None
         self.available = False
         self.init_error = ""
         self._lock = threading.RLock()
@@ -469,7 +469,7 @@ class ToolRuntime:
                         fmt,
                         vlm=self.vlm_provider,
                         fallback_capture=self._capture_current_frame_jpeg,
-                        approach=self.approach_target_step,
+                        locate=self.locate_image_point,
                     )
                 except Exception as exc:
                     import logging
@@ -521,6 +521,57 @@ class ToolRuntime:
         except Exception:
             return None
 
+    def locate_image_point(
+        self,
+        x_norm: float,
+        y_norm: float,
+        vehicle_name: str = "",
+        hint_w: float = 0.0,
+        hint_h: float = 0.0,
+    ) -> dict[str, Any]:
+        """归一化图像点 → 距离 + 世界坐标（``airsim_locate_point`` 的实现）。
+
+        纯读取：深度图 + 无人机位姿 → NED。几何只有一份实现在
+        ``perception_airsim_adapter.project_point_to_world`` 里；这里只负责解析
+        相机名，以及"视觉模型归一化坐标的基准画幅"——视觉模型看到的是感知轴的
+        彩色帧，深度图分辨率/纵向视场与它不同，纵向必须按角度映射，所以基准画幅
+        取自感知轴快照（frame_width/frame_height）。
+        """
+        controller = self._perception_camera_controller()
+        if controller is None:
+            return {
+                "valid": False,
+                "reason": "no_controller",
+                "message": "当前后端没有可用的深度相机（本工具依赖 AirSim 深度链路）。",
+            }
+        axis = getattr(self, "perception_axis", None)
+        profile = getattr(axis, "profile", None)
+        camera_name = str(getattr(profile, "camera_name", "") or "0")
+        frame_shape: tuple[int, int] | None = None
+        try:
+            snap = axis.snapshot() or {} if axis is not None else {}
+        except Exception:
+            snap = {}
+        frame_w = int(snap.get("frame_width") or 0)
+        frame_h = int(snap.get("frame_height") or 0)
+        if frame_w > 0 and frame_h > 0:
+            frame_shape = (frame_h, frame_w)
+        try:
+            from src.modules.perception_airsim_adapter import project_point_to_world
+
+            return project_point_to_world(
+                frame_provider=controller,
+                x_norm=float(x_norm),
+                y_norm=float(y_norm),
+                camera_name=camera_name,
+                vehicle_name=str(vehicle_name or ""),
+                frame_shape=frame_shape,
+                hint_w=float(hint_w or 0.0),
+                hint_h=float(hint_h or 0.0),
+            )
+        except Exception as exc:  # noqa: BLE001 — 给模型一句可执行的话，不抛穿
+            return {"valid": False, "reason": "projection_error", "message": f"点位投影失败: {exc}"}
+
     def _perception_health(self) -> dict[str, Any]:
         """感知轴健康：相机链路是否还在出帧。
 
@@ -548,6 +599,10 @@ class ToolRuntime:
             "detection_stale": snapshot.get("detection_stale"),
             "targets": len(snapshot.get("targets") or []),
             "locked": bool(snapshot.get("primary")),
+            # 取景随遥测下发：相机面板据此把下拉框默认成"轴正在看的那一路"，
+            # 而不是各自默认 0 号相机，一开就分叉。
+            "view": health.get("view") or snapshot.get("view") or {},
+            "preview": snapshot.get("preview") or {},
         }
 
     def _camera_tools_ready(self) -> bool:
@@ -993,7 +1048,7 @@ class ToolRuntime:
     @staticmethod
     def _adapt_camera_tool(fn: Callable[..., str]) -> Callable[..., str]:
         """按函数签名过滤入参：不同相机源（AirSim/RTSP/本机）的拍照工具
-        参数集不同（例如 RTSP 版没有 verify_target_class）。LLM 按统一卡片
+        参数集不同（例如 RTSP 版没有 save_path）。LLM 按统一卡片
         传参时，多出来的键不应变成 TypeError。"""
         import functools
         import inspect
@@ -1182,351 +1237,11 @@ class ToolRuntime:
             controller._last_preview_used = time.time()
             return controller, ""
 
-    # 抵近回退窗口：显示层的新鲜度 TTL 只有 1.5s 左右，检测循环偶发慢一帧
-    # （YOLO 在 1280 分辨率下单帧就可能 300ms+）时 primary 会瞬间为空，抵近被
-    # 反复拒绝、模型只能原地回读状态。这里允许用"最近一次真实检测"发起一次
-    # 有界抵近——预测框不算，飞机只朝真实看到过的方向走。
-    _APPROACH_FALLBACK_WINDOW_S = 4.0
+    # 视觉抵近武器库（fallback target / 目标距离估计 / 前向避障 / 自动对准 /
+    # approach_target_step）随 drone_approach_target 一起删除：运行时不再持有任何
+    # 抵近策略。靠近由模型按技能用"VLM 取点 + airsim_get_depth_map + 有界
+    # drone_move_relative"完成；净空判断写进技能，用深度点读数做。
 
-    @classmethod
-    def _fallback_approach_target(cls, snap: dict[str, Any]) -> dict[str, Any] | None:
-        candidates: list[tuple[float, float, dict[str, Any]]] = []
-        for target in snap.get("targets") or []:
-            if not isinstance(target, dict) or target.get("predicted"):
-                continue
-            try:
-                age = float(target.get("age_s"))
-            except (TypeError, ValueError):
-                continue
-            if age < 0 or age > cls._APPROACH_FALLBACK_WINDOW_S:
-                continue
-            bbox = target.get("bbox") or []
-            if len(bbox) != 4:
-                continue
-            try:
-                area = max(0.0, (float(bbox[2]) - float(bbox[0])) * (float(bbox[3]) - float(bbox[1])))
-            except (TypeError, ValueError):
-                continue
-            candidates.append((age, -area, target))
-        if not candidates:
-            return None
-        # 最新的一帧检测优先；同一帧里取最大的框（近处目标更大）
-        candidates.sort(key=lambda item: (item[0], item[1]))
-        return dict(candidates[0][2])
-
-    def _target_distance_from_depth(
-        self, target: dict[str, Any], snap: dict[str, Any], vehicle_name: str = ""
-    ) -> float | None:
-        """用深度图估算目标距离（米）；拿不到返回 None。
-
-        AirSim 的 DepthPlanar 是相机坐标下的深度值，取目标框中心一小块区域的中
-        位数比取单点稳。深度图与彩图分辨率不同（256x144 vs 800x600），坐标按快照
-        里的画幅比例映射。距离只用来决定"这一步该走多远"，失败不影响抵近可行性。
-        """
-        controller = self._perception_camera_controller()
-        if controller is None:
-            return None
-        profile = getattr(getattr(self, "perception_axis", None), "profile", None)
-        camera_name = str(getattr(profile, "camera_name", "") or "CameraImage")
-        bbox = [float(v) for v in (target.get("bbox") or [])]
-        if len(bbox) != 4:
-            return None
-        try:
-            import numpy as np
-
-            from src.modules.perception_airsim_adapter import get_depth_image
-
-            depth = get_depth_image(controller, camera_name, vehicle_name, timeout_sec=3.0)
-            if depth is None:
-                return None
-            height, width = int(depth.shape[0]), int(depth.shape[1])
-            frame_w = float(snap.get("frame_width") or 0.0) or float(width)
-            frame_h = float(snap.get("frame_height") or 0.0) or float(height)
-            cx = (bbox[0] + bbox[2]) / 2.0
-            cy = (bbox[1] + bbox[3]) / 2.0
-            dx = int(max(0.0, min(width - 1.0, cx / max(frame_w, 1.0) * width)))
-            dy = int(max(0.0, min(height - 1.0, cy / max(frame_h, 1.0) * height)))
-            patch = depth[max(0, dy - 2) : dy + 3, max(0, dx - 2) : dx + 3]
-            values = patch[np.isfinite(patch) & (patch > 0.1)]
-            if values.size == 0:
-                return None
-            return float(np.median(values))
-        except Exception:  # noqa: BLE001 — 距离估计失败不能阻断抵近
-            return None
-
-    def approach_target_step(
-        self,
-        step_m: float = 12.0,
-        vehicle_name: str = "",
-        standoff_m: float = 0.0,
-        min_fill: float = 0.25,
-    ) -> dict[str, Any]:
-        """向画面中央锁定的目标做一次有界前向抵近（视觉伺服式靠近）。
-
-        只走机体前方；要求感知轴当前有目标且横向足够居中，否则拒绝（先转向
-        对准）。**"够近"由目标在画面里的大小决定**（``min_fill``，默认占画面
-        高度 25%），不是某个写死的米数——目标高度占比达标就返回 reached，
-        让调用方改用视觉分析去看细节。前进量用深度图换算（表观大小与距离成
-        反比），一步走到阈值距离而不冲过头；没有深度就退到 ``step_m`` 上限。
-
-        Args:
-            step_m: 单步最大前进距离（米），1~12
-            standoff_m: 可选的绝对距离约束（米），0 = 不启用
-            min_fill: 目标高度占画面比例达到多少算"够近可辨认"，默认 0.25
-        """
-        axis = self.perception_axis
-        if axis is None or not getattr(axis, "enabled", False):
-            return {"status": "error", "message": "perception axis unavailable"}
-        controller = self.controller
-        if controller is None or not bool(getattr(controller, "is_connected", False)):
-            return {"status": "error", "message": "flight controller not connected"}
-        try:
-            snap = axis.snapshot() or {}
-        except Exception as exc:
-            return {"status": "error", "message": f"感知快照读取失败: {exc}"}
-        primary = snap.get("primary") or self._fallback_approach_target(snap)
-        if not primary:
-            return {"status": "error", "message": "画面中当前没有锁定目标，先检测/对准再抵近"}
-        bbox = primary.get("bbox") or []
-        if len(bbox) != 4:
-            return {"status": "error", "message": "目标像素框不可用，无法安全抵近"}
-        frame_w = float(snap.get("frame_width") or 0.0)
-        if frame_w <= 0.0:
-            # The axis has not reported a frame size yet (just started); decode
-            # the annotated JPEG as a one-off fallback.
-            frame_w = 640.0
-            try:
-                annotated = axis.annotated_frame()
-                jpeg = annotated[0] if isinstance(annotated, (tuple, list)) else None
-                if jpeg:
-                    import cv2
-                    import numpy as np
-
-                    img = cv2.imdecode(np.frombuffer(jpeg, np.uint8), cv2.IMREAD_UNCHANGED)
-                    if img is not None:
-                        frame_w = float(img.shape[1])
-            except Exception:
-                pass
-        cx = (float(bbox[0]) + float(bbox[2])) / 2.0
-        ex = (cx - frame_w / 2.0) / (frame_w / 2.0)
-        if abs(ex) > 0.35:
-            # 目标偏得多：先自己对准再前进。像素偏差→偏航角是几何换算，模型算不
-            # 出来；但"要不要靠近"才是模型的判断，所以对准属于工具的职责，不该
-            # 变成要模型自己拼的额外步骤。
-            aligned = self._align_to_target(vehicle_name=vehicle_name)
-            if abs(float(aligned.get("ex") or 1.0)) > 0.35:
-                return {
-                    "status": "error",
-                    "message": "目标偏离画面中央且自动对准未收敛，请先手动转向对准再抵近",
-                    "ex": aligned.get("ex", round(ex, 3)),
-                }
-            snap = axis.snapshot() or {}
-            primary = snap.get("primary") or self._fallback_approach_target(snap) or primary
-            bbox = primary.get("bbox") or bbox
-            frame_w = float(snap.get("frame_width") or 0.0) or frame_w
-            cx = (float(bbox[0]) + float(bbox[2])) / 2.0
-            ex = (cx - frame_w / 2.0) / (frame_w / 2.0)
-            if abs(ex) > 0.35:
-                return {"status": "error", "message": f"目标仍未居中(偏差 {ex:+.2f})，已停止抵近", "ex": round(ex, 3)}
-        try:
-            max_step = abs(float(step_m if step_m is not None else 12.0))
-        except (TypeError, ValueError):
-            max_step = 12.0
-        max_step = max(1.0, min(12.0, max_step))
-        # "够近"的判据是目标在画面里的大小，不是某个写死的米数：面积随距离平方
-        # 增长，目标高度占到画面 min_fill 时，特征就足够辨认了（默认 0.25）。
-        # 这样"靠近它"由意图（看清特征）驱动，而不是由配置里的数字驱动。
-        try:
-            min_fill = abs(float(min_fill if min_fill is not None else 0.25))
-        except (TypeError, ValueError):
-            min_fill = 0.25
-        min_fill = max(0.05, min(0.9, min_fill))
-        try:
-            standoff = abs(float(standoff_m or 0.0))
-        except (TypeError, ValueError):
-            standoff = 0.0
-        standoff = max(0.0, min(30.0, standoff))  # 0 = 不启用绝对距离约束
-
-        frame_h = float(snap.get("frame_height") or 0.0) or 480.0
-        bbox_h = abs(float(bbox[3]) - float(bbox[1]))
-        fill = bbox_h / frame_h if frame_h > 0 else 0.0
-        if fill >= min_fill:
-            return {
-                "status": "ok",
-                "reached": True,
-                "target_fill": round(fill, 3),
-                "min_fill": round(min_fill, 2),
-                "target_track_id": primary.get("track_id"),
-                "message": (
-                    f"目标已占画面高度 {fill * 100:.0f}%（阈值 {min_fill * 100:.0f}%），"
-                    "距离足够辨认特征，不需要继续抵近；要看清细节请改用视觉分析动作。"
-                ),
-            }
-
-        distance_m = self._target_distance_from_depth(primary, snap, vehicle_name)
-        if distance_m is not None and fill > 0.0:
-            # 小孔成像：表观大小与距离成反比，所以"要达到 min_fill 还需要走多远"
-            # 可以直接从当前距离换算，一步到位而不冲过头。
-            target_distance = distance_m * (fill / min_fill)
-            remaining = distance_m - target_distance
-            if standoff > 0.0:
-                remaining = min(remaining, distance_m - standoff)
-            if remaining <= 0.5:
-                return {
-                    "status": "ok",
-                    "reached": True,
-                    "distance_m": round(distance_m, 2),
-                    "message": f"目标距离约 {distance_m:.1f} 米，已到达期望的观察距离，不需要继续抵近。",
-                }
-            step = max(1.0, min(max_step, remaining))
-        else:
-            step = max_step
-        # 前方避障：深度图里"目标框以外、画面中央"最近的像素就是挡在路上的东西。
-        # 太近就停住并报告，而不是继续盲目前进（实测操作员看到飞机一路顶到障碍物）。
-        obstacle_m = self._forward_obstacle_distance(primary, snap, vehicle_name)
-        if obstacle_m is not None:
-            if obstacle_m < 1.5:
-                return {
-                    "status": "error",
-                    "blocked": True,
-                    "obstacle_m": round(obstacle_m, 2),
-                    "message": f"前方约 {obstacle_m:.1f} 米处有障碍物，已停止抵近（不会盲目前进）。",
-                }
-            step = max(0.5, min(step, obstacle_m - self._OBSTACLE_MARGIN_M))
-        result = self.execute(
-            "drone_move_relative",
-            {"forward_m": step, "velocity": 1.0, "vehicle_name": vehicle_name} if vehicle_name
-            else {"forward_m": step, "velocity": 1.0},
-            dry_run=False,
-            blocked_by_supervisor=False,
-        )
-        data = dict(result.data or {})
-        data["approach_step_m"] = step
-        data["ex"] = round(ex, 3)
-        data["target_fill"] = round(fill, 3)
-        data["min_fill"] = round(min_fill, 2)
-        if distance_m is not None:
-            data["distance_m"] = round(distance_m, 2)
-        data["target_track_id"] = primary.get("track_id")
-        if not result.ok:
-            data.setdefault("status", "error")
-        return data
-
-    # 机载相机水平视场（settings.json 里 CameraImage 的 FOV_Degrees）。像素偏差
-    # 换算成偏航角必须用它，模型自己算不出"该转多少度"。
-    _CAMERA_FOV_H_DEG = 90.0
-    # 障碍物前保留的安全余量（米）：一步最多走到"障碍距离 - 余量"。
-    _OBSTACLE_MARGIN_M = 0.8
-
-    def _forward_obstacle_distance(
-        self, target: dict[str, Any], snap: dict[str, Any], vehicle_name: str = ""
-    ) -> float | None:
-        """前方（目标框以外）最近的障碍距离（米）；拿不到深度返回 None。
-
-        深度图是逐像素的相机距离：画面中央区域里，除了被观察目标本身，任何很近
-        的像素都意味着有东西挡在路上（墙、树、路障、别的车）。取 5 分位而不是
-        最小值，避免单个噪点让抵近彻底停摆。
-        """
-        controller = self._perception_camera_controller()
-        if controller is None:
-            return None
-        profile = getattr(getattr(self, "perception_axis", None), "profile", None)
-        camera_name = str(getattr(profile, "camera_name", "") or "CameraImage")
-        try:
-            import numpy as np
-
-            from src.modules.perception_airsim_adapter import get_depth_image
-
-            depth = get_depth_image(controller, camera_name, vehicle_name, timeout_sec=3.0)
-            if depth is None:
-                return None
-            height, width = int(depth.shape[0]), int(depth.shape[1])
-            x0, x1 = int(width * 0.25), max(int(width * 0.75), int(width * 0.25) + 1)
-            y0, y1 = int(height * 0.17), max(int(height * 0.83), int(height * 0.17) + 1)
-            region = np.array(depth[y0:y1, x0:x1], dtype=np.float32, copy=True)
-            valid = np.isfinite(region) & (region > 0.2)
-            bbox = [float(v) for v in (target.get("bbox") or [])]
-            if len(bbox) == 4:
-                frame_w = float(snap.get("frame_width") or 0.0) or float(width)
-                frame_h = float(snap.get("frame_height") or 0.0) or float(height)
-                bx0 = int(max(0.0, min(float(width - 1), bbox[0] / max(frame_w, 1.0) * width)))
-                bx1 = int(max(0.0, min(float(width), bbox[2] / max(frame_w, 1.0) * width)))
-                by0 = int(max(0.0, min(float(height - 1), bbox[1] / max(frame_h, 1.0) * height)))
-                by1 = int(max(0.0, min(float(height), bbox[3] / max(frame_h, 1.0) * height)))
-                rx0, rx1 = max(bx0 - x0, 0), min(bx1 - x0, region.shape[1])
-                ry0, ry1 = max(by0 - y0, 0), min(by1 - y0, region.shape[0])
-                if rx1 > rx0 and ry1 > ry0:
-                    valid[ry0:ry1, rx0:rx1] = False  # 被观察对象不是障碍
-            values = region[valid]
-            if values.size < 8:
-                return None
-            return float(np.percentile(values, 5))
-        except Exception:  # noqa: BLE001 — 避障读数失败不能阻断抵近
-            return None
-
-    def _align_to_target(self, tolerance: float = 0.12, vehicle_name: str = "") -> dict[str, Any]:
-        """把机头转向让画面里的目标居中（视觉对准）。
-
-        绕目标移动、飞到它某一侧、抵近之前都要先对准：抵近工具只接受居中目标，
-        而"目标偏在画面右边 → 该往右转多少度"这种换算必须由工具来做。
-        用相机水平 FOV 把归一化像素偏差换成偏航增量，迭代最多三次收敛。
-        """
-        axis = self.perception_axis
-        if axis is None or not getattr(axis, "enabled", False):
-            return {"status": "error", "message": "perception axis unavailable"}
-        controller = self.controller
-        if controller is None or not bool(getattr(controller, "is_connected", False)):
-            return {"status": "error", "message": "flight controller not connected"}
-        try:
-            limit = max(0.02, min(0.5, float(tolerance)))
-        except (TypeError, ValueError):
-            limit = 0.12
-        attempts: list[float] = []
-        # 侧移之后目标往往偏得较多（一次绕行就换了半张画面），迭代次数要够；
-        # 每一轮都要等检测更新，否则拿旧框算出来的角度是错的。
-        for _ in range(5):
-            try:
-                snap = axis.snapshot() or {}
-            except Exception as exc:
-                return {"status": "error", "message": f"感知快照读取失败: {exc}"}
-            primary = snap.get("primary") or self._fallback_approach_target(snap)
-            if not primary:
-                return {"status": "error", "message": "画面中没有锁定目标，无法对准", "attempts": attempts}
-            bbox = [float(v) for v in (primary.get("bbox") or [])]
-            if len(bbox) != 4:
-                return {"status": "error", "message": "目标像素框不可用，无法对准", "attempts": attempts}
-            frame_w = float(snap.get("frame_width") or 0.0) or 640.0
-            ex = ((bbox[0] + bbox[2]) / 2.0 - frame_w / 2.0) / (frame_w / 2.0)
-            attempts.append(round(ex, 3))
-            if abs(ex) <= limit:
-                return {
-                    "status": "ok",
-                    "aligned": True,
-                    "ex": round(ex, 3),
-                    "attempts": attempts,
-                    "target_track_id": primary.get("track_id"),
-                    "message": "目标已在画面中央。",
-                }
-            try:
-                status = controller.get_status(vehicle_name) if vehicle_name else controller.get_status()
-                heading = float(getattr(status, "heading_deg", 0.0) or 0.0)
-            except Exception as exc:
-                return {"status": "error", "message": f"航向读取失败: {exc}", "attempts": attempts}
-            target_heading = (heading + ex * (self._CAMERA_FOV_H_DEG / 2.0)) % 360.0
-            try:
-                ok = controller.rotate_to_heading(target_heading, vehicle_name=vehicle_name)
-            except Exception as exc:
-                return {"status": "error", "message": f"转向失败: {exc}", "attempts": attempts}
-            if not ok:
-                return {"status": "error", "message": "转向指令未完成", "attempts": attempts}
-            time.sleep(0.9)  # 等检测跟上这次转动（检测约 2~4 Hz，太短会拿旧框再算）
-        return {
-            "status": "ok" if abs(attempts[-1]) <= max(limit * 2, 0.2) else "error",
-            "aligned": abs(attempts[-1]) <= max(limit * 2, 0.2),
-            "ex": attempts[-1],
-            "attempts": attempts,
-            "message": "目标接近居中。" if abs(attempts[-1]) <= max(limit * 2, 0.2) else "对准未收敛，请再试一次或手动转向。",
-        }
 
     def acquire_control_gate(self, blocking: bool = False, timeout: float = -1.0) -> bool:
         """获取飞控指令串行闸门（Agent 飞行工具与视觉伺服共用）。"""
@@ -1684,61 +1399,107 @@ class ToolRuntime:
         raw_params = dict(params or {})
         settings = self._camera_settings()
         source = str(raw_params.get("source") or settings.get("source") or "airsim").strip().lower()
-        want_detect = str(raw_params.get("detect") or "0").strip().lower() in {"1", "true", "yes", "on"}
         req_camera = str(raw_params.get("camera_name") or settings.get("camera_name") or "0").strip()
         req_image_type = str(raw_params.get("image_type") or settings.get("image_type") or "scene").strip().lower()
-        # 感知轴标注帧只对应"相机0 / Scene"。面板切到 Depth/Segmentation/
-        # Infrared 或别的相机时，必须走下面的真实抓帧路径，否则选项形同虚设。
-        axis_view_matches = req_camera in {"", "0"} and req_image_type in {"", "scene"}
-        if want_detect and source == "airsim" and axis_view_matches:
-            axis = getattr(self, "perception_axis", None)
-            if axis is not None:
+        axis = getattr(self, "perception_axis", None)
+        axis_view: dict[str, Any] = {}
+        if axis is not None:
+            try:
+                axis_view = axis.view() or {}
+            except Exception:
+                axis_view = {}
+        # 判断"面板要的是不是感知轴正在看的那一路"要跟轴自己报的相机名比，不能
+        # 再拿 {"", "0"} 猜：配置里相机叫 CameraImage，猜法的结果是"0"被当成轴
+        # 那一路（于是显示的是轴的画面、报的名字却是 0），而显式填 CameraImage
+        # 反倒被判成另一路、掉进直连抓帧。空串仍表示"按轴的当前相机走"。
+        axis_camera = str(axis_view.get("camera_name") or "")
+        # 轴没报相机名时无法与它比对，就按"面板要的就是轴那一路"处理：轴的帧本来
+        # 就是 Agent 在看的那份，宁可回放它也不要无谓地去开第二条取流。
+        camera_matches = (not axis_camera) or req_camera in {"", axis_camera}
+        axis_view_matches = camera_matches and req_image_type in {"", "scene"}
+        # 面板看的就是轴上那一路时，预览**一律**回放轴的缓存：感知轴是唯一的 AirSim
+        # 帧源（UI 与 Agent 消费同一份），再拉一次模拟器就是和轴的采集线程抢单线程
+        # RPC。走直连抓帧那条路每次要几秒，表现出来正是"出图率和面板 FPS 一起塌到
+        # ~1 FPS"。
+        #
+        # 这里以前额外要求 `detect=1`——那是"面板要带检测框的标注帧"的年代留下的
+        # 开关（面板为了画框才传它）。检测已从产品中移除、标注框也不存在了，那个门
+        # 就退化成了纯粹的性能回归开关：前端一停止传它，预览立刻退回阻塞直连。护栏
+        # 现在落在行为上（默认请求就必须走缓存），见
+        # tests/test_perception_axis.py::test_preview_uses_axis_cache_without_detect_param。
+        if source == "airsim" and axis_view_matches and axis is not None:
+            try:
+                jpeg, dets, ts = axis.annotated_frame()
+            except Exception:
+                jpeg, dets, ts = None, [], 0.0
+            if jpeg:
+                # 采集偶发卡顿不该让画面和锁定整个消失。这里优先回放感知轴
+                # 缓存，并把新鲜度如实报给前端；不再因为 is_online 一秒内为
+                # 假就回退到阻塞式的重新抓帧——那条路每次要几秒，表现出来
+                # 正是"标注一会有一会没有"。只有缓存完全为空时才回退。
+                age_s = max(0.0, time.time() - float(ts or 0.0))
                 try:
-                    jpeg, dets, ts = axis.annotated_frame()
+                    online = bool(axis.is_online())
                 except Exception:
-                    jpeg, dets, ts = None, [], 0.0
-                if jpeg:
-                    # 采集偶发卡顿不该让画面和锁定整个消失。这里优先回放感知轴
-                    # 缓存，并把新鲜度如实报给前端；不再因为 is_online 一秒内为
-                    # 假就回退到阻塞式的重新抓帧——那条路每次要几秒，表现出来
-                    # 正是"标注一会有一会没有"。只有缓存完全为空时才回退。
-                    age_s = max(0.0, time.time() - float(ts or 0.0))
-                    try:
-                        online = bool(axis.is_online())
-                    except Exception:
-                        online = False
-                    # 帧率不再烧录进 JPEG：画面用 object-fit: cover 铺满画面区，
-                    # 烧在图片左上角的字在小面板上会被裁掉（要放大才看得到）。
-                    # 这里随 meta 报给前端，由面板固定位置的徽标显示。
-                    try:
-                        health = axis.health()
-                    except Exception:
-                        health = {}
-                    max_width = 560
-                    quality = 54
-                    body, mime = self._encode_preview_frame(jpeg, max_width=max_width, quality=quality)
-                    meta: dict[str, Any] = {
-                        "status": "ok",
-                        "vehicle": "perception-axis",
-                        "camera": req_camera or "0",
-                        "image_type": "scene",
-                        "size_kb": round(len(body) / 1024, 1),
-                        "source": "airsim",
-                        "detections": list(dets),
-                        "axis_online": online,
-                        "axis_frame_age_s": round(age_s, 2),
-                        "frame_timestamp": float(ts or 0.0),
-                        "preview_cached": True,
-                        "fps": float(health.get("fps") or 0.0),
-                    }
-                    # 远端感知服务不报检测率，缺键时不要补 0.0：前端会把它当成
-                    # "检测确实停了"显示出来。
-                    if health.get("detect_fps") is not None:
-                        meta["detect_fps"] = float(health.get("detect_fps") or 0.0)
-                    return True, body, mime, meta
+                    online = False
+                # 帧率不再烧录进 JPEG：画面用 object-fit: cover 铺满画面区，
+                # 烧在图片左上角的字在小面板上会被裁掉（要放大才看得到）。
+                # 这里随 meta 报给前端，由面板固定位置的徽标显示。
+                try:
+                    health = axis.health()
+                except Exception:
+                    health = {}
+                max_width = 560
+                quality = 54
+                body, mime = self._encoded_preview_for_frame(
+                    jpeg, ts, max_width=max_width, quality=quality
+                )
+                meta: dict[str, Any] = {
+                    "status": "ok",
+                    "vehicle": "perception-axis",
+                    # 报轴实际在用的相机名，而不是请求里那个字符串：这一帧就是从
+                    # 那路相机来的，meta 必须说实话（此前恒等于请求值，出现过
+                    # "画面来自 CameraImage、meta 写 0"）。
+                    "camera": axis_camera or req_camera or "0",
+                    "image_type": "scene",
+                    "size_kb": round(len(body) / 1024, 1),
+                    "source": "airsim",
+                    "detections": list(dets),
+                    # 框的来源：感知轴的连续检测（有 track_id、会做时序关联）还是
+                    # 面板直连抓帧时的一次性检测。两者可信度不同，前端和 Agent
+                    # 都要能区分。
+                    "detection_source": "axis",
+                    "axis_online": online,
+                    "axis_frame_age_s": round(age_s, 2),
+                    "frame_timestamp": float(ts or 0.0),
+                    "preview_cached": True,
+                    "fps": float(health.get("fps") or 0.0),
+                }
+                # 远端感知服务不报检测率，缺键时不要补 0.0：前端会把它当成
+                # "检测确实停了"显示出来。
+                if health.get("detect_fps") is not None:
+                    meta["detect_fps"] = float(health.get("detect_fps") or 0.0)
+                try:
+                    axis.note_preview(
+                        camera_name=axis_camera or req_camera,
+                        image_type="scene",
+                        source="airsim",
+                        detection_source="axis",
+                        detections=list(dets),
+                        target_class=str(getattr(axis.profile, "target_class", "") or ""),
+                    )
+                except Exception:
+                    pass
+                return True, body, mime, meta
         self._start_preview_reaper()
         raw_params = dict(params or {})
-        controller, error = self._ensure_preview_controller(raw_params)
+        # AirSim 上优先复用感知轴那个控制器：另开一条连接会和轴抢仿真器单线程
+        # 的 RPC（实测表现为深度一直读不到、出图率塌陷），共用一个控制器时请求
+        # 只是在它的执行锁上排队。RTSP/本机相机不存在这个竞争，各走各的。
+        controller = self._perception_camera_controller() if source == "airsim" else None
+        error = ""
+        if controller is None:
+            controller, error = self._ensure_preview_controller(raw_params)
         if controller is None:
             return False, b"", "text/plain; charset=utf-8", {
                 "status": "error",
@@ -1750,7 +1511,6 @@ class ToolRuntime:
         camera_name = str(raw_params.get("camera_name") or settings.get("camera_name") or "0")
         vehicle_name = str(raw_params.get("vehicle_name") or settings.get("vehicle_name") or "")
         image_type_name = str(raw_params.get("image_type") or settings.get("image_type") or "scene").lower()
-        detect = str(raw_params.get("detect") or "0").strip().lower() in {"1", "true", "yes", "on"}
         try:
             timeout_sec = float(raw_params.get("timeout_sec") or 2.0)
         except (TypeError, ValueError):
@@ -1813,12 +1573,16 @@ class ToolRuntime:
                     "status": "error",
                     "message": "AirSim returned an empty camera preview frame",
                 }
-            detections: list[dict[str, Any]] = []
             preview_bytes = bytes(raw)
-            # 只在 Scene 图上做检测标注：Depth/Segmentation/Infrared 是有专门
-            # 用途的通道，叠加 YOLO 框没有意义，还会白占模型推理锁（拖慢画面）。
-            if detect and image_type_name in {"scene", ""} and source in {"airsim", "rtsp", "local"}:
-                preview_bytes, detections = self._detect_and_annotate(preview_bytes)
+            # 这条路**不做检测**：框只有感知轴一个来源。
+            #
+            # 这里原本会跑一次性单帧检测，代价是把"检测有几处事实来源"变成两处，
+            # 而且很贵——实测一次单帧检测 1.3s（抖到 14s），叠上抓帧 0.4~2s，再
+            # 和感知轴自己的 5fps 抓帧、2Hz 推理抢同一台机器，整帧能拖到十几到
+            # 四十几秒（前端每帧只等 3.6s，于是画面永远刷不出来）。
+            #
+            # 没有它也不会丢能力：要看这一路的框，把感知轴切到这台相机即可（面板
+            # 换一下相机），那条路是 13ms 的缓存回放，还带 track_id 和世界坐标。
             body, mime_type = self._encode_preview_frame(preview_bytes, max_width=max_width, quality=quality)
             meta: dict[str, Any] = {
                 "status": "ok",
@@ -1827,9 +1591,21 @@ class ToolRuntime:
                 "image_type": image_type_name,
                 "size_kb": round(len(body) / 1024, 1),
                 "source": source,
+                "detection_source": "none",
+                "detections": [],
+                # 这条路的框永远为空，得让面板说清原因：false = 这一路不是感知轴
+                # 在看的那台相机（要看它的框就把感知轴切过去）。RTSP/USB 源上相机
+                # 名不构成"另一路"，那种情况不报 false。
+                "matches_axis_view": bool(axis_view_matches),
             }
-            if detections:
-                meta["detections"] = detections
+            # 记下"操作员在看哪一路"：不记的话 Agent 完全不知道面板已经切走了。
+            self._note_preview_observation(
+                camera_name=camera_name,
+                image_type=image_type_name,
+                source=source,
+                detections=[],
+                detection_source="",
+            )
             return True, body, mime_type, meta
         except Exception as exc:
             self.camera_error = str(exc)
@@ -1902,63 +1678,52 @@ class ToolRuntime:
         except Exception:
             return None
 
-    def _detection_confidence(self, fallback: float = 0.35) -> float:
-        """Confidence threshold from the perception profile, so both paths agree.
+    def _encoded_preview_for_frame(
+        self, jpeg: bytes, frame_ts: Any, *, max_width: int, quality: int
+    ) -> tuple[bytes, str]:
+        """同一帧的预览编码只做一次，重复请求直接复用字节。
 
-        The UI preview used to hardcode 0.20 while the perception axis used the
-        configured value. Different thresholds mean the UI and the Agent are not
-        looking at the same detections, which makes the UI an unreliable
-        reference for judging whether recognition is stable.
+        面板在缓存路径下 100ms 轮询一次（10Hz），而感知轴只出 5Hz——实测 83 次
+        请求里 44 次拿到的是同一帧，却各自重新编码一遍（20.5ms/次，合计约 0.17
+        颗核）。这些 CPU 和采集、YOLO 推理抢的是同一台机器，直接放大出帧抖动，
+        所以必须复用。键里带上尺寸参数：两个面板用不同尺寸时各自算各自的。
         """
-        profile = getattr(getattr(self, "perception_axis", None), "profile", None)
-        try:
-            value = float(getattr(profile, "confidence", 0.0) or 0.0)
-        except (TypeError, ValueError):
-            value = 0.0
-        return value if value > 0.0 else fallback
+        key = (round(float(frame_ts or 0.0), 6), len(jpeg), int(max_width), int(quality))
+        cached = getattr(self, "_preview_encode_cache", None)
+        if isinstance(cached, dict) and cached.get("key") == key:
+            return cached["body"], cached["mime"]
+        body, mime = self._encode_preview_frame(jpeg, max_width=max_width, quality=quality)
+        self._preview_encode_cache = {"key": key, "body": body, "mime": mime}
+        return body, mime
 
-    def _detect_and_annotate(self, raw: bytes, threshold: float | None = None) -> tuple[bytes, list[dict[str, Any]]]:
-        """Run YOLO on one preview frame and overlay detection boxes.
+    def _note_preview_observation(
+        self,
+        *,
+        camera_name: str,
+        image_type: str,
+        source: str,
+        detections: list[dict[str, Any]],
+        detection_source: str,
+    ) -> None:
+        """把"面板此刻在看什么"写进感知轴，让 Agent 也能看到。
 
-        One-shot path (not a continuous stream): a single AirSim frame is
-        captured, annotated with detection boxes/labels, and returned for the
-        UI. Serialized through the shared model inference lock.
+        只记录事实，不碰 targets：面板旁看的画面没有 track_id、没有世界坐标、
+        没有经过轴的时序关联，混进去会让模型把它当成自己检测到的目标。
         """
-        if threshold is None:
-            threshold = self._detection_confidence()
+        note = getattr(getattr(self, "perception_axis", None), "note_preview", None)
+        if not callable(note):
+            return
         try:
-            import cv2
-            import numpy as np
-
-            from src.modules.yolo_detection import detect_objects_stateless
-
-            img = cv2.imdecode(np.frombuffer(raw, dtype=np.uint8), cv2.IMREAD_UNCHANGED)
-            if img is None:
-                return raw, []
-            if img.ndim == 3 and img.shape[2] == 4:
-                img = cv2.cvtColor(img, cv2.COLOR_BGRA2BGR)
-            if img.ndim != 3:
-                return raw, []
-            # 标准类别走 COCO 固定类别模型（比 YOLO-World 更准更稳）
-            dets = detect_objects_stateless(img, "car", threshold)
-            labeled: list[dict[str, Any]] = []
-            for det in dets:
-                x1, y1, x2, y2 = [int(v) for v in det["bbox"]]
-                cv2.rectangle(img, (x1, y1), (x2, y2), (0, 200, 255), 2)
-                label = f"{det['class']} {det['confidence']:.2f}"
-                (tw, th), _ = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.7, 2)
-                bx1, by1 = x1, max(0, y1 - th - 8)
-                bx2, by2 = min(img.shape[1], x1 + tw + 8), max(0, y1 - 2)
-                cv2.rectangle(img, (bx1, by1), (bx2, by2), (0, 0, 0), -1)
-                cv2.putText(img, label, (bx1 + 4, by2 - 5), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 255), 2)
-                labeled.append({"class": det["class"], "confidence": det["confidence"], "bbox": det["bbox"]})
-            ok, buf = cv2.imencode(".jpg", img, [int(cv2.IMWRITE_JPEG_QUALITY), 85])
-            if not ok:
-                return raw, labeled
-            return buf.tobytes(), labeled
-        except Exception as exc:
-            self.camera_error = str(exc)
-            return raw, []
+            note(
+                camera_name=camera_name,
+                image_type=image_type,
+                source=source,
+                detection_source=detection_source,
+                detections=list(detections or []),
+                target_class="",
+            )
+        except Exception:
+            pass  # 记录观测失败不能拖垮取景
 
     @staticmethod
     def _encode_preview_frame(raw: bytes, max_width: int = 640, quality: int = 62) -> tuple[bytes, str]:

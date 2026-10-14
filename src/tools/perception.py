@@ -107,8 +107,6 @@ def register_perception_tools(mcp, controller: FlightController, _fmt_result):
         max_retries: int = 3,
         save_to_cwd: bool = False,
         timeout_sec: float = 30.0,
-        verify_target_class: str = "",
-        verify_min_confidence: float = 0.2,
     ) -> str:
         """拍照。返回 base64 PNG 图像，自动保存到 captures 目录。
 
@@ -118,7 +116,9 @@ def register_perception_tools(mcp, controller: FlightController, _fmt_result):
         - 拍照前先做健康检查（ping）
         - 拍照前检查无人机是否静止
         - 每次拍照后冷却 1 秒
-        - 可选 YOLO 验证: 设置 verify_target_class 后自动检测确认画面是否包含目标
+
+        本工具只负责把画面取回来/存下来。**判断画面里有没有目标、目标在哪个位置，
+        用 inspect_current_frame（把画面交给视觉模型）**——本产品没有目标检测。
 
         Args:
             camera_name: 相机ID，默认"0"（前方视角，当前仅配置前向相机）
@@ -129,8 +129,6 @@ def register_perception_tools(mcp, controller: FlightController, _fmt_result):
             max_retries: 最大重试次数，默认3
             save_to_cwd: 是否保存到当前工作目录，默认False
             timeout_sec: RPC 调用超时秒数，默认30
-            verify_target_class: 验证目标类别(英文)。如"car"，拍照后YOLO检测确认画面中有该目标才返回
-            verify_min_confidence: YOLO验证最低置信度，默认0.2
         """
         if not controller.is_connected:
             return _fmt_result({"status": "error", "message": "AirSim 未连接"})
@@ -218,45 +216,12 @@ def register_perception_tools(mcp, controller: FlightController, _fmt_result):
             "image_base64": img_b64,
         }
 
-        # ── YOLO 验证: 确认画面中是否包含目标 ──
-        if verify_target_class:
-            try:
-                import cv2
-                import numpy as np
-                # 延迟导入避免循环依赖
-                from src.modules.yolo_detection import detect_objects_stateless
-
-                nparr = np.frombuffer(response, np.uint8)
-                img = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
-                if img is not None:
-                    detections = detect_objects_stateless(img, verify_target_class, verify_min_confidence)
-
-                    if not detections:
-                        # 画面中没有目标，返回错误
-                        return _fmt_result({
-                            "status": "error",
-                            "message": (
-                                f"拍照审核失败: 画面中未检测到'{verify_target_class}'类目标。"
-                                f"当前画面可能没有目标，或目标不在视野内。"
-                                f"建议先用 detect_objects 确认目标可见后再拍照，"
-                                f"或调整无人机位置使目标进入视野。"
-                            ),
-                            "camera": camera_name,
-                            "verify_target_class": verify_target_class,
-                            "verify_confidence_threshold": verify_min_confidence,
-                        })
-
-                    # 验证通过，记录检测信息
-                    result["verified"] = True
-                    result["verify_detections"] = detections
-                    result["message"] += f" (YOLO验证通过: 检测到{len(detections)}个{verify_target_class})"
-                else:
-                    result["verified"] = False
-                    result["message"] += " (YOLO验证跳过: 图像解码失败)"
-            except Exception as e:
-                result["verified"] = False
-                result["verify_error"] = str(e)
-                result["message"] += f" (YOLO验证异常: {e})"
+        # ── 目标确认不在这里做 ──
+        # 这里原来有一段"可选 YOLO 验证"：传 verify_target_class 就让检测器确认画面里
+        # 有没有该类目标，没有就整次拍照返回 error（"拍照审核失败"）。检测已从产品中
+        # 移除，这个后门也一起去掉——否则模型按旧文档传参就会触发一条已废弃的检测
+        # 路径，还会把一次成功的拍照变成一次失败。要确认目标请用
+        # inspect_current_frame（视觉模型）。
 
         if save_path:
             final_path = save_path

@@ -259,8 +259,6 @@ function prepareCameraTemplateRoles(el = els.cameraViewer) {
   el.querySelector("[data-camera-role='vehicle']")?.closest("label")?.setAttribute("data-camera-role", "vehicleField");
   el.querySelector("[data-camera-role='imageType']")?.closest("label")?.setAttribute("data-camera-role", "imageTypeField");
   el.querySelector("#cameraLiveIndicator")?.setAttribute("data-camera-role", "live");
-  el.querySelector("#cameraDetectStatus")?.setAttribute("data-camera-role", "detectStatus");
-  el.querySelector("#cameraDetectToggle")?.setAttribute("data-camera-role", "detectToggle");
   el.querySelector("#cameraPerf")?.setAttribute("data-camera-role", "perf");
   el.querySelector("#cameraSnapshotStatus")?.setAttribute("data-camera-role", "status");
   el.querySelector("#cameraImage")?.setAttribute("data-camera-role", "image");
@@ -297,8 +295,6 @@ function createCameraWindow({ id = "", el = null, settings = null, primary = fal
     primary,
     el,
     ...cameraWindowParts(el),
-    detectStatusEl: el.querySelector("[data-camera-role='detectStatus']"),
-    detectToggleEl: el.querySelector("[data-camera-role='detectToggle']"),
     settings: normalizeCameraSettings(settings || cameraSettings),
     positioned: false,
     captureInFlight: false,
@@ -313,12 +309,11 @@ function createCameraWindow({ id = "", el = null, settings = null, primary = fal
     objectUrl: "",
     staleObjectUrls: [],
     liveBadgeKey: "",
-    detectBadgeKey: "",
     perfKey: "",
     statusKey: "",
-    detectErrorMessage: "",
-    detectErrorUntil: 0,
     errorCount: 0,
+    // 连续超时计数：只用于提示降频，不参与『停止重试』的判定（见 catch 分支）
+    timeoutCount: 0,
     eventsBound: false,
     lastSuccessSource: "",
   };
@@ -334,11 +329,8 @@ function createCameraWindow({ id = "", el = null, settings = null, primary = fal
   }
   cameraWindows.set(winId, win);
   syncCameraWindowControls(win);
-  renderCameraMeta(null, win);
   setupCameraWindowEvents(win);
-  win.detectToggleEl?.addEventListener("click", () => toggleCameraDetection());
   setCameraStreamActive(win, false);
-  renderCameraDetection(win);
   return win;
 }
 
@@ -412,7 +404,32 @@ function syncCameraWindowControls(win) {
   if (!win) return;
   if (win.sourceSelect) win.sourceSelect.value = String(win.settings.source || "airsim").toLowerCase();
   if (win.cameraSelect) {
-    const cameraName = String(win.settings.camera_name || "0");
+    let cameraName = String(win.settings.camera_name || "0");
+    // 首次同步：面板加入感知轴当前的取景，而不是把它拽到面板默认的 0 号相机。
+    // 感知轴才是"哪一路画面"的事实来源；面板一开就跟它对齐，才不会出现
+    // "面板看着 A、Agent 看着 B"而两边都不知道。之后操作员改选项就走
+    // updateCameraViewerSelection 把轴切过去（轴跟着面板）。
+    //
+    // latch 只在**真的拿到**轴相机名时置位：第一帧时遥测可能还没到，那时
+    // 置位会让面板永远停在错的那一路（"0" 和轴的 CameraImage 是两台不同的
+    // 相机，判成"要看别的路"就会绕开缓存直连抓帧）。
+    if (win.primary && !win.viewJoinedAxis) {
+      const axisCamera = axisViewCameraName();
+      if (axisCamera) {
+        if (cameraName !== axisCamera) {
+          cameraName = axisCamera;
+          win.settings.camera_name = cameraName;
+          // 对齐后要落盘：设置里那个对不上的旧相机名会在下次启动时把面板再拽
+          // 回去，又绕开缓存。
+          if (cameraSettings.camera_name !== cameraName) {
+            cameraSettings = { ...cameraSettings, camera_name: cameraName };
+            renderCameraSettings();
+            saveCameraSettings({ silent: true }).catch(() => {});
+          }
+        }
+        win.viewJoinedAxis = true;
+      }
+    }
     if (![...win.cameraSelect.options].some((option) => option.value === cameraName)) {
       win.cameraSelect.add(new Option(`${cameraName} · custom`, cameraName));
     }
@@ -429,6 +446,12 @@ function syncCameraWindowControls(win) {
     win.vehicleSelect.value = vehicleName || win.vehicleSelect.value || "";
   }
   toggleCameraSourceSpecificFields(win);
+}
+
+// 感知轴当前取景的相机名（遥测里下发；Agent 看的就是这一路）。
+function axisViewCameraName() {
+  const view = latestState?.tool_runtime?.perception?.view || {};
+  return String(view.camera_name || "").trim();
 }
 
 function renderCameraSettings() {
@@ -455,22 +478,18 @@ function cameraSourceLabel(settings) {
   return source;
 }
 
+// 目标检测标注 HUD 已随 YOLO 检测一起下线：函数保留为空壳，只为不打断现有
+// 调用点（含 ui-chat.js），HUD 永远保持隐藏，不再渲染 detections。
 function renderCameraMeta(data = null, win = primaryCameraWindow()) {
   const hudEl = win?.hudEl || els.cameraHud;
   if (!hudEl) return;
-  const detections = Array.isArray(data?.detections) ? data.detections : [];
-  if (detections.length) {
-    hudEl.textContent = detections.map((d) => `🎯 ${d.class} ${Number(d.confidence || 0).toFixed(2)}`).join("\n");
-    hudEl.hidden = false;
-  } else {
-    hudEl.hidden = true;
-  }
+  hudEl.hidden = true;
 }
 
 // -- 帧率徽标 ---------------------------------------------------------
 // 固定显示在面板控制条里，不再烧录进画面：画面是 object-fit: cover 铺满画面区的，
 // 烧在图片左上角的字在小面板上会被裁掉，只有放大面板才看得见。
-// 数值优先用感知轴 meta 报的 fps/detect_fps（服务端近 3 秒的真实采集/检测速率）；
+// 数值优先用感知轴 meta 报的 fps（服务端近 3 秒的真实采集速率）；
 // 本机摄像头 / RTSP / 深度图这些没有感知轴的源，就用本面板自己收到的帧率兜底。
 const CAMERA_PERF_WINDOW_MS = 3000;
 
@@ -525,15 +544,7 @@ function renderCameraPerf(win, meta = null) {
     if (!el.hidden) el.hidden = true;
     return;
   }
-  // 检测速率与检测徽标/开关同源：都读遥测的 tool_runtime.perception.detect_fps，
-  // 只有检测在跑（detect_fps > 0）才显示。预览 meta 里的 detect_fps 是另一套
-  // 数据源，预览失败/缓存时会过期，曾出现"未检测"和"检测 1.2/s"同屏打架，
-  // 不再采用。
-  const detection = cameraDetectionSnapshot();
-  const detectFps = detection.running ? Number(detection.detectFps) : NaN;
-  const text = Number.isFinite(detectFps) && detectFps > 0
-    ? `FPS ${fps.toFixed(1)} · 识别 ${detectFps.toFixed(1)}/s`
-    : `FPS ${fps.toFixed(1)}`;
+  const text = `FPS ${fps.toFixed(1)}`;
   const title = hasServerFps
     ? `面板新帧刷新率；后台采集 ${serverFps.toFixed(1)} FPS`
     : "面板近 3 秒实际收到的画面帧率";
@@ -545,143 +556,6 @@ function renderCameraPerf(win, meta = null) {
     el.title = title;
   }
   if (el.hidden) el.hidden = false;
-}
-
-// -- 检测开关与状态徽标 -------------------------------------------------
-// 相机流默认自己跑，YOLO 检测由操作员手动开关：状态全部从遥测的
-// tool_runtime.perception 派生，detect_fps 为 null/缺省 = 检测未运行。
-// 开关标签与动作只看派生的 running（detect_fps > 0）：running = "停止目标检测"，
-// 否则 = "开启目标检测"，绝不能用另一套判据，否则会出现"检测在跑但按钮还写着
-// 开启"的矛盾。刚点过"开启目标检测"后的模型加载期本地记一个 pending 窗口，
-// 只用来让徽标显示"检测启动中"，不拿 enabled 判断——它只说明感知轴/相机流
-// 被启用，检测可能已经停了。
-// 徽标和开关一起放在面板标题行里（原先在控制条第二行，把面板撑得很挤），
-// 与 LIVE 徽标一样，遥测 250ms 一刷，但只有派生出的文案键变化才写 DOM。
-const CAMERA_DETECT_PENDING_MS = 20000;
-const CAMERA_DETECT_ERROR_MS = 6000;
-let cameraDetectionPendingUntil = 0;
-let cameraDetectionRequestInFlight = false;
-
-function markCameraDetectionPending(ms = CAMERA_DETECT_PENDING_MS) {
-  cameraDetectionPendingUntil = Date.now() + Math.max(0, Number(ms) || 0);
-}
-
-function clearCameraDetectionPending() {
-  cameraDetectionPendingUntil = 0;
-}
-
-function cameraDetectionSnapshot(runtime = null, now = Date.now()) {
-  const perception = runtime?.perception || latestState?.tool_runtime?.perception || {};
-  const detectFps = Number(perception.detect_fps);
-  const running = Number.isFinite(detectFps) && detectFps > 0;
-  const starting = !running && now < cameraDetectionPendingUntil;
-  const stale = running && perception.detection_stale === true;
-  const rawTargets = Number(perception.targets);
-  const targetCount = Number.isFinite(rawTargets) && rawTargets >= 0 ? Math.round(rawTargets) : null;
-  const parts = [];
-  let tone = "idle";
-  let title = "目标检测未运行，画面仍会持续更新；点『开启目标检测』启动 YOLO";
-  if (running) {
-    parts.push(stale ? "检测陈旧" : "检测中");
-    parts.push(`${detectFps.toFixed(1)}/s`);
-    tone = stale ? "warn" : "live";
-    title = stale
-      ? `检测线程在跑（${detectFps.toFixed(1)} 次/秒），但最近一次检测结果已过期，可能正在排队或卡住`
-      : `后台目标检测运行中：${detectFps.toFixed(1)} 次/秒`;
-    if (targetCount != null) {
-      parts.push(`${targetCount} 目标`);
-      if (!stale) title += `，当前 ${targetCount} 个目标`;
-    }
-  } else if (starting) {
-    parts.push("检测启动中");
-    title = "检测服务已启动，YOLO 模型加载可能需要十几秒";
-  } else {
-    parts.push("未检测");
-  }
-  return {
-    running,
-    starting,
-    stale,
-    targetCount,
-    detectFps: running ? detectFps : null,
-    label: parts.join(" · "),
-    tone,
-    title,
-    key: `${tone}|${parts.join("|")}`,
-  };
-}
-
-function renderCameraDetection(win) {
-  if (!win) return;
-  const statusEl = win.detectStatusEl;
-  const toggleEl = win.detectToggleEl;
-  if (!statusEl && !toggleEl) return;
-  const snapshot = cameraDetectionSnapshot();
-  const errorText = win.detectErrorMessage && Date.now() < Number(win.detectErrorUntil || 0)
-    ? win.detectErrorMessage
-    : "";
-  if (statusEl) {
-    const key = `${snapshot.key}|${errorText}`;
-    if (win.detectBadgeKey !== key) {
-      win.detectBadgeKey = key;
-      if (errorText) {
-        statusEl.dataset.health = "error";
-        statusEl.textContent = errorText;
-        statusEl.title = errorText;
-      } else {
-        statusEl.dataset.health = snapshot.tone;
-        statusEl.textContent = snapshot.label;
-        statusEl.title = snapshot.title;
-      }
-    }
-  }
-  if (toggleEl) {
-    const busy = cameraDetectionRequestInFlight;
-    // 标签必须说清开的是"目标检测"（YOLO），且只跟 running 走：
-    // running（detect_fps > 0）= 检测在跑 → 按钮是"停止目标检测"。
-    const label = busy ? "处理中…" : (snapshot.running ? "停止目标检测" : "开启目标检测");
-    const title = snapshot.running
-      ? "停止后台 YOLO 目标检测（画面继续更新）"
-      : "启动后台 YOLO 目标检测（模型加载可能需要十几秒）";
-    if (toggleEl.textContent !== label) toggleEl.textContent = label;
-    if (toggleEl.title !== title) toggleEl.title = title;
-    if (toggleEl.disabled !== busy) toggleEl.disabled = busy;
-    const detecting = String(snapshot.running);
-    if (toggleEl.dataset.detecting !== detecting) toggleEl.dataset.detecting = detecting;
-  }
-}
-
-async function toggleCameraDetection() {
-  if (cameraDetectionRequestInFlight) return;
-  const snapshot = cameraDetectionSnapshot();
-  // 与按钮标签同一个判据：running 才发停止指令
-  const stopping = snapshot.running;
-  cameraDetectionRequestInFlight = true;
-  cameraWindows.forEach(renderCameraDetection);
-  try {
-    const result = await post("/api/tool", {
-      tool: stopping ? "perception_stop" : "perception_start",
-      params: {},
-      dry_run: false,
-    });
-    if (stopping) clearCameraDetectionPending();
-    else markCameraDetectionPending();
-    cameraWindows.forEach((win) => {
-      win.detectErrorMessage = "";
-      win.detectErrorUntil = 0;
-    });
-    showNotice(extractApiSuccess(result, stopping ? "检测已停止" : "检测已启动"), "success");
-    refresh().catch(() => {});
-  } catch (error) {
-    const message = (error && error.message) || "检测指令执行失败";
-    cameraWindows.forEach((win) => {
-      win.detectErrorMessage = message;
-      win.detectErrorUntil = Date.now() + CAMERA_DETECT_ERROR_MS;
-    });
-  } finally {
-    cameraDetectionRequestInFlight = false;
-    cameraWindows.forEach(renderCameraDetection);
-  }
 }
 
 function setCameraViewerVisible(visible, win = primaryCameraWindow()) {
@@ -790,7 +664,7 @@ function setupCameraWindowDrag(win) {
 // 标题行只放短标签（连接中…/连接失败/已暂停/未连接），完整说明（失败原因 +
 // 恢复办法）进 title 提示，并继续写进画面区的占位文字。fetch 失败时浏览器给的
 // 是 "Failed to fetch"，再拼上"已停止重试…"整句塞进标题行会把这个槽的基准宽度
-// 撑到整行，逼着图像源下拉与检测开关换行、被推着走（截图反馈）。
+// 撑到整行，逼着图像源下拉换行、被推着走（截图反馈）。
 // 抓帧 0.7s 一次、恢复流程也会调，派生出的标签/提示没变就不写 DOM。
 const CAMERA_STATUS_LABELS = {
   loading: "连接中…",
@@ -949,7 +823,6 @@ function cameraPreviewUrl(settings) {
     params.set("camera_name", settings.camera_name || "0");
     params.set("vehicle_name", settings.vehicle_name || "");
     params.set("image_type", settings.image_type || "scene");
-    params.set("detect", "1");
   }
   return `/api/camera/preview?${params.toString()}`;
 }
@@ -1005,6 +878,7 @@ async function captureCameraFrame({ notify = true, openViewer = true, windowId =
     if (!blob.size) throw new Error("未返回图像数据");
     if (seq !== win.frameSeq) return;
     win.errorCount = 0;
+    win.timeoutCount = 0;
     if (!noteCameraFrameArrival(win, data)) {
       setCameraViewerState(win, "ready", "");
       renderCameraPerf(win, data);
@@ -1030,8 +904,14 @@ async function captureCameraFrame({ notify = true, openViewer = true, windowId =
     win.lastSuccessSource = win.settings.source;
     if (notify) showNotice(data.message || "摄像头画面已更新", "success");
   } catch (error) {
-    win.errorCount += 1;
-    const message = error.name === "AbortError" ? "摄像头预览超时，正在降频重试" : (error.message || "获取摄像头画面失败");
+    const timedOut = error.name === "AbortError";
+    const message = timedOut ? "摄像头预览超时，正在降频重试" : (error.message || "获取摄像头画面失败");
+    // 超时是"这一帧慢"，不是"这个源不可用"：模型冷加载、仿真器瞬时卡顿都会让
+    // 单帧超时。把它计进停止阈值会让一次慢启动把整个画面流永久打死——实测
+    // 三次超时就"已停止重试"，而首帧的模型冷加载要几十秒，服务端其实正在
+    // 正常出帧。所以只有"连不上/明确报错"才算致命。
+    if (timedOut) win.timeoutCount = Number(win.timeoutCount || 0) + 1;
+    else win.errorCount += 1;
     setCameraViewerState(win, "error", message);
     if (notify || win.errorCount === 1) showNotice(message, "error");
     // 持续失败达到阈值后停止轮询, 避免对已断开/不可达的源做无效重试 (例如 AirSim 端口未开)
@@ -1128,6 +1008,17 @@ async function updateCameraViewerSelection(eventOrWindow = null) {
     cameraSettings = { ...win.settings };
     renderCameraSettings();
     await saveCameraSettings({ silent: true });
+    // 主窗口是操作员的直接入口，切相机就切感知轴——"看哪一路"只有一个事实
+    // 来源，面板和 Agent 因此永远同步。附加窗口是旁看，不动轴（否则两个窗口
+    // 会互相把轴拽来拽去）。非 Scene 通道（深度/分割）不切轴。
+    if (String(win.settings.source).toLowerCase() === "airsim"
+      && String(win.settings.image_type || "scene").toLowerCase() === "scene"
+      && String(win.settings.camera_name || "").trim()) {
+      await syncPerceptionViewToAxis(String(win.settings.camera_name).trim());
+    }
+  } else if (String(win.settings.camera_name || "").trim() !== axisViewCameraName()) {
+    // 说明白：附加窗口看别的相机时，Agent 看的仍是主窗口那一路。
+    showNotice("附加窗口只用于旁看；Agent 仍跟随主窗口的相机", "info");
   }
   renderCameraMeta(null, win);
   if (cameraViewerIsVisible(win)) {
@@ -1137,6 +1028,18 @@ async function updateCameraViewerSelection(eventOrWindow = null) {
     setCameraViewerState(win, "loading", "正在切换图像源");
     if (!win.streamActive) setCameraStreamActive(win, true);
     await captureCameraFrame({ notify: false, openViewer: false, windowId: win.id });
+  }
+}
+
+async function syncPerceptionViewToAxis(cameraName) {
+  if (!cameraName || cameraName === axisViewCameraName()) return;
+  try {
+    const result = await post("/api/perception/view", { camera_name: cameraName });
+    if (result && result.ok === false) {
+      showNotice(`感知轴切换相机失败：${result.error || result.message || "未知原因"}`, "error");
+    }
+  } catch (error) {
+    showNotice(`感知轴切换相机失败：${(error && error.message) || "请求失败"}`, "error");
   }
 }
 
@@ -1242,10 +1145,9 @@ function syncCameraVehicleOptions(vehicles) {
   const list = Array.isArray(vehicles) ? vehicles : [];
   const names = list.map((vehicle) => String(vehicle?.vehicle_name || "").trim()).filter(Boolean);
   cameraWindows.forEach((win) => {
-    // 遥测 250ms 一刷，顺手刷新状态徽标与帧率徽标：飞控链路和检测开关
-    // 都可能在两帧画面之间变化，帧率徽标里的检测速率要跟着一起翻
+    // 遥测 250ms 一刷，顺手刷新状态徽标与帧率徽标：飞控链路可能在两帧
+    // 画面之间变化，帧率徽标要跟着一起翻
     renderCameraLiveIndicator(win);
-    renderCameraDetection(win);
     renderCameraPerf(win);
     if (!win.vehicleSelect) return;
     const select = win.vehicleSelect;

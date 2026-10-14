@@ -202,5 +202,11 @@ def test_disarm_allowed_on_ground():
 # Approval coverage
 # ----------------------------------------------------------------------
 def test_visual_approach_requires_signature_on_real_vehicle():
-    """approach_target really moves the aircraft; it must not slip past the gate."""
-    assert "drone_approach_target" in _REAL_VEHICLE_APPROVAL_TOOLS
+    """靠近目标在真机上就是真的位移，必须走签字门。
+
+    抵近工具已随 YOLO 移除；现在靠近由 drone_move_relative 完成（VLM 取点 +
+    深度 + 有界一步），它同样在签字集里——不能让"靠近目标"绕过审批。
+    """
+    assert "drone_approach_target" not in _REAL_VEHICLE_APPROVAL_TOOLS
+    assert "drone_move_relative" in _REAL_VEHICLE_APPROVAL_TOOLS
+    assert "drone_fly_to" in _REAL_VEHICLE_APPROVAL_TOOLS

@@ -183,8 +183,8 @@ class LocalPerceptionEngine:
         self._latest_primary: dict[str, Any] | None = None
         self._frame_count = 0
         self._detect_thread: Optional[threading.Thread] = None
-        # 检测是"按需开启"的：系统启动只把画面跑起来，YOLO 模型要等操作员点
-        # "开始检测"（或任务调用 perception_start）才加载，避免一开机就吃算力。
+        # 检测线程是"休眠能力"：产品已无目标检测（YOLO 移除），这里保留代码路径
+        # 只为将来可能的复用，正常运行时 _detect_enabled 恒为 False。
         self._detect_enabled = False
         # Internal coasting retains IDs for reacquisition for 4s. Display lifetime
         # is separate: predictions are never visible and measurements use TTL.
@@ -197,8 +197,8 @@ class LocalPerceptionEngine:
     def start(self, *, detect: bool = False) -> bool:
         """启动相机采集；``detect=True`` 时才连带启动目标检测。
 
-        默认只出画面不检测：模型加载（YOLO）与逐帧推理都按需开始，操作员在
-        相机面板点"开始检测"、或任务调用 perception_start 时才加载。
+        默认只出画面不检测：产品已无目标检测（YOLO 移除），``detect=True``
+        只是保留给测试/未来的休眠入口。
         """
         if self._running:
             if detect:
@@ -239,6 +239,26 @@ class LocalPerceptionEngine:
             self._detect_thread = threading.Thread(target=self._detect_loop, daemon=True, name="perception-detect")
             self._detect_thread.start()
         return True
+
+    @property
+    def detection_enabled(self) -> bool:
+        """检测线程是否在跑。
+
+        相机面板的"检测中"徽标和视图切换时的状态保留都读它：切相机要重建帧源，
+        必须知道切之前检测是开着的，否则一次换相机会把操作员开的检测悄悄关掉。
+        """
+        return bool(self._detect_enabled)
+
+    @property
+    def detector(self) -> Any | None:
+        """已加载的检测器实例；检测没开过时为 None。
+
+        对外暴露是为了让"预览标注"这类旁路复用它已经加载好的模型：另走
+        `detect_objects_stateless` 会去加载模块级的另一个模型实例，冷启动实测
+        近 40 秒（torch 导入 + 权重加载 + 首次推理），而前端每帧只等 3.6 秒，
+        结果就是画面永远刷不出来。
+        """
+        return self._detector
 
     def stop_detection(self) -> None:
         """停止检测但保留画面；同时清掉目标快照，避免"已停止但旧框还挂着"。"""
@@ -872,6 +892,11 @@ class PerceptionAxis:
         self._start_error = ""
         # 启动时的检测意图（默认只出画面）；后台重试也沿用。
         self._detect_on_start = False
+        # 改取景/改目标类别都要"停引擎再起引擎"，和取帧线程是两件事，所以各自
+        # 一把锁：重建锁护"改 profile + 重建"，预览锁护面板那份记录。
+        self._reconfigure_lock = threading.RLock()
+        self._preview_lock = threading.Lock()
+        self._preview: dict[str, Any] = {}
 
     def _rtsp_config(self) -> tuple[str, str]:
         """当前应使用的 RTSP (url, transport)：面板优先，其次 .env。"""
@@ -894,6 +919,178 @@ class PerceptionAxis:
     @property
     def profile(self) -> Any:
         return self._profile
+
+    @property
+    def detector(self) -> Any | None:
+        """感知轴已加载的检测器（未加载时为 None）。
+
+        预览标注等旁路入口复用它的理由见 `LocalPerceptionEngine.detector`：
+        另起一个模型实例的冷加载是几十秒级的，扛不住逐帧请求。
+        """
+        return getattr(self._engine, "detector", None)
+
+    # -- 取景（"哪一路画面"的唯一事实来源）------------------------------
+
+    def view(self) -> dict[str, Any]:
+        """感知轴此刻在看的这一路相机。
+
+        相机面板和 Agent 都读这里，谁都不再靠猜（此前面板按 `camera_name in
+        {"", "0"}` 猜自己看的是不是轴那一路，而配置里相机叫 CameraImage，
+        于是"看着同一路"和"看着两路"在代码里分不清）。检测通道只有 Scene：
+        Depth/Segmentation 不是检测用的视图，面板要看那些通道时走直连抓帧，
+        轴的取景不变。
+        """
+        profile = self._profile
+        frame_source = str(getattr(profile, "frame_source", "") or "")
+        deploy = str(getattr(profile, "deploy", "") or "")
+        return {
+            "camera_name": str(getattr(profile, "camera_name", "") or ""),
+            "image_type": "scene",
+            "frame_source": frame_source,
+            "deploy": deploy,
+            # 只有本机 AirSim 取流才谈得上"换一路相机"：RTSP 是一路流、USB 是
+            # 本机设备号，两者由各自的面板设置决定，不由相机名决定。
+            "switchable": frame_source == "airsim" and deploy != "remote",
+        }
+
+    def set_view(self, camera_name: str) -> dict[str, Any]:
+        """把感知轴切到指定相机（相机面板的操作员意图）。
+
+        感知轴只有一个视角。要看别的相机就把轴切过去、重建取景，而不是另开一条
+        取流链路去看——"面板看到的"和"Agent 看到的"因此永远是同一路。切换会
+        停掉引擎再起（帧源在构造时固定相机名），并保留切换前的检测开关状态。
+
+        刻意不暴露成 Agent 工具：取景归操作员。让模型自己把画面切走，等于系统
+        背着操作员改他正在看的东西。Agent 想换视角就自己转向/移动。
+        """
+        wanted = str(camera_name or "").strip()
+        if not wanted:
+            return {"ok": False, "status": "invalid_camera", "message": "camera_name is empty"}
+        with self._reconfigure_lock:
+            current = self.view()
+            if not current.get("switchable", False):
+                return {
+                    "ok": False,
+                    "status": "not_switchable",
+                    "message": (
+                        f"当前帧源（{current.get('frame_source')}/{current.get('deploy')}）"
+                        "不支持按相机名切换取景"
+                    ),
+                    "view": current,
+                }
+            if wanted == current.get("camera_name"):
+                return {"ok": True, "status": "unchanged", "view": current}
+            was_detecting = bool(getattr(self._engine, "detection_enabled", False))
+            self._profile.camera_name = wanted
+            if not self._started:
+                # 还没起来：只记下意图，下一次启动就用它（不必为一个还没跑的
+                # 引擎走一遍停/起）。
+                return {
+                    "ok": True,
+                    "status": "deferred",
+                    "view": self.view(),
+                    "detection_preserved": was_detecting,
+                }
+            self.stop()
+            ok = self.start(detect=was_detecting)
+            return {
+                "ok": bool(ok),
+                "status": "switched" if ok else "switch_failed",
+                "message": "" if ok else (self._start_error or "取景切换失败"),
+                "view": self.view(),
+                # 报告"检测状态是否保住了"：换相机不该把操作员开着的检测顺手关掉，
+                # 但新相机若起不来，检测确实会跟着停——这件事必须说出来。
+                "detection_preserved": bool(ok and was_detecting),
+            }
+
+    def set_target_class(self, target_class: str) -> dict[str, Any]:
+        """切换检测的目标类别（重建引擎）。
+
+        类别在引擎构造时就固化成字段，检测器实例也按它创建——只改 profile 上的
+        值对正在跑的检测线程毫无影响。这条曾经是真的坏过：改了 profile 就以为
+        切好了，结果让它找 person，它照旧找 car，Agent 于是得到"没有人"的结论。
+        改类别和改取景一样，必须停掉再起。
+        """
+        wanted = str(target_class or "").strip()
+        if not wanted:
+            return {"ok": False, "status": "invalid_class", "message": "target_class is empty"}
+        try:
+            from src.modules.yolo_detection import canonical_target_class
+
+            wanted = canonical_target_class(wanted) or wanted
+        except Exception:
+            pass
+        with self._reconfigure_lock:
+            current = str(getattr(self._profile, "target_class", "") or "")
+            # 正在跑的检测器认哪个类别，才是"现在到底在找什么"的事实。profile
+            # 可能已经被改过而引擎还没重建（那正是这条 bug 的现场）。
+            running = str(getattr(self.detector, "canonical", "") or "")
+            if wanted == current and (not running or running == wanted):
+                return {"ok": True, "status": "unchanged", "target_class": current}
+            was_detecting = bool(getattr(self._engine, "detection_enabled", False))
+            self._profile.target_class = wanted
+            if not self._started:
+                return {"ok": True, "status": "deferred", "target_class": wanted}
+            self.stop()
+            ok = self.start(detect=was_detecting)
+            return {
+                "ok": bool(ok),
+                "status": "reconfigured" if ok else "reconfigure_failed",
+                "message": "" if ok else (self._start_error or "目标类别切换失败"),
+                "target_class": wanted,
+                "detection_preserved": bool(ok and was_detecting),
+            }
+
+    # -- 相机面板的取景观测 -------------------------------------------
+
+    # 面板预览是"人正在看什么"的记录，不是检测结果。过期就当作没有，避免拿
+    # 几分钟前看过的一路画面冒充当前状态。
+    _PREVIEW_TTL_S = 10.0
+
+    def note_preview(
+        self,
+        *,
+        camera_name: str,
+        image_type: str,
+        source: str,
+        detection_source: str,
+        detections: Optional[list[dict[str, Any]]] = None,
+        target_class: str = "",
+    ) -> None:
+        """记录相机面板此刻在放什么（可能不是感知轴这一路）。
+
+        面板可以看 Depth、看另一台相机，那些画面不进检测通道，Agent 原本完全
+        看不见——"操作员正盯着什么"对模型是黑的。这里只记录事实，**不混进
+        targets**：那会让模型把它当成自己检测到的目标，而它没有 track_id、没有
+        世界坐标，也没有经过轴的时序关联。
+        """
+        with self._preview_lock:
+            self._preview = {
+                "camera_name": str(camera_name or ""),
+                "image_type": str(image_type or "scene"),
+                "source": str(source or ""),
+                "detection_source": str(detection_source or ""),
+                "detections": list(detections or []),
+                "detections_count": len(detections or []),
+                "target_class": str(target_class or ""),
+                "timestamp": time.time(),
+            }
+
+    def preview(self) -> dict[str, Any]:
+        """相机面板最近的取景观测；没有或已过期则返回空。"""
+        with self._preview_lock:
+            record = dict(self._preview)
+        if not record:
+            return {}
+        age = max(0.0, time.time() - float(record.get("timestamp") or 0.0))
+        record["age_s"] = round(age, 2)
+        record["stale"] = age > self._PREVIEW_TTL_S
+        axis_view = self.view()
+        record["matches_axis_view"] = (
+            record.get("camera_name") == axis_view.get("camera_name")
+            and record.get("image_type") == axis_view.get("image_type")
+        )
+        return record
 
     def start(self, *, detect: bool = False) -> bool:
         # 记住"启动时要不要开检测"：后台重试（AirSim 比 UI 后起来）必须沿用同一
@@ -991,6 +1188,10 @@ class PerceptionAxis:
             "online": False,
             "source": "",
             "fps": 0.0,
+            # 取景随 health 一起下发：相机面板要靠它把下拉框默认成"轴正在看的
+            # 那一路"，否则面板一开就默认 0 号相机，和轴实际用的相机名对不上，
+            # 立刻掉进直连抓帧那条旁路。
+            "view": self.view(),
         }
         if self._engine is not None:
             base.update(self._engine.health())
@@ -998,14 +1199,20 @@ class PerceptionAxis:
 
     def snapshot(self) -> dict[str, Any]:
         if self._engine is None:
-            return {
+            base: dict[str, Any] = {
                 "targets": [],
                 "primary": None,
                 "timestamp": 0.0,
                 "frame_width": 0,
                 "frame_height": 0,
             }
-        return self._engine.snapshot()
+        else:
+            base = self._engine.snapshot()
+        base["view"] = self.view()
+        preview = self.preview()
+        if preview:
+            base["preview"] = preview
+        return base
 
     def pop_events(self) -> list[dict[str, Any]]:
         if self._engine is None:

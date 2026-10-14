@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 import threading
 import time
 import queue
@@ -235,14 +236,23 @@ class AgentRuntime(GuardiansMixin, ReplayMixin, GcsMixin, ApprovalsMixin, Events
         self.tools = ToolRuntime(
             camera_settings_provider=lambda: _camera_settings(),
             perception_axis=self.perception_axis,
-            # VLM 图像分析固定走多模态模型（dots-studio），与默认规划模型
-            # 解耦：默认模型可能是纯文本（如 deepseek），规划低延迟但看不了图。
-            vlm_provider=lambda question, image_b64: self.planner.analyze_image(
-                question, image_b64, model_id=""
-            ),
+            # 视觉分析（inspect_current_frame）与规划共用同一个模型：用户在设置里
+            # 配了哪个模型，规划与看图就都用它。这里必须传当前任务的 model_id，
+            # 留空会回落到注册表 default，于是"选的模型"和"看图的模型"变成两个
+            # ——用户改了选择器却不生效，且系统背着他另选了一个模型。
+            vlm_provider=self._vlm_analyze,
         )
         self.memory = AgentMemory()
         self.task_runs = TaskRunStore()
+        # 进程启动时的记录层崩溃恢复：把上一次进程留下的"运行中"记录标成
+        # interrupted（界面不再永远转圈）。只改状态，绝不重放动作——飞行指令是
+        # 非幂等的，这一条是刻意与"会话可恢复"的编码 agent 划清界限的地方。
+        try:
+            recovered = self.task_runs.mark_running_as_interrupted()
+        except Exception:
+            recovered = 0
+        if recovered:
+            logging.getLogger("runtime").warning("task_runs_marked_interrupted", extra={"count": recovered})
         self.supervisor = ExecutionSupervisor(default_timeout=30.0)
         self.skills = SkillRegistry(overrides_path=SKILLS_OVERRIDES_PATH)
         self._init_runtime_state()
@@ -260,6 +270,24 @@ class AgentRuntime(GuardiansMixin, ReplayMixin, GcsMixin, ApprovalsMixin, Events
             args=(self._backend_generation, self._auto_connect_initial_backend_id),
             daemon=True,
         ).start()
+
+    def _vlm_analyze(self, question: str, image_b64: str) -> dict[str, Any]:
+        """`inspect_current_frame` 的视觉分析入口：走当前任务用的那个模型。"""
+        return self.planner.analyze_image(question, image_b64, model_id=self._active_model_id())
+
+    def _active_model_id(self) -> str:
+        """当前生效的模型 id：跑着的任务用它自己的模型，否则交给注册表默认值。
+
+        规划与视觉分析必须落在同一个模型上。任务内取 `run.model_id`（就是操作员
+        在模型选择器里选的那个），任务外返回空串让 `_resolve_config` 回落默认值
+        ——空串在这里是"没有任务在跑"，不是"另选一个图像模型"。
+        """
+        run = self._current
+        if run is not None:
+            model_id = str(getattr(run, "model_id", "") or "").strip()
+            if model_id:
+                return model_id
+        return ""
 
     def _init_runtime_state(self) -> None:
         """所有可变运行态字段的初值。不依赖注入对象、无副作用。
@@ -366,8 +394,8 @@ class AgentRuntime(GuardiansMixin, ReplayMixin, GcsMixin, ApprovalsMixin, Events
                 rtsp_config_provider=_perception_rtsp_config,
                 frame_provider=self._perception_camera_controller,
             )
-            # 默认只启动画面，不加载 YOLO：检测由操作员在相机面板手动开始
-            # （或任务调用 perception_start），避免一开机就吃算力。
+            # 只启动画面，不加载 YOLO：产品已无目标检测（语义问视觉模型、距离问
+            # 深度图），检测线程保持休眠，不在启动时吃算力。
             ok = axis.start(detect=False)
             if not ok:
                 import logging

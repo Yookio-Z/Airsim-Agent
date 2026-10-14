@@ -107,10 +107,10 @@ class AgentBridgeMixin:
                         run.agent_state["_round_reasoning"] = ""
                     self._append_process(
                         run,
-                        "模型决策",
-                        "正在根据最新遥测、工具结果和任务目标选择下一步动作。",
+                        "等待模型回复",
+                        "",
                         status="running",
-                        kind="reasoning",
+                        kind="pending",
                     )
             if decision_count > previous_decision_count:
                 decision = loop.decisions[-1]
@@ -144,6 +144,30 @@ class AgentBridgeMixin:
                             params=decision.params,
                             kind="plan_step",
                         )
+                elif decision_source == "guard":
+                    # 运行时守卫注入的决定：**不是模型的思考**。以前它混进"模型
+                    # 思考"里，操作员看到的就是"模型一直说要抵近"——而那句话是
+                    # 守卫写的（实测 2026-10-12：三条"Approved visual approach"
+                    # 全是守卫字符串，模型自己选的动作被覆盖掉了）。单独成类，
+                    # 前端才能把它和模型的思考分开显示。
+                    self._close_pending_reasoning(run, decision.action, decision.params)
+                    self._append_process(
+                        run,
+                        "系统自动处理",
+                        decision_text or decision.action or "守卫接管本轮决策",
+                        status="completed",
+                        kind="guard",
+                    )
+                    if decision.action:
+                        self._append_process(
+                            run,
+                            decision.action,
+                            self._format_tool_call_body(decision.params),
+                            status="running",
+                            tool=decision.action,
+                            params=decision.params,
+                            kind="tool",
+                        )
                 else:
                     # 每个真实 LLM 决策轮次前加分隔标题，前端思考块能看出
                     # "第 N 轮思考（基于上一步结果）"的 ReAct 节奏
@@ -174,7 +198,7 @@ class AgentBridgeMixin:
                         # 模型这一轮只给了工具调用、没有思考文本：把本轮开头创建的
                         # "正在选择下一步"占位收尾。否则它会一直挂在时间线上冒充
                         # 本轮思考——实测从第二轮起永远显示那句固定占位。
-                        self._close_pending_reasoning(run, decision.action)
+                        self._close_pending_reasoning(run, decision.action, decision.params)
                     if decision.action:
                         # 顺序由 agent_loop 保证：真正的模型思考事件已先于本
                         # 决策写入时间线（见 AgentLoop.run）。这里只落动作行；
@@ -243,6 +267,109 @@ class AgentBridgeMixin:
         return f"参数 {payload}"
 
     @classmethod
+    def _humanize_perception_result(cls, data: dict[str, Any]) -> str:
+        """感知/几何类返回的可读渲染（locate_point / depth / inspect）。
+
+        操作员反馈"这个工具的返回看起来很奇怪"：以前它们掉进通用分支，变成
+        `valid=True, depth_meters=30.0, distance_to_drone=30.0, distance_m=30.0,
+        depth_m=30.0 … 其他: {…}` 这样一坨。这里按用途各写两三行中文要点。
+        """
+        if not isinstance(data, dict):
+            return ""
+        lines: list[str] = []
+
+        world = data.get("world_pos")
+        if isinstance(world, dict) and ("distance_m" in data or "depth_m" in data or "valid" in data):
+            distance = data.get("distance_m", data.get("depth_m"))
+            try:
+                distance_text = f"{float(distance):.1f} m"
+            except (TypeError, ValueError):
+                distance_text = "未知"
+            try:
+                wx = float(world.get("x") or 0.0)
+                wy = float(world.get("y") or 0.0)
+                wz = float(world.get("z") or 0.0)
+                where = f"N {wx:.2f} / E {wy:.2f} / D {wz:.2f}"
+            except (TypeError, ValueError):
+                where = str(world)
+            if data.get("valid") is False:
+                lines.append(f"点位定位失败：{data.get('message') or '该点没有有效深度'}")
+            else:
+                lines.append(f"点位定位：距离 {distance_text}｜世界坐标 {where}")
+            angles: list[str] = []
+            for key, label in (("angle_h_deg", "水平"), ("angle_v_deg", "垂直")):
+                if data.get(key) is not None:
+                    try:
+                        angles.append(f"{label} {float(data[key]):+.1f}°")
+                    except (TypeError, ValueError):
+                        pass
+            if angles:
+                lines.append("偏角 " + " / ".join(angles))
+            warning = str(data.get("probe_warning") or "").strip()
+            if warning:
+                lines.append("⚠ " + warning)
+            return "\n".join(lines)
+
+        if "distance_median_m" in data or isinstance(data.get("query_results"), list):
+            points: list[str] = []
+            for item in (data.get("query_results") or [])[:6]:
+                if not isinstance(item, dict):
+                    continue
+                value = item.get("distance_m")
+                if value is None:
+                    continue
+                try:
+                    points.append(f"{float(value):.1f}")
+                except (TypeError, ValueError):
+                    continue
+            median = data.get("distance_median_m")
+            head = "深度读数"
+            if median is not None:
+                try:
+                    head += f"：中值 {float(median):.1f} m"
+                except (TypeError, ValueError):
+                    pass
+            if points:
+                head += f"｜{len(points)} 个点 " + " / ".join(points) + " m"
+            lines.append(head)
+            return "\n".join(lines)
+
+        answer = data.get("answer") if isinstance(data.get("answer"), dict) else None
+        if answer is not None or data.get("question"):
+            question = str(data.get("question") or "").strip()
+            if question:
+                lines.append(f"提问：{question[:120]}")
+            payload = answer or data
+            summary = str(payload.get("summary_zh") or payload.get("message") or "").strip()
+            if summary:
+                lines.append(f"视觉模型：{summary[:300]}")
+            candidates = payload.get("target_candidates")
+            if isinstance(candidates, list) and candidates:
+                for item in candidates[:3]:
+                    if not isinstance(item, dict):
+                        continue
+                    hint = item.get("bbox_hint") if isinstance(item.get("bbox_hint"), dict) else {}
+                    bits = [str(item.get("label") or "目标")]
+                    try:
+                        bits.append(f"置信 {float(item.get('confidence')):.2f}")
+                    except (TypeError, ValueError):
+                        pass
+                    try:
+                        bits.append(f"中心 {float(hint.get('x')):.2f},{float(hint.get('y')):.2f}")
+                    except (TypeError, ValueError):
+                        pass
+                    try:
+                        bits.append(f"大小 {float(hint.get('w')) * 100:.0f}%×{float(hint.get('h')) * 100:.0f}%")
+                    except (TypeError, ValueError):
+                        pass
+                    if item.get("relative_direction"):
+                        bits.append(str(item["relative_direction"]))
+                    lines.append("候选：" + " · ".join(bits))
+            if lines:
+                return "\n".join(lines)
+        return ""
+
+    @classmethod
     def _humanize_result(cls, data: dict[str, Any]) -> str:
         """把工具返回渲染成操作员能读的要点，而不是一整块 JSON。
 
@@ -251,6 +378,11 @@ class AgentBridgeMixin:
         中文要点，只把无法归类的内容压成一行精简 JSON 兜底。
         """
         src = data.get("drone") if isinstance(data.get("drone"), dict) else data
+        # 感知/几何类结果先走专用渲染：它们的字段名（distance_m / world_pos /
+        # target_candidates）不属于遥测，通用分支只会把它们塞进"其他: {…}"。
+        perception = cls._humanize_perception_result(data)
+        if perception.strip():
+            return perception
         lines: list[str] = []
 
         pos = src.get("position_ned")
@@ -358,7 +490,16 @@ class AgentBridgeMixin:
             rendered = rendered[:1200] + " …"
         return rendered if rendered.strip() not in {"{}", "null"} else message
 
-    def _format_loop_result_body(data: dict[str, Any] | None) -> str:
+    # classmethod 而不是 staticmethod：这个函数要调 `_result_body_fallback`，而那
+    # 个 classmethod 读的是 `cls._RESULT_NOISE_KEYS` —— 常量挂在 AgentRuntime 上，
+    # 不在 mixin 上。写成静态方法并用 `AgentBridgeMixin.xxx` 去调同级方法，会把
+    # cls 绑成 mixin 本身，走到回退分支就 AttributeError。
+    # 另外首参必须是 cls：两处调用都是 `self._format_loop_result_body(data)`，
+    # 写成 `def _format_loop_result_body(data)` 会让 self 被当成第一个位置参数，
+    # 抛 "takes 1 positional argument but 2 were given"，整个 execute 任务在
+    # Agent Loop 第一次出结果时崩掉（只有多步任务会走到这条路径，平时不易察觉）。
+    @classmethod
+    def _format_loop_result_body(cls, data: dict[str, Any] | None) -> str:
         if not isinstance(data, dict):
             return ""
         # 技能激活返回的是完整操作指导，正文本身就是结果：压缩成一行摘要会让
@@ -383,8 +524,8 @@ class AgentBridgeMixin:
             summary = " → ".join(parts)
             if len(tool_results) > 12:
                 summary += f" → +{len(tool_results) - 12} more"
-            return f"{AgentBridgeMixin._result_body_fallback(data, message)}\n{summary}".strip() if AgentBridgeMixin._result_body_fallback(data, message) else summary
-        fallback = AgentBridgeMixin._result_body_fallback(data, message)
+            return f"{cls._result_body_fallback(data, message)}\n{summary}".strip() if cls._result_body_fallback(data, message) else summary
+        fallback = cls._result_body_fallback(data, message)
         # 首行保留人话摘要（折叠标题只用第一行），完整数据接在后面：
         # 展开才看得到遥测、坐标这些真正返回的东西。
         if message and fallback and not fallback.lstrip().startswith(message):
@@ -1110,7 +1251,7 @@ class AgentBridgeMixin:
             "airsim_take_photo": "Capture image",
             "airsim_get_sensors": "Read sensors",
             "airsim_get_depth_map": "Read depth map",
-            "airsim_detect_objects": "Detect objects",
+            "airsim_locate_point": "Locate image point in world",
             "inspect_current_frame": "Inspect current frame",
             "provider_bridge_health": "Check provider bridge",
             "provider_obstacle_summary": "Read obstacle provider",

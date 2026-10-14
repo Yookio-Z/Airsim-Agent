@@ -1,13 +1,31 @@
-"""Perception axis tools: a thin read-only surface for the Agent.
+"""Perception tools: a thin read-only surface for the Agent.
 
-These tools expose the perception axis state (health / snapshot / events)
-regardless of the flight backend. The Agent consumes state; the detection and
-tracking algorithms live inside the axis engines and never enter the LLM loop.
+The product has **no object detection**: YOLO was removed by design decision.
+Semantics come from the vision model (``inspect_current_frame``), metric
+distance from the depth image (``airsim_get_depth_map``), and world position
+from a depth-point projection (``airsim_locate_point``). Nothing in this module
+moves the vehicle.
 """
 
 from __future__ import annotations
 
 from typing import Any, Callable
+
+# 相机健康里对 Agent 有意义的字段。检测相关字段（detect_fps / detector /
+# detection_age_s / detection_stale）一律不暴露：它们描述的是一个已经不在
+# 产品里的子系统，模型看到只会增加困惑。
+_CAMERA_HEALTH_KEYS = (
+    "online",
+    "fps",
+    "update_fps_target",
+    "capture_age_s",
+    "latency_ms",
+    "last_update_ts",
+    "total_frames",
+    "error",
+    "source",
+    "view",
+)
 
 
 def register_perception_axis_tools(
@@ -16,168 +34,95 @@ def register_perception_axis_tools(
     fmt: Callable[[dict], str],
     vlm: Callable[[str, str], dict] | None = None,
     fallback_capture: Callable[[], bytes | None] | None = None,
-    approach: Callable[[float], dict] | None = None,
+    locate: Callable[..., dict] | None = None,
 ) -> None:
-    """Register axis tools against a ToolCollector (mcp.tool decorator).
+    """Register camera tools against a ToolCollector (mcp.tool decorator).
 
     ``vlm`` (optional) is a callable (question, image_base64) -> dict that runs
     a multimodal model over the current perception frame; injected by the
     runtime with the planner when a vision-capable model is configured.
-    ``approach`` (optional) is a callable (step_m) -> dict that performs ONE
-    bounded body-frame forward step toward the currently centered/locked
-    target. It is the "approved visual approach tool" the loop's safety guard
-    looks for; without it the Agent must not fly toward a 2D image target.
+    ``fallback_capture`` (optional) grabs one frame directly from the simulator
+    when the axis has no cached frame yet.
+    ``locate`` (optional) is a callable (x_norm, y_norm, vehicle_name) -> dict
+    that projects one normalised image point to a metric distance and world
+    position through the depth image and the drone pose.
     """
 
     @mcp.tool()
-    def perception_status(include_snapshot: bool = True, include_events: bool = True, limit: int = 5) -> str:
-        """感知轴状态：感知服务健康、当前检测到的目标快照与最近事件。
+    def perception_status(include_events: bool = True, limit: int = 5) -> str:
+        """相机/画面健康：感知轴是否在线、帧率、画面多久没更新、当前取景。
 
-        只读工具，不产生任何飞行动作。感知离线时同样可调用（用于判断
-        为何检测不到目标）。目标状态由底层感知服务（本机进程或 Jetson
-        机载）持续维护，Agent 只消费结果、不参与检测循环。
+        只读工具，不产生任何飞行动作，也**不含目标检测信息**（本产品已无目标
+        检测：语义问题问 `inspect_current_frame`，距离问 `airsim_get_depth_map`）。
+
+        判断"相机是不是卡住了"看 `capture_age_s`：它持续增大就是画面不再更新，
+        此时任何基于画面的判断（包括视觉模型的回答）都不可信——先悬停并报告
+        链路问题，不要继续飞。
+
+        `view` 是感知轴此刻取景的相机与图像类型。感知轴只有一个视角，它就是
+        本 Agent 正在看的画面；取景归操作员，Agent 不切相机，需要看别的方向
+        时自己转向（`drone_rotate_to`）或移动。
 
         Args:
-            include_snapshot: 是否包含当前目标检测快照，默认 true
-            include_events: 是否包含最近感知事件（目标发现/丢失/恢复），默认 true
+            include_events: 是否包含最近感知事件（相机/链路类），默认 true
             limit: 事件条数上限，默认 5
         """
         if axis is None:
             return fmt({"status": "error", "message": "perception axis unavailable", "enabled": False})
-
+        try:
+            health = axis.health() or {}
+        except Exception as exc:
+            return fmt({"status": "error", "message": f"感知状态读取失败: {exc}"})
         payload: dict[str, Any] = {
             "status": "ok",
-            "health": axis.health(),
+            "enabled": bool(getattr(axis, "enabled", False)),
         }
-        if include_snapshot:
-            payload["snapshot"] = axis.snapshot()
+        payload.update({key: health[key] for key in _CAMERA_HEALTH_KEYS if key in health})
+        # 画面尺寸：把归一化坐标换成像素（或反过来）时要用。
+        try:
+            snap = axis.snapshot() or {}
+        except Exception:
+            snap = {}
+        for key in ("frame_width", "frame_height"):
+            if snap.get(key):
+                payload[key] = snap[key]
         if include_events:
-            events = axis.pop_events()
-            payload["events"] = events[-max(1, int(limit)) :]
+            try:
+                events = axis.pop_events()
+            except Exception:
+                events = []
+            payload["events"] = list(events)[-max(1, int(limit)) :]
         return fmt(payload)
 
     @mcp.tool()
-    def perception_start(target_class: str = "") -> str:
-        """启动/确保感知轴的目标检测服务在后台运行。
-
-        感知服务持续在后台做 YOLO 检测（含跟踪保持），Agent 只消费其状态。
-        若服务已在线则返回 already_online；需要切换检测类别时传 target_class。
-
-        Args:
-            target_class: 可选，目标类别（如 car/person/truck）；留空保持当前配置
-        """
-        if axis is None:
-            return fmt({"status": "error", "message": "perception axis unavailable", "enabled": False})
-        started = False
-        # 切换检测类别：写入 profile 后 start() 会用新类别重建引擎
-        if target_class and getattr(axis, "profile", None) is not None:
-            try:
-                axis.profile.target_class = str(target_class).strip()
-            except Exception:
-                pass
-        if hasattr(axis, "start"):
-            try:
-                # detect=True：相机画面本来就在跑，这里要的是把检测（YOLO）也
-                # 打开；轴已经在运行时它只启动检测线程，不重启采集。
-                started = bool(axis.start(detect=True))
-            except Exception as exc:
-                return fmt({"status": "error", "message": f"感知启动失败: {exc}"})
-        online = bool(getattr(axis, "is_online", lambda: False)())
-        return fmt({
-            "status": "ok",
-            "started": started,
-            "online": online,
-            "message": "检测服务运行中" if online else "检测服务已启动，正在初始化（模型加载可能需要十几秒）",
-            "health": axis.health() if hasattr(axis, "health") else {},
-        })
-
-    @mcp.tool()
-    def perception_stop() -> str:
-        """停止目标检测（相机画面保留，随时可以再点开始检测）。
-
-        只停检测线程：停画面会让操作员失去观察手段，而检测才是吃算力的部分。
-        """
-        if axis is None:
-            return fmt({"status": "error", "message": "perception axis unavailable", "enabled": False})
-        try:
-            if hasattr(axis, "stop_detection"):
-                axis.stop_detection()
-            else:
-                axis.stop()
-        except Exception as exc:
-            return fmt({"status": "error", "message": f"检测停止失败: {exc}"})
-        return fmt({"status": "ok", "detecting": False, "message": "检测已停止（相机画面保留）"})
-
-    @mcp.tool()
-    def airsim_detect_objects(target_class: str = "", confidence: float = 0.25) -> str:
-        """单帧目标检测：返回感知轴最近一帧里检测到的目标（类别/置信度/像素框）。
-
-        感知轴在底层持续做 YOLO 检测，本工具只读取最新一帧的检测结果，
-        不产生飞行动作。目标不在画面里时返回空的 detections 列表。
-
-        Args:
-            target_class: 可选，过滤类别（如 car/person/truck）；留空返回全部
-            confidence: 可选，最低置信度过滤。实际生效值不会高于探测器自身的
-                灵敏度（见返回里的 effective_confidence），避免调用方习惯性
-                传高阈值把真实检出全部滤掉。
-        """
-        if axis is None:
-            return fmt({"status": "error", "message": "perception axis unavailable", "enabled": False})
-        try:
-            snap = axis.snapshot()
-        except Exception as exc:
-            return fmt({"status": "error", "message": f"感知快照读取失败: {exc}"})
-        targets = list(snap.get("targets") or [])
-        try:
-            requested = float(confidence)
-        except (TypeError, ValueError):
-            requested = 0.25
-        # 复检阈值不得比探测器本身更严格：夜间/远距离小目标的原始置信度常常
-        # 只有 0.1 左右，调用方习惯性传 0.25 会把真实检出全部滤掉（表现为
-        # "画面里明明有车却检测不到"）。所以以探测器灵敏度为上限收口——上限
-        # 取自感知轴当前 profile，而不是写死的常数，否则改了 detector 阈值
-        # 这里就会与之脱节。
-        detector_conf = float(getattr(getattr(axis, "profile", None), "confidence", 0.0) or 0.0)
-        ceiling = detector_conf if detector_conf > 0.0 else requested
-        min_conf = min(requested, ceiling)
-        wanted = str(target_class or "").strip().lower()
-        detections = [
-            t
-            for t in targets
-            if float(t.get("confidence") or 0.0) >= min_conf
-            and (not wanted or wanted in str(t.get("class") or "").lower())
-        ]
-        return fmt(
-            {
-                "status": "ok",
-                "target_class": wanted,
-                "confidence": min_conf,
-                "requested_confidence": requested,
-                "effective_confidence": min_conf,
-                "detections": detections,
-                "count": len(detections),
-                "total_frames": snap.get("total_frames", 0),
-                "source": snap.get("source", ""),
-            }
-        )
-
-    @mcp.tool()
     def inspect_current_frame(question: str) -> str:
-        """用多模态模型分析感知轴当前画面并回答问题。
+        """用当前配置的模型分析感知轴当前画面并回答问题。
 
-        读取感知轴的最近一帧(标注后的画面)交给视觉模型理解,返回模型对
-        画面的描述/判断。适合"画面里有什么""目标是什么颜色"等开放问题;
-        若当前没有可用画面(感知离线/未取帧)或模型不支持视觉则返回错误。
+        读取感知轴的最近一帧交给模型理解,返回模型对画面的描述/判断。适合
+        "画面里有什么""目标是什么颜色""它朝哪边""车牌上写着什么"等语义问题,
+        以及"画面里有没有<目标>?在哪个位置?"这类确认问题。
+
+        规划与看图是同一个模型:当前配的模型必须支持图像输入,否则本工具直接
+        返回错误,不会另找模型代答。
+
+        返回的 `answer.target_candidates[]` 里每个候选带 `bbox_hint`
+        ({x, y, w, h}，归一化 0~1 的中心与宽高，**都是粗值**)：把它交给
+        `airsim_get_depth_map` 读距离、交给 `airsim_locate_point` 换世界坐标，
+        就能把"我看见了"变成可执行的几何量。一次调用只问一次,同一位置不要
+        重复问——回答含糊意味着距离或角度不对,应移动或转向后再看。
 
         Args:
-            question: 针对当前画面的问题(中文即可),例如"画面里有什么目标"
+            question: 针对当前画面的问题(中文即可),例如"画面里那辆浅蓝色汽车在什么位置?"
         """
         if vlm is None:
-            return fmt({"status": "error", "message": "当前模型不支持图像分析(多模态未启用或未配置视觉模型)"})
+            return fmt({
+                "status": "error",
+                "message": "未配置可用的模型，无法分析图像。请在模型设置里配置一个支持图像的模型。",
+            })
         if axis is None:
             return fmt({"status": "error", "message": "perception axis unavailable"})
         try:
-            jpeg, dets, _ts = axis.annotated_frame()
+            jpeg, _dets, _ts = axis.annotated_frame()
         except Exception as exc:
             return fmt({"status": "error", "message": f"画面读取失败: {exc}"})
         if not jpeg and fallback_capture is not None:
@@ -196,30 +141,58 @@ def register_perception_axis_tools(
         try:
             answer = vlm(question, image_b64)
         except Exception as exc:
-            return fmt({"status": "error", "message": f"视觉模型调用失败: {exc}"})
-        payload: dict[str, Any] = {"status": "ok", "question": question, "answer": answer}
-        if dets:
-            payload["detections"] = dets
-        return fmt(payload)
+            # 模型侧的错误(未配 key / 不支持图像 / 调用失败)已经带完整说明,
+            # 这里原样透出,不要再包一层"视觉模型"——那会让人以为系统另有一个
+            # 视觉模型被调挂了。
+            return fmt({"status": "error", "message": str(exc)})
+        return fmt({"status": "ok", "question": question, "answer": answer})
 
     @mcp.tool()
-    def drone_approach_target(step_m: float = 12.0, min_fill: float = 0.25, standoff_m: float = 0.0) -> str:
-        """向当前锁定/居中的目标做一次有界的前向抵近（视觉伺服式靠近）。
+    def airsim_locate_point(
+        x: float,
+        y: float,
+        w: float = 0.0,
+        h: float = 0.0,
+        vehicle_name: str = "",
+    ) -> str:
+        """把一个归一化图像点换算成公制距离与世界坐标（NED）。
 
-        "够近"看的是目标在画面里的大小，不是固定距离：目标高度占到画面
-        min_fill（默认 25%）就认为已经能辨认特征，直接返回 reached 不再前进。
-        用深度图换算出"走到阈值还需要多远"，一步到位；目标不在画面中央、或
-        感知无目标时拒绝执行——先转向对准再靠近。
+        用法：视觉模型（inspect_current_frame）给出目标的归一化位置
+        （`answer.target_candidates[].bbox_hint` 的 x/y，或按画面比例自己量的
+        x/y）后调用本工具。它读该点的深度、结合无人机位姿做针孔投影，返回：
+
+        - `distance_m` / `depth_m`：目标点到相机的公制距离；
+        - `world_pos`：NED 世界坐标（米）——需要朝目标飞（drone_fly_to）、
+          记住目标位置、或有别处坐标要比较时用它；
+        - `valid=false` 时 `message` 说明原因（天空/过远/云台稳定/无深度），
+          此时该点不可用于规划移动。
+
+        只读工具，不做任何飞行动作。点的准确性由你负责：点错位置得到的是
+        那个位置的距离和坐标，不是目标的——先确认目标在画面里的位置再调用。
 
         Args:
-            min_fill: 目标高度占画面比例达到多少算够近（0.05~0.9），默认 0.25
-            step_m: 单步最大前进距离（米），限制 1~12，默认 12
-            standoff_m: 可选的绝对距离下限（米），0 = 不启用
+            x: 归一化横向坐标 0~1（0=最左，1=最右）
+            y: 归一化纵向坐标 0~1（0=最上，1=最下）
+            w: 可选：目标归一化宽度（视觉模型 bbox_hint 的 w）。**强烈建议传**——
+               传了之后本工具会在框内/框外各取 4 点做深度交叉验证，回答"这个框里
+               是不是一个独立目标"（框内外深度几乎一样 = 你画的是一整片连续表面，
+               比如地面/墙面，不是目标），并给出按深度换算的米制尺寸供你把关。
+            h: 可选：目标归一化高度（同上）。
+            vehicle_name: 无人机名称，留空=默认机
         """
-        if approach is None:
-            return fmt({"status": "error", "message": "当前运行时不支持视觉抵近(未注入 approach 回调)"})
+        if locate is None:
+            return fmt({
+                "status": "error",
+                "message": "当前运行时不支持点位定位（未注入深度投影，通常是 AirSim 后端未连接）",
+            })
         try:
-            data = approach(float(step_m), standoff_m=float(standoff_m), min_fill=float(min_fill))
+            data = locate(
+                float(x), float(y), vehicle_name=str(vehicle_name or ""),
+                hint_w=float(w or 0.0), hint_h=float(h or 0.0),
+            )
         except Exception as exc:
-            return fmt({"status": "error", "message": f"抵近执行失败: {exc}"})
-        return fmt(data)
+            return fmt({"status": "error", "message": f"点位定位失败: {exc}"})
+        payload = dict(data or {})
+        payload.setdefault("status", "ok" if payload.get("valid") else "error")
+        payload["query_point"] = {"x": float(x), "y": float(y)}
+        return fmt(payload)

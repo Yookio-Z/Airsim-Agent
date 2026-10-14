@@ -378,14 +378,37 @@ def test_status_readback_alone_does_not_hide_failure() -> None:
 
 
 def test_unavailable_tool_is_not_reported_as_completed() -> None:
+    """模型选了当前后端没有的工具时：交回模型换一个，而不是判失败或报完成。
+
+    旧记忆里可能还推荐着已删除的工具（检测类），模型照抄一次就会撞上这条——
+    所以"不可用工具"必须是可纠正的一轮，不是任务终态。
+    """
     tools = FakeTools({"drone_get_status": _result("drone_get_status", True, {"status": "ok"})})
-    planner = SequencePlanner([LoopDecision("missing_tool", {}, "bad selection")])
+    planner = SequencePlanner([
+        LoopDecision("missing_tool", {}, "bad selection"),
+        LoopDecision("drone_get_status", {}, "read status instead"),
+        LoopDecision(action="", reason="done", is_complete=True),
+    ])
     loop = AgentLoop(tools, planner, FakeMemory(), skills=FakeSkills())
 
-    state = loop.run("run_missing", "do something", {}, [{"name": "drone_get_status"}], max_steps=2)
+    state = loop.run("run_missing", "do something", {}, [{"name": "drone_get_status"}], max_steps=4)
 
-    assert state.status == "failed"
-    assert not state.results
+    assert "missing_tool" not in tools.calls
+    assert tools.calls == ["drone_get_status"]
+    assert state.status == "completed"
+
+    # 反复选不可用工具（模型没能换一个）：只能停下来，绝不能报完成
+    exhausted_tools = FakeTools({"drone_get_status": _result("drone_get_status", True, {"status": "ok"})})
+    loop2 = AgentLoop(
+        exhausted_tools,
+        SequencePlanner([LoopDecision("missing_tool", {}, "bad") for _ in range(4)]),
+        FakeMemory(),
+        skills=FakeSkills(),
+    )
+    state2 = loop2.run("run_missing2", "do something", {}, [{"name": "drone_get_status"}], max_steps=6)
+
+    assert not exhausted_tools.calls
+    assert state2.status != "completed"
 
 
 def test_llm_payload_with_unavailable_tool_is_not_complete() -> None:
@@ -464,7 +487,13 @@ def test_visual_question_forces_capture_then_frame_inspection() -> None:
     assert planner.calls == 0
 
 
-def test_visual_confirmation_guard_uses_native_tools_before_blocking_2d_approach() -> None:
+def test_visual_approach_guard_observes_then_lets_the_model_move() -> None:
+    """视觉接近指令：守卫只保证"先看"，靠近动作由模型决定。
+
+    2026-10-12 的现场是相反的：守卫把模型的动作**无条件**改写成只认检测锁定的
+    抵近工具，检测没开 → 连撞三次 → 任务失败。检测（YOLO）与那个工具都已移除，
+    现在运行时不再持有任何"靠近"策略，也不阻断模型的有界移动。
+    """
     tools = FakeTools({
         "airsim_take_photo": _result("airsim_take_photo", True, {"status": "ok", "image_base64": "aW1hZ2U="}),
         "inspect_current_frame": _result(
@@ -478,30 +507,38 @@ def test_visual_confirmation_guard_uses_native_tools_before_blocking_2d_approach
                     "target_found": True,
                     "relative_direction": "center",
                     "summary_zh": "red car visible",
-                    "target_candidates": [{"label": "car", "confidence": 0.9}],
+                    "target_candidates": [
+                        {"label": "car", "confidence": 0.9, "bbox_hint": {"x": 0.5, "y": 0.55, "w": 0.2, "h": 0.15}}
+                    ],
                 },
             },
         ),
+        "drone_move_relative": _result("drone_move_relative", True, {"status": "ok"}),
     })
-    planner = SequencePlanner([])
+    planner = SequencePlanner([
+        LoopDecision("drone_move_relative", {"forward_m": 1.0}, "bounded body-frame step"),
+        LoopDecision(action="", reason="done", is_complete=True),
+    ])
     loop = AgentLoop(tools, planner, FakeMemory(), skills=FakeSkills())
 
     state = loop.run(
-        "run_visual_skill",
+        "run_visual_approach",
         "fly to the red car in the camera view",
         {"image_capture": True},
         [{"name": name} for name in tools.handlers],
-        max_steps=4,
+        max_steps=6,
     )
 
-    assert state.status == "failed"
-    assert [item.tool for item in state.results] == ["airsim_take_photo", "inspect_current_frame"]
-    assert tools.calls == ["airsim_take_photo", "inspect_current_frame"]
-    assert "2D image target" in state.failure_reason
-    assert planner.calls == 0
+    # 守卫先补齐观测（拍照 → 视觉确认），并把注入的决定标成 guard
+    assert tools.calls[:2] == ["airsim_take_photo", "inspect_current_frame"], tools.calls
+    assert state.decisions[0].source == "guard"
+    # 模型自己的有界靠近被执行（以前会被守卫改写掉）
+    assert "drone_move_relative" in tools.calls, tools.calls
+    assert "2D image target" not in (state.failure_reason or "")
 
 
-def test_visual_approach_is_blocked_without_safe_3d_target_or_approach_tool() -> None:
+def test_visual_approach_is_not_blocked_by_the_runtime() -> None:
+    """模型选的动作不再被运行时阻断；内部记忆工具被交回模型重新决策。"""
     tools = FakeTools({
         "airsim_take_photo": _result("airsim_take_photo", True, {"status": "ok", "image_base64": "aW1hZ2U="}),
         "inspect_current_frame": _result(
@@ -515,30 +552,35 @@ def test_visual_approach_is_blocked_without_safe_3d_target_or_approach_tool() ->
                     "target_found": True,
                     "relative_direction": "center",
                     "summary_zh": "确认画面中央有红色车辆。",
-                    "target_candidates": [{"label": "car", "confidence": 0.9}],
+                    "target_candidates": [
+                        {"label": "car", "confidence": 0.9, "bbox_hint": {"x": 0.5, "y": 0.55, "w": 0.2, "h": 0.15}}
+                    ],
                 },
             },
         ),
+        "drone_hover": _result("drone_hover", True, {"status": "ok"}),
     })
     planner = SequencePlanner([
         LoopDecision("memory_store", {}, "bad internal tool"),
-        LoopDecision(action="", reason="done", is_complete=True),
+        LoopDecision("drone_hover", {}, "hold position"),
         LoopDecision(action="", reason="done", is_complete=True),
     ])
     loop = AgentLoop(tools, planner, FakeMemory(), skills=FakeSkills())
 
     state = loop.run(
-        "run_visual_approach",
+        "run_visual_approach_blocked",
         "飞向画面中红色车辆位置",
         {"image_capture": True},
         [{"name": name} for name in tools.handlers],
-        max_steps=5,
+        max_steps=6,
     )
 
-    assert state.status == "failed"
-    assert [item.tool for item in state.results] == ["airsim_take_photo", "inspect_current_frame"]
-    assert "2D image target" in state.failure_reason
-    assert planner.calls == 0
+    assert "memory_store" not in tools.calls  # 内部工具不执行
+    # 守卫把"内部工具"这类无效决定交回模型重新决策（needs_replan），而不是判失败
+    assert any(d.source == "guard" and d.needs_replan for d in state.decisions), state.decisions
+    assert "drone_hover" in tools.calls, tools.calls
+    assert "2D image target" not in (state.failure_reason or "")
+    assert state.status == "completed"
 
 
 def test_tool_runtime_marks_started_result_as_non_terminal() -> None:
@@ -1337,3 +1379,46 @@ def test_execute_run_orphaned_after_grace_when_not_pending() -> None:
     stale_msg = next(m for m in runtime._messages if m.run_id == "execute_stale")
     assert stale_msg.status == "error"
     assert stale_msg.details.get("phase") == "interrupted"
+
+
+def test_native_empty_response_is_retried_before_failing(monkeypatch) -> None:
+    """原生工具调用模式下模型偶发空回复：必须重试，而不是一次就判失败。
+
+    实测：一次空回复（没有内容、也没有工具调用）把一次已经起飞的悬停任务直接推进
+    失败流程并降落。现在重试 `_NATIVE_EMPTY_RETRIES` 次；仍然为空才抛出带中文说明
+    的空回复错误（调用方原有的 `except LLMUnavailableError` 捕获依旧生效）。
+    """
+    calls = {"n": 0}
+
+    class _FlakyClient:
+        last_reasoning = ""
+
+        def chat_tools(self, messages, tools):
+            calls["n"] += 1
+            if calls["n"] < 3:
+                return [], "", {}
+            return [{"name": "drone_get_status", "arguments": {}}], "", {}
+
+    monkeypatch.setattr(llm_module, "_create_client", lambda config: _FlakyClient())
+    planner = LLMMissionPlanner()
+    decision = planner._native_decision(
+        {"api_type": "openai"},
+        [{"role": "user", "content": "x"}],
+        [{"type": "function", "function": {"name": "drone_get_status"}}],
+        {"drone_get_status"},
+    )
+    assert calls["n"] == 3, calls
+    assert decision.action == "drone_get_status"
+
+    class _AlwaysEmpty:
+        last_reasoning = ""
+
+        def chat_tools(self, messages, tools):
+            calls["n"] += 1
+            return [], "", ""
+
+    monkeypatch.setattr(llm_module, "_create_client", lambda config: _AlwaysEmpty())
+    with pytest.raises(llm_module.LLMEmptyResponseError) as excinfo:
+        planner._native_decision({"api_type": "openai"}, [], [], {"drone_get_status"})
+    assert "空回复" in str(excinfo.value)
+    assert isinstance(excinfo.value, LLMUnavailableError)

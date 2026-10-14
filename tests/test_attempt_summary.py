@@ -131,7 +131,10 @@ def test_max_steps_exhausted_uses_model_summary() -> None:
     assert state.status == "blocked"
     assert "max_steps" in state.failure_reason
     assert planner.summarize_called is True
-    assert state.summary == "模型总结：已完成状态回读，但任务未达成，建议检查目标区域。"
+    # 报告以机器结论开头，模型正文接在后面：模型写"任务未达成"也不该改变
+    # 终态口径（终态由运行时判定），反过来模型写得再乐观也要先看到"未完成"。
+    assert state.summary.startswith("任务未完成")
+    assert "模型总结：已完成状态回读，但任务未达成，建议检查目标区域。" in state.summary
 
 
 def test_max_steps_without_require_llm_keeps_template_summary() -> None:

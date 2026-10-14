@@ -213,12 +213,12 @@ TOOL_MANIFEST: dict[str, ToolManifestEntry] = {
         ("depth_perception",),
         future="ROS depth topics or point clouds should normalize here or into a mapping provider.",
     ),
-    "airsim_detect_objects": _atomic(
-        "airsim_detect_objects",
+    "airsim_locate_point": _atomic(
+        "airsim_locate_point",
         "perception",
-        "detection_source",
-        ("object_detection",),
-        notes="Single-frame inference is atomic. Search/tracking loops are not.",
+        "depth_source",
+        ("depth_perception",),
+        notes="Projects one normalised image point through the depth image and drone pose to a world position. Pure geometry, no detection.",
     ),
     "provider_bridge_health": _atomic(
         "provider_bridge_health",
@@ -328,41 +328,8 @@ TOOL_MANIFEST: dict[str, ToolManifestEntry] = {
         surface="perception",
         recommended_layer="tool",
         stable=True,
-        notes="Read-only perception axis health/snapshot/events; independent of the flight backend.",
+        notes="Read-only camera/frame health (online, fps, capture_age_s, view). No detection information.",
         future_backend_notes="Works unchanged for sim (local engine) and real vehicles (remote Jetson engine).",
-    ),
-    "perception_start": ToolManifestEntry(
-        name="perception_start",
-        group="perception",
-        kind="atomic",
-        surface="perception",
-        recommended_layer="tool",
-        stable=True,
-        notes="Start/ensure the perception axis detector and optionally set the target class.",
-        future_backend_notes="Same call starts a local or onboard engine; only the profile differs.",
-    ),
-    "perception_stop": ToolManifestEntry(
-        name="perception_stop",
-        group="perception",
-        kind="atomic",
-        surface="perception",
-        recommended_layer="tool",
-        stable=True,
-        notes="Stop the perception axis detector.",
-        future_backend_notes="Same call stops a local or onboard engine.",
-    ),
-    "drone_approach_target": ToolManifestEntry(
-        name="drone_approach_target",
-        group="perception",
-        kind="atomic",
-        surface="perception",
-        recommended_layer="tool",
-        stable=True,
-        notes=(
-            "One bounded 1-3 m body-forward step toward the centred locked target. Refuses when "
-            "horizontal pixel error exceeds 0.35, so the target must be centred first."
-        ),
-        future_backend_notes="Needs a locked target plus velocity control; currently PX4 MAVLink for the closed loop.",
     ),
 }
 

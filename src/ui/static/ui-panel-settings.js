@@ -44,7 +44,6 @@ function fillApplicationSettingsForm() {
   if (els.appMissionAccept) els.appMissionAccept.value = String(settings.mission.default_acceptance_radius_m);
   if (els.appRequireMissionGps) els.appRequireMissionGps.checked = Boolean(settings.safety.require_gps_for_global_mission);
   if (els.appShowContext) els.appShowContext.checked = Boolean(settings.agent.show_context_usage);
-  if (els.appAutoMultimodal) els.appAutoMultimodal.checked = Boolean(settings.agent.auto_select_multimodal_model);
   if (els.appMaxMapJump) els.appMaxMapJump.value = String(settings.safety.max_display_jump_m);
   document.body.dataset.density = settings.appearance.density || "comfortable";
 }
@@ -85,7 +84,6 @@ function applicationSettingsFromForm() {
     },
     agent: {
       show_context_usage: els.appShowContext ? Boolean(els.appShowContext.checked) : applicationSettings.agent.show_context_usage,
-      auto_select_multimodal_model: els.appAutoMultimodal ? Boolean(els.appAutoMultimodal.checked) : applicationSettings.agent.auto_select_multimodal_model,
       persist_full_session_history: applicationSettings.agent.persist_full_session_history,
     },
   });

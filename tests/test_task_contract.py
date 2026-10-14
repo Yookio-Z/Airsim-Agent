@@ -131,11 +131,11 @@ def test_verify_target_confirmed():
     loop = _loop()
     state = _state()
     found_state = _state()
-    found_state.results.append(_result("skill:search", True, {"target_found": True, "target_class": "car"}))
+    found_state.results.append(_result("inspect_current_frame", True, {"target_found": True, "target_class": "car"}))
     assert loop._verify_criterion({"metric": "target_confirmed", "target": "car"}, found_state, LoopObservation(1, {}))["satisfied"] is True
 
     not_found_state = _state()
-    not_found_state.results.append(_result("skill:search", True, {"target_found": False, "status": "target_not_confirmed"}))
+    not_found_state.results.append(_result("inspect_current_frame", True, {"target_found": False, "status": "target_not_confirmed"}))
     assert loop._verify_criterion({"metric": "target_confirmed", "target": "car"}, not_found_state, LoopObservation(1, {}))["satisfied"] is True
 
     nothing_state = _state()
@@ -281,8 +281,19 @@ def test_loop_accepts_completion_when_criterion_met(tmp_path):
     assert tools.calls == []  # no corrective action needed
 
 
-def test_loop_ignores_completion_gate_when_no_criteria(tmp_path):
+def test_empty_completion_claim_is_flagged_even_without_criteria(tmp_path):
+    """没有任何判据时也有一条兜底判据：至少成功执行过一个动作。
+
+    这里以前是"无判据 → 不做任何动作也算完成"（原测试名就叫
+    `test_loop_ignores_completion_gate_when_no_criteria`）。那条路正是
+    "模型声明完成即完成"的入口——一个动作都没做、没有任何证据，运行却是
+    completed。2026-10-12 的实机任务排查后改成兜底判据 `any_action_succeeded`：
+    它比 status_ok 宽松（允许末尾有失败动作，那有别的机制管），只拦空声明。
+
+    注意 status 仍是 completed：循环层的 status 表示"模型请求收尾"，机器否决
+    记在 verification_status 上，由运行层的 failed-verification gate 落地。
+    """
     tools = _FakeTools()
     state = _run_loop(tmp_path, tools, [LoopDecision(action="", reason="完", is_complete=True)], {})
     assert state.status == "completed"
-    assert state.verification_status == ""
+    assert state.verification_status == "failed"

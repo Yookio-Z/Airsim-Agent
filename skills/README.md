@@ -1,7 +1,7 @@
 # Agent Skills
 
 Skills are **operating knowledge**, not actions. They teach the Agent how to run a
-class of task and which native tools to reach for; every flight action still goes
+kind of task and which native tools to reach for; every flight action still goes
 through the ordinary tool surface with the ordinary safety gates.
 
 ## Layout
@@ -65,8 +65,23 @@ optional decoration.
 | Skill | Covers |
 |---|---|
 | `flight-sequence` | One compact command chaining several single-vehicle steps: status → arm → takeoff → move → photo → vision analysis → return → land. |
-| `region-search` | Find / confirm / track a target from the air, including the detection-first budget and the in-place sweep plus expanding-grid search. |
+| `visual-approach` | **The approach path.** Go to any visible target: vision-model point + depth distance loop, the 90° pixel-to-metre arithmetic, passing through an opening, landing on a small object. |
+| `target-inspection` | Close inspection and re-acquisition: one look + one depth reading before any movement, the fill-ratio stopping rule via the rough normalised height, orientation before repositioning, obstacles stop the approach. |
+| `region-search` | Find / confirm / follow a target from the air with a strict vision-model look budget (one look per heading, ≤8 headings × ≤3 positions) and an honest "not found". |
 | `formation` | Multi-vehicle formation flight and area coverage via `formation_command`. |
+
+## Perception decision (project level)
+
+Object detection has been **removed from this project**: there is no detector tool
+anywhere in the tool surface. The perception path is **"vision model for semantics + depth
+for metric distance"** — `inspect_current_frame` answers "is it there / what is it /
+roughly where and how big" (its `bbox_hint` is explicitly rough), and
+`airsim_get_depth_map` at that normalised point supplies the metre (`distance_median_m`).
+`perception_status` now reports **camera health only** (online, fps, `capture_age_s`,
+view) — it carries no targets. Absolute coordinates come from `airsim_locate_point(x, y)`,
+which turns a normalised image point plus the drone pose into a NED `world_pos` (optional;
+the bounded body-frame loop does not need it). Approach missions are handled by
+`visual-approach`.
 
 ## Legacy executable skills
 
@@ -77,4 +92,4 @@ builds the registry without `register_builtins`, and they were retired because
 they were too rule-driven and brittle. Only migration tests opt into them.
 
 Extension points for skills that need code belong under the skill folder as
-helper scripts, not as the primary policy path.
+helper scripts, not as the main policy path.

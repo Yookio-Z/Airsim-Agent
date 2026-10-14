@@ -98,10 +98,15 @@ def test_move_body_follows_current_heading() -> None:
     client = FakePersonClient(yaw_deg=90.0)
     with _actor(client) as actor:
         actor.move_body(1.6, 0.0)
-        assert actor.wait(0.6) is True
-        actor.stop()
-        time.sleep(0.3)
+        # 等它真的走到位，而不是等一个固定时长：全量套件在负载高的机器上跑时，
+        # 0.6s 内这条线程可能还没走够 0.6m，断言就偶发失败（实测红过一次，单独跑
+        # 必过）。改成截止时间轮询：语义不变（"forward 使 y 增加"），结果稳定。
+        deadline = time.monotonic() + 3.0
         state = actor.state(fresh=True)
+        while time.monotonic() < deadline and state.y <= 0.6:
+            time.sleep(0.05)
+            state = actor.state(fresh=True)
+        actor.stop()
     assert state.y > 0.6, f"expected travel along +y, got y={state.y:.2f}"
     assert abs(state.x) < 0.25
 
@@ -111,11 +116,15 @@ def test_move_body_strafe_is_perpendicular() -> None:
     client = FakePersonClient(yaw_deg=0.0)
     with _actor(client) as actor:
         actor.move_body(0.0, 1.5, speed=1.5)
-        assert actor.wait(0.6) is True
-        actor.stop()
-        time.sleep(0.3)
+        # 与上一条同理：等它走到位，而不是等一个固定时长（同一类时序脆弱在
+        # 负载高的机器上会偶发变红）。
+        deadline = time.monotonic() + 3.0
         state = actor.state(fresh=True)
-    assert state.y > 0.5
+        while time.monotonic() < deadline and state.y <= 0.5:
+            time.sleep(0.05)
+            state = actor.state(fresh=True)
+        actor.stop()
+    assert state.y > 0.5, f"expected strafe along +y, got y={state.y:.2f}"
     assert abs(state.x) < 0.25
 
 

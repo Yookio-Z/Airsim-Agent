@@ -111,8 +111,11 @@ class LoopState:
     finished_at: float = 0.0
     failure_reason: str = ""
     summary: str = ""
-    # "ok" / "failed" / "" when the task contract criteria were machine-verified
+    # "ok" / "unverified" / "failed" / "" —— 任务契约的判据是否被机器校验过。
+    # "unverified"：判据因缺遥测等原因无法评估，运行照常收尾但**不能宣称已验证**。
     verification_status: str = ""
+    # 无法评估的判据明细（metric + 原因），让最终报告能如实说出"哪一项没能确认"。
+    verification_unevaluated: list[dict[str, Any]] = field(default_factory=list)
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -130,4 +133,5 @@ class LoopState:
             "failure_reason": self.failure_reason,
             "summary": self.summary,
             "verification_status": self.verification_status,
+            "verification_unevaluated": list(self.verification_unevaluated),
         }

@@ -26,7 +26,6 @@ OBSERVATION_TOOLS = {
 }
 
 STRUCTURED_PERCEPTION_TOOLS = {
-    "airsim_detect_objects",
     "airsim_get_sensors",
     "perception_status",
 }
@@ -75,10 +74,8 @@ _REAL_VEHICLE_APPROVAL_TOOLS = {
     "drone_dispatch_path",
     "drone_dispatch_land",
     "drone_dispatch_return_land",
-    # 视觉伺服驱动的抵近：会在真机上真的把飞机挪最多 12m。原先只因为风险是
-    # medium 而不在签字集里，审批门只在 high 时开，于是真机上一句
-    # "接近目标"就能不经确认位移——和 drone_fly_to 其实是同一类动作。
-    "drone_approach_target",
+    # 真机上任何会真的挪动飞机的动作都要签字。抵近工具已随 YOLO 移除；现在
+    # 靠近由 drone_move_relative（已在上面）完成，不再有单独的抵近工具。
 }
 
 CONNECTION_FAILURE_TERMS = (

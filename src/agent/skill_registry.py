@@ -243,7 +243,6 @@ class SearchAgentSkill(_SequentialSkill):
             "drone_takeoff",
             "drone_rotate_to",
             "airsim_take_photo",
-            "airsim_detect_objects",
             "inspect_current_frame",
         ],
         failure_policy="Stop if the vehicle cannot safely become airborne or the camera cannot capture a frame.",
@@ -264,7 +263,6 @@ class SearchAgentSkill(_SequentialSkill):
         image_type = str(params.get("image_type") or "scene").strip() or "scene"
         max_steps = _clamped_int(params.get("max_steps") or params.get("sweep_steps"), 4, 1, 12)
         headings = _search_headings(params.get("sweep_headings") or params.get("headings"), max_steps)
-        confidence = _bounded_float(params.get("confidence"), 0.3, 0.01, 1.0)
 
         for tool, payload in (("drone_connect", {}), ("drone_get_status", {})):
             result = self._call(tools, results, tool, payload, dry_run=dry_run, execute_tool=execute_tool)
@@ -290,7 +288,6 @@ class SearchAgentSkill(_SequentialSkill):
             )
 
         rotate_available = _tool_available(tools, "drone_rotate_to")
-        detection_available = _tool_available(tools, "airsim_detect_objects")
         vlm_available = _tool_available(tools, "inspect_current_frame")
 
         for index, heading in enumerate(headings, 1):
@@ -334,32 +331,6 @@ class SearchAgentSkill(_SequentialSkill):
                     },
                 )
 
-            if detection_available:
-                detection = self._call(
-                    tools,
-                    results,
-                    "airsim_detect_objects",
-                    {"target_class": target_class, "confidence": confidence},
-                    dry_run=dry_run,
-                    execute_tool=execute_tool,
-                )
-                evidence = _target_evidence(detection.data, target_class) if detection.ok else None
-                if evidence:
-                    return self._finish(
-                        True,
-                        "search skill complete: target found by detection provider",
-                        results,
-                        {
-                            "target_class": target_class,
-                            "search_altitude": altitude,
-                            "search_radius": radius,
-                            "target_found": True,
-                            "provider": "airsim_detect_objects",
-                            "heading_deg": heading,
-                            "evidence": evidence,
-                        },
-                    )
-
             if vlm_available:
                 confirmation = self._call(
                     tools,
@@ -398,7 +369,6 @@ class SearchAgentSkill(_SequentialSkill):
                 "sweep_headings": headings,
                 "providers": {
                     "rotation": rotate_available,
-                    "detection": detection_available,
                     "vlm": vlm_available,
                 },
             },

@@ -763,16 +763,6 @@ body.resizing .h-resizer::after {
   background: rgba(85, 223, 244, 0.09);
 }
 
-/* 检测徽标 + 开关：作为一个整体放在标题行里（原先开关单独占控制条第二行，
-   面板被撑得很挤）。窄面板下整组可以收缩，徽标先被裁短，开关保持完整。 */
-.camera-viewer-detect {
-  flex: 0 1 auto;
-  min-width: 0;
-  display: flex;
-  align-items: center;
-  gap: 4px;
-}
-
 .camera-stream-play-icon {
   display: none;
 }
@@ -889,102 +879,6 @@ body.resizing .h-resizer::after {
 
 .camera-perf[hidden] {
   display: none;
-}
-
-.camera-perf .camera-perf-det {
-  color: var(--amber);
-}
-
-/* 检测状态徽标：检测是操作员手动开关的（相机流自己跑），徽标说明检测在不在跑、
-   检测率与目标数；陈旧用琥珀色，请求失败用红色。徽标与开关一起放在面板标题行
-   的 .camera-viewer-detect 组里，不再占控制条的位置。 */
-.camera-detect-status {
-  flex: 0 0 auto;
-  height: 27px;
-  padding: 0 7px;
-  display: inline-flex;
-  align-items: center;
-  border: 1px solid rgba(255, 255, 255, 0.12);
-  border-radius: 5px;
-  background: rgba(255, 255, 255, 0.04);
-  color: var(--muted);
-  font: 700 10px/1 Consolas, monospace;
-  font-variant-numeric: tabular-nums;
-  white-space: nowrap;
-}
-
-/* 标题行里与 24px 的 +/- 图标按钮对齐；最长文案（检测中 · x/s · N 目标）
-   放不下时徽标先收缩裁短，开关键始终完整可见 */
-.camera-viewer header .camera-detect-status {
-  flex: 0 1 auto;
-  height: 24px;
-  min-width: 0;
-  max-width: 220px;
-}
-
-/* 错误文案要能读全：允许换行、高度自适应，不被 24px 行高裁掉 */
-.camera-viewer header .camera-detect-status[data-health="error"] {
-  height: auto;
-  min-height: 24px;
-  padding: 3px 7px;
-  overflow: visible;
-}
-
-.camera-viewer header .camera-detect-toggle {
-  height: 24px;
-  padding: 0 8px;
-}
-
-.camera-detect-status[data-health="live"] {
-  border-color: rgba(78, 230, 164, 0.28);
-  background: rgba(78, 230, 164, 0.08);
-  color: var(--green);
-}
-
-.camera-detect-status[data-health="warn"] {
-  border-color: rgba(240, 184, 74, 0.32);
-  background: rgba(240, 184, 74, 0.09);
-  color: var(--amber);
-}
-
-.camera-detect-status[data-health="error"] {
-  border-color: rgba(255, 107, 107, 0.38);
-  background: rgba(255, 107, 107, 0.1);
-  color: var(--danger);
-  white-space: normal;
-}
-
-.camera-detect-toggle {
-  flex: 0 0 auto;
-  height: 27px;
-  padding: 0 9px;
-  border: 1px solid rgba(255, 255, 255, 0.12);
-  border-radius: 5px;
-  background: rgba(31, 34, 42, 0.92);
-  color: var(--ink);
-  font-family: inherit;
-  font-size: 10px;
-  font-weight: 700;
-  line-height: 1;
-  white-space: nowrap;
-  cursor: pointer;
-}
-
-.camera-detect-toggle:hover:not(:disabled) {
-  color: var(--cyan);
-  border-color: rgba(85, 223, 244, 0.28);
-  background: rgba(85, 223, 244, 0.09);
-}
-
-.camera-detect-toggle[data-detecting="true"] {
-  color: var(--amber);
-  border-color: rgba(240, 184, 74, 0.32);
-  background: rgba(240, 184, 74, 0.08);
-}
-
-.camera-detect-toggle:disabled {
-  opacity: 0.55;
-  cursor: wait;
 }
 
 .camera-frame {
@@ -7593,7 +7487,3 @@ body.dragging-system-settings #systemSettingsModal .modal-head {
 .agent-column.tight .composer-left-actions { gap: 5px; }
 .agent-column.tight .composer-right-actions { gap: 5px; }
 .agent-column.tight .mode-option { padding: 0 7px; }
-
-/* 未检测时不显示这块占位文字：面板本来就窄，把宽度让给按钮与画面。
-   一旦开始检测，徽标带着速率/目标数再出现。 */
-.camera-detect-status[data-health="idle"] { display: none; }

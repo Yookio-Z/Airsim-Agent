@@ -180,17 +180,11 @@ els.commandForm.addEventListener("submit", async (event) => {
   // （“打断对话即后台停止调用”）。输入框始终在提交后清空。
   const command = els.commandInput.value.trim();
   if (!command && !pendingImages.length) return;
-  let selectedModel = modelsCache.find((model) => model.id === els.modelSelector.value);
-  if (pendingImages.length && !selectedModel?.multimodal && applicationSettings.agent.auto_select_multimodal_model) {
-    const visionModel = modelsCache.find((model) => model.multimodal && model.enabled);
-    if (visionModel) {
-      setSelectedModelId(visionModel.id);
-      selectedModel = visionModel;
-      showNotice(`已自动切换到图像模型 ${visionModel.name}`, "info");
-    }
-  }
+  const selectedModel = modelsCache.find((model) => model.id === els.modelSelector.value);
+  // 规划与看图共用操作员选中的这一个模型：模型不支持图像就明确报错，不再替他
+  // 自动切换到"图像模型"——那会让对话里的回答来自一个他没选的模型。
   if (pendingImages.length && !selectedModel?.multimodal) {
-    showNotice("未检测到可用图像模型，请在模型设置中修正模型 ID 或手动指定输入能力", "error");
+    showNotice(`当前模型 ${selectedModel?.name || "（未选择）"} 不支持图像输入，请换一个支持图像的模型`, "error");
     return;
   }
   const effectiveCommand = command || "请分析我提供的图片。";

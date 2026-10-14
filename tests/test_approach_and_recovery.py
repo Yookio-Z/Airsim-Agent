@@ -1,14 +1,16 @@
-"""抵近目标的可执行性、占位思考收尾、以及任务收尾终态的分流。
+"""占位思考收尾、以及任务收尾终态的分流。
 
 实测回归：操作员说"我看到一个目标，希望你靠近确认特征"，飞机却反复被
 "画面中当前没有锁定目标"拒绝抵近，一直原地回读状态，最后撞上步数上限 ——
-而步数上限又触发了自动降落。这里锁住三处修复：
+而步数上限又触发了自动降落。这里锁住两处修复：
 
-1. 显示层新鲜度窗口之外、但仍在回退窗口内的最近真实检测，可以用来发起一次
-   有界抵近（预测框不算）；
-2. 模型某一轮只给了工具调用、没有思考文本时，"正在选择下一步"的占位必须被
+1. 模型某一轮只给了工具调用、没有思考文本时，"正在选择下一步"的占位必须被
    收尾，不能挂在时间线上冒充本轮思考；
-3. 收尾终态按是否危险分流：failed 降落，cancelled/blocked 保持悬停。
+2. 收尾终态按是否危险分流：failed 降落，cancelled/blocked 保持悬停。
+
+（"用最近一次真实检测发起抵近"那组测试随 drone_approach_target 一起删除：
+检测与抵近工具都已从产品中移除，靠近由模型按技能用 VLM 取点 + 深度 + 有界
+drone_move_relative 完成。）
 """
 
 from __future__ import annotations
@@ -17,44 +19,15 @@ import threading
 from types import SimpleNamespace
 
 from src.agent.runtime import AgentRuntime
-from src.agent.tool_executor import ToolRuntime
 
 
-def test_fallback_approach_target_uses_recent_measured_detection():
-    snap = {
-        "targets": [
-            {"bbox": [10, 10, 50, 50], "age_s": 9.9, "predicted": False, "track_id": 1},
-            {"bbox": [100, 100, 180, 200], "age_s": 2.4, "predicted": False, "track_id": 2},
-            {"bbox": [200, 200, 260, 260], "age_s": 1.0, "predicted": True, "track_id": 3},
-        ]
-    }
-    target = ToolRuntime._fallback_approach_target(snap)
-    assert target is not None and target["track_id"] == 2
+def test_pending_placeholder_becomes_a_decision_row_when_model_gives_no_text():
+    """模型没给思考文本时：这一行改成"模型决策"，写出它实际调用了什么。
 
-
-def test_fallback_approach_target_rejects_predicted_and_stale():
-    snap = {
-        "targets": [
-            {"bbox": [1, 1, 9, 9], "age_s": 5.0, "predicted": False, "track_id": 1},
-            {"bbox": [1, 1, 99, 99], "age_s": 0.2, "predicted": True, "track_id": 2},
-        ]
-    }
-    assert ToolRuntime._fallback_approach_target(snap) is None
-    assert ToolRuntime._fallback_approach_target({"targets": []}) is None
-
-
-def test_fallback_approach_target_prefers_newest_then_largest():
-    snap = {
-        "targets": [
-            {"bbox": [0, 0, 100, 100], "age_s": 1.0, "predicted": False, "track_id": 1},
-            {"bbox": [0, 0, 10, 10], "age_s": 0.5, "predicted": False, "track_id": 2},
-        ]
-    }
-    target = ToolRuntime._fallback_approach_target(snap)
-    assert target is not None and target["track_id"] == 2
-
-
-def test_pending_placeholder_is_replaced_when_model_gives_no_text():
+    操作员明确要求过两件事：不要编造思考文本；但**模型的输出必须能看到**——
+    工具调用就是它的输出。以前这里会编一句"本轮模型未输出思考文本"再显示成
+    "模型思考"，两头都错。
+    """
     run = SimpleNamespace(
         process_trace=[
             {"kind": "reasoning", "status": "running", "body": "正在根据最新遥测、工具结果和任务目标选择下一步动作。"}
@@ -63,11 +36,12 @@ def test_pending_placeholder_is_replaced_when_model_gives_no_text():
     stub = SimpleNamespace(
         _lock=threading.RLock(),
         _PENDING_REASONING_PLACEHOLDERS=AgentRuntime._PENDING_REASONING_PLACEHOLDERS,
+        _decision_line=AgentRuntime._decision_line,
     )
-    AgentRuntime._close_pending_reasoning(stub, run, "airsim_detect_objects")
-    item = run.process_trace[-1]
-    assert item["status"] == "completed"
-    assert "airsim_detect_objects" in item["body"]
+    AgentRuntime._close_pending_reasoning(stub, run, "airsim_get_depth_map", {"query_points": "0.6,0.39"})
+    item = run.process_trace[0]
+    assert item["kind"] == "decision" and item["title"] == "模型决策"
+    assert item["body"].startswith("调用 airsim_get_depth_map(")
 
 
 def test_close_pending_reasoning_keeps_real_text():
@@ -127,8 +101,8 @@ def test_mission_plan_declares_keep_reacting_for_continuous_tasks():
 
 
 
-def test_settle_replaces_pending_placeholder_at_task_end():
-    """循环在"结果回来、模型刚准备想下一步"那一拍收敛时，占位行必须被替换。"""
+def test_settle_drops_pending_placeholder_at_task_end():
+    """收尾时占位行同样摘掉（不是换成"本轮模型未输出思考文本"）。"""
     run = SimpleNamespace(
         status="completed",
         process_trace=[
@@ -137,9 +111,7 @@ def test_settle_replaces_pending_placeholder_at_task_end():
     )
     stub = SimpleNamespace(_PENDING_REASONING_PLACEHOLDERS=AgentRuntime._PENDING_REASONING_PLACEHOLDERS)
     AgentRuntime._settle_process_trace(stub, run)
-    item = run.process_trace[-1]
-    assert item["status"] == "completed"
-    assert item["body"] == "本轮模型未输出思考文本。"
+    assert run.process_trace == []
 
 
 def test_settle_keeps_real_reasoning_text():

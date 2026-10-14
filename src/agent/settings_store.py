@@ -182,7 +182,6 @@ def _default_application_settings() -> dict[str, Any]:
         },
         "agent": {
             "show_context_usage": True,
-            "auto_select_multimodal_model": True,
             "persist_full_session_history": True,
         },
     }

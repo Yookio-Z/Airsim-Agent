@@ -68,7 +68,7 @@ State whether the sequence completed; list the executed chain in one sentence; r
 ## Failure Policy
 
 - Stop after a flight-control failure unless a simulated-mode recovery is clearly appropriate.
-- Never invent telemetry, GPS coordinates, image content, or detection results.
+- Never invent telemetry, GPS coordinates, or image content.
 - If return-to-start cannot be resolved from telemetry, land if already near the start; otherwise hover and explain.
 
 ## Not For
@@ -89,7 +89,7 @@ The operator notices every inaccuracy: a move that lands 0.8 m short, a "turn le
 
 **Return home is an absolute-position task.** Do not try to compose it from relative legs — that is how "return home" ends up nowhere near home. Read the position before takeoff (that is the home point), remember it, and at the end fly back with `drone_fly_to(home_x, home_y, home_z)` at the flight altitude, then `drone_land`. `drone_fly_to` steers the nose toward the target by itself, so do not add a separate rotate; only turn deliberately when the mission needs a specific viewing direction on arrival.
 
-**Heading changes change what the camera sees.** The gimbal holds pitch and roll in the world frame, but **yaw follows the airframe** — after any turn the picture faces a different direction. If the operator cares about what is being looked at, re-confirm the view (`airsim_detect_objects` / `inspect_current_frame`) after turning rather than assuming the earlier framing still holds.
+**Heading changes change what the camera sees.** The gimbal holds pitch and roll in the world frame, but **yaw follows the airframe** — after any turn the picture faces a different direction. If the operator cares about what is being looked at, re-confirm the view (`inspect_current_frame`) after turning rather than assuming the earlier framing still holds.
 
 **Never report a motion as done without reading it back.** A tool returning "command sent" is not the same as the vehicle reaching the target: after each motion step in an ordered task, read `drone_get_status` (position, altitude, heading) and compare against the intended value before moving on.
 

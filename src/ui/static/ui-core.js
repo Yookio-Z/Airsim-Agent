@@ -168,7 +168,6 @@ const els = {
   appMissionAccept: $("appMissionAccept"),
   appRequireMissionGps: $("appRequireMissionGps"),
   appShowContext: $("appShowContext"),
-  appAutoMultimodal: $("appAutoMultimodal"),
   appMaxMapJump: $("appMaxMapJump"),
   addModelBtn: $("addModelBtn"),
   modelModal: $("modelModal"),
@@ -348,7 +347,7 @@ const DEFAULT_APPLICATION_SETTINGS = {
   telemetry: { refresh_ms: 250, setup_refresh_ms: 100, history_seconds: 60, chart_sample_hz: 20 },
   mission: { default_altitude_m: 3, default_speed_mps: 2, default_hold_s: 0, default_acceptance_radius_m: 2 },
   safety: { confirm_real_vehicle_actions: true, require_gps_for_global_mission: true, max_display_jump_m: 120 },
-  agent: { show_context_usage: true, auto_select_multimodal_model: true, persist_full_session_history: true },
+  agent: { show_context_usage: true, persist_full_session_history: true },
 };
 let applicationSettings = JSON.parse(JSON.stringify(DEFAULT_APPLICATION_SETTINGS));
 let applicationSettingsLoaded = false;
