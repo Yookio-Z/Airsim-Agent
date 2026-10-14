@@ -28,9 +28,12 @@ third_party/
 scripts/manual/
 scripts/verify_p*.py
 
-# Internal development tracking/handoff docs.
-docs/dev_task_list.md
-docs/px4_agent_handoff.md
+# Internal documents (design drafts, failure analyses, research notes, ideas)
+# are deliberately NOT tracked: the repository may be public and these are
+# working material, not product documentation. The files stay in the local
+# working tree. Previously listed one by one (docs/dev_task_list.md,
+# docs/px4_agent_handoff.md); now the whole folder.
+docs/
 
 # ZCode tool session artifacts.
 .zcode/

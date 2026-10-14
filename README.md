@@ -73,21 +73,12 @@ src/          Python package: agent runtime, autonomy, modules, tools, GCS, web 
 ros2/         ROS2 package with the PX4 ROS2 gateway node
 skills/       Runtime-loaded SKILL.md guidance documents
 scripts/      Development launchers and smoke-test scripts
-docs/         Architecture, design, and upgrade-plan documentation
 tests/        Pytest suite (local development)
 ```
 
-See [`docs/project_structure.md`](docs/project_structure.md) for the detailed
-layout and [`docs/README.md`](docs/README.md) for the documentation index.
-
-## Documentation
-
-- [`docs/system_upgrade_plan.md`](docs/system_upgrade_plan.md) - current system
-  baseline and upgrade roadmap (authoritative).
-- [`docs/ros_provider_bridge.md`](docs/ros_provider_bridge.md) - PX4 ROS2
-  gateway operation and ROS provider integration.
-- [`docs/agent_harness_design.md`](docs/agent_harness_design.md) - agent loop,
-  skills, providers, state, safety, and verification principles.
+Design, planning and experiment notes live in a local `docs/` folder that is
+deliberately **not** tracked by git (see `.gitignore`), so they are not part of
+this repository and links to them do not resolve here.
 
 ## Notes
 
