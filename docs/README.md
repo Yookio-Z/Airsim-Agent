@@ -11,6 +11,18 @@
 | [`agent_harness_design.md`](agent_harness_design.md) | Agent Loop、Skill、Provider、状态、安全和验证原则 | 稳定设计 |
 | [`agent_tool_skill_refactor.md`](agent_tool_skill_refactor.md) | 原子工具、Skill 和 ROS Provider 的边界约定 | 稳定设计 |
 
+## 资料库（论文 · 开源项目 · 创新点）
+
+| 文档 | 作用 |
+|---|---|
+| [`research/README.md`](research/README.md) | **资料库索引**：论文考究、开源项目考究、创新点与实验设计（毕设写作资料底座，每条带验证状态） |
+| [`research/papers/vla-sct-2602.01811.md`](research/papers/vla-sct-2602.01811.md) | VLA 缺乏可靠的任务完成识别 → 冗余动作与超时（"无限逼近"的文献级印证） |
+| [`research/ideas/01-criteria-contract.md`](research/ideas/01-criteria-contract.md) | 创新点：完成判据契约（任务声明、运行时评估） |
+| [`research/references.bib`](research/references.bib) | BibTeX（引用前按验证状态核对） |
+| [`task_completion_criteria_research.md`](task_completion_criteria_research.md) | 判据调研的两份完整结论 + 反模式清单 |
+| [`vision_depth_fusion.md`](vision_depth_fusion.md) | 视觉 × 深度融合：框内外深度交叉验证、探测点溯源、到位判据 |
+| [`loop_context_design.md`](loop_context_design.md) | 循环上下文规则（能力不裁 / 历史摘要 / 记忆按需取） |
+
 ## 专题文档
 
 | 文档 | 作用 |
