@@ -112,6 +112,12 @@ def tool_runtime(
     return runtime
 
 
+def _manager_ok():
+    from src.gcs.managers import ManagerResult
+
+    return ManagerResult(True, "ok", {"status": "ok"})
+
+
 def agent_runtime(
     *,
     tools: Any | None = None,
@@ -156,6 +162,24 @@ def agent_runtime(
         "task_runs": None,
         "skills": SimpleNamespace(guidance_cards=lambda *a, **k: [], execute=_noop),
         "rule_planner": None,
+        # 面板遥测的唯一读口是 gcs.telemetry（机队清单走 gcs.vehicle）：
+        # 壳运行时也要有一套惰性替身，否则任何触到状态载荷的用例都会炸。
+        "gcs": SimpleNamespace(
+            telemetry=SimpleNamespace(
+                snapshot=lambda: (tools.status_snapshot() if hasattr(tools, "status_snapshot") else {}),
+                get_state=lambda: SimpleNamespace(to_dict=lambda: {}),
+            ),
+            vehicle=SimpleNamespace(list_vehicles=lambda: []),
+            command=SimpleNamespace(DEVICE_TOOLS=frozenset(), execute_tool=lambda *a, **k: None),
+            link=SimpleNamespace(
+                connect=lambda *a, **k: _manager_ok(),
+                disconnect=lambda *a, **k: _manager_ok(),
+                reconnect=lambda *a, **k: _manager_ok(),
+                status=lambda: SimpleNamespace(to_dict=lambda: {}),
+            ),
+            state=lambda: SimpleNamespace(to_dict=lambda: {}),
+            mission=SimpleNamespace(progress=lambda: {}),
+        ),
     }
     for key, value in {**defaults, **overrides}.items():
         if not hasattr(runtime, key) and key not in defaults:

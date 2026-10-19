@@ -7,7 +7,6 @@ import time
 from dataclasses import dataclass, field
 from typing import Any
 
-from src.utils.coordinates import gps_to_local_meters, haversine_meters
 
 
 def _mission_id() -> str:
@@ -234,3 +233,30 @@ def _item_distance(a: MissionItem, b: MissionItem, home: GeoPoint | None) -> flo
     if pa and pb:
         return math.sqrt((pa.x - pb.x) ** 2 + (pa.y - pb.y) ** 2 + (pa.z - pb.z) ** 2)
     return 0.0
+
+# ---------------------------------------------------------------------------
+# 地理换算（原 src/utils/coordinates.py，只有这两个函数有调用方；
+# 2026-10-19 收进唯一的消费者，删掉 utils 包）
+# ---------------------------------------------------------------------------
+
+_EARTH_RADIUS_M = 6371000.0
+
+
+def gps_to_local_meters(lat: float, lon: float, lat_origin: float, lon_origin: float) -> tuple[float, float]:
+    """GPS 坐标（度）→ 本地 ENU 平面坐标（米），返回 (x=East, y=North)。"""
+    dlat = math.radians(lat - lat_origin)
+    dlon = math.radians(lon - lon_origin)
+    x = dlon * _EARTH_RADIUS_M * math.cos(math.radians(lat_origin))
+    y = dlat * _EARTH_RADIUS_M
+    return (x, y)
+
+
+def haversine_meters(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
+    """两点间球面距离（米）。"""
+    dlat = math.radians(lat2 - lat1)
+    dlon = math.radians(lon2 - lon1)
+    a = (
+        math.sin(dlat / 2) ** 2
+        + math.cos(math.radians(lat1)) * math.cos(math.radians(lat2)) * math.sin(dlon / 2) ** 2
+    )
+    return 2 * _EARTH_RADIUS_M * math.atan2(math.sqrt(a), math.sqrt(1 - a))

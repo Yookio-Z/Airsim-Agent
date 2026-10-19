@@ -7,8 +7,8 @@ from types import SimpleNamespace
 
 import numpy as np
 
-from src.modules.frame_source import RtspFrameSource
-from src.modules.rtsp_camera_controller import RtspCameraController
+from src.modules.perception.frame_source import RtspFrameSource
+from src.modules.perception.rtsp_camera import RtspCameraController
 
 
 class _FakeVideoCapture:
@@ -118,7 +118,7 @@ def test_rtsp_controller_status_reports_stream() -> None:
 def test_local_camera_source_reads_frames(monkeypatch) -> None:
     import cv2 as cv2_module
 
-    from src.modules.frame_source import CameraFrameSource
+    from src.modules.perception.frame_source import CameraFrameSource
 
     monkeypatch.setattr(cv2_module, "VideoCapture", lambda index: _FakeVideoCapture(_bgr_frame()))
     source = CameraFrameSource(index=0)
@@ -134,7 +134,7 @@ def test_local_camera_source_reads_frames(monkeypatch) -> None:
 def test_local_camera_controller_captures_jpeg(monkeypatch) -> None:
     import cv2 as cv2_module
 
-    from src.modules.rtsp_camera_controller import LocalCameraController
+    from src.modules.perception.rtsp_camera import LocalCameraController
 
     monkeypatch.setattr(cv2_module, "VideoCapture", lambda index: _FakeVideoCapture(_bgr_frame()))
     controller = LocalCameraController(index=0)

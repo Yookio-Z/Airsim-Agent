@@ -378,15 +378,13 @@ document.addEventListener("click", async (event) => {
     await runButton(
       button,
       async () => {
-        // 多选(或未选=全部)时:解锁/上锁/起飞逐台下发;起飞用非阻塞派发,多机同时升空
+        // 多选(或未选=全部)时:解锁/上锁/起飞逐台下发（只对选中的那些台，
+        // 不用 vehicle_name="all"，否则会波及没选中的飞机）。dispatch_* 工具
+        // 已删除——"同时"由控制器内部的目标分发完成，这里每台各自等它的结果。
         if (targets.length > 1 && (tool === "drone_takeoff" || tool === "drone_arm" || tool === "drone_disarm")) {
           let last = null;
           for (const name of targets) {
-            if (tool === "drone_takeoff") {
-              last = await invokeFlightTool("drone_dispatch_takeoff", { ...params, vehicle_name: name });
-            } else {
-              last = await invokeFlightTool(tool, { ...params, vehicle_name: name });
-            }
+            last = await invokeFlightTool(tool, { ...params, vehicle_name: name });
           }
           return last;
         }

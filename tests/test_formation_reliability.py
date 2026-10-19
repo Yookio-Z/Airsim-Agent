@@ -14,7 +14,7 @@ from __future__ import annotations
 import threading
 import time
 
-from src.modules.formation import FormationController
+from src.modules.formation.controller import FormationController
 
 
 class _Status:
@@ -178,7 +178,7 @@ def test_schedule_next_anchors_cadence_and_counts_dropped() -> None:
 
 def _schedule_next_anchor(next_tick: float, period: float, now: float, metrics: dict[str, float]) -> float:
     """Local alias so the test does not depend on importing the controller."""
-    from src.modules.formation import FormationController
+    from src.modules.formation.controller import FormationController
 
     return FormationController._schedule_next(next_tick, period, now, metrics)
 

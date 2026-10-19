@@ -216,7 +216,8 @@ class EventsMixin:
         if orphan_changed:
             self._persist_current_session()
 
-        tool_runtime = self.tools.status_snapshot()
+        # 面板遥测只从 gcs.telemetry 取（唯一读口）；运行时内部决策仍直读工具层。
+        tool_runtime = self.gcs.telemetry.snapshot()
         agent_state = self._agent_state_context(tool_runtime)
         gcs_state = self.gcs.state().to_dict()
         agent_skill_cards = self.agent_loop.skills.guidance_cards(
@@ -259,7 +260,7 @@ class EventsMixin:
                 "time": time.time(),
             },
             "supervisor": self.supervisor.get_status(),
-            "tool_runtime": self.tools.status_snapshot(),
+            "tool_runtime": self.gcs.telemetry.snapshot(),
             "current_run": current,
             "llm": self.planner.status(),
         }
@@ -750,8 +751,6 @@ class EventsMixin:
         if run.plan and run.current_step:
             for step in run.plan.steps:
                 if step.id == run.current_step:
-                    if step.tool == "memory_store":
-                        return "正在整理最终结果..."
                     label = step.label or self._tool_action_label(step.tool)
                     return f"正在执行：{label}..."
         if run.plan and run.plan.steps:
@@ -759,8 +758,6 @@ class EventsMixin:
             if not current:
                 current = next((step for step in run.plan.steps if step.status in {"pending", "planned"}), None)
             if current:
-                if current.tool == "memory_store":
-                    return "正在整理最终结果..."
                 label = current.label or self._tool_action_label(current.tool)
                 return f"正在执行：{label}..."
 
@@ -814,7 +811,7 @@ class EventsMixin:
         steps = [
             str(step.tool)
             for step in (run.plan.steps if run.plan else [])
-            if getattr(step, "tool", "") and step.tool != "memory_store"
+            if getattr(step, "tool", "")
         ]
         if not steps:
             return ""

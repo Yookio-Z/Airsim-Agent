@@ -192,6 +192,77 @@ function renderTelemetry(drone, toolRuntime) {
 
   renderMissionMetrics(drone);
   renderSystemConnection(drone, toolRuntime);
+  syncFlightModeControl(drone, toolRuntime);
+}
+
+// 飞行模式受限切换：控件可用性取决于后端（PX4 专有）与链路；选项来自后端白名单。
+let flightModeAllowed = [];
+let flightModeInfoLoaded = false;
+let lastKnownFlightMode = "";
+
+async function loadFlightModeInfo() {
+  if (flightModeInfoLoaded) return;
+  try {
+    const data = await api("/api/vehicle/mode");
+    flightModeAllowed = Array.isArray(data?.allowed) ? data.allowed : [];
+    const select = document.getElementById("flightModeSelect");
+    if (select) {
+      select.innerHTML = "";
+      for (const mode of flightModeAllowed) {
+        const option = document.createElement("option");
+        option.value = mode;
+        option.textContent = mode;
+        select.appendChild(option);
+      }
+      select.dataset.supported = data?.supported ? "1" : "0";
+    }
+    flightModeInfoLoaded = true;
+  } catch (error) {
+    // 后端未就绪：下一次渲染再试
+  }
+}
+
+function syncFlightModeControl(drone, toolRuntime) {
+  const select = document.getElementById("flightModeSelect");
+  if (!select) return;
+  void loadFlightModeInfo();
+  const connected = Boolean(toolRuntime?.connected) && !toolRuntime?.stale_connection;
+  const supported = select.dataset.supported === "1";
+  const mode = String(drone?.mode || "");
+  if (mode) lastKnownFlightMode = mode;
+  if (mode && Array.from(select.options).some((option) => option.value === mode)) {
+    select.value = mode;
+  }
+  select.disabled = !connected || !supported || flightModeAllowed.length === 0;
+  select.title = supported
+    ? `飞行模式：${mode || "未知"}（受限切换：${flightModeAllowed.join(" / ")}）`
+    : "当前后端不支持模式切换（PX4 MAVLink 专有）";
+}
+
+{
+  const select = document.getElementById("flightModeSelect");
+  if (select) {
+    select.addEventListener("change", async () => {
+      const mode = String(select.value || "");
+      if (!mode) return;
+      const confirmed = await confirmDialog({
+        title: "切换飞行模式",
+        message: `将把飞行模式切到 ${mode}。是否继续？（AUTO/MISSION/OFFBOARD 不在白名单：前者会启动已上传航线，后者需要连续 setpoint 流。）`,
+        confirmLabel: "切换模式",
+        danger: false,
+      });
+      if (!confirmed) {
+        select.value = lastKnownFlightMode || select.value;
+        return;
+      }
+      try {
+        const result = await post("/api/vehicle/mode", { mode });
+        if (!result?.ok) throw new Error(result?.error || "切换模式失败");
+      } catch (error) {
+        select.value = lastKnownFlightMode || select.value;
+      }
+    });
+  }
 }
 
 function angleDeltaDeg(a, b) {

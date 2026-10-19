@@ -13,7 +13,7 @@ from .run_state import (
     _REAL_VEHICLE_APPROVAL_TOOLS,
 )
 from .tool_cards import TOOL_CARDS
-from src.modules.formation import FLIGHT_ACTIONS as FORMATION_FLIGHT_ACTIONS
+from src.modules.formation.controller import FLIGHT_ACTIONS as FORMATION_FLIGHT_ACTIONS
 from typing import Any
 import time
 

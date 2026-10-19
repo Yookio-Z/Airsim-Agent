@@ -13,8 +13,8 @@ from types import SimpleNamespace
 import numpy as np
 import pytest
 
-from src.modules.frame_source import RtspFrameSource
-from src.modules.rtsp_camera_controller import RtspCameraController
+from src.modules.perception.frame_source import RtspFrameSource
+from src.modules.perception.rtsp_camera import RtspCameraController
 
 
 class _FakeVideoCapture:
@@ -128,7 +128,7 @@ def test_perception_rtsp_config_prefers_camera_panel(monkeypatch) -> None:
 
 
 def test_perception_axis_prefers_provider_over_env(monkeypatch) -> None:
-    from src.modules.perception_axis import PerceptionAxis
+    from src.modules.perception.axis import PerceptionAxis
 
     axis = PerceptionAxis(
         profile=SimpleNamespace(frame_source="rtsp", deploy="local"),

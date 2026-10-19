@@ -8,9 +8,9 @@ import time
 import queue
 from typing import Any
 
-from src.autonomy.supervisor import ExecutionSupervisor
+from .supervisor import ExecutionSupervisor
 from src.gcs import GroundStationServices
-from src.replay.session import ReplaySession
+from src.flightlog import FlightLogSession
 
 from .agent_loop import AgentLoop
 from .memory import AgentMemory
@@ -33,7 +33,6 @@ from .run_state import (
     reasoning_delta,
 )
 from .settings_store import (
-    AIRSIM_SETTINGS_TEMPLATES,
     ATTACHMENTS_DIR,
     REPO_ROOT,
     SETTINGS_PATH,
@@ -57,7 +56,7 @@ from .session_api import SessionMixin
 from .events import EventsMixin
 from .approval_gate import ApprovalsMixin
 from .gcs_api import GcsMixin
-from .replay_api import ReplayMixin
+from .flightlog_api import FlightLogMixin
 from .llm import LLMMissionPlanner
 from .planner import MissionPlanner
 from .tool_executor import ToolRuntime
@@ -103,7 +102,6 @@ __all__ = [
     "ATTACHMENTS_DIR",
     "SESSIONS_DIR",
     "SESSION_MEMORY_DIR",
-    "AIRSIM_SETTINGS_TEMPLATES",
     "_application_settings",
     "_build_connect_params",
     "_camera_settings",
@@ -156,11 +154,6 @@ logger = get_logger(__name__)
 
 
 
-
-# AirSim settings.json 通信模式模板（config/airsim_settings/）：
-#   airsim_simpleflight_multirotor -> airsim 后端（本机直接 RPC 控制，3 机）
-#   px4_mavlink_udp_sitl          -> px4_mavlink 后端（UDP 连本机/WSL PX4 SITL）
-#   px4_ros2_tcp_edge             -> px4_ros2 后端（TCP 连 Jetson/边端 PX4 SITL）
 
 # Plan-Execute ⇄ ReAct collaboration:
 # - OBSERVATION_TOOLS: steps whose outcome必须由 LLM 读图/深度后才能决策
@@ -215,7 +208,7 @@ logger = get_logger(__name__)
 
 
 
-class AgentRuntime(GuardiansMixin, ReplayMixin, GcsMixin, ApprovalsMixin, EventsMixin, SessionMixin, CancellationMixin, VehicleMixin, ExecutionMixin, AgentBridgeMixin):
+class AgentRuntime(GuardiansMixin, FlightLogMixin, GcsMixin, ApprovalsMixin, EventsMixin, SessionMixin, CancellationMixin, VehicleMixin, ExecutionMixin, AgentBridgeMixin):
     """Coordinates planner, tools, memory, and safety supervisor."""
 
     def __init__(self) -> None:
@@ -253,7 +246,7 @@ class AgentRuntime(GuardiansMixin, ReplayMixin, GcsMixin, ApprovalsMixin, Events
             recovered = 0
         if recovered:
             logging.getLogger("runtime").warning("task_runs_marked_interrupted", extra={"count": recovered})
-        self.supervisor = ExecutionSupervisor(default_timeout=30.0)
+        self.supervisor = ExecutionSupervisor()
         self.skills = SkillRegistry(overrides_path=SKILLS_OVERRIDES_PATH)
         self._init_runtime_state()
         self._auto_connect_initial_backend_id = self.tools.backend_id
@@ -262,6 +255,9 @@ class AgentRuntime(GuardiansMixin, ReplayMixin, GcsMixin, ApprovalsMixin, Events
             self.tools,
             supervisor=self.supervisor,
             current_run_provider=lambda: self._current.to_dict() if self._current else None,
+            # 设备动作走同一条治理入口：操作员的手动操作与 Agent 的飞行步骤共用
+            # 执行槽、编队冲突、真机审批、后端切换这些守卫。
+            governed_executor=self._execute_agent_tool,
         )
         self._append_event("info", "system", "AirSim VLA Agent runtime ready")
         self._load_or_create_default_session()
@@ -320,8 +316,7 @@ class AgentRuntime(GuardiansMixin, ReplayMixin, GcsMixin, ApprovalsMixin, Events
         # self._current being assigned.
         self._pending_run_ids: set[str] = set()
         # 子 Agent 编号由父级持有，保证同一任务的多个子任务各自拿到唯一的日志名
-        # （<parent>.sub1 / .sub2 ...），不会互相追加到同一个审计文件里。
-        self._sub_agent_counter: list[int] = [0]
+
         self._thread: threading.Thread | None = None
         self._current_session_id: str = ""
         # 追踪辅助：算法负责把锁定目标保持在画面中央（不经 LLM、不暴露工具）
@@ -341,10 +336,10 @@ class AgentRuntime(GuardiansMixin, ReplayMixin, GcsMixin, ApprovalsMixin, Events
         self._pending_approvals: dict[str, ToolApprovalRequest] = {}
         # Append-only run event log for the currently executing run (or None).
         self._run_log: RunLog | None = None
-        # Replay: telemetry recording around runs and manual flights
-        self._active_replay: ReplaySession | None = None
-        self._manual_replay: ReplaySession | None = None
-        self._replay_lock = threading.Lock()
+        # 飞行记录：任务执行与手动飞行期间自动采集遥测（src/flightlog/）
+        self._active_flightlog: FlightLogSession | None = None
+        self._manual_flightlog: FlightLogSession | None = None
+        self._flightlog_lock = threading.Lock()
 
     def _wire_callbacks(self) -> None:
         """把 runtime 的方法接到工具层与 Agent 循环上（依赖已注入的对象）。"""
@@ -377,8 +372,8 @@ class AgentRuntime(GuardiansMixin, ReplayMixin, GcsMixin, ApprovalsMixin, Events
         axis just reports health/start_error through perception_status.
         """
         try:
-            from src.modules.perception_axis import PerceptionAxis
-            from src.modules.perception_profile import resolve_profile
+            from src.modules.perception.axis import PerceptionAxis
+            from src.modules.perception.profile import resolve_profile
 
             profile = resolve_profile(config)
             if profile is None:
@@ -467,7 +462,7 @@ class AgentRuntime(GuardiansMixin, ReplayMixin, GcsMixin, ApprovalsMixin, Events
         if controller is None:
             try:
                 from src.config import config as _cfg
-                from src.modules.airsim_controller import AirSimController
+                from src.modules.backends.airsim import AirSimController
 
                 controller = AirSimController(ip=str(_cfg.airsim_ip), port=int(_cfg.airsim_port))
             except Exception as exc:
@@ -500,7 +495,10 @@ class AgentRuntime(GuardiansMixin, ReplayMixin, GcsMixin, ApprovalsMixin, Events
 
 
 
-    _AGENT_INSTRUCTIONS_PATH = REPO_ROOT / "config" / "agent_system.md"
+    _AGENT_INSTRUCTIONS_PATH = REPO_ROOT / ".airsim_agent" / "SYSTEM.md"
+    # Agent 的长期笔记（pi 的 AGENTS.md 那个角色）：知识写在文件里、每轮自动注入，
+    # 而不是让模型调用"记忆工具"。文件由操作员维护，运行时不写它。
+    _AGENT_NOTES_PATH = REPO_ROOT / ".airsim_agent" / "NOTES.md"
 
 
 
@@ -518,7 +516,7 @@ class AgentRuntime(GuardiansMixin, ReplayMixin, GcsMixin, ApprovalsMixin, Events
 
 
 
-    # ── Replay 录制 ──
+    # ── 飞行记录（flight log）──
 
 
 
@@ -616,7 +614,6 @@ class AgentRuntime(GuardiansMixin, ReplayMixin, GcsMixin, ApprovalsMixin, Events
 
 
 
-    # ── AirSim settings.json 模板（通信模式一键切换） ──
 
 
 

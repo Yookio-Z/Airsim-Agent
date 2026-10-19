@@ -13,13 +13,13 @@ from src.agent import runtime as runtime_module
 from src.agent import settings_store
 from src.agent.runtime import _build_connect_params, _connection_settings
 from src.agent.tool_executor import ToolCollector, ToolRuntime
-from src.modules.flight_controller import DroneStatus
-from src.modules.mavlink_autodiscovery import (
+from src.modules.backends.base import DroneStatus
+from src.modules.backends.serial_discovery import (
     discover_serial_mavlink_candidates,
     normalize_serial_baud,
 )
-from src.modules.mavlink_controller import MavlinkController
-from src.tools.core import register_core_tools
+from src.modules.backends.mavlink import MavlinkController
+from src.tools.flight import register_flight_tools
 
 
 class _StaleController:
@@ -72,7 +72,7 @@ def test_status_snapshot_marks_stale_px4_heartbeat_offline():
 def test_core_relative_move_uses_attitude_yaw_when_heading_field_is_missing():
     controller = _YawOnlyController()
     collector = ToolCollector()
-    register_core_tools(collector, controller, lambda data: data)
+    register_flight_tools(collector, controller, lambda data: data)
 
     result = collector.tools["drone_move_relative"](forward_m=3.0, right_m=0.0, up_m=0.0, velocity=1.5)
 
@@ -414,55 +414,6 @@ def test_param_value_cache_decodes_bytewise_int32():
     assert params["parameters"][0]["type_name"] == "MAV_PARAM_TYPE_INT32"
 
 
-def test_firmware_info_tool_is_registered_as_read_only():
-    class _FirmwareController:
-        backend_name = "mavlink"
-
-        def get_firmware_info(self, force=False):
-            return {
-                "status": "ok",
-                "flight_version": {"text": "1.17.0"},
-                "force": force,
-            }
-
-    collector = ToolCollector()
-    register_core_tools(collector, _FirmwareController(), lambda data: data)
-
-    result = collector.tools["drone_get_firmware_info"](force=True)
-
-    assert result["status"] == "ok"
-    assert result["flight_version"]["text"] == "1.17.0"
-    assert result["force"] is True
-
-
-def test_parameters_tool_is_registered_as_read_only():
-    class _ParameterController:
-        backend_name = "mavlink"
-
-        def get_parameters(self, refresh=False, query="", limit=50, offset=0, timeout=20.0):
-            return {
-                "status": "ready",
-                "refresh": refresh,
-                "query": query,
-                "limit": limit,
-                "offset": offset,
-                "timeout": timeout,
-                "received_count": 1,
-                "expected_count": 1,
-                "parameters": [{"name": "BAT_N_CELLS", "value": 4}],
-            }
-
-    collector = ToolCollector()
-    register_core_tools(collector, _ParameterController(), lambda data: data)
-
-    result = collector.tools["drone_get_parameters"](query="BAT", limit=10, refresh=True)
-
-    assert "drone_get_parameters" in ToolRuntime.READ_ONLY_TOOLS
-    assert result["status"] == "ready"
-    assert result["query"] == "BAT"
-    assert result["parameters"][0]["name"] == "BAT_N_CELLS"
-
-
 def test_vehicle_setup_snapshot_exposes_qgc_style_diagnostics():
     class _Link:
         target_system = 1
@@ -623,90 +574,6 @@ def test_vehicle_telemetry_snapshot_is_lightweight_live_subset():
     assert snapshot["telemetry"]["battery"]["voltage"] == 16.8
     assert len(snapshot["history"]["imu"]) == 1
     assert "parameters" not in snapshot
-
-
-def test_set_vehicle_parameter_sends_param_set_and_updates_cache():
-    class _MavSender:
-        def __init__(self, link):
-            self.link = link
-
-        def param_set_send(self, target_system, target_component, param_id, param_value, param_type):
-            self.link.sent = {
-                "target_system": target_system,
-                "target_component": target_component,
-                "param_id": param_id,
-                "param_value": param_value,
-                "param_type": param_type,
-            }
-
-    class _Link:
-        target_system = 1
-        target_component = 1
-        source_system = 255
-        source_component = 190
-
-        def __init__(self):
-            self.sent = None
-            self.mav = _MavSender(self)
-            self.messages = []
-
-        def recv_match(self, **_kwargs):
-            return self.messages.pop(0) if self.messages else None
-
-    class _Message:
-        def __init__(self, msg_type, data):
-            self._msg_type = msg_type
-            self._data = data
-
-        def get_type(self):
-            return self._msg_type
-
-        def get_srcSystem(self):
-            return 1
-
-        def get_srcComponent(self):
-            return 1
-
-        def to_dict(self):
-            return dict(self._data)
-
-    link = _Link()
-    controller = MavlinkController()
-    controller._connected = True
-    controller._mavlink = link
-    controller._last_heartbeat = time.time()
-    controller._handle_message(_Message("PARAM_VALUE", {
-        "param_id": "MC_AIRMODE",
-        "param_value": 0.0,
-        "param_type": mavutil.mavlink.MAV_PARAM_TYPE_UINT8,
-        "param_count": 1,
-        "param_index": 0,
-    }))
-    link.messages.append(_Message("PARAM_VALUE", {
-        "param_id": "MC_AIRMODE",
-        "param_value": 2.0,
-        "param_type": mavutil.mavlink.MAV_PARAM_TYPE_UINT8,
-        "param_count": 1,
-        "param_index": 0,
-    }))
-
-    result = controller.set_parameter("MC_AIRMODE", "2", timeout=1.0)
-
-    assert result["status"] == "ok"
-    assert link.sent["target_system"] == 1
-    assert link.sent["target_component"] == 1
-    assert link.sent["param_id"] == b"MC_AIRMODE"
-    assert link.sent["param_value"] == 2.0
-    assert result["parameter"]["value"] == 2
-    assert controller.get_parameter_status()["received_count"] == 1
-
-
-# ---------------------------------------------------------------------------
-# 连接如实上报：监听模式（udpin:0.0.0.0）会接收任意来源的心跳，
-# "已连接"不等于"连上了配置里那台设备"。
-# ---------------------------------------------------------------------------
-
-
 def _listening_controller(**details_overrides):
     controller = MavlinkController()
     details = {
@@ -853,8 +720,33 @@ def _runtime_with_stored_settings(monkeypatch, stored):
 
     runtime = object.__new__(runtime_module.AgentRuntime)
     runtime.tools = _Tools()
+    # 链路动作走 gcs.link（持久化仍归 settings_store）；这里记录被调用的动作
+    link_calls: list[str] = []
+
+    def _record(name):
+        def _fn(*args, **kwargs):
+            link_calls.append(name)
+            return _ok()
+
+        return _fn
+
+    runtime.gcs = SimpleNamespace(
+        link=SimpleNamespace(
+            connect=_record("connect"),
+            disconnect=_record("disconnect"),
+            reconnect=_record("reconnect"),
+            status=lambda: SimpleNamespace(to_dict=lambda: {}),
+            calls=link_calls,
+        )
+    )
     monkeypatch.setattr(runtime, "_append_event", lambda *args, **kwargs: None)
     return runtime
+
+
+def _ok():
+    from src.gcs.managers import ManagerResult
+
+    return ManagerResult(True, "ok", {"status": "ok"})
 
 
 def test_deactivate_connection_disconnects_and_clears_active_id(monkeypatch):
@@ -868,7 +760,7 @@ def test_deactivate_connection_disconnects_and_clears_active_id(monkeypatch):
 
     assert result["ok"] is True
     assert result["action"] == "disconnect"
-    assert runtime.tools.calls == ["drone_disconnect"]
+    assert runtime.gcs.link.calls == ["disconnect"]
     assert stored["connections"]["active_connection_id"] == ""
 
 
@@ -883,7 +775,7 @@ def test_activate_connection_disconnects_when_it_is_the_remembered_link(monkeypa
     result = runtime.activate_connection("px4_wsl")
 
     assert result["action"] == "disconnect"
-    assert runtime.tools.calls == ["drone_disconnect"]
+    assert runtime.gcs.link.calls == ["disconnect"]
 
 
 _JETSON_LINK = {

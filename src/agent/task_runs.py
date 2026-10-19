@@ -18,8 +18,9 @@ class TaskRunStore:
     """Small JSON-backed store for recent Agent task executions."""
 
     def __init__(self, data_dir: Path | None = None, max_index: int = 80) -> None:
-        root = Path(__file__).resolve().parents[2]
-        self.data_dir = data_dir or root / "src" / "data" / "task_runs"
+        from src.paths import AGENT_HOME
+
+        self.data_dir = data_dir or AGENT_HOME / "task_runs"
         self.index_path = self.data_dir / "index.json"
         self.max_index = max_index
         self.data_dir.mkdir(parents=True, exist_ok=True)
@@ -293,6 +294,14 @@ class TaskRunStore:
             "runs": runs[: self.max_index],
         }
         self._write_json_unlocked(self.index_path, self._index)
+        # 索引裁掉了谁，磁盘上的记录一起删：否则文件只增不减（实测 332 个 / 217MB）。
+        keep = {str(entry.get("run_id") or "") for entry in self._index.get("runs", [])}
+        try:
+            for path in self.data_dir.glob("*.json"):
+                if path != self.index_path and path.stem not in keep:
+                    path.unlink()
+        except OSError:
+            pass
 
     def _load_index(self) -> dict[str, Any]:
         try:

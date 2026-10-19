@@ -11,8 +11,8 @@ import time
 import numpy as np
 import pytest
 
-from src.modules.perception_axis import LocalPerceptionEngine, PerceptionAxis, to_target_state
-from src.modules.perception_profile import BUILTIN_PROFILES, PerceptionProfile, resolve_profile
+from src.modules.perception.axis import LocalPerceptionEngine, PerceptionAxis, to_target_state
+from src.modules.perception.profile import BUILTIN_PROFILES, PerceptionProfile, resolve_profile
 
 
 # ----------------------------------------------------------------------
@@ -280,7 +280,7 @@ def test_preview_uses_axis_cache_first():
     """capture_camera_preview consumes the axis annotated frame before AirSim."""
     import numpy as np
     from src.agent.tool_executor import ToolRuntime
-    from src.modules.perception_axis import LocalPerceptionEngine, PerceptionAxis
+    from src.modules.perception.axis import LocalPerceptionEngine, PerceptionAxis
 
     engine = LocalPerceptionEngine(
         frame_source=StubFrameSource(),
@@ -323,7 +323,7 @@ def test_preview_uses_axis_cache_without_detect_param():
     """
     import numpy as np
     from src.agent.tool_executor import ToolRuntime
-    from src.modules.perception_axis import LocalPerceptionEngine, PerceptionAxis
+    from src.modules.perception.axis import LocalPerceptionEngine, PerceptionAxis
 
     engine = LocalPerceptionEngine(
         frame_source=StubFrameSource(),

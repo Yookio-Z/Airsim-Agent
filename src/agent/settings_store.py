@@ -17,16 +17,18 @@ from pathlib import Path
 from typing import Any
 
 from src.config import config
-from src.modules.mavlink_autodiscovery import normalize_serial_baud
+from src.modules.backends.serial_discovery import normalize_serial_baud
 
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 
-SETTINGS_PATH = REPO_ROOT / "src" / "data" / "settings.json"
+from src.paths import AGENT_HOME
 
-SKILLS_OVERRIDES_PATH = REPO_ROOT / "src" / "data" / "skills.json"
+SETTINGS_PATH = AGENT_HOME / "settings.json"
 
-ATTACHMENTS_DIR = REPO_ROOT / "src" / "data" / "attachments"
+SKILLS_OVERRIDES_PATH = AGENT_HOME / "skills.json"
+
+ATTACHMENTS_DIR = AGENT_HOME / "attachments"
 ATTACHMENTS_DIR.mkdir(parents=True, exist_ok=True)
 
 
@@ -40,27 +42,6 @@ def attachments_dir() -> Path:
     directory, which is exactly what happened when this module was split out.
     """
     return ATTACHMENTS_DIR
-
-AIRSIM_SETTINGS_TEMPLATES: dict[str, dict[str, str]] = {
-    "airsim_simpleflight_multirotor": {
-        "label": "AirSim 纯仿真（SimpleFlight · 3 机）",
-        "description": "本机 AirSim 直接 API 控制，对应系统 airsim 后端。三架 SimpleFlight 用于多机验证。",
-        "backend": "airsim",
-        "file": "airsim_simpleflight_multirotor.json",
-    },
-    "px4_mavlink_udp_sitl": {
-        "label": "PX4 MAVLink（UDP · 本机/虚拟机 SITL）",
-        "description": "AirSim 作为 PX4 仿真器，UDP 14540/14580 连接本机或 WSL 的 PX4 SITL，对应 px4_mavlink 后端。",
-        "backend": "px4_mavlink",
-        "file": "px4_mavlink_udp_sitl.json",
-    },
-    "px4_ros2_tcp_edge": {
-        "label": "PX4 ROS2（TCP · Jetson/边端 SITL）",
-        "description": "TCP 4560 连接 Jetson 边端 PX4 SITL（ControlIp 按实际 IP 修改），对应 px4_ros2 后端。",
-        "backend": "px4_ros2",
-        "file": "px4_ros2_tcp_edge.json",
-    },
-}
 
 # 随安装包出厂的连接预设 id。它们不代表操作员的意图：回退选链路时，真机偏好
 # 只对操作员自己添加的连接生效，免得新装机器在 active id 失效时静默连上真机。
@@ -148,7 +129,6 @@ def _default_camera_settings() -> dict[str, Any]:
         "vehicle_name": "",
         "image_type": "scene",
         "timeout_sec": 30.0,
-        "auto_save": False,
     }
 
 def _default_application_settings() -> dict[str, Any]:
@@ -313,7 +293,6 @@ def _camera_settings(settings: dict[str, Any] | None = None) -> dict[str, Any]:
         "vehicle_name": str(section.get("vehicle_name") or defaults["vehicle_name"]).strip(),
         "image_type": image_type,
         "timeout_sec": timeout_sec,
-        "auto_save": bool(section.get("auto_save", defaults["auto_save"])),
     }
 
 def _perception_rtsp_config() -> tuple[str, str]:

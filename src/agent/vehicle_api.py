@@ -9,20 +9,18 @@ from __future__ import annotations
 
 from . import settings_store
 from .run_state import RunState
+from .tool_executor import ToolCallResult
 from .settings_store import (
-    AIRSIM_SETTINGS_TEMPLATES,
-    REPO_ROOT,
     _build_connect_params,
     _camera_settings,
     _connection_settings,
     _select_connection_for_backend,
 )
 from pathlib import Path
-from src.modules.mavlink_autodiscovery import discover_serial_mavlink_candidates
+from src.modules.backends.serial_discovery import discover_serial_mavlink_candidates
 from src.config import config
 from typing import Any
 import math
-import os
 import time
 
 
@@ -50,7 +48,7 @@ class VehicleMixin:
         return f"{name}：{armed}，{state_text}{alt_text}，位置 {pos_text}"
 
     def _agent_state_context(self, tool_runtime: dict[str, Any] | None = None) -> dict[str, Any]:
-        runtime = tool_runtime or self.tools.status_snapshot()
+        runtime = tool_runtime or self.gcs.telemetry.snapshot()
         profile = runtime.get("backend_profile") or {}
         drone = runtime.get("drone") if isinstance(runtime.get("drone"), dict) else None
         with self._lock:
@@ -67,17 +65,18 @@ class VehicleMixin:
             "ready": bool(runtime.get("ready")),
             "connected": bool(runtime.get("connected")),
             "stale_connection": bool(runtime.get("stale_connection")),
-            # 操作员可编辑的基本操作规范（config/agent_system.md）：注入到
-            # agent_state 后，规划器与 Agent Loop 的提示词都会带上它；飞行的
-            # 前置条件这类"基本常识"（未起飞不能转向、降落后要重新解锁）
-            # 放在这里，比散落在各个技能里更可靠。
+            # 操作员可编辑的常驻上下文（.airsim_agent/SYSTEM.md 操作规范 +
+            # NOTES.md 长期笔记）：注入到 agent_state 后，规划器与 Agent Loop 的
+            # 提示词都会带上它们；飞行的前置条件这类"基本常识"放在这里，比散落
+            # 在各个技能里更可靠。记忆不是工具，知识就靠这两份文件。
             "agent_instructions": self._agent_instructions(),
             "busy": bool(runtime.get("busy")) or self._execution_slot.locked(),
             "backend": str(runtime.get("backend") or ""),
             "backend_name": str(profile.get("name") or profile.get("id") or runtime.get("backend") or ""),
             "capabilities": dict(profile.get("capabilities") or {}),
             "vehicle": self._compact_vehicle_state(drone),
-            "vehicles": self._compact_vehicles_state(runtime.get("vehicles")),
+            # 机队清单的唯一来源是 gcs.vehicle（它读的就是这份快照里的载具列表）
+            "vehicles": self._compact_vehicles_state(self.gcs.vehicle.list_vehicles()),
             "active_run": active_run,
         }
 
@@ -278,6 +277,17 @@ class VehicleMixin:
             self._append_event("warning", "tool", "保持悬停失败", {"reason": reason, "error": str(exc)})
             return {"ok": False, "error": str(exc)}
 
+    def _device_call(
+        self, tool: str, params: dict[str, Any] | None = None, vehicle_id: str = ""
+    ) -> ToolCallResult:
+        """操作员路径的一次设备动作：统一走 ``gcs.command``（安全校验 + 治理入口）。
+
+        面板上的手动动作（降落、返航、悬停兜底、上锁…）与 Agent 的飞行步骤共用
+        同一条路径；唯一例外是急停进行中的那次悬停——那一刻 supervisor 正处于
+        停用状态，必须走低层入口（见 ``control`` 的 emergency_stop 分支）。
+        """
+        return self.gcs.command.execute_tool(tool, params or {}, vehicle_id=vehicle_id)
+
     def _manual_land(self, targets: list[str] | None = None) -> dict[str, Any]:
         """降落目标机（空 = 全部载具）：并发派发降落，逐机验证落地后上锁。
 
@@ -316,19 +326,10 @@ class VehicleMixin:
             else:
                 results.append({"vehicle": name or "默认机", "state": "already_grounded_disarmed", "ok": True})
 
-        controller = getattr(self.tools, "controller", None)
-        dispatch_land = getattr(controller, "dispatch_land", None) if controller is not None else None
         for name in to_land:
-            if callable(dispatch_land):
-                if not dispatch_land(name):
-                    return {"ok": False, "error": f"{name or '默认机'} 降落派发失败", "vehicles": results}
-            else:
-                r = self.tools.execute(
-                    "drone_land", {"vehicle_name": name} if name else {},
-                    dry_run=False, blocked_by_supervisor=False,
-                )
-                if not r.ok:
-                    return {"ok": False, "error": f"{name or '默认机'} 降落指令失败", "vehicles": results}
+            r = self._device_call("drone_land", vehicle_id=name)
+            if not r.ok:
+                return {"ok": False, "error": f"{name or '默认机'} 降落指令失败", "vehicles": results}
 
         # 轮询验证：只有在拿到"确实在地面"的强证据后才上锁。
         # 不能用 flying==False 当落地依据：PX4 一进入 LAND 模式 landed_state 就
@@ -388,8 +389,7 @@ class VehicleMixin:
                     unstable_counts[n] = unstable_counts.get(n, 0) + 1
                     if unstable_counts[n] >= 2:
                         try:
-                            self.tools.execute("drone_hover", {"vehicle_name": n} if n else {},
-                                               dry_run=False, blocked_by_supervisor=False)
+                            self._device_call("drone_hover", vehicle_id=n)
                         except Exception:
                             pass
                         abort_note = (
@@ -403,16 +403,10 @@ class VehicleMixin:
 
         landed = [n for n in to_land if n not in pending]
         for name in to_disarm:
-            r = self.tools.execute(
-                "drone_disarm", {"vehicle_name": name} if name else {},
-                dry_run=False, blocked_by_supervisor=False,
-            )
+            r = self._device_call("drone_disarm", vehicle_id=name)
             results.append({"vehicle": name or "默认机", "state": "grounded_disarmed", "ok": bool(r.ok)})
         for name in landed:
-            r = self.tools.execute(
-                "drone_disarm", {"vehicle_name": name} if name else {},
-                dry_run=False, blocked_by_supervisor=False,
-            )
+            r = self._device_call("drone_disarm", vehicle_id=name)
             results.append({"vehicle": name or "默认机", "state": "landed_disarmed", "ok": bool(r.ok)})
 
         ok = not pending and all(r.get("ok") for r in results)
@@ -547,16 +541,10 @@ class VehicleMixin:
 
             if flying and dist_home < 0.6:
                 # 空中且已在初始点上方 → 直接降落并锁定
-                land_result = self.tools.execute(
-                    "drone_land", {"vehicle_name": name} if name else {},
-                    dry_run=False, blocked_by_supervisor=False,
-                )
+                land_result = self._device_call("drone_land", vehicle_id=name)
                 disarm_result = None
                 if land_result.ok:
-                    disarm_result = self.tools.execute(
-                        "drone_disarm", {"vehicle_name": name} if name else {},
-                        dry_run=False, blocked_by_supervisor=False,
-                    )
+                    disarm_result = self._device_call("drone_disarm", vehicle_id=name)
                 ok_near = land_result.ok and (disarm_result is None or disarm_result.ok)
                 results.append({
                     "vehicle": name, "ok": bool(ok_near),
@@ -565,21 +553,18 @@ class VehicleMixin:
                 })
                 continue
 
-            # 其余所有状态(空中远处/待飞/已锁在远处) → 引导返航+降落锁定
-            move_result = self.tools.execute(
-                "drone_dispatch_return_land",
-                {
-                    **target,
-                    "velocity": speed,
-                    "vehicle_name": name,
-                },
-                dry_run=False,
-                blocked_by_supervisor=False,
+            # 其余所有状态(空中远处/待飞/已锁在远处) → 返航 + 降落锁定
+            # （阻塞语义：飞到位再降落；非阻塞由编排层后台任务承担，不再有 dispatch 工具）
+            move_result = self._device_call(
+                "drone_fly_to", {**target, "velocity": speed}, vehicle_id=name
             )
+            land_result = None
+            if move_result.ok:
+                land_result = self._device_call("drone_land", vehicle_id=name)
             results.append({
                 "vehicle": name,
-                "ok": bool(move_result.ok),
-                "message": move_result.data.get("message", "return + land dispatched"),
+                "ok": bool(move_result.ok and (land_result is None or land_result.ok)),
+                "message": (move_result.data.get("message", "") if move_result.ok else "return failed"),
                 "target_position_ned": target,
                 "dist_home_m": round(dist_home, 2),
             })
@@ -670,10 +655,7 @@ class VehicleMixin:
         if action == "hover":
             results = []
             for name in target_vehicles or [""]:
-                result = self.tools.execute(
-                    "drone_hover", {"vehicle_name": name} if name else {},
-                    dry_run=False, blocked_by_supervisor=False,
-                )
+                result = self.gcs.command.execute_tool("drone_hover", {}, vehicle_id=name)
                 results.append(result.to_dict())
             ok = all(r["ok"] for r in results)
             self._append_event("info", "tool", "手动悬停", {"vehicles": results})
@@ -688,12 +670,7 @@ class VehicleMixin:
             backend = str(runtime.get("backend") or "")
             capabilities = (runtime.get("backend_profile") or {}).get("capabilities") or {}
             if backend in {"px4_mavlink", "px4_ros2"} and capabilities.get("mode_control"):
-                rtl_result = self.tools.execute(
-                    "drone_set_mode",
-                    {"mode": "RTL"},
-                    dry_run=False,
-                    blocked_by_supervisor=False,
-                )
+                rtl_result = self.gcs.command.execute_tool("drone_set_mode", {"mode": "RTL"})
                 result = {
                     "ok": rtl_result.ok,
                     "message": "PX4 native RTL requested" if rtl_result.ok else "PX4 rejected native RTL",
@@ -707,9 +684,11 @@ class VehicleMixin:
                 result["cancelled_active_task"] = cancel_result
             return result
         if action in {"connect", "reconnect"}:
-            result = self.tools.reconnect()
-            self._append_event("info", "tool", "Reconnect AirSim", result.to_dict())
-            return {"ok": result.ok, "result": result.to_dict()}
+            # 链路动作归 gcs.link（持久化仍归 settings_store，见 activate_connection）
+            link_result = self.gcs.link.reconnect()
+            result = {"ok": link_result.ok, "result": dict(link_result.data or {})}
+            self._append_event("info", "tool", "Reconnect link", result["result"])
+            return result
         if action == "clear_events":
             with self._lock:
                 self._events.clear()
@@ -744,12 +723,14 @@ class VehicleMixin:
             "hint": "",
         }
         try:
-            tr = self.tools.status_snapshot()
-            backend = str(tr.get("backend") or self.tools.backend_id or "")
+            tr = self.gcs.telemetry.snapshot()
+            link = self.gcs.link.status()
+            backend = str(link.backend or tr.get("backend") or self.tools.backend_id or "")
             dr = tr.get("drone") or {}
             summary["flight"] = {
                 "backend": backend,
-                "connected": bool(tr.get("connected") and not tr.get("stale_connection")),
+                # 链路是否可用以 gcs.link 的判断为准（它读同一份快照，规则集中在一处）
+                "connected": bool(link.connected and not link.stale),
                 "vehicle": dr.get("vehicle_name") or "px4_sys1",
                 "mode": dr.get("mode"),
                 "armed": dr.get("armed"),
@@ -819,6 +800,49 @@ class VehicleMixin:
             settings["vehicle_info"] = {"status": "error", "message": str(exc)}
         return settings
 
+    # UI 受限模式切换白名单：只放"悬停类"安全模式。危险模式刻意不在列——
+    # AUTO/MISSION 会启动已上传的航线，OFFBOARD 需要连续 setpoint 流（切进去没人
+    # 喂流等于把飞机置于"解锁但没人管"），它们只能由飞控端或航线流程切换。
+    MODE_SWITCH_ALLOWLIST = ("POSCTL", "ALTCTL", "LOITER", "HOLD", "RTL")
+
+    def vehicle_mode_info(self) -> dict[str, Any]:
+        """当前飞行模式 + 受限可切换集合（UI 模式控件用；PX4 专有）。"""
+        try:
+            snapshot = self.tools.status_snapshot()
+        except Exception as exc:
+            return {"ok": False, "error": str(exc), "allowed": list(self.MODE_SWITCH_ALLOWLIST)}
+        drone = snapshot.get("drone") if isinstance(snapshot, dict) else {}
+        capabilities = (snapshot.get("backend_profile") or {}).get("capabilities") or {}
+        return {
+            "ok": True,
+            "backend": str(snapshot.get("backend") or ""),
+            "connected": bool(snapshot.get("connected")),
+            "mode": str((drone or {}).get("mode") or ""),
+            "supported": bool(capabilities.get("mode_control")),
+            "allowed": list(self.MODE_SWITCH_ALLOWLIST),
+        }
+
+    def set_vehicle_mode(self, mode: str) -> dict[str, Any]:
+        """UI 受限切换：白名单校验后才下发（AUTO/OFFBOARD 一律拒绝）。"""
+        target = str(mode or "").strip().upper()
+        allowed = {item.upper() for item in self.MODE_SWITCH_ALLOWLIST}
+        if target not in allowed:
+            return {
+                "ok": False,
+                "mode": target,
+                "error": (
+                    f"模式 {target or '(空)'} 不在受限切换白名单（{', '.join(self.MODE_SWITCH_ALLOWLIST)}）；"
+                    "AUTO/MISSION 会启动已上传航线、OFFBOARD 需要连续 setpoint 流，只能由飞控端或航线流程切换"
+                ),
+            }
+        result = self.gcs.command.execute_tool("drone_set_mode", {"mode": target})
+        data = result.data if isinstance(result.data, dict) else {}
+        return {
+            "ok": bool(result.ok),
+            "mode": target,
+            "message": str(data.get("message") or ("模式已切换到 " + target if result.ok else "切换模式失败")),
+        }
+
     def vehicle_info(self, refresh: bool = False) -> dict[str, Any]:
         """Return current active vehicle connection and firmware metadata."""
         try:
@@ -826,48 +850,6 @@ class VehicleMixin:
             return {"ok": info.get("status") != "error", "vehicle_info": info}
         except Exception as exc:
             return {"ok": False, "vehicle_info": {"status": "error", "message": str(exc)}}
-
-    def vehicle_parameters(
-        self,
-        refresh: bool = False,
-        query: str = "",
-        limit: int = 200,
-        offset: int = 0,
-        timeout: float = 20.0,
-    ) -> dict[str, Any]:
-        """Return current active vehicle parameter cache/query results."""
-        try:
-            data = self.tools.vehicle_parameters(
-                refresh=refresh,
-                query=query,
-                limit=limit,
-                offset=offset,
-                timeout=timeout,
-            )
-            return {"ok": data.get("status") not in {"error", "busy"}, "parameter_info": data}
-        except Exception as exc:
-            return {"ok": False, "parameter_info": {"status": "error", "message": str(exc), "parameters": []}}
-
-    def set_vehicle_parameter(
-        self,
-        name: str,
-        value: Any,
-        component_id: int | None = None,
-        param_type: int | None = None,
-        timeout: float = 3.0,
-    ) -> dict[str, Any]:
-        """Set one active vehicle parameter through MAVLink."""
-        try:
-            data = self.tools.set_vehicle_parameter(
-                name=name,
-                value=value,
-                component_id=component_id,
-                param_type=param_type,
-                timeout=timeout,
-            )
-            return {"ok": data.get("status") == "ok", "parameter_write": data}
-        except Exception as exc:
-            return {"ok": False, "parameter_write": {"status": "error", "message": str(exc)}}
 
     def vehicle_setup_snapshot(self, include_history: bool = True, history_limit: int = 240) -> dict[str, Any]:
         """Return current active vehicle setup diagnostics and telemetry histories."""
@@ -934,87 +916,6 @@ class VehicleMixin:
             settings["camera"] = persisted
             settings_store._save_settings(settings)
             return {"ok": True, "camera": merged}
-        except Exception as exc:
-            return {"ok": False, "error": str(exc)}
-
-    def airsim_settings_info(self) -> dict[str, Any]:
-        """List AirSim settings.json templates (with full content) + target path.
-
-        AirSim's communication mode is decided by the settings.json:
-          * SimpleFlight           -> airsim backend (direct RPC control)
-          * PX4Multirotor + UDP    -> px4_mavlink backend (local/WSL PX4 SITL)
-          * PX4Multirotor + TCP    -> px4_ros2 backend (Jetson/edge PX4 SITL)
-        """
-        templates_dir = REPO_ROOT / "config" / "airsim_settings"
-        templates: list[dict[str, Any]] = []
-        for template_id, meta in AIRSIM_SETTINGS_TEMPLATES.items():
-            path = templates_dir / meta["file"]
-            templates.append(
-                {
-                    "id": template_id,
-                    "label": meta["label"],
-                    "description": meta["description"],
-                    "backend": meta["backend"],
-                    "exists": path.is_file(),
-                    "size": path.stat().st_size if path.is_file() else 0,
-                    "content": path.read_text(encoding="utf-8") if path.is_file() else "",
-                }
-            )
-        target = self._airsim_settings_path()
-        return {
-            "templates": templates,
-            "target_path": str(target),
-            "target_exists": target.is_file(),
-        }
-
-    @classmethod
-    def _airsim_settings_path(cls) -> Path:
-        """Resolve the AirSim settings.json location automatically.
-
-        Nothing is hard-coded: %USERPROFILE% resolves from the current
-        Windows user (Path.home()), so moving to another machine just works.
-        The AIRSIM_SETTINGS_PATH environment variable remains available for
-        deployment-level overrides (e.g. a custom AirSim install location);
-        it is not exposed in the UI.
-        """
-        env_path = os.environ.get("AIRSIM_SETTINGS_PATH", "").strip()
-        if env_path:
-            return Path(env_path)
-        candidates = [
-            Path.home() / "Documents" / "AirSim" / "settings.json",
-            Path.home() / "AirSim" / "settings.json",
-        ]
-        for candidate in candidates:
-            if candidate.is_file():
-                return candidate
-        return candidates[0]
-
-    def apply_airsim_settings_template(self, template_id: str) -> dict[str, Any]:
-        """Backup the current settings.json and write the requested template.
-
-        Never destructive: the existing file (if any) is copied to
-        settings.json.bak-<timestamp> before writing.
-        """
-        meta = AIRSIM_SETTINGS_TEMPLATES.get(str(template_id or ""))
-        if meta is None:
-            return {"ok": False, "error": f"unknown template: {template_id}"}
-        template_path = REPO_ROOT / "config" / "airsim_settings" / meta["file"]
-        if not template_path.is_file():
-            return {"ok": False, "error": f"template file missing: {template_path.name}"}
-        target = self._airsim_settings_path()
-        try:
-            target.parent.mkdir(parents=True, exist_ok=True)
-            backup_path = None
-            if target.is_file():
-                backup_path = target.with_name(f"settings.json.bak-{time.strftime('%Y%m%d-%H%M%S')}")
-                backup_path.write_bytes(target.read_bytes())
-            target.write_bytes(template_path.read_bytes())
-            return {
-                "ok": True,
-                "template": template_id,
-                "target_path": str(target),
-                "backup_path": str(backup_path) if backup_path else None,
-            }
         except Exception as exc:
             return {"ok": False, "error": str(exc)}
 
@@ -1110,8 +1011,10 @@ class VehicleMixin:
         blocked = self._run_in_progress_error("断开当前链路")
         if blocked:
             return blocked
-        result = self.tools.execute("drone_disconnect", {})
-        ok = result.ok
+        # 链路动作走 gcs.link；"记住哪条连接"仍归 settings_store（方案 B）。
+        link_result = self.gcs.link.disconnect()
+        ok = bool(link_result.ok)
+        detail = {"ok": ok, "message": link_result.message, **dict(link_result.data or {})}
         if ok:
             settings = settings_store._load_settings()
             settings["connections"] = settings.get("connections") or {}
@@ -1121,9 +1024,9 @@ class VehicleMixin:
             "info" if ok else "warning",
             "tool",
             "Disconnect link",
-            result.to_dict(),
+            detail,
         )
-        return {"ok": ok, "action": "disconnect", "result": result.to_dict()}
+        return {"ok": ok, "action": "disconnect", "result": detail}
 
     def activate_connection(self, connection_id: str) -> dict[str, Any]:
         """Connect/disconnect a QGC Links entry.
@@ -1213,15 +1116,14 @@ class VehicleMixin:
         mismatch = self._backend_mismatch(expected_backend)
         if mismatch:
             return mismatch
-        result = self._execute_agent_tool(tool, params or {}, dry_run=dry_run)
+        # 设备动作走 gcs.command（安全校验 + 治理入口）；其余工具照旧。
+        if not dry_run and tool in self.gcs.command.DEVICE_TOOLS:
+            result = self.gcs.command.execute_tool(tool, params or {})
+        else:
+            result = self._execute_agent_tool(tool, params or {}, dry_run=dry_run)
         self.memory.remember_tool_call(tool, result.ok)
         self._remember_position_from_payload(result.data, source=tool)
         self._append_event("info" if result.ok else "warning", "tool", f"工具调用: {tool}", result.to_dict())
-        return {"ok": result.ok, "result": result.to_dict()}
-
-    def capture_camera_frame(self, params: dict[str, Any] | None = None) -> dict[str, Any]:
-        """Capture a UI stream frame without polluting task history or tool statistics."""
-        result = self._execute_agent_tool("airsim_take_photo", params or {}, dry_run=False)
         return {"ok": result.ok, "result": result.to_dict()}
 
     def camera_preview_frame(self, params: dict[str, Any] | None = None) -> tuple[bool, bytes, str, dict[str, Any]]:

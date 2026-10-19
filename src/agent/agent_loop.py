@@ -44,11 +44,10 @@ _PLANNED_MOTION_TOOLS = {
 _PLAN_DEVIATION_RETRIES = 2
 
 # 依赖相机画面的工具：任务用过其中任意一个，感知停滞就必须让任务停下来。
-# 检测类工具已随 YOLO 一起移除；现在依赖画面的是"看图"和"读深度"这两条。
+# 检测类工具已随 YOLO 一起移除；现在依赖画面的是"看图"和"几何测距"这两条。
 _PERCEPTION_TOOLS = {
     "perception_status",
-    "airsim_take_photo",
-    "airsim_get_depth_map",
+    "locate_image_point",
     "inspect_current_frame",
 }
 
@@ -62,9 +61,7 @@ _PERCEPTION_STALL_S = 20.0
 _OBSERVATION_TOOLS = {
     "drone_get_status",
     "perception_status",
-    "airsim_take_photo",
-    "airsim_get_depth_map",
-    "airsim_locate_point",
+    "locate_image_point",
     "inspect_current_frame",
 }
 
@@ -72,10 +69,8 @@ _OBSERVATION_TOOLS = {
 # 计划里"视觉观察 → 运动"这个形状意味着运动参数必须由观察推算，不能执行计划里
 # 猜好的字面参数——判据是结构性的，不依赖模型有没有给步骤标 needs_observation。
 _VISUAL_OBSERVATION_TOOLS = {
-    "airsim_take_photo",
     "inspect_current_frame",
-    "airsim_get_depth_map",
-    "airsim_locate_point",
+    "locate_image_point",
 }
 
 # "只观察不动作"的连续轮数上限。到了上限就按计划把那一步执行掉（有界单步、安全层
@@ -121,8 +116,6 @@ class AgentLoop:
         skills: SkillRegistry | None = None,
         execute_tool: AgentToolExecutor | None = None,
         on_state: LoopStateCallback | None = None,
-        async_timeout: float = 120.0,
-        async_poll_interval: float = 1.0,
         steer_provider: LoopSteerProvider | None = None,
     ) -> None:
         self.tools = tools
@@ -135,8 +128,6 @@ class AgentLoop:
         self.execute_tool = execute_tool
         self.on_state = on_state
         self.steer_provider = steer_provider
-        self.async_timeout = max(1.0, float(async_timeout))
-        self.async_poll_interval = max(0.05, float(async_poll_interval))
         # 观察者异常只记录、不上抛：回显/UI 镜像跑在循环的调用栈上，让它把异常
         # 抛穿等于"界面出错就毁掉任务"（实测：一个格式化辅助函数签名写错，整个
         # execute 任务在 Agent Loop 第一次出结果时崩掉，飞机停在半路）。这里把它
@@ -196,13 +187,10 @@ class AgentLoop:
                     if isinstance(item, dict)
                 }
                 names.discard("")
-                names -= self._internal_tools()
                 if names:
                     allowed_tools = names
             except Exception:
                 pass
-        for extra in ("memory_recall", "memory_remember", "agent_subtask"):
-            allowed_tools.add(extra)
         # Skill documents are activatable actions, not just prompt text: the
         # model loads a skill's guidance by emitting its action name, so the
         # name has to survive _sanitize_decision. Added after the registered-tool
@@ -297,7 +285,6 @@ class AgentLoop:
             # （视觉给点、深度定步长），所以紧跟其后的这一步必须由模型基于最新
             # 观察重新给出，不能照计划里猜好的字面参数执行。以前这个字段只被
             # 解析、从不消费——表现就是"Agent 不看刚量到的距离就飞"。
-            plan_cursor = self._resolve_plan_cursor(initial_plan, plan_cursor)
             previous_step = self._plan_step_at(initial_plan, plan_cursor - 1)
             upcoming_step = self._plan_step_at(initial_plan, plan_cursor)
             previous_tool = str(getattr(previous_step, "tool", "") or "")
@@ -419,7 +406,7 @@ class AgentLoop:
                     current_tool = str(getattr(current_step, "tool", "") or "")
                     if current_tool and decision.action == current_tool:
                         # 模型按计划选了同一个工具（参数来自最新观察）→ 该步骤已兑现
-                        plan_cursor = self._resolve_plan_cursor(initial_plan, plan_cursor + 1)
+                        plan_cursor = plan_cursor + 1
                         gap_rounds = 0
                     elif decision.action in _OBSERVATION_TOOLS or str(decision.action or "").startswith("skill:"):
                         # 补一次观察 / 重读技能指导 → 都不算偏离计划：保留游标，
@@ -707,7 +694,6 @@ class AgentLoop:
                 break
 
             result = self._execute_action(decision, dry_run=not execute)
-            result = self._settle_async_result(result, dry_run=not execute)
             result_row = LoopActionResult(
                 step_index=step_index,
                 tool=result["tool"],
@@ -780,7 +766,7 @@ class AgentLoop:
                     kind="tool.result",
                 )
                 continue
-            if result_row.tool not in {"drone_get_status", "airsim_task_status"}:
+            if result_row.tool not in {"drone_get_status"}:
                 unresolved_failure = False
 
             # 本步由计划驱动且成功 → 计划游标前移，继续按计划执行下一步
@@ -929,20 +915,10 @@ class AgentLoop:
         + 交回模型），而不是把整次任务判失败——"检测没开/工具不可用"从来不是
         任务的终态。
         """
-        if decision.action in self._internal_tools():
-            return LoopDecision(
-                action="",
-                reason=f"{decision.action} is handled by runtime memory, not by the Agent Loop.",
-                is_complete=False,
-                reflection="Internal memory writes are not valid loop actions.",
-                needs_replan=True,
-                source="guard",
-            )
-
         if not self._is_visual_request(command):
             return decision
 
-        has_capture_tool = bool(capabilities.get("image_capture")) or "airsim_take_photo" in allowed_tools
+        has_capture_tool = bool(capabilities.get("image_capture")) or "inspect_current_frame" in allowed_tools
         if not has_capture_tool:
             if not self._wants_open_image_analysis(command):
                 return decision
@@ -958,24 +934,17 @@ class AgentLoop:
         has_image = self._has_recent_image(state)
         needs_guard_action = not decision.action or decision.is_complete or decision.action not in allowed_tools
         if (
-            not has_image
-            and "skill:visual_observe" in allowed_tools
+            not self._has_successful_tool(state, "inspect_current_frame")
+            and "inspect_current_frame" in allowed_tools
             and needs_guard_action
         ):
-            params = {"question": command, "image_type": "scene"}
-            if self._wants_target_confirmation(command):
-                params["target_description"] = self._target_description(command)
+            # 视觉请求先看一眼：看图工具自己会取帧（感知轴尚未出帧时有直连兜底）。
+            # 已经看过就不再重复注入——拍照已并入本工具，"有没有图"不再由单独
+            # 的取帧工具决定，重复注入会让循环空转。
             return LoopDecision(
-                "skill:visual_observe",
-                params,
-                "Use the visual observation skill to capture and analyze the current camera frame.",
-                source="guard",
-            )
-        if not has_image and "airsim_take_photo" in allowed_tools and needs_guard_action:
-            return LoopDecision(
-                "airsim_take_photo",
-                {"image_type": "scene", "auto_save": False, "max_retries": 1, "timeout_sec": 8.0},
-                "Capture the current camera frame before answering the visual request.",
+                "inspect_current_frame",
+                {"question": command},
+                "让视觉模型取当前帧并回答这次视觉请求。",
                 source="guard",
             )
 
@@ -1079,9 +1048,9 @@ class AgentLoop:
         atomic_cards: list[dict[str, Any]],
         capabilities: dict[str, Any],
     ) -> list[dict[str, Any]]:
-        cards = [card for card in skill_cards if card.get("name") not in self._internal_tools()]
+        cards = list(skill_cards)
         for card in atomic_cards:
-            if isinstance(card, dict) and card.get("name") not in self._internal_tools():
+            if isinstance(card, dict):
                 cards.append(card)
 
         deduped: list[dict[str, Any]] = []
@@ -1092,22 +1061,12 @@ class AgentLoop:
                 continue
             seen.add(name)
             deduped.append(card)
-        # Agent-level cards (memory/subtask) always keep a slot even when the
-        # regular tool set overflows the decision-card budget.
-        agent_names = {"memory_recall", "memory_remember", "agent_subtask"}
-        agent_cards = [card for card in deduped if card.get("name") in agent_names]
-        regular = [card for card in deduped if card.get("name") not in agent_names]
         # 提示卡片预算：控制 prompt 体积；白名单不依赖它（见 run() 的注释）。
-        # 35+ 个工具时 32 张会把感知类工具挤出去，这里放宽到 44。
-        return (regular[: max(0, 44 - len(agent_cards))] + agent_cards)[:44]
+        return deduped[:44]
 
     def _allowed_tools(self, tool_cards: list[dict[str, Any]]) -> set[str]:
         card_names = {card.get("name") for card in tool_cards if isinstance(card, dict)}
-        return {str(name) for name in card_names if name and str(name) not in self._internal_tools()}
-
-    @staticmethod
-    def _internal_tools() -> set[str]:
-        return {"memory_store"}
+        return {str(name) for name in card_names if name}
 
     def _is_visual_request(self, command: str) -> bool:
         return extract_intents(command)["visual"]
@@ -1260,17 +1219,9 @@ class AgentLoop:
 
     def _is_parallel_safe(self, name: str) -> bool:
         """Batch actions are restricted to read-only tools so a batch can never
-        smuggle a flight-control call past the one-flight-tool-per-turn rule.
-        airsim_task_cancel is deliberately excluded: cancelling an in-flight
-        task is a control-side effect and stays single-turn."""
+        smuggle a flight-control call past the one-flight-tool-per-turn rule."""
         read_only = getattr(self.tools, "READ_ONLY_TOOLS", set())
-        if name in read_only:
-            return True
-        if name in {"airsim_task_status", "memory_store", "memory_recall", "memory_remember"}:
-            return True
-        if name == "skill:visual_observe":
-            return True
-        return False
+        return name in read_only
 
     # Task-contract verification: machine-checkable completion criteria that
     # gate model-declared completion ("LLM 提议 + 确定性验证").
@@ -1279,7 +1230,7 @@ class AgentLoop:
         "landed": "drone_get_status",
         "flying_at": "drone_get_status",
         "position_reached": "drone_get_status",
-        "photo_taken": "airsim_take_photo",
+        "photo_taken": "inspect_current_frame",
         "mission_progress_complete": "drone_get_mission_progress",
         "target_confirmed": "inspect_current_frame",
         "formation_stable": "formation_command",
@@ -1317,16 +1268,9 @@ class AgentLoop:
     # 计划收敛时忽略的"辅助/只读"工具：它们不构成任务目标，只用于准备或
     # 读数；缺少它们不算任务未完成，避免收敛判据永远不成立。
     _CONVERGENCE_IGNORED_TOOLS = {
-        "memory_store",
-        "memory_remember",
-        "memory_recall",
         "drone_connect",
         "drone_get_status",
-        "drone_list_vehicles",
-        "drone_get_firmware_info",
-        "drone_get_parameters",
         "perception_status",
-        "airsim_task_status",
     }
 
     # 反应式任务里允许"照计划自动推进"的确定性准备步骤；其余动作（确认、机动、
@@ -1337,20 +1281,7 @@ class AgentLoop:
         "drone_arm",
         "drone_set_mode",
         "drone_takeoff",
-        "memory_recall",
     }
-
-    # 计划里出现这些内部动作时直接跳过：它们不是 Agent 可调用工具，由 runtime
-    # 自己处理（记忆写入在任务收尾完成）。
-    _PLAN_SKIP_TOOLS = {"memory_store", "memory_remember"}
-
-    @classmethod
-    def _resolve_plan_cursor(cls, initial_plan: Any, cursor: int) -> int:
-        """跳过计划里的内部动作步骤（如 memory_store），返回可执行步骤下标。"""
-        steps = list(getattr(initial_plan, "steps", None) or [])
-        while 0 <= cursor < len(steps) and str(getattr(steps[cursor], "tool", "") or "") in cls._PLAN_SKIP_TOOLS:
-            cursor += 1
-        return cursor
 
     @classmethod
     def _plan_step_at(cls, initial_plan: Any, cursor: int) -> Any | None:
@@ -1447,7 +1378,7 @@ class AgentLoop:
     def _latest_located_target(self, state: LoopState) -> tuple[float, float] | None:
         """最近一次成功定位的目标点（NED 水平坐标）；没有返回 None。"""
         for item in self._iter_tool_results(state):
-            if item.get("tool") != "airsim_locate_point" or not item.get("ok"):
+            if item.get("tool") != "locate_image_point" or not item.get("ok"):
                 continue
             data = item.get("data") if isinstance(item.get("data"), dict) else {}
             if data.get("valid") is False:
@@ -1487,7 +1418,7 @@ class AgentLoop:
     ) -> str:
         """'这一飞会掠过目标'的否决理由；不适用时返回 ""。
 
-        实测事故（2026-10-13）：模型用 `airsim_locate_point` 拿到一个"目标"坐标
+        实测事故（2026-10-13）：模型用 `locate_image_point` 拿到一个"目标"坐标
         —— 距离本身是对的（30 m），但那个点是**路面**：视线朝下 9°，深度射线打在
         目标前面的地上。模型据此 `drone_fly_to` 直飞过去，掠过汽车、目标出画，
         之后一路空转找不到它。
@@ -1545,7 +1476,7 @@ class AgentLoop:
         """最近一次视觉确认的（目标占画面高 h, 距离 m, 是否确认到目标）。
 
         两者都从工具结果里取：h 来自 `inspect_current_frame` 的 bbox_hint（视觉模型的
-        粗值），距离来自 `airsim_locate_point` / `airsim_get_depth_map`（深度）。
+        粗值），距离来自 `locate_image_point`（深度几何）。
         "到位与否"的判定必须建立在这两个数上——否则判据只能由模型自己说。
         """
         height: float | None = None
@@ -1568,7 +1499,7 @@ class AgentLoop:
             break
         distance: float | None = None
         for item in self._iter_tool_results(state):
-            if item.get("tool") not in {"airsim_locate_point", "airsim_get_depth_map"} or not item.get("ok"):
+            if item.get("tool") != "locate_image_point" or not item.get("ok"):
                 continue
             data = item.get("data") if isinstance(item.get("data"), dict) else {}
             for key in ("distance_m", "distance_median_m", "depth_m"):
@@ -1836,8 +1767,13 @@ class AgentLoop:
                 detail=f"missing={','.join(missing)}" if missing else "all planned motion steps succeeded",
             )
         elif metric == "photo_taken":
-            ok = self._has_successful_tool(state, "airsim_take_photo") or any(
-                result.ok and self._result_contains_image(result.data) for result in state.results
+            ok = any(
+                result.ok
+                and (
+                    self._result_contains_image(result.data)
+                    or str((result.data or {}).get("saved_path") or "").strip()
+                )
+                for result in state.results
             )
             base.update(satisfied=ok, detail="photo captured" if ok else "no successful photo in results")
         elif metric == "target_fill":
@@ -1874,7 +1810,7 @@ class AgentLoop:
         elif metric == "target_confirmed":
             found = self._target_found_any(state)
             explicitly_not_found = self._target_not_found_explicit(state)
-            looked = self._has_successful_tool(state, "airsim_take_photo") or self._has_successful_tool(state, "inspect_current_frame")
+            looked = self._has_successful_tool(state, "inspect_current_frame")
             satisfied = bool(found) or (explicitly_not_found and looked)
             base.update(satisfied=satisfied, detail=f"found={found} not_found={explicitly_not_found}")
         elif metric == "landed":
@@ -1933,15 +1869,7 @@ class AgentLoop:
             if tool is None or tool not in allowed_tools:
                 continue
             if tool == "inspect_current_frame":
-                if not self._has_recent_image(state):
-                    if "airsim_take_photo" in allowed_tools:
-                        return LoopDecision(
-                            "airsim_take_photo",
-                            {"image_type": "scene", "auto_save": False},
-                            "Capture a fresh frame before re-verifying the target.",
-                            is_complete=False,
-                        )
-                    continue
+                # inspect 自身可取帧（含直连兜底），不需要"先拍一张"的前置步骤。
                 return LoopDecision(
                     "inspect_current_frame",
                     {"question": self._confirmation_question(str(criterion.get("target") or state.command[:160]))},
@@ -2120,7 +2048,6 @@ class AgentLoop:
             if sub.is_complete or not sub.action:
                 continue
             batch_result = self._execute_action(sub, dry_run=not execute)
-            batch_result = self._settle_async_result(batch_result, dry_run=not execute)
             batch_row = LoopActionResult(
                 step_index=step_index,
                 tool=batch_result["tool"],
@@ -2154,7 +2081,7 @@ class AgentLoop:
                 if failure_count >= 3:
                     state.status = "failed"
                     break
-            elif batch_row.tool not in {"drone_get_status", "airsim_task_status"}:
+            elif batch_row.tool not in {"drone_get_status"}:
                 unresolved_failure = False
         return {"failure_count": failure_count, "unresolved_failure": unresolved_failure}
 
@@ -2205,98 +2132,6 @@ class AgentLoop:
             dry_run=dry_run,
             blocked_by_supervisor=self._should_stop(),
         )
-
-    def _settle_async_result(self, result: dict[str, Any], dry_run: bool) -> dict[str, Any]:
-        if dry_run or not result.get("ok"):
-            return result
-        descriptor = self._find_async_descriptor(result.get("raw") or result.get("data") or {})
-        if not descriptor:
-            return result
-        task_id = str(descriptor.get("task_id") or "")
-        if not task_id:
-            return result
-
-        accepted = dict(result.get("data") or {})
-        deadline = time.monotonic() + self.async_timeout
-        self._event("info", "async_task", f"Waiting for background task {task_id}", {"task_id": task_id})
-        while time.monotonic() < deadline:
-            if self._should_stop():
-                self._cancel_async_task(task_id)
-                result["ok"] = False
-                result["data"] = {"status": "blocked", "task_id": task_id, "message": "background task cancelled by emergency stop"}
-                return result
-            self._wait_if_paused()
-            status_result = self._call_tool("airsim_task_status", {"task_id": task_id}, False)
-            polled = True
-            # Backend coupling guard: airsim_task_status is an AirSim-backend
-            # tool. If the active backend does not register it (PX4 backends
-            # never return async descriptors today, but a future tool could),
-            # polling would spin the whole timeout for nothing — accept the
-            # original result and note the gap instead.
-            if status_result.error_code == "UNKNOWN_TOOL":
-                result["data"] = {
-                    "status": "accepted",
-                    "task_id": task_id,
-                    "task": status_result.data,
-                    "accepted_result": accepted,
-                    "message": "background task accepted; task_status tool is not available on this backend",
-                }
-                self._event("warning", "async_task", f"Task {task_id} accepted, but airsim_task_status is unavailable on this backend", {"task_id": task_id})
-                return result
-            status = str((status_result.data or {}).get("status") or "").strip().lower()
-            self._event(
-                "info" if status_result.ok else "warning",
-                "async_task",
-                f"Background task {task_id}: {status or 'unknown'}",
-                status_result.to_dict(),
-            )
-            if status in {"completed", "failed", "cancelled", "canceled", "error", "blocked"} or status_result.terminal:
-                result["ok"] = status_result.ok and status == "completed"
-                result["data"] = {
-                    "status": status or ("completed" if status_result.ok else "failed"),
-                    "task_id": task_id,
-                    "task": status_result.data,
-                    "accepted_result": accepted,
-                }
-                result["raw"] = status_result.to_dict()
-                return result
-            time.sleep(self.async_poll_interval)
-
-        self._cancel_async_task(task_id)
-        result["ok"] = False
-        result["data"] = {
-            "status": "failed",
-            "task_id": task_id,
-            "message": f"background task timed out after {self.async_timeout:.0f}s and was cancelled",
-            "accepted_result": accepted,
-        }
-        return result
-
-    def _cancel_async_task(self, task_id: str) -> None:
-        try:
-            self._call_tool("airsim_task_cancel", {"task_id": task_id}, False)
-        except Exception:
-            pass
-
-    def _find_async_descriptor(self, value: Any, _depth: int = 0) -> dict[str, Any] | None:
-        if _depth > 24:
-            return None
-        if isinstance(value, dict):
-            status = str(value.get("status") or "").strip().lower()
-            task_id = str(value.get("task_id") or "")
-            terminal = value.get("terminal")
-            if task_id and (terminal is False or status in {"accepted", "started", "pending", "queued", "running", "in_progress"}):
-                return value
-            for nested in value.values():
-                found = self._find_async_descriptor(nested, _depth + 1)
-                if found:
-                    return found
-        elif isinstance(value, list):
-            for nested in reversed(value):
-                found = self._find_async_descriptor(nested, _depth + 1)
-                if found:
-                    return found
-        return None
 
     def _wait_if_paused(self) -> None:
         if not self.should_pause:

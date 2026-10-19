@@ -267,9 +267,9 @@ def test_approval_reason_includes_vehicles():
 
 def test_planner_atomic_tools_include_formation_for_keywords():
     rt = object.__new__(AgentRuntime)
-    allowed = rt._allowed_planner_atomic_tools("编队飞行到 (50,50)", set(), {"flight_control": True})
+    allowed = rt._allowed_planner_atomic_tools("编队飞行到 (50,50)", {"flight_control": True})
     assert "formation_command" in allowed
-    allowed_en = rt._allowed_planner_atomic_tools("formation fly to 50,50", set(), {"flight_control": True})
+    allowed_en = rt._allowed_planner_atomic_tools("formation fly to 50,50", {"flight_control": True})
     assert "formation_command" in allowed_en
 
 

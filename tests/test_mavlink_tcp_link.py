@@ -18,7 +18,7 @@ import time
 
 import pytest
 
-from src.modules.mavlink_controller import MavlinkController
+from src.modules.backends.mavlink import MavlinkController
 
 # PX4 AUTO.LOITER：main_mode=4(AUTO) sub_mode=3(LOITER)
 CUSTOM_MODE_LOITER = (3 << 24) | (4 << 16)

@@ -68,7 +68,6 @@ function normalizeCameraSettings(raw = {}) {
     vehicle_name: String(raw.vehicle_name || "").trim(),
     image_type: ["scene", "depth", "segmentation", "infrared"].includes(imageType) ? imageType : DEFAULT_CAMERA_SETTINGS.image_type,
     timeout_sec: Math.max(3, Math.min(120, Number.isFinite(timeout) ? timeout : DEFAULT_CAMERA_SETTINGS.timeout_sec)),
-    auto_save: Boolean(raw.auto_save),
   };
 }
 
@@ -120,7 +119,6 @@ async function loadCameraSettings(force = false) {
     showNotice("摄像头设置加载失败: " + (error.message || "未知错误"), "error");
   }
   renderCameraSettings();
-  renderCameraMeta();
   return cameraSettings;
 }
 
@@ -134,7 +132,6 @@ function readCameraSettingsForm() {
     vehicle_name: els.cameraVehicle?.value || "",
     image_type: els.cameraImageType?.value || cameraSettings.image_type,
     timeout_sec: els.cameraTimeout?.value || cameraSettings.timeout_sec,
-    auto_save: Boolean(els.cameraAutoSave?.checked),
   });
 }
 
@@ -144,13 +141,11 @@ function readCameraSettingsForm() {
 
 async function saveCameraSettings({ silent = false } = {}) {
   cameraSettings = readCameraSettingsForm();
-  renderCameraMeta();
   try {
     const data = await post("/api/settings/camera", cameraSettings);
     cameraSettings = normalizeCameraSettings(data.camera || cameraSettings);
     cameraSettingsLoaded = true;
     renderCameraSettings();
-    renderCameraMeta();
     if (!silent) showNotice("摄像头设置已保存", "success");
     return true;
   } catch (error) {
@@ -462,7 +457,6 @@ function renderCameraSettings() {
   if (els.cameraVehicle) els.cameraVehicle.value = cameraSettings.vehicle_name;
   if (els.cameraImageType) els.cameraImageType.value = cameraSettings.image_type;
   if (els.cameraTimeout) els.cameraTimeout.value = String(Math.round(cameraSettings.timeout_sec));
-  if (els.cameraAutoSave) els.cameraAutoSave.checked = Boolean(cameraSettings.auto_save);
   updateCameraSourceFields();
   cameraWindows.forEach(syncCameraWindowControls);
 }
@@ -476,14 +470,6 @@ function cameraSourceLabel(settings) {
     return url ? `RTSP ${url.length > 28 ? url.slice(0, 27) + "…" : url}` : "RTSP";
   }
   return source;
-}
-
-// 目标检测标注 HUD 已随 YOLO 检测一起下线：函数保留为空壳，只为不打断现有
-// 调用点（含 ui-chat.js），HUD 永远保持隐藏，不再渲染 detections。
-function renderCameraMeta(data = null, win = primaryCameraWindow()) {
-  const hudEl = win?.hudEl || els.cameraHud;
-  if (!hudEl) return;
-  hudEl.hidden = true;
 }
 
 // -- 帧率徽标 ---------------------------------------------------------
@@ -838,7 +824,6 @@ async function captureCameraFrame({ notify = true, openViewer = true, windowId =
   if (!cameraSettingsLoaded) await loadCameraSettings();
   win.settings = readCameraViewerSettings(win);
   syncCameraWindowControls(win);
-  renderCameraMeta(null, win);
 
   if (!["airsim", "rtsp", "local"].includes(win.settings.source)) {
     const message = `暂未接入 ${win.settings.source} 图像源`;
@@ -899,7 +884,6 @@ async function captureCameraFrame({ notify = true, openViewer = true, windowId =
     }
     // 视频流正常时不显示时间戳, 保持头部紧凑; 仅在非流式(单帧)时给出提示
     setCameraViewerState(win, "ready", win.streamActive ? "" : (data.message || "画面已更新"));
-    renderCameraMeta(data, win);
     renderCameraPerf(win, data);
     win.lastSuccessSource = win.settings.source;
     if (notify) showNotice(data.message || "摄像头画面已更新", "success");
@@ -1020,7 +1004,6 @@ async function updateCameraViewerSelection(eventOrWindow = null) {
     // 说明白：附加窗口看别的相机时，Agent 看的仍是主窗口那一路。
     showNotice("附加窗口只用于旁看；Agent 仍跟随主窗口的相机", "info");
   }
-  renderCameraMeta(null, win);
   if (cameraViewerIsVisible(win)) {
     if (win.settings.source !== (win.lastSuccessSource || "")) {
       clearCameraWindowImage(win);

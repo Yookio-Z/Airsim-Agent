@@ -15,9 +15,11 @@ import sys
 import threading
 import time
 import urllib.request
+from dataclasses import dataclass
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
+from typing import Any
 from urllib.parse import parse_qs, unquote, urlparse
 
 from src.agent import AgentRuntime
@@ -87,6 +89,112 @@ class AgentThreadingHTTPServer(ThreadingHTTPServer):
         super().handle_error(request, client_address)
 
 
+# ---------------------------------------------------------------------------
+# 路由表（单一事实来源）
+#
+# 约定：pattern 以 "*" 结尾表示前缀匹配（其余为精确匹配）；handler 是
+# AgentRequestHandler 上的方法名；summary 是给人和脚本看的一句话说明——
+# ``GET /api/endpoints`` 直接把这张表吐出来，所以新增端点必须先加一行。
+# 匹配顺序：精确优先，其次前缀（长的优先），见 match_route()。
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class Route:
+    method: str
+    pattern: str
+    handler: str
+    summary: str
+
+    def public(self) -> dict[str, str]:
+        return {"method": self.method, "path": self.pattern, "summary": self.summary}
+
+
+ROUTES: tuple[Route, ...] = (
+    Route("GET", "/api/state", "_ep_api_state", "整体状态快照（会话、任务、工具、相机、记忆、Agent 说明）"),
+    Route("GET", "/api/telemetry", "_ep_api_telemetry", "轻量遥测帧：顶部状态栏与地图的数据源"),
+    Route("GET", "/api/stream", "_ep_api_stream", "SSE 实时事件流（会话消息、运行状态、任务列表）"),
+    Route("GET", "/api/sessions", "_ep_api_sessions", "会话列表"),
+    Route("GET", "/api/sessions/*", "_ep_api_sessions_tail", "单个会话：读取/加载/重命名/删除（动作在路径尾段）"),
+    Route("GET", "/api/flightlog/sessions", "_ep_api_flightlog_sessions", "飞行记录列表（新→旧，含摘要索引）"),
+    Route("GET", "/api/flightlog/sessions/*", "_ep_api_flightlog_sessions_tail", "读取一次飞行记录：meta + summary + 最后 N 帧"),
+    Route("GET", "/api/tools", "_ep_api_tools", "工具清单（注册面：名称/参数/清单元数据）"),
+    Route("GET", "/api/skills", "_ep_api_skills", "技能列表与详情（含 SKILL.md 原文）"),
+    Route("GET", "/api/health", "_ep_api_health", "服务健康检查"),
+    Route("GET", "/api/backends", "_ep_api_backends", "后端清单与各自能力位"),
+    Route("GET", "/api/link", "_ep_api_link", "链路汇总：飞控链路 + 感知链路 + 遥测源"),
+    Route("GET", "/api/settings/connections", "_ep_api_settings_connections", "连接配置读取（链路面板）"),
+    Route("GET", "/api/settings/agent-prompt", "_ep_api_settings_agent_prompt", "常驻提示词 SYSTEM.md 读取（设置面板）"),
+    Route("GET", "/api/settings/application", "_ep_api_settings_application", "应用设置读取"),
+    Route("GET", "/api/settings/vehicle-info", "_ep_api_settings_vehicle_info", "载具信息（固件/状态，按需刷新）"),
+    Route("GET", "/api/vehicle/mode", "_ep_api_vehicle_mode", "飞行模式信息（当前模式 + 可切换白名单）"),
+    Route("GET", "/api/settings/vehicle-setup", "_ep_api_settings_vehicle_setup", "载具安装/调参快照"),
+    Route("GET", "/api/settings/vehicle-telemetry", "_ep_api_settings_vehicle_telemetry", "载具遥测历史（波形用）"),
+    Route("GET", "/api/settings/camera", "_ep_api_settings_camera", "相机设置读取"),
+    Route("GET", "/api/camera/preview", "_ep_api_camera_preview", "单帧相机预览（优先感知轴缓存）"),
+    Route("GET", "/api/gcs/mission", "_ep_api_gcs_mission", "任务草案读取（航线面板）"),
+    Route("GET", "/api/gcs/mission/progress", "_ep_api_gcs_mission_progress", "任务执行进度"),
+    Route("GET", "/api/models", "_ep_api_models", "模型配置列表（含能力探测结果）"),
+    Route("GET", "/api/attachments/*", "_ep_api_attachments_tail", "会话附件二进制（图片等）"),
+    Route("GET", "/tile/*", "_ep_tile_tail", "地图瓦片代理（带磁盘缓存）"),
+    Route("GET", "/captures/*", "_ep_captures_tail", "本地截图/证据帧文件"),
+    Route("POST", "/api/command", "_ep_api_command", "下发自然语言指令，启动一次 Agent 任务"),
+    Route("POST", "/api/control", "_ep_api_control", "手动飞控动作：解锁/起飞/降落/悬停/返航/暂停/急停"),
+    Route("POST", "/api/perception/view", "_ep_api_perception_view", "切换感知轴取景（相机名/图像类型）"),
+    Route("POST", "/api/settings/connections", "_ep_api_settings_connections_post", "保存连接配置"),
+    Route("POST", "/api/settings/agent-prompt", "_ep_api_settings_agent_prompt_post", "保存常驻提示词 SYSTEM.md"),
+    Route("POST", "/api/settings/application", "_ep_api_settings_application_post", "保存应用设置"),
+    Route("POST", "/api/settings/camera", "_ep_api_settings_camera_post", "保存相机设置"),
+    Route("POST", "/api/vehicle/mode", "_ep_api_vehicle_mode_post", "切换飞行模式（仅白名单内的模式）"),
+    Route("POST", "/api/settings/connections/activate", "_ep_api_settings_connections_activate", "激活一条连接（等价于切换后端并连接）"),
+    Route("POST", "/api/settings/connections/deactivate", "_ep_api_settings_connections_deactivate", "断开当前连接"),
+    Route("POST", "/api/gcs/mission", "_ep_api_gcs_mission_post", "保存任务草案"),
+    Route("POST", "/api/gcs/mission/download", "_ep_api_gcs_mission_download", "从飞控下载当前任务到草案"),
+    Route("POST", "/api/gcs/mission/upload", "_ep_api_gcs_mission_upload", "上传草案到飞控"),
+    Route("POST", "/api/gcs/mission/start", "_ep_api_gcs_mission_start", "启动已上传的任务"),
+    Route("POST", "/api/gcs/mission/start_multi", "_ep_api_gcs_mission_start_multi", "多机任务：后台任务非阻塞执行（每机起飞+航线）"),
+    Route("POST", "/api/gcs/mission/progress", "_ep_api_gcs_mission_progress_post", "任务执行进度（POST 版）"),
+    Route("POST", "/api/gcs/mission/clear", "_ep_api_gcs_mission_clear", "清空飞控任务"),
+    Route("POST", "/api/approve", "_ep_api_approve", "批准待审批的高风险动作（真机审批门）"),
+    Route("POST", "/api/reject", "_ep_api_reject", "拒绝待审批动作"),
+    Route("POST", "/api/flightlog/record", "_ep_api_flightlog_record", "手动开始/停止飞行记录"),
+    Route("POST", "/api/sessions*", "_ep_api_sessionstail", "会话操作：新建/加载/重命名/删除（路径尾段指定动作）"),
+    Route("POST", "/api/skills", "_ep_api_skills_post", "技能管理：新建/编辑/删除/停用"),
+    Route("POST", "/api/models", "_ep_api_models_post", "保存模型配置"),
+    Route("POST", "/api/models/catalog", "_ep_api_models_catalog", "从模型厂商目录拉取可用模型列表"),
+    Route("POST", "/api/models/*", "_ep_api_models_tail", "模型操作（连通性探测/删除等）"),
+    Route("POST", "/api/tool", "_ep_api_tool", "直接执行一次工具调用（调试/运维用）"),
+    Route("GET", "/api/endpoints", "_ep_api_endpoints", "本表：所有 HTTP 端点的方法、路径与说明（自文档）"),
+)
+
+_PREFIX_ROUTES: tuple[Route, ...] = tuple(
+    sorted((r for r in ROUTES if r.pattern.endswith("*")), key=lambda r: -len(r.pattern))
+)
+
+
+def match_route(method: str, path: str) -> Route | None:
+    """按方法 + 路径找路由：精确匹配优先，其次前缀（长的优先）。"""
+    for route in ROUTES:
+        if route.method == method and not route.pattern.endswith("*") and route.pattern == path:
+            return route
+    for route in _PREFIX_ROUTES:
+        if route.method == method and path.startswith(route.pattern[:-1]):
+            return route
+    return None
+
+
+class _Request:
+    """一次请求的上下文：路由后的处理函数只从这里取输入。"""
+
+    __slots__ = ("method", "path", "parsed", "payload")
+
+    def __init__(self, method: str, path: str, parsed: Any, payload: dict[str, Any]) -> None:
+        self.method = method
+        self.path = path
+        self.parsed = parsed
+        self.payload = payload
+
+
 class AgentRequestHandler(BaseHTTPRequestHandler):
     server_version = "AirSimAgentUI/0.1"
 
@@ -94,443 +202,455 @@ class AgentRequestHandler(BaseHTTPRequestHandler):
         return
 
     def do_GET(self) -> None:
+        self._dispatch("GET")
+
+    def do_POST(self) -> None:
+        self._dispatch("POST")
+
+    def _dispatch(self, method: str) -> None:
+        """路由 → 端点方法；未命中时：GET 兜底静态文件，POST 返回 404。"""
         parsed = urlparse(self.path)
-        path = unquote(parsed.path)
-
-        if path == "/api/state":
-            self._send_json(RUNTIME.state())
-            return
-        if path == "/api/telemetry":
-            self._send_json(RUNTIME.telemetry_state())
-            return
-        if path == "/api/stream":
-            self._send_sse()
-            return
-        if path == "/api/sessions":
-            self._send_json({"ok": True, "sessions": RUNTIME.list_sessions()})
-            return
-        if path.startswith("/api/sessions/"):
-            self._handle_session_get(path, parsed)
-            return
-        if path == "/api/replay/sessions":
-            self._send_json({"ok": True, "sessions": RUNTIME.replay_sessions()})
-            return
-        if path.startswith("/api/replay/sessions/"):
-            name = unquote(path[len("/api/replay/sessions/"):])
-            session = RUNTIME.get_replay_session(name)
-            if session is None:
-                self._send_json({"ok": False, "error": "replay session not found"}, HTTPStatus.NOT_FOUND)
+        path = unquote(parsed.path) if method == "GET" else parsed.path
+        payload: dict[str, Any] = {}
+        if method == "POST":
+            try:
+                payload = self._read_json()
+            except ValueError as e:
+                self._send_json({"ok": False, "error": str(e)}, HTTPStatus.BAD_REQUEST)
                 return
-            self._send_json({"ok": True, "session": session})
+        route = match_route(method, path)
+        if route is not None:
+            getattr(self, route.handler)(_Request(method, path, parsed, payload))
             return
-        if path == "/api/tools":
-            self._send_json({"tools": RUNTIME.tools.list_tools()})
+        if method == "POST":
+            self._send_json({"ok": False, "error": "not found"}, HTTPStatus.NOT_FOUND)
             return
-        if path == "/api/skills":
-            self._send_json({"ok": True, "skills": self._list_skills()})
-            return
-        if path == "/api/health":
-            self._send_json({"ok": True, "service": "airsim-agent-ui"})
-            return
-        if path == "/api/backends":
-            self._send_json({
-                "ok": True,
-                "backends": RUNTIME.tools.backend_registry.list_public(),
-                "current": RUNTIME.tools.backend_id,
-            })
-            return
-        if path == "/api/link":
-            # Single end-point describing how the Agent is wired to the
-            # vehicle: flight control link + perception axis link + telemetry
-            # source. Surfaces connection strings, source type, health.
-            self._send_json({"ok": True, **RUNTIME.link_summary()})
-            return
-
-        if path == "/api/settings/connections":
-            self._send_json({"ok": True, **RUNTIME.connection_settings()})
-            return
-        if path == "/api/settings/agent-prompt":
-            self._send_json({"ok": True, **RUNTIME.agent_instructions_payload()})
-            return
-        if path == "/api/settings/application":
-            self._send_json({"ok": True, "application": RUNTIME.application_settings()})
-            return
-        if path == "/api/settings/vehicle-info":
-            params = self._query_params(parsed)
-            refresh = str(params.get("refresh", "")).lower() in {"1", "true", "yes", "force"}
-            self._send_json(RUNTIME.vehicle_info(refresh=refresh))
-            return
-        if path == "/api/settings/vehicle-setup":
-            params = self._query_params(parsed)
-            include_history = str(params.get("history", "1")).lower() not in {"0", "false", "no"}
-            try:
-                history_limit = int(params.get("limit", 240) or 240)
-            except (TypeError, ValueError):
-                history_limit = 240
-            self._send_json(RUNTIME.vehicle_setup_snapshot(
-                include_history=include_history,
-                history_limit=history_limit,
-            ))
-            return
-        if path == "/api/settings/vehicle-telemetry":
-            params = self._query_params(parsed)
-            include_history = str(params.get("history", "1")).lower() not in {"0", "false", "no"}
-            try:
-                history_limit = int(params.get("limit", 240) or 240)
-            except (TypeError, ValueError):
-                history_limit = 240
-            history_keys = [
-                value.strip()
-                for value in str(params.get("groups") or "").split(",")
-                if value.strip()
-            ]
-            self._send_json(RUNTIME.vehicle_telemetry_snapshot(
-                include_history=include_history,
-                history_limit=history_limit,
-                history_keys=history_keys or None,
-            ))
-            return
-        if path == "/api/settings/vehicle-parameters":
-            params = self._query_params(parsed)
-            refresh = str(params.get("refresh", "")).lower() in {"1", "true", "yes", "force"}
-            try:
-                limit = int(params.get("limit", 200) or 200)
-            except (TypeError, ValueError):
-                limit = 200
-            try:
-                offset = int(params.get("offset", 0) or 0)
-            except (TypeError, ValueError):
-                offset = 0
-            try:
-                timeout = float(params.get("timeout", 20.0) or 20.0)
-            except (TypeError, ValueError):
-                timeout = 20.0
-            self._send_json(RUNTIME.vehicle_parameters(
-                refresh=refresh,
-                query=str(params.get("q", "")),
-                limit=limit,
-                offset=offset,
-                timeout=timeout,
-            ))
-            return
-        if path == "/api/settings/camera":
-            self._send_json({"ok": True, "camera": RUNTIME.camera_settings()})
-            return
-        if path == "/api/airsim-settings":
-            self._send_json({"ok": True, **RUNTIME.airsim_settings_info()})
-            return
-        if path == "/api/camera/preview":
-            params = self._query_params(parsed)
-            ok, body, mime_type, meta = RUNTIME.camera_preview_frame(params)
-            if not ok:
-                self._send_json({"ok": False, "error": meta.get("message", "camera preview unavailable"), "meta": meta}, HTTPStatus.SERVICE_UNAVAILABLE)
-                return
-            self._send_binary(
-                body,
-                mime_type,
-                headers={
-                    "Cache-Control": "no-store, max-age=0",
-                    "X-Camera-Meta": json.dumps(meta, ensure_ascii=True, separators=(",", ":")),
-                },
-            )
-            return
-
-        # P6: GCS MissionManager facade endpoints
-        if path == "/api/gcs/mission":
-            self._send_json(RUNTIME.gcs_mission_get())
-            return
-        if path == "/api/gcs/mission/progress":
-            self._send_json(RUNTIME.gcs_mission_progress())
-            return
-
-        if path == "/api/models":
-            self._send_json({
-                "ok": True,
-                "models": MODEL_REGISTRY.list_public(),
-                "default": MODEL_REGISTRY._default_id,
-            })
-            return
-
-        if path.startswith("/api/attachments/"):
-            storage_key = path.rsplit("/", 1)[-1]
-            item = RUNTIME.attachment_file(storage_key)
-            if not item:
-                self.send_error(HTTPStatus.NOT_FOUND)
-                return
-            file_path, mime_type = item
-            self._serve_binary(file_path, mime_type)
-            return
-
-        if path.startswith("/tile/"):
-            self._serve_tile(path)
-            return
-
-        if path.startswith("/captures/"):
-            self._serve_file(REPO_ROOT / path.lstrip("/"), base=REPO_ROOT / "captures")
-            return
-
+        # GET 兜底：静态文件（/ → index.html）。未知路径由 _serve_file 报 404。
         if path == "/":
             path = "/index.html"
         self._serve_file(STATIC_DIR / path.lstrip("/"), base=STATIC_DIR)
 
-    def do_POST(self) -> None:
-        parsed = urlparse(self.path)
-        path = parsed.path
+    # ------------------------------------------------------------------
+    # 端点处理器：与 ROUTES 一一对应（分支体与原实现逐字一致）
+    # ------------------------------------------------------------------
+
+    def _ep_api_state(self, req: "_Request") -> None:
+        path, parsed, payload = req.path, req.parsed, req.payload
+        self._send_json(RUNTIME.state())
+        return
+
+    def _ep_api_telemetry(self, req: "_Request") -> None:
+        path, parsed, payload = req.path, req.parsed, req.payload
+        self._send_json(RUNTIME.telemetry_state())
+        return
+
+    def _ep_api_stream(self, req: "_Request") -> None:
+        path, parsed, payload = req.path, req.parsed, req.payload
+        self._send_sse()
+        return
+
+    def _ep_api_sessions(self, req: "_Request") -> None:
+        path, parsed, payload = req.path, req.parsed, req.payload
+        self._send_json({"ok": True, "sessions": RUNTIME.list_sessions()})
+        return
+
+    def _ep_api_sessions_tail(self, req: "_Request") -> None:
+        path, parsed, payload = req.path, req.parsed, req.payload
+        self._handle_session_get(path, parsed)
+        return
+
+    def _ep_api_flightlog_sessions(self, req: "_Request") -> None:
+        path, parsed, payload = req.path, req.parsed, req.payload
+        self._send_json({"ok": True, "sessions": RUNTIME.flightlog_sessions()})
+        return
+
+    def _ep_api_flightlog_sessions_tail(self, req: "_Request") -> None:
+        path, parsed, payload = req.path, req.parsed, req.payload
+        name = unquote(path[len("/api/flightlog/sessions/"):])
+        session = RUNTIME.flightlog_session(name)
+        if session is None:
+            self._send_json({"ok": False, "error": "flightlog session not found"}, HTTPStatus.NOT_FOUND)
+            return
+        self._send_json({"ok": True, "session": session})
+        return
+
+    def _ep_api_tools(self, req: "_Request") -> None:
+        path, parsed, payload = req.path, req.parsed, req.payload
+        self._send_json({"tools": RUNTIME.tools.list_tools()})
+        return
+
+    def _ep_api_skills(self, req: "_Request") -> None:
+        path, parsed, payload = req.path, req.parsed, req.payload
+        self._send_json({"ok": True, "skills": self._list_skills()})
+        return
+
+    def _ep_api_health(self, req: "_Request") -> None:
+        path, parsed, payload = req.path, req.parsed, req.payload
+        self._send_json({"ok": True, "service": "airsim-agent-ui"})
+        return
+
+    def _ep_api_backends(self, req: "_Request") -> None:
+        path, parsed, payload = req.path, req.parsed, req.payload
+        self._send_json({
+            "ok": True,
+            "backends": RUNTIME.tools.backend_registry.list_public(),
+            "current": RUNTIME.tools.backend_id,
+        })
+        return
+
+    def _ep_api_link(self, req: "_Request") -> None:
+        path, parsed, payload = req.path, req.parsed, req.payload
+        # Single end-point describing how the Agent is wired to the
+        # vehicle: flight control link + perception axis link + telemetry
+        # source. Surfaces connection strings, source type, health.
+        self._send_json({"ok": True, **RUNTIME.link_summary()})
+        return
+
+    def _ep_api_settings_connections(self, req: "_Request") -> None:
+        path, parsed, payload = req.path, req.parsed, req.payload
+        self._send_json({"ok": True, **RUNTIME.connection_settings()})
+        return
+
+    def _ep_api_settings_agent_prompt(self, req: "_Request") -> None:
+        path, parsed, payload = req.path, req.parsed, req.payload
+        self._send_json({"ok": True, **RUNTIME.agent_instructions_payload()})
+        return
+
+    def _ep_api_settings_application(self, req: "_Request") -> None:
+        path, parsed, payload = req.path, req.parsed, req.payload
+        self._send_json({"ok": True, "application": RUNTIME.application_settings()})
+        return
+
+    def _ep_api_settings_vehicle_info(self, req: "_Request") -> None:
+        path, parsed, payload = req.path, req.parsed, req.payload
+        params = self._query_params(parsed)
+        refresh = str(params.get("refresh", "")).lower() in {"1", "true", "yes", "force"}
+        self._send_json(RUNTIME.vehicle_info(refresh=refresh))
+        return
+
+    def _ep_api_vehicle_mode(self, req: "_Request") -> None:
+        path, parsed, payload = req.path, req.parsed, req.payload
+        self._send_json(RUNTIME.vehicle_mode_info())
+        return
+
+    def _ep_api_settings_vehicle_setup(self, req: "_Request") -> None:
+        path, parsed, payload = req.path, req.parsed, req.payload
+        params = self._query_params(parsed)
+        include_history = str(params.get("history", "1")).lower() not in {"0", "false", "no"}
         try:
-            payload = self._read_json()
-        except ValueError as e:
+            history_limit = int(params.get("limit", 240) or 240)
+        except (TypeError, ValueError):
+            history_limit = 240
+        self._send_json(RUNTIME.vehicle_setup_snapshot(
+            include_history=include_history,
+            history_limit=history_limit,
+        ))
+        return
+
+    def _ep_api_settings_vehicle_telemetry(self, req: "_Request") -> None:
+        path, parsed, payload = req.path, req.parsed, req.payload
+        params = self._query_params(parsed)
+        include_history = str(params.get("history", "1")).lower() not in {"0", "false", "no"}
+        try:
+            history_limit = int(params.get("limit", 240) or 240)
+        except (TypeError, ValueError):
+            history_limit = 240
+        history_keys = [
+            value.strip()
+            for value in str(params.get("groups") or "").split(",")
+            if value.strip()
+        ]
+        self._send_json(RUNTIME.vehicle_telemetry_snapshot(
+            include_history=include_history,
+            history_limit=history_limit,
+            history_keys=history_keys or None,
+        ))
+        return
+
+    def _ep_api_settings_camera(self, req: "_Request") -> None:
+        path, parsed, payload = req.path, req.parsed, req.payload
+        self._send_json({"ok": True, "camera": RUNTIME.camera_settings()})
+        return
+
+    def _ep_api_camera_preview(self, req: "_Request") -> None:
+        path, parsed, payload = req.path, req.parsed, req.payload
+        params = self._query_params(parsed)
+        ok, body, mime_type, meta = RUNTIME.camera_preview_frame(params)
+        if not ok:
+            self._send_json({"ok": False, "error": meta.get("message", "camera preview unavailable"), "meta": meta}, HTTPStatus.SERVICE_UNAVAILABLE)
+            return
+        self._send_binary(
+            body,
+            mime_type,
+            headers={
+                "Cache-Control": "no-store, max-age=0",
+                "X-Camera-Meta": json.dumps(meta, ensure_ascii=True, separators=(",", ":")),
+            },
+        )
+        return
+
+    def _ep_api_gcs_mission(self, req: "_Request") -> None:
+        path, parsed, payload = req.path, req.parsed, req.payload
+        self._send_json(RUNTIME.gcs_mission_get())
+        return
+
+    def _ep_api_gcs_mission_progress(self, req: "_Request") -> None:
+        path, parsed, payload = req.path, req.parsed, req.payload
+        self._send_json(RUNTIME.gcs_mission_progress())
+        return
+
+    def _ep_api_models(self, req: "_Request") -> None:
+        path, parsed, payload = req.path, req.parsed, req.payload
+        self._send_json({
+            "ok": True,
+            "models": MODEL_REGISTRY.list_public(),
+            "default": MODEL_REGISTRY._default_id,
+        })
+        return
+
+    def _ep_api_attachments_tail(self, req: "_Request") -> None:
+        path, parsed, payload = req.path, req.parsed, req.payload
+        storage_key = path.rsplit("/", 1)[-1]
+        item = RUNTIME.attachment_file(storage_key)
+        if not item:
+            self.send_error(HTTPStatus.NOT_FOUND)
+            return
+        file_path, mime_type = item
+        self._serve_binary(file_path, mime_type)
+        return
+
+    def _ep_tile_tail(self, req: "_Request") -> None:
+        path, parsed, payload = req.path, req.parsed, req.payload
+        self._serve_tile(path)
+        return
+
+    def _ep_captures_tail(self, req: "_Request") -> None:
+        path, parsed, payload = req.path, req.parsed, req.payload
+        self._serve_file(REPO_ROOT / path.lstrip("/"), base=REPO_ROOT / "captures")
+        return
+
+    def _ep_api_command(self, req: "_Request") -> None:
+        path, parsed, payload = req.path, req.parsed, req.payload
+        try:
+            command = str(payload.get("command", ""))
+            execute = bool(payload.get("execute", False))
+            model_id = str(payload.get("model", ""))
+            mode = str(payload.get("mode", ""))
+            attachments = payload.get("attachments") or []
+            if not isinstance(attachments, list):
+                raise ValueError("attachments must be a list")
+            self._send_json(RUNTIME.submit_command(
+                command,
+                execute=execute,
+                model_id=model_id,
+                mode=mode,
+                attachments=attachments,
+            ))
+        except Exception as e:
             self._send_json({"ok": False, "error": str(e)}, HTTPStatus.BAD_REQUEST)
-            return
+        return
 
-        if path == "/api/command":
-            try:
-                command = str(payload.get("command", ""))
-                execute = bool(payload.get("execute", False))
-                model_id = str(payload.get("model", ""))
-                mode = str(payload.get("mode", ""))
-                attachments = payload.get("attachments") or []
-                if not isinstance(attachments, list):
-                    raise ValueError("attachments must be a list")
-                self._send_json(RUNTIME.submit_command(
-                    command,
-                    execute=execute,
-                    model_id=model_id,
-                    mode=mode,
-                    attachments=attachments,
-                ))
-            except Exception as e:
-                self._send_json({"ok": False, "error": str(e)}, HTTPStatus.BAD_REQUEST)
-            return
+    def _ep_api_control(self, req: "_Request") -> None:
+        path, parsed, payload = req.path, req.parsed, req.payload
+        action = str(payload.get("action", ""))
+        vehicles = payload.get("vehicles")
+        self._send_json(RUNTIME.control(
+            action,
+            expected_backend=str(payload.get("expected_backend", "")),
+            vehicles=vehicles if isinstance(vehicles, list) else None,
+        ))
+        return
 
-        if path == "/api/control":
-            action = str(payload.get("action", ""))
-            vehicles = payload.get("vehicles")
-            self._send_json(RUNTIME.control(
-                action,
+    def _ep_api_perception_view(self, req: "_Request") -> None:
+        path, parsed, payload = req.path, req.parsed, req.payload
+        # 相机面板切相机/图像类型时走这里：把"看哪一路"变成感知轴的显式
+        # 动作，而不是让面板另开一条取流各看各的。
+        camera_name = str(payload.get("camera_name") or "").strip()
+        if not camera_name:
+            self._send_json({"ok": False, "error": "camera_name required"}, HTTPStatus.BAD_REQUEST)
+            return
+        self._send_json(RUNTIME.perception_set_view(camera_name))
+        return
+
+    def _ep_api_settings_connections_post(self, req: "_Request") -> None:
+        path, parsed, payload = req.path, req.parsed, req.payload
+        self._send_json(RUNTIME.save_connection_settings(payload))
+        return
+
+    def _ep_api_settings_agent_prompt_post(self, req: "_Request") -> None:
+        path, parsed, payload = req.path, req.parsed, req.payload
+        self._send_json(RUNTIME.save_agent_instructions(str(payload.get("content") or "")))
+        return
+
+    def _ep_api_settings_application_post(self, req: "_Request") -> None:
+        path, parsed, payload = req.path, req.parsed, req.payload
+        self._send_json(RUNTIME.save_application_settings(payload))
+        return
+
+    def _ep_api_settings_camera_post(self, req: "_Request") -> None:
+        path, parsed, payload = req.path, req.parsed, req.payload
+        self._send_json(RUNTIME.save_camera_settings(payload))
+        return
+
+    def _ep_api_vehicle_mode_post(self, req: "_Request") -> None:
+        path, parsed, payload = req.path, req.parsed, req.payload
+        self._send_json(RUNTIME.set_vehicle_mode(str(payload.get("mode") or "")))
+        return
+
+    def _ep_api_settings_connections_activate(self, req: "_Request") -> None:
+        path, parsed, payload = req.path, req.parsed, req.payload
+        connection_id = str(payload.get("connection_id", ""))
+        if not connection_id:
+            self._send_json({"ok": False, "error": "connection_id required"}, HTTPStatus.BAD_REQUEST)
+            return
+        self._send_json(RUNTIME.activate_connection(connection_id))
+        return
+
+    def _ep_api_settings_connections_deactivate(self, req: "_Request") -> None:
+        path, parsed, payload = req.path, req.parsed, req.payload
+        self._send_json(RUNTIME.deactivate_connection())
+        return
+
+    def _ep_api_gcs_mission_post(self, req: "_Request") -> None:
+        path, parsed, payload = req.path, req.parsed, req.payload
+        draft_data = payload.get("draft") if isinstance(payload.get("draft"), dict) else payload
+        self._send_json(RUNTIME.gcs_mission_set(draft_data))
+        return
+
+    def _ep_api_gcs_mission_download(self, req: "_Request") -> None:
+        path, parsed, payload = req.path, req.parsed, req.payload
+        self._send_json(RUNTIME.gcs_mission_download(expected_backend=str(payload.get("expected_backend", ""))))
+        return
+
+    def _ep_api_gcs_mission_upload(self, req: "_Request") -> None:
+        path, parsed, payload = req.path, req.parsed, req.payload
+        draft_data = payload.get("draft") if isinstance(payload.get("draft"), dict) else (payload if payload else None)
+        self._send_json(RUNTIME.gcs_mission_upload(
+            draft_data,
+            expected_backend=str(payload.get("expected_backend", "")),
+        ))
+        return
+
+    def _ep_api_gcs_mission_start(self, req: "_Request") -> None:
+        path, parsed, payload = req.path, req.parsed, req.payload
+        draft_data = payload.get("draft") if isinstance(payload.get("draft"), dict) else (payload if payload else None)
+        self._send_json(RUNTIME.gcs_mission_start(
+            draft_data,
+            expected_backend=str(payload.get("expected_backend", "")),
+        ))
+        return
+
+    def _ep_api_gcs_mission_start_multi(self, req: "_Request") -> None:
+        path, parsed, payload = req.path, req.parsed, req.payload
+        assignments = payload.get("assignments")
+        self._send_json(RUNTIME.gcs_mission_start_multi(
+            assignments,
+            expected_backend=str(payload.get("expected_backend", "")),
+        ))
+        return
+
+    def _ep_api_gcs_mission_progress_post(self, req: "_Request") -> None:
+        path, parsed, payload = req.path, req.parsed, req.payload
+        self._send_json(RUNTIME.gcs_mission_progress())
+        return
+
+    def _ep_api_gcs_mission_clear(self, req: "_Request") -> None:
+        path, parsed, payload = req.path, req.parsed, req.payload
+        self._send_json(RUNTIME.gcs_mission_clear(expected_backend=str(payload.get("expected_backend", ""))))
+        return
+
+    def _ep_api_approve(self, req: "_Request") -> None:
+        path, parsed, payload = req.path, req.parsed, req.payload
+        run_id = str(payload.get("run_id", ""))
+        if not run_id:
+            self._send_json({"ok": False, "error": "run_id required"}, HTTPStatus.BAD_REQUEST)
+            return
+        self._send_json(RUNTIME.approve_run(run_id))
+        return
+
+    def _ep_api_reject(self, req: "_Request") -> None:
+        path, parsed, payload = req.path, req.parsed, req.payload
+        run_id = str(payload.get("run_id", ""))
+        if not run_id:
+            self._send_json({"ok": False, "error": "run_id required"}, HTTPStatus.BAD_REQUEST)
+            return
+        self._send_json(RUNTIME.reject_run(run_id))
+        return
+
+    def _ep_api_flightlog_record(self, req: "_Request") -> None:
+        path, parsed, payload = req.path, req.parsed, req.payload
+        action = str(payload.get("action", "")).strip().lower()
+        if action == "start":
+            self._send_json(RUNTIME.start_manual_flightlog(name=str(payload.get("name", ""))))
+        elif action == "stop":
+            self._send_json(RUNTIME.stop_manual_flightlog())
+        else:
+            self._send_json({"ok": False, "error": "action must be start or stop"}, HTTPStatus.BAD_REQUEST)
+        return
+
+    def _ep_api_sessionstail(self, req: "_Request") -> None:
+        path, parsed, payload = req.path, req.parsed, req.payload
+        self._handle_session_post(path, payload)
+        return
+
+    def _ep_api_skills_post(self, req: "_Request") -> None:
+        path, parsed, payload = req.path, req.parsed, req.payload
+        self._handle_skill_post(payload)
+        return
+
+    def _ep_api_models_post(self, req: "_Request") -> None:
+        path, parsed, payload = req.path, req.parsed, req.payload
+        self._handle_model_post(payload)
+        return
+
+    def _ep_api_models_catalog(self, req: "_Request") -> None:
+        path, parsed, payload = req.path, req.parsed, req.payload
+        result = list_provider_models(
+            str(payload.get("base_url", "")),
+            str(payload.get("api_type", "openai")),
+            str(payload.get("api_key", "")),
+        )
+        self._send_json(result, HTTPStatus.OK if result.get("ok") else HTTPStatus.BAD_REQUEST)
+        return
+
+    def _ep_api_models_tail(self, req: "_Request") -> None:
+        path, parsed, payload = req.path, req.parsed, req.payload
+        self._handle_model_action(path, payload)
+        return
+
+    def _ep_api_tool(self, req: "_Request") -> None:
+        path, parsed, payload = req.path, req.parsed, req.payload
+        tool = str(payload.get("tool", ""))
+        params = payload.get("params", {})
+        dry_run = bool(payload.get("dry_run", False))
+        if not isinstance(params, dict):
+            self._send_json({"ok": False, "error": "params must be an object"}, HTTPStatus.BAD_REQUEST)
+            return
+        try:
+            self._send_json(RUNTIME.execute_tool(
+                tool,
+                params=params,
+                dry_run=dry_run,
                 expected_backend=str(payload.get("expected_backend", "")),
-                vehicles=vehicles if isinstance(vehicles, list) else None,
             ))
-            return
-        if path == "/api/camera/frame":
-            params = payload.get("params", {})
-            if not isinstance(params, dict):
-                self._send_json({"ok": False, "error": "params must be an object"}, HTTPStatus.BAD_REQUEST)
-                return
-            self._send_json(RUNTIME.capture_camera_frame(params))
-            return
+        except Exception as e:
+            # 工具异常必须带 traceback 落日志，否则前端只看到一个干巴巴的
+            # 错误字符串，无法定位（例如编码/模型返回格式问题）。
+            import logging
+            import traceback
 
-        if path == "/api/perception/view":
-            # 相机面板切相机/图像类型时走这里：把"看哪一路"变成感知轴的显式
-            # 动作，而不是让面板另开一条取流各看各的。
-            camera_name = str(payload.get("camera_name") or "").strip()
-            if not camera_name:
-                self._send_json({"ok": False, "error": "camera_name required"}, HTTPStatus.BAD_REQUEST)
-                return
-            self._send_json(RUNTIME.perception_set_view(camera_name))
-            return
-        if path == "/api/backend":
-            backend_id = str(payload.get("backend", ""))
-            connect_params = payload.get("connect_params")
-            connection_id = payload.get("connection_id")
-            if not backend_id:
-                self._send_json({"ok": False, "error": "backend required"}, HTTPStatus.BAD_REQUEST)
-                return
-            self._send_json(RUNTIME.set_backend(
-                backend_id,
-                connect_params=connect_params,
-                connection_id=connection_id,
-            ))
-            return
-
-        if path == "/api/settings/connections":
-            self._send_json(RUNTIME.save_connection_settings(payload))
-            return
-
-        if path == "/api/settings/agent-prompt":
-            self._send_json(RUNTIME.save_agent_instructions(str(payload.get("content") or "")))
-            return
-        if path == "/api/settings/application":
-            self._send_json(RUNTIME.save_application_settings(payload))
-            return
-
-        if path == "/api/settings/camera":
-            self._send_json(RUNTIME.save_camera_settings(payload))
-            return
-
-        # AirSim settings.json 模板（通信模式一键切换，自动备份）
-        if path == "/api/airsim-settings":
-            self._send_json({"ok": True, **RUNTIME.airsim_settings_info()})
-            return
-        if path == "/api/airsim-settings/apply":
-            template_id = str(payload.get("template") or "")
-            if not template_id:
-                self._send_json({"ok": False, "error": "template required"}, HTTPStatus.BAD_REQUEST)
-                return
-            self._send_json(RUNTIME.apply_airsim_settings_template(template_id))
-            return
-
-        if path == "/api/settings/vehicle-parameters/set":
-            name = str(payload.get("name", "")).strip()
-            if not name:
-                self._send_json({"ok": False, "error": "name required"}, HTTPStatus.BAD_REQUEST)
-                return
-            component_id = payload.get("component_id")
-            param_type = payload.get("param_type")
-            try:
-                clean_component_id = int(component_id) if component_id not in (None, "") else None
-            except (TypeError, ValueError):
-                self._send_json({"ok": False, "error": "component_id must be an integer"}, HTTPStatus.BAD_REQUEST)
-                return
-            try:
-                clean_param_type = int(param_type) if param_type not in (None, "") else None
-            except (TypeError, ValueError):
-                self._send_json({"ok": False, "error": "param_type must be an integer"}, HTTPStatus.BAD_REQUEST)
-                return
-            try:
-                timeout = float(payload.get("timeout", 3.0) or 3.0)
-            except (TypeError, ValueError):
-                timeout = 3.0
-            self._send_json(RUNTIME.set_vehicle_parameter(
-                name=name,
-                value=payload.get("value"),
-                component_id=clean_component_id,
-                param_type=clean_param_type,
-                timeout=timeout,
-            ))
-            return
-
-        if path == "/api/settings/connections/activate":
-            connection_id = str(payload.get("connection_id", ""))
-            if not connection_id:
-                self._send_json({"ok": False, "error": "connection_id required"}, HTTPStatus.BAD_REQUEST)
-                return
-            self._send_json(RUNTIME.activate_connection(connection_id))
-            return
-
-        # 显式断开：面板按真实端点识别出来的活动链路未必等于 settings 里记的
-        # active_connection_id，那种情况下 activate 的切换逻辑会变成"重连"。
-        if path == "/api/settings/connections/deactivate":
-            self._send_json(RUNTIME.deactivate_connection())
-            return
-
-        # P6: GCS MissionManager facade endpoints (UI and Agent unified path)
-        if path == "/api/gcs/mission":
-            draft_data = payload.get("draft") if isinstance(payload.get("draft"), dict) else payload
-            self._send_json(RUNTIME.gcs_mission_set(draft_data))
-            return
-        if path == "/api/gcs/mission/download":
-            self._send_json(RUNTIME.gcs_mission_download(expected_backend=str(payload.get("expected_backend", ""))))
-            return
-        if path == "/api/gcs/mission/upload":
-            draft_data = payload.get("draft") if isinstance(payload.get("draft"), dict) else (payload if payload else None)
-            self._send_json(RUNTIME.gcs_mission_upload(
-                draft_data,
-                expected_backend=str(payload.get("expected_backend", "")),
-            ))
-            return
-        if path == "/api/gcs/mission/start":
-            draft_data = payload.get("draft") if isinstance(payload.get("draft"), dict) else (payload if payload else None)
-            self._send_json(RUNTIME.gcs_mission_start(
-                draft_data,
-                expected_backend=str(payload.get("expected_backend", "")),
-            ))
-            return
-        if path == "/api/gcs/mission/start_multi":
-            assignments = payload.get("assignments")
-            self._send_json(RUNTIME.gcs_mission_start_multi(
-                assignments,
-                expected_backend=str(payload.get("expected_backend", "")),
-            ))
-            return
-        if path == "/api/gcs/mission/progress":
-            self._send_json(RUNTIME.gcs_mission_progress())
-            return
-        if path == "/api/gcs/mission/clear":
-            self._send_json(RUNTIME.gcs_mission_clear(expected_backend=str(payload.get("expected_backend", ""))))
-            return
-
-        # P5: operator approval endpoints for high-risk direct tool calls
-        if path == "/api/approve":
-            run_id = str(payload.get("run_id", ""))
-            if not run_id:
-                self._send_json({"ok": False, "error": "run_id required"}, HTTPStatus.BAD_REQUEST)
-                return
-            self._send_json(RUNTIME.approve_run(run_id))
-            return
-
-        if path == "/api/reject":
-            run_id = str(payload.get("run_id", ""))
-            if not run_id:
-                self._send_json({"ok": False, "error": "run_id required"}, HTTPStatus.BAD_REQUEST)
-                return
-            self._send_json(RUNTIME.reject_run(run_id))
-            return
-
-        # Replay: manual recording start/stop (runs auto-record in the runtime).
-        if path == "/api/replay/record":
-            action = str(payload.get("action", "")).strip().lower()
-            if action == "start":
-                self._send_json(RUNTIME.start_manual_replay(name=str(payload.get("name", ""))))
-            elif action == "stop":
-                self._send_json(RUNTIME.stop_manual_replay())
-            else:
-                self._send_json({"ok": False, "error": "action must be start or stop"}, HTTPStatus.BAD_REQUEST)
-            return
-
-        if path.startswith("/api/sessions"):
-            self._handle_session_post(path, payload)
-            return
-
-        if path == "/api/skills":
-            self._handle_skill_post(payload)
-            return
-
-        if path == "/api/models":
-            self._handle_model_post(payload)
-            return
-
-        # 拉取厂商当前实际提供的模型清单（厂商会改模型命名，不能靠写死的名字猜）
-        if path == "/api/models/catalog":
-            result = list_provider_models(
-                str(payload.get("base_url", "")),
-                str(payload.get("api_type", "openai")),
-                str(payload.get("api_key", "")),
+            logging.getLogger("ui").warning(
+                "tool_exception tool=%s: %s\n%s",
+                tool, e, "\n".join(traceback.format_exc().splitlines()[-25:]),
             )
-            self._send_json(result, HTTPStatus.OK if result.get("ok") else HTTPStatus.BAD_REQUEST)
-            return
+            self._send_json({"ok": False, "error": str(e)}, HTTPStatus.INTERNAL_SERVER_ERROR)
+        return
 
-        if path.startswith("/api/models/"):
-            self._handle_model_action(path, payload)
-            return
 
-        if path == "/api/tool":
-            tool = str(payload.get("tool", ""))
-            params = payload.get("params", {})
-            dry_run = bool(payload.get("dry_run", False))
-            if not isinstance(params, dict):
-                self._send_json({"ok": False, "error": "params must be an object"}, HTTPStatus.BAD_REQUEST)
-                return
-            try:
-                self._send_json(RUNTIME.execute_tool(
-                    tool,
-                    params=params,
-                    dry_run=dry_run,
-                    expected_backend=str(payload.get("expected_backend", "")),
-                ))
-            except Exception as e:
-                # 工具异常必须带 traceback 落日志，否则前端只看到一个干巴巴的
-                # 错误字符串，无法定位（例如编码/模型返回格式问题）。
-                import logging
-                import traceback
-
-                logging.getLogger("ui").warning(
-                    "tool_exception tool=%s: %s\n%s",
-                    tool, e, "\n".join(traceback.format_exc().splitlines()[-25:]),
-                )
-                self._send_json({"ok": False, "error": str(e)}, HTTPStatus.INTERNAL_SERVER_ERROR)
-            return
-
-        self._send_json({"ok": False, "error": "not found"}, HTTPStatus.NOT_FOUND)
+    def _ep_api_endpoints(self, req: "_Request") -> None:
+        self._send_json(
+            {"ok": True, "count": len(ROUTES), "endpoints": [route.public() for route in ROUTES]}
+        )
 
     def _read_json(self) -> dict:
         length = int(self.headers.get("Content-Length", "0"))
@@ -864,7 +984,7 @@ class AgentRequestHandler(BaseHTTPRequestHandler):
         if doc_path:
             try:
                 resolved = Path(doc_path).resolve()
-                skills_root = (REPO_ROOT / "skills").resolve()
+                skills_root = (REPO_ROOT / ".airsim_agent" / "skills").resolve()
                 if resolved == skills_root or skills_root in resolved.parents:
                     markdown = resolved.read_text(encoding="utf-8")
             except Exception:
@@ -955,7 +1075,7 @@ class AgentRequestHandler(BaseHTTPRequestHandler):
         if not doc_path:
             raise ValueError("skill has no SKILL.md document")
         resolved = Path(doc_path).resolve()
-        skills_root = (REPO_ROOT / "skills").resolve()
+        skills_root = (REPO_ROOT / ".airsim_agent" / "skills").resolve()
         if skills_root not in resolved.parents:
             raise ValueError("only workspace skills can be deleted")
         resolved.unlink()
@@ -974,7 +1094,7 @@ class AgentRequestHandler(BaseHTTPRequestHandler):
         if not doc_path:
             raise ValueError("skill has no SKILL.md document")
         resolved = Path(doc_path).resolve()
-        skills_root = (REPO_ROOT / "skills").resolve()
+        skills_root = (REPO_ROOT / ".airsim_agent" / "skills").resolve()
         if resolved == skills_root or skills_root not in resolved.parents:
             raise ValueError("skill document path is outside skills/")
         text = markdown.replace("\r\n", "\n").strip() + "\n"
@@ -998,30 +1118,31 @@ class AgentRequestHandler(BaseHTTPRequestHandler):
         if not skill_slug:
             raise ValueError("skill name required")
         action_name = f"skill:{skill_slug}"
-        skills_root = (REPO_ROOT / "skills").resolve()
+        skills_root = (REPO_ROOT / ".airsim_agent" / "skills").resolve()
         destination = (skills_root / skill_slug / "SKILL.md").resolve()
         if skills_root not in destination.parents:
             raise ValueError("invalid skill name")
         if destination.exists():
             raise ValueError(f"skill '{action_name}' already exists")
         display_name = str(payload.get("display_name") or skill_slug.replace("_", " ").title()).strip()
-        description = str(payload.get("description") or "Operator guidance for a UAV workflow.").strip()
+        description = str(payload.get("description") or "当操作员需要执行该工作流时使用本技能。").strip()
         markdown = payload.get("markdown")
         if not isinstance(markdown, str) or not markdown.strip():
-            # Trae/Codex 风格：frontmatter 只保留 name/description
+            # Trae/Codex 风格：frontmatter 只保留 name/description；
+            # 节标题用规范中文名（解析器把"使用时机/失败处理"读进卡片字段）。
             markdown = (
                 "---\n"
                 f"name: {skill_slug}\n"
                 f"description: {description}\n"
                 "---\n\n"
                 f"# {display_name}\n\n"
-                "## Purpose\n\n"
+                "## 目的\n\n"
                 f"{description}\n\n"
-                "## When to Use\n\n"
-                "Describe the operator intent that should activate this guidance.\n\n"
-                "## Operating Rules\n\n"
-                "- Read current vehicle state before issuing commands.\n"
-                "- Use only tools exposed by the active backend.\n"
+                "## 使用时机\n\n"
+                "描述应该在什么操作员意图下激活这份指导。\n\n"
+                "## 操作规则\n\n"
+                "- 下达指令前先读取飞行器当前状态。\n"
+                "- 只使用当前后端暴露的工具。\n"
             )
         text = markdown.replace("\r\n", "\n").strip() + "\n"
         destination.parent.mkdir(parents=True, exist_ok=False)
@@ -1136,7 +1257,9 @@ def _utc_now_iso() -> str:
 
 def _load_saved_backend() -> str:
     try:
-        data = json.loads((REPO_ROOT / "src" / "data" / "settings.json").read_text(encoding="utf-8"))
+        from src.paths import AGENT_HOME
+
+        data = json.loads((AGENT_HOME / "settings.json").read_text(encoding="utf-8"))
         return str(data.get("backend", ""))
     except Exception:
         return ""

@@ -140,13 +140,29 @@ def _title(body: str) -> str:
     return ""
 
 
+# 中文节标题 → 英文规范键。技能文档以中文书写，但卡片字段
+# （when_to_use / failure_policy / verification / parameters）按英文键取用；
+# 在解析时一次性归一，中英文标题产出完全相同的字段。
+_SECTION_ALIASES = {
+    "目的": "purpose",
+    "目标": "objective",
+    "使用时机": "when to use",
+    "何时使用": "when to use",
+    "失败处理": "failure policy",
+    "失败策略": "failure policy",
+    "验证": "verification",
+    "输入": "inputs",
+}
+
+
 def _sections(body: str) -> dict[str, str]:
     result: dict[str, list[str]] = {}
     current = ""
     for line in body.splitlines():
         stripped = line.strip()
         if stripped.startswith("## "):
-            current = stripped[3:].strip().lower()
+            key = stripped[3:].strip().lower()
+            current = _SECTION_ALIASES.get(key, key)
             result.setdefault(current, [])
             continue
         if current:

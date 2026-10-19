@@ -14,7 +14,7 @@ from typing import Any, Callable
 from .backends import BackendProfile, BackendRegistry, create_builtin_backend_registry
 from .llm_protocol import validate_json_schema
 from src.config import config
-from src.modules.formation import FLIGHT_ACTIONS, FormationController
+from src.modules.formation.controller import FLIGHT_ACTIONS, FormationController
 from src.modules.safety_validator import FlightConstraint, SafetyValidator, ValidationResult
 from src.tools.manifest import manifest_metadata, list_tool_manifest
 
@@ -36,14 +36,6 @@ TOOL_OUTPUT_SCHEMAS: dict[str, dict[str, Any]] = {
             "position_ned": {"type": "object"},
             "velocity_ned": {"type": "object"},
             "attitude_rad": {"type": "object"},
-        },
-    },
-    "airsim_task_status": {
-        "type": "object",
-        "properties": {
-            "status": {"type": "string"},
-            "task_id": {"type": "string"},
-            "terminal": {"type": "boolean"},
         },
     },
     "formation_command": {
@@ -126,53 +118,6 @@ class ToolCollector:
             return fn
 
         return decorator
-
-
-def _agent_subtask_tool_card() -> dict[str, Any]:
-    from .tool_cards import ToolCard
-
-    return ToolCard(
-        name="agent_subtask",
-        purpose="Delegate an open-ended interpretation subtask (multi-target confirmation, ambiguous goal analysis) to a bounded sub-agent that returns a structured report.",
-        when_to_use="When the goal needs several rounds of focused analysis that would consume the parent loop's step budget, or when an independent check of an ambiguous requirement is useful.",
-        inputs={
-            "goal": "one-sentence focused subtask for the sub-agent",
-            "constraints": "optional constraints (altitude limits, target list, no-fly hints)",
-            "max_steps": "sub-agent step budget (default 6)",
-            "model_id": "optional model id for the sub-agent",
-        },
-        outputs="structured report {status, summary, steps, findings}.",
-        risk="low",
-        kind="atomic",
-        execution_mode="immediate",
-    ).to_dict()
-
-
-def _agent_memory_tool_cards() -> list[dict[str, Any]]:
-    """Agent-level memory tool cards appended to the regular tool set so the
-    LLM can actively store and recall durable facts (agenticros-style)."""
-    from .tool_cards import ToolCard
-
-    return [
-        ToolCard(
-            name="memory_recall",
-            purpose="Recall previously stored facts, missions, lessons, and run transcripts from long-term memory.",
-            when_to_use="When the operator refers to an earlier task, fact, or lesson, or when past experience can inform the current decision.",
-            inputs={"query": "natural language search text", "limit": "max results (default 5)"},
-            outputs="matching memory records with relevance scores.",
-            risk="low",
-            kind="atomic",
-        ).to_dict(),
-        ToolCard(
-            name="memory_remember",
-            purpose="Store a durable fact about the mission or environment for future runs.",
-            when_to_use="When the operator states a persistent fact (target area, vehicle id, learned preference) that future tasks should know.",
-            inputs={"key": "short fact key", "value": "fact content", "tags": "optional comma-separated tags"},
-            outputs="stored confirmation.",
-            risk="low",
-            kind="atomic",
-        ).to_dict(),
-    ]
 
 
 def parse_no_fly_zones(raw: str | list[Any] | None) -> list[dict[str, float]]:
@@ -268,15 +213,10 @@ class ToolRuntime:
 
     READ_ONLY_TOOLS = {
         "drone_get_status",
-        "drone_get_firmware_info",
-        "drone_get_parameters",
-        "drone_list_vehicles",
         "drone_download_mission",
         "drone_get_mission_progress",
-        "airsim_take_photo",
         "airsim_get_sensors",
-        "airsim_get_depth_map",
-        "airsim_locate_point",
+        "locate_image_point",
         "inspect_current_frame",
         "provider_bridge_health",
         "provider_obstacle_summary",
@@ -288,19 +228,11 @@ class ToolRuntime:
         "drone_arm",
         "drone_disarm",
         "drone_takeoff",
-        # drone_dispatch_* 是**操作员/GCS 的异步（fire-and-forget）路径**：地面站的
-        # 编队/多机任务用它并行派发。它们刻意**没有卡片**，因此不进模型面（模型侧用
-        # drone_takeoff / drone_fly_path / drone_land）。别为了"对称"给它们补卡片。
-        "drone_dispatch_takeoff",
         "drone_land",
         "drone_hover",
         "drone_fly_to",
-        "drone_fly_velocity",
         "drone_move_relative",
         "drone_fly_path",
-        "drone_dispatch_path",
-        "drone_dispatch_land",
-        "drone_dispatch_return_land",
         "drone_upload_mission",
         "drone_clear_mission",
         "drone_start_mission",
@@ -312,7 +244,7 @@ class ToolRuntime:
     # TIMEOUT. Flight tools are deliberately excluded: a control call may have
     # partially executed before the timeout, and blind retries could double a
     # move; link-loss is handled by the reconnect path instead.
-    _RETRYABLE_READ_TOOLS = READ_ONLY_TOOLS | {"airsim_task_status", "airsim_task_cancel"}
+    _RETRYABLE_READ_TOOLS = READ_ONLY_TOOLS
 
     CONNECTION_ERROR_MARKERS = (
         "not connected",
@@ -333,7 +265,10 @@ class ToolRuntime:
         "\u672a\u8fde\u63a5",
         "\u8fde\u63a5\u88ab\u62d2",
     )
-    CAMERA_SOURCE_TOOLS = {"airsim_take_photo", "airsim_get_depth_map"}
+    # 相机链路工具：失败是相机的问题，不代表飞控链路断开（见
+    # _requires_vehicle_connection）。名字带 airsim_ 前缀，但读的是深度/几何，
+    # 不依赖飞控指令通道；真机上相机往往根本不在飞控链路上。
+    CAMERA_CHAIN_TOOLS = {"locate_image_point"}
 
     def __init__(
         self,
@@ -351,8 +286,6 @@ class ToolRuntime:
         self.camera_settings_provider = camera_settings_provider
         self.perception_axis = perception_axis
         self.vlm_provider = vlm_provider
-        self.camera_controller: Any | None = None
-        self.camera_collector: ToolCollector | None = None
         self.camera_key = ""
         self.camera_error = ""
         self._camera_lock = threading.RLock()
@@ -390,7 +323,7 @@ class ToolRuntime:
         if self.available and self.collector is not None:
             return True
         try:
-            from src.tools.core import register_core_tools
+            from src.tools.flight import register_flight_tools
 
             self.backend_profile = self.backend_registry.require(self.backend_id)
             capabilities = self.backend_profile.capabilities
@@ -406,7 +339,16 @@ class ToolRuntime:
             def fmt(data: dict[str, Any]) -> str:
                 return json.dumps(data, ensure_ascii=False, indent=2)
 
-            register_core_tools(self.collector, self.controller, fmt)
+            register_flight_tools(self.collector, self.controller, fmt)
+            # 任务组单独一个文件（mission.py）：GCS 专用，模型面没有卡片。
+            try:
+                from src.tools.mission import register_mission_tools
+
+                register_mission_tools(self.collector, self.controller, fmt)
+            except Exception as exc:
+                import logging
+
+                logging.getLogger(__name__).warning(f"mission tools skipped: {exc}")
 
             # Optional tool groups: failures must not block core tools.
             # 图像工具跟着"相机源"走，不跟飞行后端绑死：
@@ -416,36 +358,16 @@ class ToolRuntime:
             # 这样无论飞控走哪条链路，LLM 拿到的拍照工具都从当前相机源取图。
             # 只有"有相机源"才注册图像工具。旧写法还 OR 了 object_detection，
             # 那是检测时代的能力键，已随 YOLO 一起移除（见 backends.py 的说明）。
-            if merged_capabilities.get("image_capture"):
+            if merged_capabilities.get("image_capture") and self.backend_id == "airsim":
+                # 相机源不再注册模型面工具：看画面走感知轴的 inspect_current_frame，
+                # 测距/算坐标走 locate_image_point，两者都与飞行后端解耦。
                 try:
-                    if self.backend_id == "airsim":
-                        from src.tools.perception import register_perception_tools
+                    from src.tools.sensors import register_sensor_tools
 
-                        register_perception_tools(self.collector, self.controller, fmt)
-                    else:
-                        cam_collector, cam_err = self._ensure_camera_tools()
-                        if cam_collector is not None:
-                            for tool_name, tool_fn in cam_collector.tools.items():
-                                self.collector.tools[tool_name] = self._adapt_camera_tool(tool_fn)
-                        elif cam_err:
-                            import logging
-
-                            logging.getLogger(__name__).warning(f"camera source tools skipped: {cam_err}")
+                    register_sensor_tools(self.collector, self.controller, fmt)
                 except Exception as exc:
                     import logging
                     logging.getLogger(__name__).warning(f"perception tools skipped: {exc}")
-            if merged_capabilities.get("depth_perception"):
-                try:
-                    from src.modules.airsim_controller import AirSimController
-                    from src.tools.vision import register_vision_tools
-
-                    depth_controller = self.controller if self.backend_id == "airsim" else self.camera_controller
-                    if isinstance(depth_controller, AirSimController):
-                        # 深度图只来自 AirSim 仿真相机；RTSP/本机相机没有深度。
-                        register_vision_tools(self.collector, depth_controller, fmt)
-                except Exception as exc:
-                    import logging
-                    logging.getLogger(__name__).warning(f"vision tools skipped: {exc}")
             if capabilities.ros2_topics:
                 try:
                     from src.tools.providers import register_provider_tools
@@ -460,8 +382,18 @@ class ToolRuntime:
             # is useful even when the axis has no frames yet (its fallback
             # pulls one frame directly from the camera), so we do not gate on
             # axis.is_online -- the tool itself reports an explanatory error.
-            axis_configured = self.perception_axis is not None and getattr(self.perception_axis, "enabled", False)
-            if axis_configured or getattr(self, "vlm_provider", None) is not None:
+            # 真机只暴露基本控制工具：感知/相机类工具一律不注册（卡片随之消失）。
+            # 真机上没有仿真相机链路，"Agent 有相机能力"必须是假命题；操作员仍能
+            # 在界面上看相机预览——那是感知轴自己的事，不是模型的工具面。
+            perception_tools_allowed = not self._real_vehicle
+            axis_configured = (
+                perception_tools_allowed
+                and self.perception_axis is not None
+                and getattr(self.perception_axis, "enabled", False)
+            )
+            if perception_tools_allowed and (
+                axis_configured or getattr(self, "vlm_provider", None) is not None
+            ):
                 # Also reached with an unconfigured axis when the active model can
                 # see images, so inspect_current_frame still serves the UI camera
                 # panel fallback path.
@@ -501,10 +433,6 @@ class ToolRuntime:
             self.camera_error = str(exc)
             return {}
 
-    def _camera_source_enabled(self) -> bool:
-        settings = self._camera_settings()
-        return str(settings.get("source") or "").lower() in {"airsim", "rtsp", "local"}
-
     def _perception_camera_controller(self) -> Any | None:
         """感知轴正在用的那个相机控制器（AirSim）。
 
@@ -520,7 +448,7 @@ class ToolRuntime:
         if not callable(provider):
             return None
         try:
-            from src.modules.perception_airsim_adapter import _resolve_controller
+            from src.modules.perception.airsim_adapter import _resolve_controller
 
             return _resolve_controller(provider)
         except Exception:
@@ -533,8 +461,9 @@ class ToolRuntime:
         vehicle_name: str = "",
         hint_w: float = 0.0,
         hint_h: float = 0.0,
+        extra_points: list[tuple[float, float]] | None = None,
     ) -> dict[str, Any]:
-        """归一化图像点 → 距离 + 世界坐标（``airsim_locate_point`` 的实现）。
+        """归一化图像点 → 距离 + 世界坐标（``locate_image_point`` 的实现）。
 
         纯读取：深度图 + 无人机位姿 → NED。几何只有一份实现在
         ``perception_airsim_adapter.project_point_to_world`` 里；这里只负责解析
@@ -562,7 +491,7 @@ class ToolRuntime:
         if frame_w > 0 and frame_h > 0:
             frame_shape = (frame_h, frame_w)
         try:
-            from src.modules.perception_airsim_adapter import project_point_to_world
+            from src.modules.perception.airsim_adapter import project_point_to_world
 
             return project_point_to_world(
                 frame_provider=controller,
@@ -573,6 +502,7 @@ class ToolRuntime:
                 frame_shape=frame_shape,
                 hint_w=float(hint_w or 0.0),
                 hint_h=float(hint_h or 0.0),
+                extra_points=list(extra_points or []),
             )
         except Exception as exc:  # noqa: BLE001 — 给模型一句可执行的话，不抛穿
             return {"valid": False, "reason": "projection_error", "message": f"点位投影失败: {exc}"}
@@ -610,23 +540,19 @@ class ToolRuntime:
             "preview": snapshot.get("preview") or {},
         }
 
-    def _camera_tools_ready(self) -> bool:
-        """相机工具是否真的注册成功了（而不是"配置里写了相机源"）。
-
-        配置写了 airsim/rtsp 不等于相机源连得上：连接失败时相机工具集为空，
-        此时若仍把 airsim_take_photo / airsim_get_depth_map 声明为可用，Agent
-        就会规划出根本无法执行的步骤——实测任务正是失败在 "unknown tool" 上。
-        判断只看已经注册好的相机收集器，不做任何阻塞式连接。
-        """
-        collector = getattr(self, "camera_collector", None)
-        if collector is None:
-            return False
-        return bool(self.CAMERA_SOURCE_TOOLS & set(getattr(collector, "tools", {}) or {}))
-
     def _camera_capabilities(self, capabilities: dict[str, Any]) -> dict[str, Any]:
         merged = dict(capabilities or {})
         settings = self._camera_settings()
         source = str(settings.get("source") or "").lower()
+        # 真机（real_vehicle）不向模型暴露任何感知/相机能力：工具不注册、卡片不出现。
+        if self._real_vehicle:
+            merged["camera_source"] = source
+            merged["image_capture"] = False
+            merged["target_search"] = False
+            merged["target_tracking"] = False
+            merged["depth_perception"] = False
+            merged["image_capture_via"] = "none"
+            return merged
         axis = getattr(self, "perception_axis", None)
         axis_enabled = bool(axis is not None and getattr(axis, "enabled", False))
         # 感知能力跟随感知轴，不跟随飞行后端。px4_mavlink/px4_ros2 下感知轴
@@ -666,193 +592,6 @@ class ToolRuntime:
             merged["camera_index"] = settings.get("camera_name", "0")
             merged["image_capture_via"] = "local_camera"
         return merged
-
-    def _camera_tool_spec(self, name: str) -> ToolSpec | None:
-        settings = self._camera_settings()
-        if name == "airsim_take_photo":
-            return ToolSpec(
-                name="airsim_take_photo",
-                category="perception",
-                description="Capture a PNG frame from the configured AirSim camera source.",
-                parameters={
-                    "camera_name": {"default": settings.get("camera_name", "0"), "annotation": "str"},
-                    "vehicle_name": {"default": settings.get("vehicle_name", ""), "annotation": "str"},
-                    "image_type": {"default": settings.get("image_type", "scene"), "annotation": "str"},
-                    "auto_save": {"default": settings.get("auto_save", False), "annotation": "bool"},
-                    "timeout_sec": {"default": settings.get("timeout_sec", 30.0), "annotation": "float"},
-                },
-            )
-        if name == "airsim_get_depth_map":
-            return ToolSpec(
-                name="airsim_get_depth_map",
-                category="perception",
-                description="Read a depth image from the configured AirSim camera source.",
-                parameters={
-                    "camera_name": {"default": settings.get("camera_name", "0"), "annotation": "str"},
-                    "vehicle_name": {"default": settings.get("vehicle_name", ""), "annotation": "str"},
-                    "return_vis": {"default": False, "annotation": "bool"},
-                    "query_points": {"default": "", "annotation": "str"},
-                },
-            )
-        return None
-
-    def _ensure_camera_tools(self) -> tuple[ToolCollector | None, str]:
-        settings = self._camera_settings()
-        source = str(settings.get("source") or "").lower()
-        if source == "rtsp":
-            return self._ensure_rtsp_camera_tools(settings)
-        if source == "local":
-            return self._ensure_local_camera_tools(settings)
-        if source != "airsim":
-            return None, "camera source is not AirSim"
-
-        host = str(settings.get("host") or "127.0.0.1")
-        try:
-            port = int(settings.get("port") or config.airsim_port)
-        except (TypeError, ValueError):
-            port = config.airsim_port
-        key = f"airsim:{host}:{port}"
-
-        if self.camera_key != key:
-            if self.camera_controller is not None:
-                try:
-                    self.camera_controller.disconnect()
-                except Exception:
-                    pass
-            self.camera_controller = None
-            self.camera_collector = None
-            self.camera_key = key
-
-        if self.camera_controller is not None and self.camera_collector is not None:
-            if bool(getattr(self.camera_controller, "is_connected", False)):
-                return self.camera_collector, ""
-            self.camera_controller = None
-            self.camera_collector = None
-
-        try:
-            from src.modules.airsim_controller import AirSimController
-            from src.tools.perception import register_perception_tools
-            from src.tools.vision import register_vision_tools
-
-            controller = AirSimController(ip=host, port=port)
-            info = controller.connect(ip=host, port=port)
-            if not info.connected:
-                details = getattr(info, "details", {}) or {}
-                message = details.get("message") if isinstance(details, dict) else ""
-                self.camera_error = message or "AirSim camera source is not connected"
-                return None, self.camera_error
-
-            collector = ToolCollector()
-
-            def fmt(data: dict[str, Any]) -> str:
-                return json.dumps(data, ensure_ascii=False, indent=2)
-
-            register_perception_tools(collector, controller, fmt)
-            register_vision_tools(collector, controller, fmt)
-            if "airsim_take_photo" not in collector.tools:
-                self.camera_error = "AirSim camera tool registration failed"
-                controller.disconnect()
-                return None, self.camera_error
-
-            self.camera_controller = controller
-            self.camera_collector = collector
-            self.camera_error = ""
-            return collector, ""
-        except Exception as exc:
-            self.camera_error = str(exc)
-            return None, self.camera_error
-
-    def _ensure_rtsp_camera_tools(self, settings: dict[str, Any]) -> tuple[ToolCollector | None, str]:
-        """Camera tool set for a real onboard camera pushed over RTSP."""
-        url = str(settings.get("url") or settings.get("rtsp_url") or "").strip()
-        if not url:
-            self.camera_error = "rtsp camera source requires a stream URL"
-            return None, self.camera_error
-        rtsp_transport = str(settings.get("transport") or "").strip().lower()
-        rtsp_timeout = _rtsp_open_timeout(settings.get("timeout_sec"))
-        key = f"rtsp:{url}|{rtsp_transport}"
-
-        if self.camera_key != key:
-            if self.camera_controller is not None:
-                try:
-                    self.camera_controller.disconnect()
-                except Exception:
-                    pass
-            self.camera_controller = None
-            self.camera_collector = None
-            self.camera_key = key
-
-        if self.camera_controller is not None and self.camera_collector is not None:
-            if bool(getattr(self.camera_controller, "is_connected", False)):
-                return self.camera_collector, ""
-            self.camera_controller = None
-            self.camera_collector = None
-
-        try:
-            from src.modules.rtsp_camera_controller import RtspCameraController
-
-            controller = RtspCameraController(
-                url,
-                transport=rtsp_transport,
-                open_timeout_sec=rtsp_timeout,
-            )
-            info = controller.connect()
-            if not info.connected:
-                self.camera_error = controller.last_error or "rtsp camera source is not connected"
-                return None, self.camera_error
-
-            collector = ToolCollector()
-            self._register_rtsp_camera_tools(collector, controller)
-            self.camera_controller = controller
-            self.camera_collector = collector
-            self.camera_error = ""
-            return collector, ""
-        except Exception as exc:
-            self.camera_error = str(exc)
-            return None, self.camera_error
-
-    def _ensure_local_camera_tools(self, settings: dict[str, Any]) -> tuple[ToolCollector | None, str]:
-        """Camera tool set for a local webcam / USB camera (pipeline testing)."""
-        try:
-            index = int(settings.get("camera_name") or 0)
-        except (TypeError, ValueError):
-            index = 0
-        key = f"local:{index}"
-
-        if self.camera_key != key:
-            if self.camera_controller is not None:
-                try:
-                    self.camera_controller.disconnect()
-                except Exception:
-                    pass
-            self.camera_controller = None
-            self.camera_collector = None
-            self.camera_key = key
-
-        if self.camera_controller is not None and self.camera_collector is not None:
-            if bool(getattr(self.camera_controller, "is_connected", False)):
-                return self.camera_collector, ""
-            self.camera_controller = None
-            self.camera_collector = None
-
-        try:
-            from src.modules.rtsp_camera_controller import LocalCameraController
-
-            controller = LocalCameraController(index)
-            info = controller.connect()
-            if not info.connected:
-                self.camera_error = controller.last_error or "local camera is not available"
-                return None, self.camera_error
-
-            collector = ToolCollector()
-            self._register_rtsp_camera_tools(collector, controller)
-            self.camera_controller = controller
-            self.camera_collector = collector
-            self.camera_error = ""
-            return collector, ""
-        except Exception as exc:
-            self.camera_error = str(exc)
-            return None, self.camera_error
 
     def _ensure_formation_tools(self) -> tuple[ToolCollector | None, str]:
         """Register the formation_command tool on formation-capable backends.
@@ -1007,162 +746,13 @@ class ToolRuntime:
             except Exception:
                 pass
 
-    @staticmethod
-    def _register_rtsp_camera_tools(collector: ToolCollector, controller: Any) -> None:
-        """Single photo tool for RTSP sources (real cameras: scene only)."""
-
-        @collector.tool()
-        def airsim_take_photo(
-            camera_name: str = "0",
-            image_type: str = "scene",
-            vehicle_name: str = "",
-            auto_save: bool = False,
-            timeout_sec: float = 30.0,
-        ) -> str:
-            """Capture a JPEG frame from the RTSP camera source."""
-            import base64
-
-            raw = controller.capture_image(
-                camera_name=camera_name,
-                image_type=image_type,
-                vehicle_name=vehicle_name,
-                timeout=float(timeout_sec or 30.0),
-            )
-            if raw is None:
-                return json.dumps(
-                    {
-                        "status": "error",
-                        "backend": controller.backend_name,
-                        "message": controller.last_error or "frame capture failed",
-                    },
-                    ensure_ascii=False,
-                )
-            return json.dumps(
-                {
-                    "status": "ok",
-                    "backend": controller.backend_name,
-                    "image_base64": base64.b64encode(raw).decode("ascii"),
-                    "format": "jpeg",
-                    "source": "rtsp",
-                    "message": "frame captured from RTSP camera",
-                },
-                ensure_ascii=False,
-            )
-
-    @staticmethod
-    def _adapt_camera_tool(fn: Callable[..., str]) -> Callable[..., str]:
-        """按函数签名过滤入参：不同相机源（AirSim/RTSP/本机）的拍照工具
-        参数集不同（例如 RTSP 版没有 save_path）。LLM 按统一卡片
-        传参时，多出来的键不应变成 TypeError。"""
-        import functools
-        import inspect
-
-        try:
-            sig = inspect.signature(fn)
-        except (TypeError, ValueError):
-            return fn
-        accepted = set(sig.parameters)
-
-        @functools.wraps(fn)
-        def _wrapped(**kwargs: Any) -> str:
-            return fn(**{k: v for k, v in kwargs.items() if k in accepted})
-
-        return _wrapped
-
-    def _camera_params(self, name: str, params: dict[str, Any]) -> dict[str, Any]:
-        settings = self._camera_settings()
-        merged = dict(params or {})
-        if name == "airsim_take_photo":
-            merged["camera_name"] = str(merged.get("camera_name") or settings.get("camera_name") or "0")
-            merged["vehicle_name"] = str(merged.get("vehicle_name") or settings.get("vehicle_name") or "")
-            merged["image_type"] = str(merged.get("image_type") or settings.get("image_type") or "scene")
-            if "auto_save" not in merged:
-                merged["auto_save"] = bool(settings.get("auto_save", False))
-            if "timeout_sec" not in merged:
-                merged["timeout_sec"] = float(settings.get("timeout_sec") or 30.0)
-        elif name == "airsim_get_depth_map":
-            merged["camera_name"] = str(merged.get("camera_name") or settings.get("camera_name") or "0")
-            merged["vehicle_name"] = str(merged.get("vehicle_name") or settings.get("vehicle_name") or "")
-        return merged
-
-    def _execute_camera_tool(self, name: str, params: dict[str, Any], started: float) -> ToolCallResult:
-        if name not in self.CAMERA_SOURCE_TOOLS:
-            return ToolCallResult(
-                name,
-                params,
-                False,
-                {"status": "error", "message": f"unknown camera tool: {name}"},
-                started,
-                time.time(),
-            )
-
-        collector, error = self._ensure_camera_tools()
-        if collector is None:
-            return ToolCallResult(
-                name,
-                params,
-                False,
-                {
-                    "status": "error",
-                    "message": f"AirSim camera source unavailable: {error or 'unknown error'}",
-                    "camera_source": self._camera_settings(),
-                },
-                started,
-                time.time(),
-            )
-
-        fn = collector.tools.get(name)
-        if not fn:
-            return ToolCallResult(
-                name,
-                params,
-                False,
-                {"status": "error", "message": f"camera tool not registered: {name}"},
-                started,
-                time.time(),
-            )
-
-        safe_params = self._camera_params(name, params)
-        try:
-            safety = self.validate(name, safe_params)
-            with self._camera_lock:
-                raw = fn(**safe_params)
-            data = json.loads(raw) if isinstance(raw, str) else {"status": "ok", "result": raw}
-            status = str(data.get("status", "ok")).strip().lower()
-            ok = status not in {"error", "blocked", "failed", "cancelled", "canceled"}
-            return ToolCallResult(
-                name,
-                safe_params,
-                ok,
-                data,
-                started,
-                time.time(),
-                safety=safety,
-            )
-        except Exception as exc:
-            return ToolCallResult(
-                name,
-                safe_params,
-                False,
-                {"status": "error", "message": str(exc), "camera_source": self._camera_settings()},
-                started,
-                time.time(),
-            )
-
-    # Real devices (local webcam / RTSP) must NOT stay opened when no preview
-    # request arrives for a while — otherwise e.g. a laptop webcam "in use" LED
-    # stays lit forever even though nobody is viewing it. Release idle preview
-    # controllers after this many seconds of no use.
-    PREVIEW_IDLE_RELEASE_SEC = 3.0
-
     def _ensure_preview_controller(self, params: dict[str, Any] | None = None) -> tuple[Any | None, str]:
         """Build (or reuse) a camera controller for a single UI preview frame.
 
-        Unlike ``_ensure_camera_tools`` (which keeps ONE global controller for the
-        agent's configured source), this honours an optional per-request
-        ``source``/``url`` override so multiple viewer windows can display
-        *different* sources at the same time — e.g. one window on the AirSim
-        drone, another on a real drone's RTSP stream for digital-twin work.
+        It honours an optional per-request ``source``/``url`` override so
+        multiple viewer windows can display *different* sources at the same
+        time — e.g. one window on the AirSim drone, another on a real drone's
+        RTSP stream for digital-twin work.
 
         Controllers are cached by a source-specific key and reused across
         requests to avoid reconnecting on every frame.
@@ -1213,12 +803,12 @@ class ToolRuntime:
                     pass
             try:
                 if source == "airsim":
-                    from src.modules.airsim_controller import AirSimController
+                    from src.modules.backends.airsim import AirSimController
 
                     controller = AirSimController(ip=host, port=port)
                     info = controller.connect(ip=host, port=port)
                 elif source == "rtsp":
-                    from src.modules.rtsp_camera_controller import RtspCameraController
+                    from src.modules.perception.rtsp_camera import RtspCameraController
 
                     controller = RtspCameraController(
                         url,
@@ -1227,7 +817,7 @@ class ToolRuntime:
                     )
                     info = controller.connect()
                 else:
-                    from src.modules.rtsp_camera_controller import LocalCameraController
+                    from src.modules.perception.rtsp_camera import LocalCameraController
 
                     controller = LocalCameraController(index)
                     info = controller.connect()
@@ -1243,8 +833,8 @@ class ToolRuntime:
 
     # 视觉抵近武器库（fallback target / 目标距离估计 / 前向避障 / 自动对准 /
     # approach_target_step）随 drone_approach_target 一起删除：运行时不再持有任何
-    # 抵近策略。靠近由模型按技能用"VLM 取点 + airsim_get_depth_map + 有界
-    # drone_move_relative"完成；净空判断写进技能，用深度点读数做。
+    # 抵近策略。靠近由模型按技能用"VLM 取点 + locate_image_point（多点测距）+
+    # 有界 drone_move_relative"完成；净空判断写进技能，用多点距离读数做。
 
 
     def acquire_control_gate(self, blocking: bool = False, timeout: float = -1.0) -> bool:
@@ -1396,9 +986,9 @@ class ToolRuntime:
     def capture_camera_preview(self, params: dict[str, Any] | None = None) -> tuple[bool, bytes, str, dict[str, Any]]:
         """Return one lightweight preview frame for the UI.
 
-        Preview frames intentionally bypass the full airsim_take_photo tool
-        path: no stationary check, no retry/cooldown loop, no base64 JSON.
-        Agent visual reasoning still uses governed tools.
+        Preview frames are the UI's own fast path (shared cached frame or a
+        direct grab) — no still-frame stationary check, no retry/cooldown loop,
+        no base64 JSON. Agent visual reasoning still uses governed tools.
         """
         raw_params = dict(params or {})
         settings = self._camera_settings()
@@ -1763,56 +1353,6 @@ class ToolRuntime:
         specs = []
         for name, fn in sorted(collector.tools.items()):
             specs.append(self._spec_for(name, fn).__dict__)
-        if self._camera_tools_ready() and self._camera_capabilities({}).get("image_capture"):
-            for camera_tool in sorted(self.CAMERA_SOURCE_TOOLS):
-                if camera_tool not in collector.tools:
-                    camera_spec = self._camera_tool_spec(camera_tool)
-                    if camera_spec is not None:
-                        specs.append(camera_spec.__dict__)
-        specs.append(
-            ToolSpec(
-                name="memory_store",
-                category="memory",
-                description="Write the current mission summary into long-term memory.",
-                parameters={"source": {"default": "mission", "annotation": "str"}},
-            ).__dict__
-        )
-        specs.append(
-            ToolSpec(
-                name="memory_recall",
-                category="memory",
-                description="Recall previously stored facts, missions, lessons, and run transcripts from long-term memory.",
-                parameters={
-                    "query": {"default": None, "annotation": "str", "required": True},
-                    "limit": {"default": 5, "annotation": "int"},
-                },
-            ).__dict__
-        )
-        specs.append(
-            ToolSpec(
-                name="memory_remember",
-                category="memory",
-                description="Store a durable fact about the mission or environment for future runs.",
-                parameters={
-                    "key": {"default": None, "annotation": "str", "required": True},
-                    "value": {"default": None, "annotation": "str", "required": True},
-                    "tags": {"default": None, "annotation": "str"},
-                },
-            ).__dict__
-        )
-        specs.append(
-            ToolSpec(
-                name="agent_subtask",
-                category="agent",
-                description="Delegate an open-ended interpretation subtask to a bounded sub-agent that returns a structured report.",
-                parameters={
-                    "goal": {"default": None, "annotation": "str", "required": True},
-                    "constraints": {"default": None, "annotation": "str"},
-                    "max_steps": {"default": 6, "annotation": "int"},
-                    "model_id": {"default": None, "annotation": "str"},
-                },
-            ).__dict__
-        )
         for spec in specs:
             if isinstance(spec, dict):
                 spec["manifest"] = manifest_metadata(str(spec.get("name") or ""))
@@ -1828,20 +1368,12 @@ class ToolRuntime:
         if not collector or not backend_profile:
             return []
         available = set(collector.tools)
-        available.add("memory_store")
-        # runtime 直接分派、不注册到 collector 的工具，也要让卡片可见
-        available.update({"memory_recall", "memory_remember", "agent_subtask"})
         if "formation_command" in collector.tools:
             available.add("formation_command")
         capabilities = self._camera_capabilities(backend_profile.capabilities.to_dict())
-        if self._camera_tools_ready():
-            available.update(self.CAMERA_SOURCE_TOOLS)
         from .tool_cards import cards_for_capabilities
 
-        cards = cards_for_capabilities(capabilities, available)
-        cards.extend(_agent_memory_tool_cards())
-        cards.append(_agent_subtask_tool_card())
-        return cards
+        return cards_for_capabilities(capabilities, available)
 
     def reset_connection(self) -> None:
         """Drop the current controller/tool registry so the next call starts fresh."""
@@ -1966,16 +1498,6 @@ class ToolRuntime:
         params = dict(params or {})
         started = time.time()
 
-        if name == "memory_store":
-            return ToolCallResult(
-                name,
-                params,
-                True,
-                {"status": "ok", "message": "memory handled by runtime"},
-                started,
-                time.time(),
-            )
-
         if dry_run:
             try:
                 safety = self.validate(name, params)
@@ -1999,30 +1521,6 @@ class ToolRuntime:
                 safety=safety,
             )
 
-        if name in self.CAMERA_SOURCE_TOOLS and self.backend_id != "airsim":
-            # 拒绝条件看"相机工具是否真的注册成功"，而不是"设置里写了相机源"：
-            # 配置了源但注册失败（源不可达）时，旧条件判为"允许执行"，然后静默
-            # 落到工具查找失败，报出含糊的 unknown tool。这台情况下给出明确的
-            # 相机源提示。_camera_tools_ready() 的注释记录过同一个故障。
-            if not self._camera_tools_ready():
-                return ToolCallResult(
-                    name,
-                    params,
-                    False,
-                    {
-                        "status": "error",
-                        "message": (
-                            f"{name} needs a camera source. On the current "
-                            f"{self.backend_id} backend configure a camera source "
-                            "(AirSim/RTSP/local) or use perception_status and "
-                            "inspect_current_frame for the perception axis stream."
-                        ),
-                    },
-                    started,
-                    time.time(),
-                    error_code="BLOCKED",
-                )
-
         if blocked_by_supervisor and name not in {"drone_hover", "drone_land", "drone_get_status"}:
             return ToolCallResult(
                 name,
@@ -2042,7 +1540,7 @@ class ToolRuntime:
         if (
             self.formation_active()
             and name in self.CONTROL_TOOLS
-            and name not in {"drone_hover", "drone_land", "drone_get_status", "drone_disconnect", "drone_connect", "airsim_task_cancel"}
+            and name not in {"drone_hover", "drone_land", "drone_get_status", "drone_disconnect", "drone_connect"}
         ):
             return ToolCallResult(
                 name,
@@ -2417,13 +1915,6 @@ class ToolRuntime:
             if result.corrected and "z" in result.corrected:
                 corrected["altitude"] = abs(float(result.corrected["z"]))
 
-        elif name == "drone_dispatch_takeoff":
-            altitude = abs(float(params.get("altitude", 3.0)))
-            result = self.safety.validate_position(0.0, 0.0, -altitude)
-            merge(result)
-            if result.corrected and "z" in result.corrected:
-                corrected["altitude"] = abs(float(result.corrected["z"]))
-
         elif name == "drone_fly_to":
             x = float(params.get("x", 0.0))
             y = float(params.get("y", 0.0))
@@ -2440,38 +1931,6 @@ class ToolRuntime:
             merge(vel)
             if vel.corrected:
                 corrected["velocity"] = abs(float(vel.corrected["vx"]))
-
-        elif name == "drone_fly_velocity":
-            vx = float(params.get("vx", 0.0))
-            vy = float(params.get("vy", 0.0))
-            vz = float(params.get("vz", 0.0))
-            result = self.safety.validate_velocity(vx, vy, vz)
-            merge(result)
-            if result.corrected:
-                corrected.update(result.corrected)
-            # 速度校验只看瞬时矢量，看不出 duration 蕴含的位移：5m/s 下降 60 秒
-            # 会从 3 米高度扎进地面，8m/s 飞 300 秒会飞出 100 米围栏 2.4 公里。
-            # 所以按 duration 推算落点，走与 drone_fly_to 相同的检查；读不到
-            # 当前位置时退化为"整段位移必须放得进围栏"这个不需要遥测的界。
-            duration = float(params.get("duration", 0.0) or 0.0)
-            if duration > 0.0:
-                speed = math.sqrt(vx * vx + vy * vy + vz * vz)
-                displacement = speed * duration
-                position = self._current_position()
-                if position is not None:
-                    end = self.safety.validate_position(
-                        position[0] + vx * duration,
-                        position[1] + vy * duration,
-                        position[2] + vz * duration,
-                    )
-                    merge(end)
-                elif displacement > self.safety.constraints.max_distance_from_home:
-                    level = "danger"
-                    violations.append(
-                        f"速度指令位移 {displacement:.1f}m 超过围栏半径 "
-                        f"{self.safety.constraints.max_distance_from_home:.0f}m，"
-                        "且当前无法读取位置以确认落点"
-                    )
 
         elif name == "drone_move_relative":
             forward_m = float(params.get("forward_m", 0.0))
@@ -2518,7 +1977,7 @@ class ToolRuntime:
 
         elif name == "drone_fly_path":
             try:
-                waypoints = json.loads(str(params.get("waypoints_json", "[]")))
+                waypoints = json.loads(str(params.get("waypoints", "[]")))
                 changed = False
                 safe_waypoints = []
                 # 航点是折线，逐段检查是否穿越禁飞区（落点检查看不出穿越）。
@@ -2538,48 +1997,10 @@ class ToolRuntime:
                     previous = (x, y, z)
                     safe_waypoints.append({"x": x, "y": y, "z": z})
                 if changed:
-                    corrected["waypoints_json"] = json.dumps(safe_waypoints, ensure_ascii=False)
+                    corrected["waypoints"] = json.dumps(safe_waypoints, ensure_ascii=False)
             except Exception as e:
                 level = "danger"
                 violations.append(f"waypoint JSON could not be parsed: {e}")
-
-        elif name == "drone_dispatch_path":
-            try:
-                waypoints = json.loads(str(params.get("waypoints_json", "[]")))
-                changed = False
-                safe_waypoints = []
-                # 航点是折线，逐段检查是否穿越禁飞区（落点检查看不出穿越）。
-                previous: tuple[float, float, float] | None = self._current_position()
-                for wp in waypoints:
-                    x = float(wp.get("x", 0.0))
-                    y = float(wp.get("y", 0.0))
-                    z = float(wp.get("z", -3.0))
-                    result = self.safety.validate_position(x, y, z)
-                    merge(result)
-                    if result.corrected:
-                        x = float(result.corrected.get("x", x))
-                        y = float(result.corrected.get("y", y))
-                        z = float(result.corrected.get("z", z))
-                        changed = True
-                    level = self._apply_leg_zone_check(previous, (x, y, z), violations, level)
-                    previous = (x, y, z)
-                    safe_waypoints.append({"x": x, "y": y, "z": z})
-                if changed:
-                    corrected["waypoints_json"] = json.dumps(safe_waypoints, ensure_ascii=False)
-            except Exception as e:
-                level = "danger"
-                violations.append(f"waypoint JSON could not be parsed: {e}")
-
-        elif name == "drone_dispatch_return_land":
-            x = float(params.get("x", 0.0))
-            y = float(params.get("y", 0.0))
-            z = float(params.get("z", -3.0))
-            result = self.safety.validate_position(x, y, z)
-            merge(result)
-            if result.corrected:
-                for key in ("x", "y", "z"):
-                    if key in result.corrected:
-                        corrected[key] = result.corrected[key]
 
         elif name == "drone_upload_mission":
             try:
@@ -2916,14 +2337,6 @@ class ToolRuntime:
             vehicles_status = self._vehicles_status(connected)
             # 围栏圆心必须跟着飞控的真实 home 走，否则真机上围的是 EKF 原点。
             self._sync_geofence_home()
-            # 已派发航线（fire-and-forget）的完成跟踪，供 UI 提示"飞行结束"
-            flight_tasks: dict[str, Any] = {}
-            update_tasks = getattr(self.controller, "update_flight_task_progress", None)
-            if callable(update_tasks):
-                try:
-                    flight_tasks = update_tasks(vehicles_status) or {}
-                except Exception:
-                    flight_tasks = {}
             snapshot = {
                 "ready": ready,
                 "init_error": self.init_error,
@@ -2936,7 +2349,7 @@ class ToolRuntime:
                 "backends": self.backend_registry.list_public(),
                 "drone": drone_status,
                 "vehicles": vehicles_status,
-                "flight_tasks": flight_tasks,
+                "flight_tasks": {},
                 "perception": self._perception_health(),
                 "operation_contract": self._operation_contract(drone_status),
                 "map_origin": self._map_origin(),
@@ -3115,112 +2528,6 @@ class ToolRuntime:
         finally:
             self._lock.release()
 
-    def vehicle_parameters(
-        self,
-        refresh: bool = False,
-        query: str = "",
-        limit: int = 200,
-        offset: int = 0,
-        timeout: float = 20.0,
-    ) -> dict[str, Any]:
-        """Return active vehicle parameters for the settings UI and Agent."""
-        if not self._lock.acquire(blocking=False):
-            return {
-                "status": "busy",
-                "connected": bool((self._last_status_snapshot or {}).get("connected")),
-                "message": "vehicle runtime is busy",
-                "backend": self.backend_id,
-                "parameters": [],
-            }
-        try:
-            ready = self.ensure_ready()
-            controller = self.controller
-            connected = bool(controller is not None and getattr(controller, "is_connected", False))
-            payload: dict[str, Any] = {
-                "status": "ok" if ready else "error",
-                "ready": ready,
-                "connected": connected,
-                "backend": self.backend_id,
-                "backend_profile": self._public_backend_profile(),
-                "parameters": [],
-            }
-            if not ready:
-                payload["message"] = self.init_error or "tool runtime unavailable"
-                return payload
-            if controller is None:
-                payload["status"] = "error"
-                payload["message"] = "controller is not initialized"
-                return payload
-            get_parameters = getattr(controller, "get_parameters", None)
-            if not callable(get_parameters):
-                payload["status"] = "error"
-                payload["message"] = "parameter download is not supported by this backend"
-                return payload
-            data = get_parameters(
-                refresh=bool(refresh),
-                timeout=float(timeout),
-                query=str(query or ""),
-                limit=int(limit),
-                offset=int(offset),
-            )
-            if isinstance(data, dict):
-                payload.update(data)
-            return payload
-        finally:
-            self._lock.release()
-
-    def set_vehicle_parameter(
-        self,
-        name: str,
-        value: Any,
-        component_id: int | None = None,
-        param_type: int | None = None,
-        timeout: float = 3.0,
-    ) -> dict[str, Any]:
-        """Set one PX4 parameter through the active MAVLink backend."""
-        if not self._lock.acquire(blocking=False):
-            return {
-                "status": "busy",
-                "connected": bool((self._last_status_snapshot or {}).get("connected")),
-                "message": "vehicle runtime is busy",
-                "backend": self.backend_id,
-            }
-        try:
-            ready = self.ensure_ready()
-            controller = self.controller
-            connected = bool(controller is not None and getattr(controller, "is_connected", False))
-            payload: dict[str, Any] = {
-                "status": "ok" if ready and connected else ("disconnected" if ready else "error"),
-                "ready": ready,
-                "connected": connected,
-                "backend": self.backend_id,
-                "backend_profile": self._public_backend_profile(),
-            }
-            if not ready:
-                payload["message"] = self.init_error or "tool runtime unavailable"
-                return payload
-            if controller is None:
-                payload["status"] = "error"
-                payload["message"] = "controller is not initialized"
-                return payload
-            set_parameter = getattr(controller, "set_parameter", None)
-            if not callable(set_parameter):
-                payload["status"] = "error"
-                payload["message"] = "parameter write is not supported by this backend"
-                return payload
-            data = set_parameter(
-                name=str(name or ""),
-                value=value,
-                component_id=component_id,
-                param_type=param_type,
-                timeout=float(timeout or 3.0),
-            )
-            if isinstance(data, dict):
-                payload.update(data)
-            return payload
-        finally:
-            self._lock.release()
-
     def vehicle_setup_snapshot(self, include_history: bool = True, history_limit: int = 240) -> dict[str, Any]:
         """Return QGC-style read-only PX4 setup diagnostics for the settings UI."""
         if not self._lock.acquire(blocking=False):
@@ -3357,13 +2664,6 @@ class ToolRuntime:
         # panel empties whenever any long tool call runs, flickering between
         # "3 drones" and "none".
         vehicles_cached = cached.get("vehicles") or []
-        flight_tasks_busy: dict[str, Any] = {}
-        update_tasks_busy = getattr(controller, "update_flight_task_progress", None)
-        if callable(update_tasks_busy):
-            try:
-                flight_tasks_busy = update_tasks_busy(vehicles_cached) or {}
-            except Exception:
-                flight_tasks_busy = {}
         snapshot = {
             "ready": ready,
             "init_error": self.init_error,
@@ -3380,7 +2680,7 @@ class ToolRuntime:
             "backends": cached.get("backends") or self.backend_registry.list_public(),
             "drone": drone_status,
             "vehicles": vehicles_cached,
-            "flight_tasks": flight_tasks_busy,
+            "flight_tasks": {},
         }
         self._last_status_snapshot = snapshot
         return dict(snapshot)
@@ -3440,12 +2740,9 @@ class ToolRuntime:
         return retry
 
     def _requires_vehicle_connection(self, name: str) -> bool:
-        if name in {"memory_store", "drone_connect", "drone_disconnect"}:
+        if name in {"drone_connect", "drone_disconnect"}:
             return False
-        # 相机类工具的超时/失败是相机链路的问题，不代表飞控链路断开。以前它同样
-        # 命中连接类标记，于是一次 airsim_take_photo 超时就会 disconnect 并重连
-        # 飞控链路——飞机可能正在空中，而且真机上相机往往根本不在飞控链路上。
-        if name in self.CAMERA_SOURCE_TOOLS:
+        if name in self.CAMERA_CHAIN_TOOLS:
             return False
         return name.startswith("drone_") or name.startswith("airsim_")
 

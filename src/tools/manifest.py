@@ -101,27 +101,12 @@ TOOL_MANIFEST: dict[str, ToolManifestEntry] = {
         ("flight_control",),
         notes="Multi-vehicle formation and coverage control on the airsim / px4_mavlink backends. A deterministic 10Hz velocity loop maintains the formation; the agent issues high-level intents and polls action=status until stable. Single-vehicle flight tools are blocked while a formation is active.",
     ),
-    "drone_list_vehicles": _atomic("drone_list_vehicles", "core", "telemetry", ("telemetry",)),
     "drone_get_status": _atomic(
         "drone_get_status",
         "core",
         "telemetry",
         ("telemetry",),
         future="Real vehicles and ROS bridges should normalize telemetry into the shared GroundStationState model.",
-    ),
-    "drone_get_firmware_info": _atomic(
-        "drone_get_firmware_info",
-        "core",
-        "telemetry",
-        ("telemetry",),
-        notes="Requests MAVLink AUTOPILOT_VERSION, including PX4 firmware version, board ids, UID, capabilities, and git hash when available.",
-    ),
-    "drone_get_parameters": _atomic(
-        "drone_get_parameters",
-        "core",
-        "telemetry",
-        ("telemetry",),
-        notes="Requests or queries the cached MAVLink PARAM_VALUE list. Read-only; it does not write, calibrate, or flash firmware.",
     ),
 
     # Vehicle command surface.
@@ -138,21 +123,7 @@ TOOL_MANIFEST: dict[str, ToolManifestEntry] = {
         ("flight_control", "telemetry"),
         notes="vehicle_name: 空=默认机, all=全部, 或具体载具名; Small convenience wrapper over telemetry plus absolute local movement.",
     ),
-    "drone_fly_velocity": _atomic(
-        "drone_fly_velocity",
-        "core",
-        "vehicle_command",
-        ("flight_control",),
-        notes="vehicle_name: 空=默认机, all=全部, 或具体载具名; Low-level command; skills should bound duration and speed.",
-    ),
     "drone_rotate_to": _atomic("drone_rotate_to", "core", "vehicle_command", ("flight_control",), notes="vehicle_name: 空=默认机, all=全部, 或具体载具名"),
-    "drone_release_yaw": _atomic(
-        "drone_release_yaw",
-        "core",
-        "vehicle_command",
-        ("flight_control",),
-        notes="把机头控制权交还遥控器，Agent 停止下发转向；人工接管前先调用，否则 Agent 会在下个航点把机头拽回去。不改飞控参数。vehicle_name: 空=默认机, all=全部, 或具体载具名",
-    ),
     "drone_set_mode": _atomic("drone_set_mode", "core", "mode", ("mode_control",)),
 
     # Mission management surface. These are atomic service calls, but high-risk.
@@ -163,34 +134,6 @@ TOOL_MANIFEST: dict[str, ToolManifestEntry] = {
         ("flight_control",),
         notes="vehicle_name: 空=默认机, all=全部, 或具体载具名; Local NED path execution. Complex path planning belongs in skills or planners.",
     ),
-    "drone_dispatch_takeoff": _atomic(
-        "drone_dispatch_takeoff",
-        "core",
-        "vehicle_command",
-        ("flight_control",),
-        notes="vehicle_name: 空=默认机, all=全部, 或具体载具名; Non-blocking takeoff dispatch (fire-and-forget) for parallel multi-vehicle launches.—— 操作员/GCS 路径，**不作为模型工具**（没有卡片，模型看不到）；模型侧请用 drone_takeoff。",
-    ),
-    "drone_dispatch_path": _atomic(
-        "drone_dispatch_path",
-        "core",
-        "mission",
-        ("flight_control",),
-        notes="vehicle_name: 空=默认机, all=全部, 或具体载具名; Non-blocking local NED path dispatch (fire-and-forget) so each vehicle can fly its own route simultaneously.—— 操作员/GCS 路径，**不作为模型工具**（没有卡片，模型看不到）；模型侧请用 drone_fly_path / drone_*_mission。",
-    ),
-    "drone_dispatch_land": _atomic(
-        "drone_dispatch_land",
-        "core",
-        "vehicle_command",
-        ("flight_control",),
-        notes="vehicle_name: 空=默认机, all=全部, 或具体载具名; Non-blocking land dispatch (fire-and-forget) for parallel multi-vehicle landings.—— 操作员/GCS 路径，**不作为模型工具**（没有卡片，模型看不到）；模型侧请用 drone_land。",
-    ),
-    "drone_dispatch_return_land": _atomic(
-        "drone_dispatch_return_land",
-        "core",
-        "vehicle_command",
-        ("flight_control",),
-        notes="vehicle_name: 空=默认机, all=全部, 或具体载具名; Non-blocking return-to-point then auto land + disarm (full RTL semantics).—— 操作员/GCS 路径，**不作为模型工具**（没有卡片，模型看不到）；模型侧请用 普通任务用 drone_fly_to + drone_land。",
-    ),
     "drone_upload_mission": _atomic("drone_upload_mission", "core", "mission", ("flight_control", "gps", "mode_control")),
     "drone_download_mission": _atomic("drone_download_mission", "core", "mission", ("gps", "mode_control")),
     "drone_clear_mission": _atomic("drone_clear_mission", "core", "mission", ("flight_control", "gps", "mode_control")),
@@ -198,27 +141,13 @@ TOOL_MANIFEST: dict[str, ToolManifestEntry] = {
     "drone_get_mission_progress": _atomic("drone_get_mission_progress", "core", "mission", ("gps", "mode_control")),
 
     # Perception.
-    "airsim_take_photo": _atomic(
-        "airsim_take_photo",
-        "perception",
-        "image_source",
-        ("image_capture",),
-        future="ROS image topics should adapt into the same image_source surface before agent use.",
-    ),
     "airsim_get_sensors": _atomic("airsim_get_sensors", "perception", "sensor_source", ("telemetry",)),
-    "airsim_get_depth_map": _atomic(
-        "airsim_get_depth_map",
+    "locate_image_point": _atomic(
+        "locate_image_point",
         "perception",
         "depth_source",
         ("depth_perception",),
-        future="ROS depth topics or point clouds should normalize here or into a mapping provider.",
-    ),
-    "airsim_locate_point": _atomic(
-        "airsim_locate_point",
-        "perception",
-        "depth_source",
-        ("depth_perception",),
-        notes="Projects one normalised image point through the depth image and drone pose to a world position. Pure geometry, no detection.",
+        notes="The system's single geometry tool: normalised image point(s) -> metric distance + world position (NED), multi-point reads for target sampling / clearance. Pure geometry, no detection.",
     ),
     "provider_bridge_health": _atomic(
         "provider_bridge_health",
@@ -243,8 +172,6 @@ TOOL_MANIFEST: dict[str, ToolManifestEntry] = {
     ),
 
     # Async task manager.
-    "airsim_task_status": _atomic("airsim_task_status", "task", "async_task", ("target_search",)),
-    "airsim_task_cancel": _atomic("airsim_task_cancel", "task", "async_task", ("target_search",)),
 
     # Legacy workflow names kept only as migration records.
     "airsim_search_target": _skill_candidate(
@@ -252,7 +179,7 @@ TOOL_MANIFEST: dict[str, ToolManifestEntry] = {
         "search",
         "workflow",
         ("flight_control", "telemetry", "target_search"),
-        "skill:search",
+        "skill:region-search",
         notes="Former hardcoded workflow name. Runtime registration has been removed; use the skill/provider contract.",
         future="ROS search should compose planner, image/detection, map, and command surfaces instead of exposing one hardcoded MCP tool.",
     ),
@@ -261,7 +188,7 @@ TOOL_MANIFEST: dict[str, ToolManifestEntry] = {
         "tracking",
         "workflow",
         ("flight_control", "telemetry", "target_search"),
-        "skill:approach_target",
+        "skill:visual-approach",
         future="For real vehicles, require depth/world-frame target localization and safety approval before movement.",
     ),
     "airsim_track_object": _skill_candidate(
@@ -269,7 +196,7 @@ TOOL_MANIFEST: dict[str, ToolManifestEntry] = {
         "tracking",
         "workflow",
         ("flight_control", "target_tracking"),
-        "skill:track_object",
+        "skill:region-search",
         future="ROS tracking should use a TrackingProvider/action interface and keep the agent out of raw topic timing.",
     ),
     "airsim_check_obstacle": _skill_candidate(
@@ -277,7 +204,7 @@ TOOL_MANIFEST: dict[str, ToolManifestEntry] = {
         "perception",
         "workflow",
         ("depth_perception", "obstacle_avoidance"),
-        "skill:avoid_obstacle",
+        "skill:visual-approach",
         notes="Depth read is atomic; avoidance policy is a skill or safety manager responsibility.",
     ),
     "airsim_formation_mission": _skill_candidate(
@@ -300,16 +227,8 @@ TOOL_MANIFEST: dict[str, ToolManifestEntry] = {
         "formation",
         "workflow",
         ("flight_control",),
-        "skill:patrol_area",
+        "skill:formation",
         notes="Coverage path generation belongs in a skill or mission planner.",
-    ),
-    "memory_store": ToolManifestEntry(
-        name="memory_store",
-        group="memory",
-        kind="internal",
-        surface="memory",
-        recommended_layer="runtime",
-        notes="Handled by AgentRuntime, not by external MCP servers.",
     ),
     "inspect_current_frame": ToolManifestEntry(
         name="inspect_current_frame",

@@ -20,7 +20,7 @@ import math
 import pytest
 
 from src.config import config
-from src.modules.px4_yaw_link import (
+from src.modules.backends.yaw_link import (
     Px4YawLink,
     bearing_to_deg,
     heading_error_deg,
@@ -199,7 +199,7 @@ def test_yaw_link_streams_a_clamped_yaw_rate():
 # MAVLink backend: the pre-rotation gate
 # ----------------------------------------------------------------------
 def _mavlink_controller():
-    from src.modules.mavlink_controller import MavlinkController
+    from src.modules.backends.mavlink import MavlinkController
 
     controller = MavlinkController()
     controller._connected = True
@@ -273,7 +273,7 @@ def test_mavlink_hold_mode_never_rotates(monkeypatch):
 # AirSim backend: lock-step PX4 must get a MAVLink path, not a refusal
 # ----------------------------------------------------------------------
 def test_airsim_lockstep_yaw_routes_to_mavlink_instead_of_refusing(monkeypatch):
-    from src.modules.airsim_controller import AirSimController
+    from src.modules.backends.airsim import AirSimController
 
     controller = AirSimController.__new__(AirSimController)
     controller.last_error = ""
@@ -290,21 +290,8 @@ def test_airsim_lockstep_yaw_routes_to_mavlink_instead_of_refusing(monkeypatch):
     assert controller.last_error == ""
 
 
-def test_airsim_release_yaw_closes_the_link():
-    from src.modules.airsim_controller import AirSimController
-
-    closed: list[bool] = []
-    controller = AirSimController.__new__(AirSimController)
-    controller._yaw_link = type("L", (), {"close": lambda self: closed.append(True)})()
-    controller._yaw_link_endpoint = "udp:127.0.0.1:14540"
-    assert controller.release_yaw_control() is True
-    assert closed == [True]
-    assert controller._yaw_link is None
-    assert controller._yaw_link_endpoint == ""
-
-
 def test_airsim_endpoint_prefers_control_port_local(monkeypatch, tmp_path):
-    from src.modules.airsim_controller import AirSimController
+    from src.modules.backends.airsim import AirSimController
 
     settings = tmp_path / "settings.json"
     settings.write_text(
@@ -323,7 +310,7 @@ def test_airsim_endpoint_prefers_control_port_local(monkeypatch, tmp_path):
 
 
 def test_airsim_endpoint_env_override_wins(monkeypatch):
-    from src.modules.airsim_controller import AirSimController
+    from src.modules.backends.airsim import AirSimController
 
     monkeypatch.setenv("AIRSIM_PX4_YAW_ENDPOINT", "tcp:127.0.0.1:5790")
     controller = AirSimController.__new__(AirSimController)
@@ -334,14 +321,14 @@ def test_airsim_endpoint_env_override_wins(monkeypatch):
 # ROS2 gateway: the third backend needs the same pre-rotation
 # ----------------------------------------------------------------------
 def _ros_controller():
-    from src.modules.ros_gateway_controller import RosGatewayController
+    from src.modules.backends.ros_gateway import RosGatewayController
 
     controller = RosGatewayController.__new__(RosGatewayController)
     return controller
 
 
 def _ros_status(x: float, y: float, heading_deg):
-    from src.modules.flight_controller import DroneStatus
+    from src.modules.backends.base import DroneStatus
 
     return DroneStatus(
         position_ned={"x": x, "y": y, "z": -5.0},

@@ -35,7 +35,6 @@ class _VisualOnlyTools:
         self.calls: list[str] = []
         self.params_seen: list[tuple[str, dict[str, Any]]] = []
         self.handlers: dict[str, ToolCallResult] = {
-            "airsim_take_photo": _ok("airsim_take_photo", {"image_base64": "AAAA"}),
             "inspect_current_frame": _ok(
                 "inspect_current_frame",
                 {
@@ -53,10 +52,14 @@ class _VisualOnlyTools:
                     },
                 },
             ),
-            "airsim_get_depth_map": _ok("airsim_get_depth_map", {"distance_median_m": 8.0}),
-            "airsim_locate_point": _ok(
-                "airsim_locate_point",
-                {"valid": True, "distance_m": 8.0, "world_pos": {"x": 3.0, "y": 0.4, "z": -3.0}},
+            "locate_image_point": _ok(
+                "locate_image_point",
+                {
+                    "valid": True,
+                    "distance_m": 8.0,
+                    "distance_median_m": 8.0,
+                    "world_pos": {"x": 3.0, "y": 0.4, "z": -3.0},
+                },
             ),
             "drone_move_relative": _ok("drone_move_relative", {"position_ned": {"x": 3.0, "y": 0.4, "z": -3.0}}),
             "drone_hover": _ok("drone_hover", {}),
@@ -94,12 +97,21 @@ def _plan() -> MissionPlan:
         intent="visual_approach",
         summary="穿过门框，降落在方块上",
         steps=[
-            MissionStep(id="s1", label="拍一张current画面", tool="airsim_take_photo"),
+            MissionStep(
+                id="s1",
+                label="留存一张current画面",
+                tool="inspect_current_frame",
+                params={"question": "先记录当前画面", "save_frame": True},
+            ),
             MissionStep(id="s2", label="视觉定位门框", tool="inspect_current_frame"),
-            MissionStep(id="s3", label="读门框距离", tool="airsim_get_depth_map"),
-            MissionStep(id="s4", label="门框换世界坐标", tool="airsim_locate_point"),
-            MissionStep(id="s5", label="有界靠近一步", tool="drone_move_relative", params={"forward_m": 2.0}),
-            MissionStep(id="s6", label="到点悬停待命", tool="drone_hover"),
+            MissionStep(
+                id="s3",
+                label="门框测距+世界坐标（一个几何工具）",
+                tool="locate_image_point",
+                params={"points": "0.52,0.48;0.515,0.485;0.525,0.475"},
+            ),
+            MissionStep(id="s4", label="有界靠近一步", tool="drone_move_relative", params={"forward_m": 2.0}),
+            MissionStep(id="s5", label="到点悬停待命", tool="drone_hover"),
         ],
         goal={"success_criteria": [{"metric": "any_action_succeeded", "detail": "至少成功执行一个动作"}]},
     )
@@ -132,10 +144,9 @@ def test_no_detection_path_can_approach_and_finish(tmp_path):
     )
 
     assert tools.calls == [
-        "airsim_take_photo",
         "inspect_current_frame",
-        "airsim_get_depth_map",
-        "airsim_locate_point",
+        "inspect_current_frame",
+        "locate_image_point",
         "drone_move_relative",
         "drone_hover",
     ], tools.calls
@@ -224,9 +235,9 @@ def test_observation_only_rounds_are_bounded_and_the_plan_step_runs(tmp_path):
     events: list[str] = []
     planner = _SequencePlanner(
         [
-            LoopDecision("airsim_get_depth_map", {}, "再看一次深度"),
+            LoopDecision("locate_image_point", {"points": "0.5,0.5"}, "再量一次距离"),
             LoopDecision("inspect_current_frame", {"question": "再确认一次"}, "再看一眼"),
-            LoopDecision("airsim_get_depth_map", {}, "还想再看"),
+            LoopDecision("locate_image_point", {"points": "0.5,0.5"}, "还想再量"),
             LoopDecision("drone_hover", {}, "悬停（不该走到这里）"),
         ]
     )
@@ -273,9 +284,9 @@ def test_detection_tool_names_are_gone_from_the_public_surface():
     assert gone.isdisjoint(ToolRuntime.READ_ONLY_TOOLS)
     assert gone.isdisjoint(ToolRuntime.CONTROL_TOOLS)
     # 替代几何路径必须在模型面上：点位 → 距离 + 世界坐标
-    assert "airsim_locate_point" in TOOL_CARDS
-    assert "airsim_locate_point" in TOOL_MANIFEST
-    assert "airsim_locate_point" in ToolRuntime.READ_ONLY_TOOLS
+    assert "locate_image_point" in TOOL_CARDS
+    assert "locate_image_point" in TOOL_MANIFEST
+    assert "locate_image_point" in ToolRuntime.READ_ONLY_TOOLS
 
 
 def test_detection_path_is_dormant_and_unreachable():
@@ -287,7 +298,7 @@ def test_detection_path_is_dormant_and_unreachable():
     from pathlib import Path
 
     from src.agent.backends import create_builtin_backend_registry
-    from src.modules.perception_axis import PerceptionAxis
+    from src.modules.perception.axis import PerceptionAxis
 
     # 1) 轴自身的默认参数就是"不检测"
     signature = inspect.signature(PerceptionAxis.start)

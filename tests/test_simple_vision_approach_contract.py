@@ -69,23 +69,23 @@ def test_plan_completion_injects_a_visual_look_for_approach_commands():
     assert planner._plan_visual_guidance("飞到坐标 (10, 0, -5)", list(steps), known) == steps
 
 
-def test_depth_card_teaches_normalised_points():
-    """测距工具的参数说明必须是"归一化坐标"，并点名彩色图像素的坑。"""
-    card = TOOL_CARDS["airsim_get_depth_map"].to_dict()
-    query_points = str(card["inputs"]["query_points"])
-    assert "归一化" in query_points
-    assert "分辨率不同" in query_points  # 为什么不能传彩色图像素
-    assert "query_points" in card["inputs"]
+def test_locate_card_teaches_normalised_points():
+    """几何工具的参数说明必须是"归一化坐标"，并点名彩色图像素的坑。"""
+    card = TOOL_CARDS["locate_image_point"].to_dict()
+    points_doc = str(card["inputs"]["points"])
+    assert "归一化" in points_doc
+    assert "分辨率" in points_doc  # 为什么不能传彩色图像素
+    assert "第一个点" in points_doc  # 多点时的语义：主点给坐标，其余给距离
 
 
 def test_photo_tool_has_no_detection_verification_parameter():
     """拍照工具不再有 YOLO 验证参数（工具、卡片、协议层三处都不能留）。"""
     from src.agent.llm_protocol import FLIGHT_TOOL_CONSTRAINTS
-    from src.tools.perception import register_perception_tools
+    from src.tools.sensors import register_sensor_tools
 
     # 工具在注册函数内部定义，签名取不到：读源码但跳过注释行（注释里会解释
     # "为什么删掉它"，那是文档不是契约）。
-    import src.tools.perception as perception_module
+    import src.tools.sensors as perception_module
 
     code_only = "\n".join(
         line for line in inspect.getsource(perception_module).splitlines()
@@ -94,15 +94,16 @@ def test_photo_tool_has_no_detection_verification_parameter():
     assert "verify_target_class" not in code_only
     assert "verify_min_confidence" not in code_only
 
-    card = TOOL_CARDS["airsim_take_photo"].to_dict()
-    assert "verify_target_class" not in card["inputs"]
+    # 拍照已并入 inspect_current_frame：模型面不再有 take_photo 卡片；
+    # 协议层也不得残留检测验证参数。
+    assert "airsim_take_photo" not in TOOL_CARDS
     assert "verify_target_class" not in FLIGHT_TOOL_CONSTRAINTS.get("airsim_take_photo", {})
-    assert register_perception_tools is not None  # 导入自检：模块仍可加载
+    assert register_sensor_tools is not None  # 导入自检：模块仍可加载
 
 
 def test_heading_deg_reaches_the_model_via_status():
     """转向要用的朝向必须随状态下发（rotate_to 收的是绝对角度）。"""
-    from src.modules.flight_controller import DroneStatus
+    from src.modules.backends.base import DroneStatus
 
     payload = DroneStatus(extra={"heading_deg": 123.4}).to_dict()
     assert payload["heading_deg"] == 123.4

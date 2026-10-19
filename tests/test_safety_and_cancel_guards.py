@@ -5,8 +5,6 @@ Each test here encodes a defect that was live in the tree:
 - the safety layer used to *clamp* danger-level violations instead of blocking
   them, so "fly to 10 m up" (positive z) silently became a 0.5 m AGL flight;
 - NaN sailed through every bound check and reached the flight controller;
-- ``drone_fly_velocity`` was validated as an instantaneous vector, so
-  5 m/s down for 60 s (ground strike) or 8 m/s for 300 s (2.4 km) passed;
 - the operator-approval gate could never fire on the px4_ros2 backend;
 - mid-risk position/mode tools needed no approval on a real vehicle;
 - the GCS "start mission" path bypassed the emergency-stop latch and the
@@ -139,72 +137,16 @@ def test_nan_tool_param_is_blocked_by_the_dispatcher():
 
 def test_nan_string_param_is_blocked_too():
     collector = ToolCollector()
-    collector.tools["drone_fly_velocity"] = _noop_tool
+    collector.tools["drone_move_relative"] = _noop_tool
     rt = _rt(collector, controller=status_controller())
 
-    result = rt.execute("drone_fly_velocity", {"vx": "nan", "vy": 0.0, "vz": 0.0})
+    result = rt.execute("drone_move_relative", {"forward_m": "nan"})
 
     assert result.ok is False
     assert result.error_code == "SAFETY_BLOCKED"
 
 
 # ---------------------------------------------------------------------------
-# drone_fly_velocity must validate the displacement duration implies
-# ---------------------------------------------------------------------------
-
-
-def test_fly_velocity_descent_into_the_ground_is_blocked():
-    """5 m/s down for 60 s from 3 m: the instantaneous speed check passes."""
-    collector = ToolCollector()
-    collector.tools["drone_fly_velocity"] = _noop_tool
-    rt = _rt(collector, controller=status_controller(z=-3.0))
-
-    result = rt.execute("drone_fly_velocity", {"vx": 0.0, "vy": 0.0, "vz": 5.0, "duration": 60.0})
-
-    assert result.ok is False
-    assert result.error_code == "SAFETY_BLOCKED"
-
-
-def test_fly_velocity_long_run_into_the_fence_is_blocked():
-    """8 m/s for 300 s travels ~2.4 km with a 100 m geofence."""
-    collector = ToolCollector()
-    collector.tools["drone_fly_velocity"] = _noop_tool
-    rt = _rt(collector, controller=status_controller(z=-3.0))
-
-    result = rt.execute("drone_fly_velocity", {"vx": 8.0, "vy": 0.0, "vz": 0.0, "duration": 300.0})
-
-    assert result.ok is False
-    assert result.error_code == "SAFETY_BLOCKED"
-
-
-def test_fly_velocity_short_bounded_burst_is_allowed():
-    collector = ToolCollector()
-    collector.tools["drone_fly_velocity"] = _noop_tool
-    rt = _rt(collector, controller=status_controller(z=-3.0))
-
-    result = rt.execute("drone_fly_velocity", {"vx": 1.0, "vy": 0.0, "vz": 0.0, "duration": 2.0})
-
-    assert result.ok is True
-
-
-def test_fly_velocity_without_position_readback_bounds_the_whole_displacement():
-    """No telemetry: the implied displacement must still fit inside the fence."""
-    collector = ToolCollector()
-    collector.tools["drone_fly_velocity"] = _noop_tool
-    rt = _rt(collector, controller=None)
-
-    blocked = rt.execute("drone_fly_velocity", {"vx": 8.0, "vy": 0.0, "vz": 0.0, "duration": 300.0})
-    allowed = rt.execute("drone_fly_velocity", {"vx": 1.0, "vy": 0.0, "vz": 0.0, "duration": 5.0})
-
-    assert blocked.ok is False
-    assert allowed.ok is True
-
-
-# ---------------------------------------------------------------------------
-# approval gate reachability and risk classification
-# ---------------------------------------------------------------------------
-
-
 def _runtime_stub(**attrs: Any) -> AgentRuntime:
     # shared shell: every runtime field is initialised by _init_runtime_state(),
     # so a test only names what it cares about.
@@ -246,20 +188,53 @@ def test_same_tools_stay_medium_on_a_simulation():
 
 
 def test_missing_tool_card_for_a_control_tool_fails_safe_to_high():
-    """drone_dispatch_* are in CONTROL_TOOLS but absent from TOOL_CARDS; the old
-    default of "low" meant no approval gate for a flight action."""
+    """CONTROL_TOOLS 里的工具如果恰好没有卡片，风险必须是 high（旧默认 low
+    等于给飞行动作开了绿灯）。"""
     runtime = _runtime_stub()
     runtime.tools = SimpleNamespace(
-        CONTROL_TOOLS={"drone_dispatch_path"},
+        CONTROL_TOOLS={"drone_made_up_control"},
         READ_ONLY_TOOLS=set(),
     )
 
-    assert runtime._tool_risk_level("drone_dispatch_path", {"real_vehicle": False}) == "high"
+    # 无卡片 + 在 CONTROL_TOOLS → 必须按 high 兜底（fail-safe）
+    assert runtime._tool_risk_level("drone_made_up_control", {"real_vehicle": False}) == "high"
 
 
 # ---------------------------------------------------------------------------
 # fixed-sequence cancellation / pause
 # ---------------------------------------------------------------------------
+
+
+def test_ui_mode_switch_is_restricted_to_safe_modes() -> None:
+    """UI 模式切换只允许悬停类安全模式：AUTO/MISSION 会启动已上传航线、
+    OFFBOARD 需要连续 setpoint 流，必须由飞控端或航线流程切换。"""
+    calls: list[tuple[str, dict]] = []
+
+    class _Tools:
+        def execute(self, name, params, **kwargs):
+            calls.append((name, dict(params or {})))
+            now = time.time()
+            return ToolCallResult(name, params, True, {"status": "ok", "message": "mode set"}, now, now)
+
+    runtime = _runtime_stub()
+    runtime.tools = _Tools()
+    # 设备动作现在走 gcs.command（安全校验 + 治理入口），测试改成观察它。
+    runtime.gcs = SimpleNamespace(
+        command=SimpleNamespace(
+            execute_tool=lambda tool, params=None, vehicle_id="": (
+                calls.append((tool, dict(params or {})))
+                or ToolCallResult("drone_set_mode", dict(params or {}), True, {"status": "ok", "message": "mode set"}, time.time(), time.time())
+            )
+        )
+    )
+
+    assert runtime.set_vehicle_mode("AUTO")["ok"] is False
+    assert runtime.set_vehicle_mode("OFFBOARD")["ok"] is False
+    assert runtime.set_vehicle_mode("")["ok"] is False
+    assert calls == [], "危险模式不得下发到飞控"
+
+    assert runtime.set_vehicle_mode("loiter")["ok"] is True
+    assert calls == [("drone_set_mode", {"mode": "LOITER"})]
 
 
 def test_fixed_sequence_stops_at_the_next_step_when_cancelled():
@@ -508,8 +483,8 @@ def test_error_code_reaches_the_agent_loop_result_data():
 def test_camera_tools_never_trigger_a_flight_link_reconnect():
     rt = _rt(ToolCollector())
 
-    assert rt._requires_vehicle_connection("airsim_take_photo") is False
-    assert rt._requires_vehicle_connection("airsim_get_depth_map") is False
+    assert rt._requires_vehicle_connection("drone_connect") is False
+    assert rt._requires_vehicle_connection("locate_image_point") is False
     assert rt._requires_vehicle_connection("drone_fly_to") is True
 
 
@@ -563,11 +538,11 @@ def test_skill_markdown_survives_the_result_compactor():
     body = "# Region search\n" + ("step line\n" * 700)
 
     trimmed = planner._trim_data(
-        {"status": "activated", "skill": "skill:search", "markdown": body, "message": "loaded"}
+        {"status": "activated", "skill": "skill:region-search", "markdown": body, "message": "loaded"}
     )
 
     assert trimmed["markdown"] == body
-    assert trimmed["skill"] == "skill:search"
+    assert trimmed["skill"] == "skill:region-search"
 
 
 def test_oversized_non_skill_result_is_still_summarised():
@@ -687,7 +662,7 @@ def test_memory_clear_removes_risk_events_and_does_not_raise(tmp_path):
     assert memory.guidance()["recent_risk_events"] == []
 
 
-def test_malformed_memory_rows_are_dropped_instead_of_crashing_recall(tmp_path):
+def test_malformed_memory_rows_are_dropped_instead_of_crashing_the_reader(tmp_path):
     from src.agent.memory import AgentMemory
 
     path = tmp_path / "memory.json"
@@ -704,9 +679,10 @@ def test_malformed_memory_rows_are_dropped_instead_of_crashing_recall(tmp_path):
     )
 
     memory = AgentMemory(data_dir=tmp_path)
-    hits = memory.recall("anything")
-
-    assert isinstance(hits, list)
+    # 坏行被逐行丢弃：读取侧（快照/建议注入）不抛异常。
+    snapshot = memory.snapshot()
+    assert isinstance(snapshot, dict)
+    assert isinstance(memory.guidance(), dict)
 
 
 # ---------------------------------------------------------------------------
@@ -851,7 +827,7 @@ def test_no_fly_zone_blocks_a_crossing_waypoint_leg():
     rt = _rt_with_zone({"x": 20.0, "y": 0.0, "radius": 8.0})
     waypoints = json.dumps([{"x": 40.0, "y": 0.0, "z": -10.0}])
 
-    safety = rt.validate("drone_fly_path", {"waypoints_json": waypoints})
+    safety = rt.validate("drone_fly_path", {"waypoints": waypoints})
 
     assert safety["level"] == "danger"
     assert any("禁飞区" in item for item in safety["violations"])
@@ -1034,7 +1010,7 @@ def test_zone_leg_check_warns_instead_of_silently_skipping_without_telemetry():
     rt.safety.constraints.no_fly_zones = [{"x": 20.0, "y": 0.0, "radius": 8.0}]
 
     safety = rt.validate(
-        "drone_fly_path", {"waypoints_json": json.dumps([{"x": 40.0, "y": 0.0, "z": -10.0}])}
+        "drone_fly_path", {"waypoints": json.dumps([{"x": 40.0, "y": 0.0, "z": -10.0}])}
     )
 
     assert safety["level"] == "warning"
@@ -1313,11 +1289,11 @@ def _recording_runtime():
     that actually executes is recorded. (A real ToolRuntime would replace both on
     ensure_ready, which would make the "nothing reached the controller"
     assertion vacuous.)"""
-    from src.tools.core import register_core_tools
+    from src.tools.flight import register_flight_tools
 
     controller = _RecordingController()
     collector = ToolCollector()
-    register_core_tools(collector, controller, lambda data: data)
+    register_flight_tools(collector, controller, lambda data: data)
     rt = tool_runtime(collector, controller)
     rt.backend_id = "airsim"
     rt.backend_registry = create_builtin_backend_registry()
@@ -1357,7 +1333,6 @@ def test_emergency_stop_latch_keeps_every_flight_command_away_from_the_controlle
         "drone_move_relative": {"forward_m": 5.0},
         "drone_rotate_to": {"yaw_deg": 90.0},
         "drone_set_mode": {"mode": "OFFBOARD"},
-        "drone_fly_velocity": {"vx": 1.0, "vy": 0.0, "vz": 0.0, "duration": 1.0},
         "drone_upload_mission": {"waypoints_json": "[]"},
         "drone_start_mission": {},
         "drone_fly_path": {"waypoints_json": '[{"x": 5, "y": 0, "z": -5}]'},

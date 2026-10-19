@@ -261,14 +261,17 @@ class ExecutionMixin:
         # multi-vehicle aware: report every vehicle, not only the default one
         names: list[str] = []
         try:
-            list_result = self.tools.execute("drone_list_vehicles", {}, dry_run=False, blocked_by_supervisor=False, allow_reconnect=False)
-            raw_names = (list_result.data or {}).get("vehicles") or []
-            names = [str(n) for n in raw_names if str(n)]
+            # 机队读取：drone_get_status 无参时返回全部载具（含名字）；
+            # 原 drone_list_vehicles 已合并进该工具。
+            fleet = self.tools.execute("drone_get_status", {}, dry_run=False, blocked_by_supervisor=False, allow_reconnect=False)
+            raw_items = (fleet.data or {}).get("vehicles") or []
+            names = [str((item or {}).get("vehicle_name") or "") for item in raw_items]
+            names = [n for n in names if n]
         except Exception:
             names = []
         if len(names) > 1 and len(names) <= 4:
             reasoning_lines.append(
-                f"回读序列：drone_list_vehicles 列出 {len(names)} 架车辆 → 逐台 drone_get_status 回读状态。"
+                f"回读序列：drone_get_status 机队读取列出 {len(names)} 架车辆 → 逐台 drone_get_status 回读状态。"
             )
             per_vehicle: list[str] = []
             ok_all = True
@@ -301,7 +304,7 @@ class ExecutionMixin:
                         "title": "读取无人机状态",
                         "body": body,
                         "status": "failed",
-                        "tool": "drone_list_vehicles",
+                        "tool": "drone_get_status",
                         "params": {},
                         "kind": "tool",
                     }
@@ -317,7 +320,7 @@ class ExecutionMixin:
                         "title": "读取无人机状态",
                         "body": body,
                         "status": "completed" if ok else "failed",
-                        "tool": "drone_list_vehicles",
+                        "tool": "drone_get_status",
                         "params": {},
                         "kind": "tool",
                     }
@@ -645,10 +648,10 @@ class ExecutionMixin:
         # 执行槽的 finally 挂在下面，任何一步在 try 之前抛异常，worker 线程就会
         # 带着已获取的执行槽死掉，此后每次提交都要等满 60 秒并返回"旧任务未能
         # 及时停止"，助手消息永远停在运行中，只能重启进程恢复。
-        replay_session = None
+        flightlog_session = None
         try:
             if execute and run_id:
-                replay_session = self._start_replay_session(
+                flightlog_session = self._start_flightlog_session(
                     run_id,
                     {"run_id": run_id, "command": command, "mode": "execute"},
                 )
@@ -786,8 +789,8 @@ class ExecutionMixin:
                 self._append_message("assistant", f"任务处理失败: {str(e)}", status="error")
             self._append_event("danger", "planner", "任务处理失败", {"error": str(e)})
         finally:
-            if replay_session is not None:
-                self._stop_replay_session()
+            if flightlog_session is not None:
+                self._stop_flightlog_session()
             self._close_run_log(run_id, execute)
             if execute and self._execution_thread_id == threading.get_ident():
                 self._execution_thread_id = 0
@@ -1101,7 +1104,7 @@ class ExecutionMixin:
         streamed_reasoning = self._strip_plan_json_draft(reasoning_full) if reasoning_full else ""
         thinking_parts = [p for p in (streamed_reasoning, plan_reasoning) if p]
         model_thinking = "\n\n".join(dict.fromkeys(thinking_parts)).strip()
-        plan_step_tools = [step.tool for step in (plan.steps or []) if step.tool and step.tool != "memory_store"]
+        plan_step_tools = [step.tool for step in (plan.steps or []) if step.tool]
         plan_summary = ""
         if plan_step_tools:
             plan_summary = "执行计划（" + str(len(plan_step_tools)) + " 步）：" + " → ".join(plan_step_tools)
@@ -1178,7 +1181,7 @@ class ExecutionMixin:
                 [
                     step
                     for step in (run.plan.steps if run.plan else [])
-                    if step.tool and step.tool != "memory_store"
+                    if step.tool
                 ]
             )
             max_steps = 28 if needs_agent_loop else max(16, min(28, plan_step_count * 3))
@@ -1439,13 +1442,12 @@ class ExecutionMixin:
         only when they are safe/read-only, needed for visual grounding, or the
         active backend has no suitable skill for the requested capability.
         """
-        skill_names: set[str] = set()
         atomic_by_name = {
             str(card.get("name")): card
             for card in atomic_cards
             if isinstance(card, dict) and card.get("name")
         }
-        allowed_atomic = self._allowed_planner_atomic_tools(command, skill_names, capabilities)
+        allowed_atomic = self._allowed_planner_atomic_tools(command, capabilities)
         cards: list[dict[str, Any]] = []
         for name in sorted(allowed_atomic):
             card = atomic_by_name.get(name)
@@ -1485,17 +1487,12 @@ class ExecutionMixin:
                 ]
             except Exception:
                 skill_cards = []
-        # Agent-level cards (memory/subtask) always keep a slot.
-        agent_names = {"memory_recall", "memory_remember", "agent_subtask"}
-        agent_cards = [card for card in deduped if card.get("name") in agent_names]
-        regular = [card for card in deduped if card.get("name") not in agent_names]
-        budget = max(0, 18 - len(agent_cards) - len(skill_cards))
-        return (skill_cards + regular[:budget] + agent_cards)[:20]
+        budget = max(0, 18 - len(skill_cards))
+        return (skill_cards + deduped[:budget])[:20]
 
     def _allowed_planner_atomic_tools(
         self,
         command: str,
-        skill_names: set[str],
         capabilities: dict[str, Any],
     ) -> set[str]:
         text = (command or "").lower()
@@ -1511,14 +1508,9 @@ class ExecutionMixin:
 
         if any(term in text for term in visual_terms):
             allowed.update({
-                "airsim_take_photo",
                 "inspect_current_frame",
-                "airsim_get_depth_map",
-                "airsim_task_status",
-                "airsim_task_cancel",
+                "locate_image_point",
             })
-            if "skill:visual_observe" not in skill_names:
-                allowed.update({"airsim_take_photo", "inspect_current_frame"})
 
         if any(term in text for term in mission_terms):
             allowed.update({
@@ -1541,9 +1533,8 @@ class ExecutionMixin:
         if any(term in text for term in formation_terms):
             allowed.add("formation_command")
 
-        if "skill:navigation" not in skill_names:
-            allowed.update({"drone_arm", "drone_takeoff", "drone_fly_to", "drone_move_relative", "drone_hover"})
-        if "skill:return_home" not in skill_names and capabilities.get("flight_control"):
+        allowed.update({"drone_arm", "drone_takeoff", "drone_fly_to", "drone_move_relative", "drone_hover"})
+        if capabilities.get("flight_control"):
             allowed.update({"drone_fly_to", "drone_land"})
         return allowed
 
@@ -2113,8 +2104,8 @@ class ExecutionMixin:
 
         wants_search = any(k in lower for k in ["search", "find", "locate", "搜索", "寻找", "查找", "目标"])
         search_steps = [step for step in steps if step.tool in {
-            "inspect_current_frame", "airsim_take_photo", "perception_status",
-            "airsim_locate_point",
+            "inspect_current_frame", "perception_status",
+            "locate_image_point",
         }]
         if wants_search or search_steps:
             search_statuses = {
@@ -2149,8 +2140,8 @@ class ExecutionMixin:
             # 本架构没有独立追踪工具（旧判据认的 airsim_track_object 从未注册过，
             # drone_approach_target 也已删除）：追踪 = 识别到目标 + Agent 完成
             # 视觉确认/定位循环。只认旧工具名会把成功的追踪任务硬判失败（假失败）。
-            track_loop_tools = {"inspect_current_frame", "airsim_take_photo",
-                                "airsim_locate_point"}
+            track_loop_tools = {"inspect_current_frame",
+                                "locate_image_point"}
             loop_ok_steps = [
                 step for step in steps
                 if step.tool in track_loop_tools and str(getattr(step, "status", "")) == "completed"
@@ -2246,7 +2237,7 @@ class ExecutionMixin:
         """Read-only query tools exposed to chat mode (function-calling
         schemas). The whitelist is the safety boundary: chat can pull live
         status data but can never arm/move/land a vehicle."""
-        allowed = {"drone_get_status", "drone_list_vehicles"}
+        allowed = {"drone_get_status"}
         schemas: list[dict[str, Any]] = []
         try:
             for spec in self.tools.list_tools():

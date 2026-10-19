@@ -1,11 +1,17 @@
-"""Atomic tools backed by external provider services."""
+"""Provider 工具组：ROS2/provider 桥（冻结期，只读）。
 
+- 注册入口：``register_provider_tools(collector, controller, fmt)``
+- 调用方：``src/agent/tool_executor.py`` 的 ``ToolRuntime.ensure_ready()``
+  （仅后端具备 ros2_topics 能力时）。
+- 整体可裁：后段若不保留，删本文件 + ``manifest.py`` 的三条 + ``tool_cards.py``
+  的三张卡片即可（2026-10-15 操作员：先单独留一个文件，方便整体取舍）。
+"""
 from __future__ import annotations
 
 from typing import Callable
 
 from src.agent.ros_provider_bridge import RosProviderBridgeClient
-from src.modules.flight_controller import FlightController
+from src.modules.backends.base import FlightController
 
 
 def register_provider_tools(

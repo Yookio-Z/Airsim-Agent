@@ -20,15 +20,13 @@ from src.agent.llm import AnthropicClient, LLMMissionPlanner, LLMUnavailableErro
 from src.agent.memory import AgentMemory
 from src.agent.planner import MissionPlan, MissionPlanner, MissionStep
 from src.agent.runtime import AgentRuntime, ChatMessage, RunState
-from src.agent.skill_registry import SkillRegistry
 from src.agent.task_runs import TaskRunStore
 from src.agent.tool_executor import ToolCallResult, ToolCollector, ToolRuntime
 from src.gcs.managers import ManagerResult
 from src.gcs.mission import MissionPlanDraft
 from src.gcs.services import ToolMissionManager
 from src.gcs.state import GroundStationState, VehicleTelemetry
-from src.modules.mavlink_controller import MavlinkController
-from src.modules.task_manager import TaskManager, TaskStatus
+from src.modules.backends.mavlink import MavlinkController
 
 
 def _result(tool: str, ok: bool, data: dict[str, Any], *, terminal: bool = True, task_id: str = "") -> ToolCallResult:
@@ -127,7 +125,6 @@ def test_chinese_conditional_navigation_uses_fast_template_plan() -> None:
         "drone_move_relative",
         "drone_hover",
         "drone_get_status",
-        "memory_store",
     ]
     assert plan.steps[3].params == {"altitude": 5.0}
     assert plan.steps[4].params["forward_m"] == 5.0
@@ -193,7 +190,7 @@ def test_local_mission_fallback_takes_off_before_path() -> None:
     flown_paths: list[list[dict[str, Any]]] = []
 
     def fly_path(params: dict[str, Any]) -> ToolCallResult:
-        flown_paths.append(json.loads(params["waypoints_json"]))
+        flown_paths.append(json.loads(params["waypoints"]))
         return _result("drone_fly_path", True, {"status": "ok", "message": "path flown"})
 
     tools = FakeTools({
@@ -244,7 +241,7 @@ def test_local_mission_fallback_offsets_global_waypoints_from_current_local_posi
     flown_paths: list[list[dict[str, Any]]] = []
 
     def fly_path(params: dict[str, Any]) -> ToolCallResult:
-        flown_paths.append(json.loads(params["waypoints_json"]))
+        flown_paths.append(json.loads(params["waypoints"]))
         return _result("drone_fly_path", True, {"status": "ok", "message": "path flown"})
 
     tools = FakeTools({
@@ -277,54 +274,6 @@ def test_local_mission_fallback_offsets_global_waypoints_from_current_local_posi
     assert 17.0 <= flown_paths[0][0]["x"] <= 17.2
     assert flown_paths[0][0]["y"] == 8.0
     assert flown_paths[0][0]["z"] == -3.0
-
-
-def test_async_tool_is_polled_to_terminal_state() -> None:
-    status_count = 0
-
-    def task_status(_: dict[str, Any]) -> ToolCallResult:
-        nonlocal status_count
-        status_count += 1
-        if status_count == 1:
-            return _result("airsim_task_status", True, {"status": "running", "task_id": "search_1"}, terminal=False, task_id="search_1")
-        return _result(
-            "airsim_task_status",
-            True,
-            {"status": "completed", "task_id": "search_1", "result": {"status": "candidate_found"}},
-            task_id="search_1",
-        )
-
-    tools = FakeTools({
-        "drone_upload_mission": _result(
-            "drone_upload_mission",
-            True,
-            {"status": "started", "task_id": "search_1"},
-            terminal=False,
-            task_id="search_1",
-        ),
-        "airsim_task_status": task_status,
-        "airsim_task_cancel": _result("airsim_task_cancel", True, {"status": "ok"}),
-    })
-    planner = SequencePlanner([
-        LoopDecision("drone_upload_mission", {"waypoints_json": "[]"}, "start async mission task"),
-        LoopDecision(action="", reason="mission task complete", is_complete=True),
-    ])
-    loop = AgentLoop(
-        tools, planner, FakeMemory(), skills=FakeSkills(), async_timeout=1.0, async_poll_interval=0.05
-    )
-
-    state = loop.run(
-        "run_async",
-        "upload mission",
-        {"gps": True, "mode_control": True},
-        [{"name": name} for name in tools.handlers],
-        max_steps=4,
-    )
-
-    assert state.status == "completed"
-    assert status_count == 2
-    assert state.results[0].data["status"] == "completed"
-    assert state.results[0].data["task"]["result"]["status"] == "candidate_found"
 
 
 def test_agent_loop_allows_bounded_recovery_after_failure() -> None:
@@ -427,9 +376,9 @@ def test_agent_loop_keeps_atomic_tools_available_with_markdown_guidance() -> Non
     })
     skills = StaticSkills([
         {
-            "name": "skill:navigation",
+            "name": "skill:flight-sequence",
             "kind": "skill",
-            "purpose": "navigation",
+            "purpose": "flight sequence",
             "required_capabilities": ["flight_control"],
         }
     ])
@@ -455,7 +404,6 @@ def test_agent_loop_keeps_atomic_tools_available_with_markdown_guidance() -> Non
 def test_visual_question_forces_capture_then_frame_inspection() -> None:
     tools = FakeTools({
         "drone_get_status": _result("drone_get_status", True, {"status": "ok"}),
-        "airsim_take_photo": _result("airsim_take_photo", True, {"status": "ok", "image_base64": "aW1hZ2U="}),
         "inspect_current_frame": _result(
             "inspect_current_frame",
             True,
@@ -468,7 +416,7 @@ def test_visual_question_forces_capture_then_frame_inspection() -> None:
     })
     planner = SequencePlanner([
         LoopDecision("drone_get_status", {}, "bad first choice"),
-        LoopDecision("memory_store", {"source": "mission"}, "bad internal tool"),
+        LoopDecision("not_a_real_tool", {}, "bad tool choice"),
         LoopDecision(action="", reason="done", is_complete=True),
     ])
     loop = AgentLoop(tools, planner, FakeMemory(), skills=FakeSkills())
@@ -482,8 +430,9 @@ def test_visual_question_forces_capture_then_frame_inspection() -> None:
     )
 
     assert state.status == "completed"
-    assert [item.tool for item in state.results] == ["airsim_take_photo", "inspect_current_frame"]
-    assert tools.calls == ["airsim_take_photo", "inspect_current_frame"]
+    # 拍照已并入 inspect：守卫一步注入，取帧 + 分析一次完成
+    assert [item.tool for item in state.results] == ["inspect_current_frame"]
+    assert tools.calls == ["inspect_current_frame"]
     assert planner.calls == 0
 
 
@@ -495,7 +444,6 @@ def test_visual_approach_guard_observes_then_lets_the_model_move() -> None:
     现在运行时不再持有任何"靠近"策略，也不阻断模型的有界移动。
     """
     tools = FakeTools({
-        "airsim_take_photo": _result("airsim_take_photo", True, {"status": "ok", "image_base64": "aW1hZ2U="}),
         "inspect_current_frame": _result(
             "inspect_current_frame",
             True,
@@ -529,8 +477,8 @@ def test_visual_approach_guard_observes_then_lets_the_model_move() -> None:
         max_steps=6,
     )
 
-    # 守卫先补齐观测（拍照 → 视觉确认），并把注入的决定标成 guard
-    assert tools.calls[:2] == ["airsim_take_photo", "inspect_current_frame"], tools.calls
+    # 守卫先补齐观测（视觉确认一步完成），并把注入的决定标成 guard
+    assert tools.calls[:1] == ["inspect_current_frame"], tools.calls
     assert state.decisions[0].source == "guard"
     # 模型自己的有界靠近被执行（以前会被守卫改写掉）
     assert "drone_move_relative" in tools.calls, tools.calls
@@ -538,9 +486,8 @@ def test_visual_approach_guard_observes_then_lets_the_model_move() -> None:
 
 
 def test_visual_approach_is_not_blocked_by_the_runtime() -> None:
-    """模型选的动作不再被运行时阻断；内部记忆工具被交回模型重新决策。"""
+    """模型选的动作不再被运行时阻断；不可用的工具被交回模型重新决策。"""
     tools = FakeTools({
-        "airsim_take_photo": _result("airsim_take_photo", True, {"status": "ok", "image_base64": "aW1hZ2U="}),
         "inspect_current_frame": _result(
             "inspect_current_frame",
             True,
@@ -561,7 +508,7 @@ def test_visual_approach_is_not_blocked_by_the_runtime() -> None:
         "drone_hover": _result("drone_hover", True, {"status": "ok"}),
     })
     planner = SequencePlanner([
-        LoopDecision("memory_store", {}, "bad internal tool"),
+        LoopDecision("not_a_real_tool", {}, "bad tool choice"),
         LoopDecision("drone_hover", {}, "hold position"),
         LoopDecision(action="", reason="done", is_complete=True),
     ])
@@ -575,8 +522,8 @@ def test_visual_approach_is_not_blocked_by_the_runtime() -> None:
         max_steps=6,
     )
 
-    assert "memory_store" not in tools.calls  # 内部工具不执行
-    # 守卫把"内部工具"这类无效决定交回模型重新决策（needs_replan），而不是判失败
+    assert "not_a_real_tool" not in tools.calls  # 不存在的工具不执行
+    # 守卫把"不可用工具"这类无效决定交回模型重新决策（needs_replan），而不是判失败
     assert any(d.source == "guard" and d.needs_replan for d in state.decisions), state.decisions
     assert "drone_hover" in tools.calls, tools.calls
     assert "2D image target" not in (state.failure_reason or "")
@@ -747,90 +694,6 @@ def test_mavlink_ignores_mission_ack_not_targeted_to_gcs() -> None:
 
     assert controller._mission_ack_targets_this_gcs({"target_system": 255, "target_component": 190}) is True
     assert controller._mission_ack_targets_this_gcs({"target_system": 0, "target_component": 0}) is False
-
-
-def test_cancelled_background_task_cannot_flip_back_to_completed() -> None:
-    manager = TaskManager()
-    started = threading.Event()
-
-    def work(*, task_info: Any) -> dict[str, Any]:
-        started.set()
-        while not task_info.cancel_flag:
-            time.sleep(0.01)
-        return {"stopped": True}
-
-    task_id = manager.start_task("tracking", work)
-    assert started.wait(timeout=0.5)
-    assert manager.cancel_task(task_id) is True
-
-    deadline = time.time() + 0.5
-    while time.time() < deadline:
-        info = manager.get_task(task_id)
-        if info and info.result is not None:
-            break
-        time.sleep(0.01)
-
-    info = manager.get_task(task_id)
-    assert info is not None
-    assert info.status == TaskStatus.CANCELLED
-
-
-def test_skill_subtools_use_governed_executor_callback() -> None:
-    tools = FakeTools({})
-    calls: list[str] = []
-
-    def governed(name: str, params: dict[str, Any], dry_run: bool) -> ToolCallResult:
-        calls.append(name)
-        if name == "drone_get_status":
-            return _result(name, True, {"status": "ok", "armed": False, "flying": False})
-        return _result(name, True, {"status": "ok"})
-
-    result = SkillRegistry(register_builtins=True).execute(
-        "skill:navigation",
-        {"altitude": 3.0},
-        tools,  # type: ignore[arg-type]
-        execute_tool=governed,
-    )
-
-    assert result.ok is True
-    assert calls == ["drone_connect", "drone_get_status", "drone_arm", "drone_takeoff", "drone_hover"]
-    assert tools.calls == []
-
-
-def test_navigation_skill_recovers_when_takeoff_failed_but_status_is_airborne() -> None:
-    tools = FakeTools({})
-    calls: list[str] = []
-    status_calls = 0
-
-    def governed(name: str, params: dict[str, Any], dry_run: bool) -> ToolCallResult:
-        nonlocal status_calls
-        calls.append(name)
-        if name == "drone_get_status":
-            status_calls += 1
-            if status_calls == 1:
-                return _result(name, True, {"status": "ok", "armed": False, "flying": False, "altitude_m": 0.1})
-            return _result(name, True, {"status": "ok", "armed": True, "flying": True, "altitude_m": 2.7})
-        if name == "drone_takeoff":
-            return _result(name, False, {"status": "error", "message": "target altitude not reached"})
-        return _result(name, True, {"status": "ok"})
-
-    result = SkillRegistry(register_builtins=True).execute(
-        "skill:navigation",
-        {"altitude": 3.0, "forward_m": 2.0, "hover_after": True},
-        tools,  # type: ignore[arg-type]
-        execute_tool=governed,
-    )
-
-    assert result.ok is True
-    assert calls == [
-        "drone_connect",
-        "drone_get_status",
-        "drone_arm",
-        "drone_takeoff",
-        "drone_get_status",
-        "drone_move_relative",
-        "drone_hover",
-    ]
 
 
 def test_runtime_skips_takeoff_when_vehicle_is_already_airborne_near_target() -> None:
@@ -1165,20 +1028,14 @@ def test_recent_context_excludes_current_user_behind_placeholder() -> None:
 
 if __name__ == "__main__":
     tests = [
-        test_async_tool_is_polled_to_terminal_state,
         test_agent_loop_allows_bounded_recovery_after_failure,
         test_status_readback_alone_does_not_hide_failure,
         test_unavailable_tool_is_not_reported_as_completed,
         test_llm_payload_with_unavailable_tool_is_not_complete,
         test_agent_loop_keeps_atomic_tools_available_with_markdown_guidance,
-        test_visual_question_forces_capture_then_vlm_analysis,
-        test_visual_confirmation_guard_uses_native_tools_before_blocking_2d_approach,
-        test_visual_approach_is_blocked_without_safe_3d_target_or_approach_tool,
         test_tool_runtime_marks_started_result_as_non_terminal,
         test_invalid_tool_parameters_return_structured_failure,
         test_async_tool_without_task_id_is_rejected,
-        test_cancelled_background_task_cannot_flip_back_to_completed,
-        test_skill_subtools_use_governed_executor_callback,
         test_high_risk_real_vehicle_tool_cannot_bypass_execute_approval_path,
         test_repeated_verified_trajectory_becomes_reviewable_skill_candidate,
         test_task_run_store_persists_replayable_run_record,
@@ -1189,54 +1046,6 @@ if __name__ == "__main__":
     for test in tests:
         test()
         print(f"PASS {test.__name__}")
-
-
-def test_async_settle_exits_quickly_when_task_status_tool_missing() -> None:
-    """Non-AirSim backends do not register airsim_task_status: settling an
-    async descriptor must return immediately instead of spinning the whole
-    async_timeout polling an unknown tool."""
-
-    def task_status(_: dict[str, Any]) -> ToolCallResult:
-        return ToolCallResult(
-            "airsim_task_status",
-            {},
-            False,
-            {"status": "error", "message": "unknown tool: airsim_task_status"},
-            time.time(),
-            time.time(),
-            error_code="UNKNOWN_TOOL",
-        )
-
-    tools = FakeTools({
-        "drone_upload_mission": _result(
-            "drone_upload_mission",
-            True,
-            {"status": "started", "task_id": "search_1"},
-            terminal=False,
-            task_id="search_1",
-        ),
-        "airsim_task_status": task_status,
-    })
-    planner = SequencePlanner([
-        LoopDecision("drone_upload_mission", {"waypoints_json": "[]"}, "start async mission task"),
-        LoopDecision(action="", reason="mission task accepted", is_complete=True),
-    ])
-    loop = AgentLoop(
-        tools, planner, FakeMemory(), skills=FakeSkills(), async_timeout=60.0, async_poll_interval=0.05
-    )
-    started = time.time()
-    state = loop.run(
-        "run_no_status_tool",
-        "upload mission",
-        {"gps": True, "mode_control": True},
-        [{"name": name} for name in tools.handlers],
-        max_steps=4,
-    )
-    elapsed = time.time() - started
-    assert elapsed < 2.0, f"settle did not exit promptly ({elapsed:.1f}s)"
-    first = state.results[0]
-    assert first.data["status"] == "accepted"
-    assert "not available on this backend" in first.data["message"]
 
 
 def test_completed_loop_clears_stale_failure_reason() -> None:
@@ -1278,7 +1087,6 @@ def test_nested_value_depth_limited() -> None:
     loop = AgentLoop(None, None, None)  # instance methods only need the receiver
     assert loop._iter_nested_tool_results(deep) == []
     assert loop._result_contains_image(deep) is False
-    assert loop._find_async_descriptor(deep) is None
 
 
 def test_status_readback_fast_path_works_in_chat_mode() -> None:
@@ -1289,8 +1097,18 @@ def test_status_readback_fast_path_works_in_chat_mode() -> None:
         backend_id = "airsim"
 
         def execute(self, tool, params, *, dry_run=False, blocked_by_supervisor=False, allow_reconnect=False):
-            if tool == "drone_list_vehicles":
-                return _result(tool, True, {"vehicles": ["Drone1", "Drone2"]})
+            if tool == "drone_get_status" and not (params or {}).get("vehicle_name"):
+                # 机队读取（原 drone_list_vehicles 已合并进本工具）
+                return _result(tool, True, {
+                    "status": "ok",
+                    "vehicle_count": 2,
+                    "vehicles": [
+                        {"vehicle_name": "Drone1", "armed": False, "flying": False,
+                         "position_ned": {"x": 0.1, "y": 0.2, "z": -0.05}},
+                        {"vehicle_name": "Drone2", "armed": False, "flying": False,
+                         "position_ned": {"x": 0.0, "y": 0.0, "z": 0.0}},
+                    ],
+                })
             return _result(
                 tool,
                 True,
@@ -1320,7 +1138,7 @@ def test_status_readback_fast_path_works_in_chat_mode() -> None:
     reasoning = str(details.get("reasoning_text") or "")
     assert "快速回读" in reasoning
     assert "状态总结" in reasoning
-    assert any(item.get("tool") == "drone_list_vehicles" for item in details.get("process_trace") or [])
+    assert any(item.get("tool") == "drone_get_status" for item in details.get("process_trace") or [])
 
 
 def test_execute_run_not_orphaned_during_startup_grace() -> None:

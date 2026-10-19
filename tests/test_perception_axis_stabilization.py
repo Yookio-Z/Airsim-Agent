@@ -3,8 +3,8 @@
 import numpy as np
 import pytest
 
-from src.modules import perception_axis
-from src.modules.perception_axis import LocalPerceptionEngine, to_target_state
+from src.modules.perception import axis as perception_axis
+from src.modules.perception.axis import LocalPerceptionEngine, to_target_state
 
 
 @pytest.fixture

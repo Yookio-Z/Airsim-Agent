@@ -58,21 +58,17 @@ test('only cached previews use fast bounded polling; errors retain backoff', () 
   assert.equal(h.delays.length, 0);
 });
 
-test('perf badge shows delivered frames; detect rate comes from telemetry, not preview meta', () => {
+test('perf badge shows delivered frames only (检测已移除，徽标不再报识别速率)', () => {
   const h = cameraHarness();
   const win = { streamActive: true, perfEl: {}, frameTimes: [9000, 9500, 10000] };
   h.context.renderCameraPerf(win, { fps: 10, detect_fps: 3 });
   assert.match(win.perfEl.innerHTML, /FPS 2\.0/);
-  // 检测未运行（tool_runtime.perception 为空）：预览 meta 里的 detect_fps=3
-  // 不再被采用，帧率徽标只报面板收到的帧率
+  // 检测已从产品移除：无论预览 meta 还是遥测，都不再出现"识别/检测"徽标
   assert.doesNotMatch(win.perfEl.innerHTML, /识别|检测/);
   assert.match(win.perfEl.title, /后台采集 10\.0/);
-  // 检测运行时：速率从遥测的 tool_runtime.perception.detect_fps 取，与检测徽标
-  // 同源；预览 meta 里不同的 detect_fps(9.9) 不参与，避免两套数据源打架
   h.context.latestState = { tool_runtime: { perception: { detect_fps: 3.1 } } };
   h.context.renderCameraPerf(win, { fps: 10, detect_fps: 9.9 });
-  assert.match(win.perfEl.innerHTML, /识别 3\.1\/s/);
-  assert.doesNotMatch(win.perfEl.innerHTML, /9\.9/);
+  assert.doesNotMatch(win.perfEl.innerHTML, /识别|检测|3\.1|9\.9/);
   win.streamActive = false;
   h.context.renderCameraPerf(win);
   assert.equal(win.perfEl.hidden, true);

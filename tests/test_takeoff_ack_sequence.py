@@ -4,7 +4,7 @@ from unittest.mock import Mock
 
 from pymavlink import mavutil
 
-from src.modules.mavlink_controller import MavlinkController
+from src.modules.backends.mavlink import MavlinkController
 
 
 def test_takeoff_temporary_rejection_returns_failure_without_timeout(monkeypatch):

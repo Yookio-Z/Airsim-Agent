@@ -8,8 +8,8 @@ import airsim
 import numpy as np
 import pytest
 
-from src.modules.airsim_controller import AirSimController
-from src.modules.camera_stabilization import CameraStabilization
+from src.modules.backends.airsim import AirSimController
+from src.modules.perception.camera_stabilization import CameraStabilization
 
 
 def matrix(roll, pitch, yaw):

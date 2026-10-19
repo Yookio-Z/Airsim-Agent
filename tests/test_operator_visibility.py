@@ -141,7 +141,7 @@ def test_overshoot_veto_blocks_flying_onto_the_located_point():
     state = LoopState(run_id="r", command="飞向画面里那辆浅蓝色汽车，靠近后悬停", status="running")
     state.results.append(
         SimpleNamespace(
-            tool="airsim_locate_point",
+            tool="locate_image_point",
             ok=True,
             data={"valid": True, "distance_m": 30.0, "world_pos": {"x": 29.02, "y": 6.37, "z": -7.49}},
         )
@@ -163,7 +163,7 @@ def test_overshoot_veto_allows_stopping_short_and_bypassing():
     state = LoopState(run_id="r", command="飞向画面里那辆浅蓝色汽车，靠近后悬停", status="running")
     state.results.append(
         SimpleNamespace(
-            tool="airsim_locate_point",
+            tool="locate_image_point",
             ok=True,
             data={"valid": True, "distance_m": 30.0, "world_pos": {"x": 30.0, "y": 0.0, "z": -7.0}},
         )
@@ -210,7 +210,7 @@ def test_surface_check_reports_flat_surface_when_the_box_is_on_the_ground():
     实测事故（2026-10-13）：视觉点落在 30 m 外的路面上，深度没错、点错了；
     以前没有任何机制能发现这一点。
     """
-    from src.modules.perception_airsim_adapter import _surface_consistency
+    from src.modules.perception.airsim_adapter import _surface_consistency
 
     depth = _synthetic_depth()
     check = _surface_consistency(depth, (150, 200), 0.6, 0.39, 0.08, 0.12, 90.0)
@@ -222,7 +222,7 @@ def test_surface_check_reports_flat_surface_when_the_box_is_on_the_ground():
 
 def test_surface_check_detects_an_object_in_front():
     """框内明显比框外近 → 像独立前景目标（点大概率真的在目标上）。"""
-    from src.modules.perception_airsim_adapter import _surface_consistency
+    from src.modules.perception.airsim_adapter import _surface_consistency
 
     depth = _synthetic_depth(object_box=(0.6, 0.39, 0.10, 0.14), object_m=12.0)
     check = _surface_consistency(depth, (150, 200), 0.6, 0.39, 0.08, 0.12, 90.0)
@@ -233,7 +233,7 @@ def test_surface_check_detects_an_object_in_front():
 
 def test_surface_check_is_silent_without_a_box():
     """没给框就不做交叉验证（没有"内外对比"可言）。"""
-    from src.modules.perception_airsim_adapter import _surface_consistency
+    from src.modules.perception.airsim_adapter import _surface_consistency
 
     depth = _synthetic_depth()
     assert _surface_consistency(depth, (150, 200), 0.6, 0.39, 0.0, 0.0, 90.0) == {}
@@ -248,8 +248,8 @@ def test_locate_tool_passes_the_vision_box_through():
 
     calls: list[tuple] = []
 
-    def locate(x, y, vehicle_name="", hint_w=0.0, hint_h=0.0):
-        calls.append((x, y, hint_w, hint_h))
+    def locate(x, y, vehicle_name="", hint_w=0.0, hint_h=0.0, extra_points=None):
+        calls.append((x, y, hint_w, hint_h, tuple(extra_points or ())))
         return {"valid": True, "distance_m": 30.0, "world_pos": {"x": 1.0, "y": 2.0, "z": -3.0},
                 "surface_check": "same_surface", "surface_hint": "框内外深度几乎一样"}
 
@@ -258,8 +258,8 @@ def test_locate_tool_passes_the_vision_box_through():
         collector, None, lambda data: json.dumps(data, ensure_ascii=False), locate=locate
     )
 
-    payload = json.loads(collector.tools["airsim_locate_point"](0.6, 0.39, 0.08, 0.12))
-    assert calls == [(0.6, 0.39, 0.08, 0.12)]
+    payload = json.loads(collector.tools["locate_image_point"]("0.6,0.39", 0.08, 0.12))
+    assert calls == [(0.6, 0.39, 0.08, 0.12, ())]
     assert payload["surface_check"] == "same_surface"
 
 
@@ -269,7 +269,7 @@ def test_overshoot_veto_ignores_a_known_flat_surface_locate():
     state = LoopState(run_id="r", command="飞向画面里那辆浅蓝色汽车，靠近后悬停", status="running")
     state.results.append(
         SimpleNamespace(
-            tool="airsim_locate_point",
+            tool="locate_image_point",
             ok=True,
             data={
                 "valid": True,
@@ -300,7 +300,7 @@ def _approach_state(command: str, *, height: float | str | None, distance: float
         )
     if distance is not None:
         state.results.append(
-            SimpleNamespace(tool="airsim_locate_point", ok=True,
+            SimpleNamespace(tool="locate_image_point", ok=True,
                             data={"valid": True, "distance_m": distance, "world_pos": {"x": 1.0, "y": 2.0, "z": -3.0}})
         )
     return state

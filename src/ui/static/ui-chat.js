@@ -134,7 +134,7 @@ function setupCameraEventListeners() {
       if (win.streamActive && cameraViewerIsVisible(win)) scheduleCameraFrame(win, 0);
     });
   });
-  [els.cameraSource, els.cameraRtspUrl, els.cameraRtspTransport, els.cameraName, els.cameraVehicle, els.cameraImageType, els.cameraTimeout, els.cameraAutoSave]
+  [els.cameraSource, els.cameraRtspUrl, els.cameraRtspTransport, els.cameraName, els.cameraVehicle, els.cameraImageType, els.cameraTimeout]
     .filter(Boolean)
     .forEach((control) => {
       control.addEventListener("change", () => {
@@ -143,7 +143,6 @@ function setupCameraEventListeners() {
         if (win) {
           win.settings = { ...cameraSettings };
           syncCameraWindowControls(win);
-          renderCameraMeta(null, win);
         }
         renderCameraSettings();
       });
@@ -874,7 +873,6 @@ function humanToolLabel(tool, label = "") {
   const labels = {
     drone_connect: "连接飞控链路",
     drone_disconnect: "断开飞控链路",
-    drone_list_vehicles: "查看可用无人机",
     drone_get_status: "读取无人机状态",
     drone_arm: "解锁电机",
     drone_disarm: "锁定电机",
@@ -883,7 +881,6 @@ function humanToolLabel(tool, label = "") {
     drone_hover: "悬停",
     drone_fly_to: "飞往目标坐标",
     drone_move_relative: "按相对方向移动",
-    drone_fly_velocity: "按速度飞行",
     drone_fly_path: "沿航线飞行",
     drone_upload_mission: "上传飞行任务",
     drone_download_mission: "下载飞行任务",
@@ -892,12 +889,18 @@ function humanToolLabel(tool, label = "") {
     drone_get_mission_progress: "读取任务进度",
     drone_rotate_to: "调整朝向",
     drone_set_mode: "切换飞行模式",
-    airsim_take_photo: "拍摄图像",
     inspect_current_frame: "分析当前画面",
     airsim_get_sensors: "读取传感器",
-    airsim_get_depth_map: "读取深度图",
+    locate_image_point: "测距/定位图像点",
     // 以下几项只是**历史运行记录**的显示名（老 run 日志里出现过这些工具名，
     // 回放时要能翻译成人话）。它们不是当前模型可用的工具，别照着这里补工具。
+    drone_list_vehicles: "查看可用无人机",
+    memory_recall: "回忆记忆",
+    memory_remember: "记住一条事实",
+    drone_fly_velocity: "按速度飞行",
+    airsim_take_photo: "拍一张画面",
+    airsim_get_depth_map: "读取深度图",
+    airsim_locate_point: "测距/定位图像点",
     airsim_search_target: "搜索目标",
     airsim_approach_target: "接近目标",
     airsim_track_object: "跟踪目标",
@@ -1722,7 +1725,6 @@ function updateAgentTurn(entry, message, run, llm) {
   // plan-execute 呈现为「思考→计划→步骤序列」，ReAct 自然呈现为
   // 「思考→工具→结果→思考→工具…」——同一套结构，无需分模式。
   const timelineItems = processTrace.filter((item) => {
-    if (item.tool === "memory_store") return false;
     // kind=plan 的工具清单与上方"执行计划"块重复，不再重复展示
     if (normalizeProcessKind(item) === "plan") return false;
     const cat = nodeCategory(item);
@@ -2187,7 +2189,6 @@ function renderAgentThoughts(message, run, active) {
   if (processTrace.length) {
     processTrace.forEach((item) => {
       const toolName = String(item?.tool || "");
-      if (toolName === "memory_store") return;
       const title = item?.tool ? humanToolLabel(item.tool, item.title) : humanThoughtTitle(item?.title || "");
       const body = humanThoughtBody(item?.body || "", item?.tool || "");
       if (title || body) {
@@ -2203,7 +2204,7 @@ function renderAgentThoughts(message, run, active) {
   if (!processRows.length) {
     decisions.forEach((decision, index) => {
       const action = String(decision?.action || "");
-      if (!action || action === "memory_store") return;
+      if (!action) return;
       const result = results.find((item) => Number(item.step_index || 0) === index + 1);
       const status = result ? (result.ok ? "completed" : "failed") : (active ? "running" : "planned");
       processRows.push({
@@ -2214,10 +2215,10 @@ function renderAgentThoughts(message, run, active) {
       });
     });
   }
-  const hasToolStep = (plan?.steps || []).some((step) => step?.tool && step.tool !== "memory_store");
+  const hasToolStep = (plan?.steps || []).some((step) => step?.tool);
   if (!processRows.length && hasToolStep) {
     (plan.steps || []).forEach((step) => {
-      if (!step?.tool || step.tool === "memory_store") return;
+      if (!step?.tool) return;
       processRows.push({
         status: step.status || "planned",
         kind: "tool",
@@ -2388,9 +2389,6 @@ function valueOrDash(value) {
 function humanDecisionReason(reason, action = "") {
   const text = String(reason || "").trim();
   const normalized = text.toLowerCase();
-  if (action === "airsim_take_photo" || normalized.includes("capture the current camera frame")) {
-    return "获取当前摄像头画面";
-  }
   if (action === "inspect_current_frame" || normalized.includes("analyze the current camera frame") || normalized.includes("confirm the requested target")) {
     return normalized.includes("confirm the requested target") ? "确认画面中是否存在目标" : "调用所选多模态模型分析画面";
   }

@@ -9,8 +9,8 @@ from __future__ import annotations
 
 import time
 
-from src.modules.formation import FormationController
-from src.modules.mavlink_controller import MavlinkController
+from src.modules.formation.controller import FormationController
+from src.modules.backends.mavlink import MavlinkController
 
 
 # ---------------------------------------------------------------------------

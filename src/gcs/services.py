@@ -9,14 +9,16 @@ and real-vehicle adapters behind the same managers.
 from __future__ import annotations
 
 import json
+import threading
 import time
-from typing import Any, Callable
-
-from src.agent.tool_executor import ToolCallResult, ToolRuntime
+from typing import TYPE_CHECKING, Any, Callable
 
 from .managers import ManagerResult
 from .mission import GeoPoint, MissionItem, MissionPlanDraft
 from .state import GroundStationState, LinkState, MissionState, SafetyState, VehicleTelemetry
+
+if TYPE_CHECKING:  # 只用于类型标注：避免 gcs → agent → gcs 的循环导入
+    from src.agent.tool_executor import ToolCallResult, ToolRuntime
 
 
 SupervisorStatusProvider = Callable[[], dict[str, Any]]
@@ -24,7 +26,13 @@ CurrentRunProvider = Callable[[], dict[str, Any] | None]
 
 
 class ToolTelemetryManager:
-    """Telemetry manager backed by ToolRuntime.status_snapshot()."""
+    """Telemetry manager backed by ToolRuntime.status_snapshot().
+
+    **面板/HUD 遥测的唯一读口**（2026-10-15）：界面能看到的一切遥测——HUD 帧、
+    整体状态载荷、链路汇总、机队清单、遥测录制——都从这里取同一份快照。
+    运行时**内部**的决策读（看门狗、审批、循环观察）仍直读工具层：那是运行时的
+    事，不是面板数据，混进来只会让"谁在读遥测"更难查。
+    """
 
     def __init__(
         self,
@@ -46,8 +54,12 @@ class ToolTelemetryManager:
             return None
         return state.vehicle
 
+    def snapshot(self) -> dict[str, Any]:
+        """一次工具运行时快照：面板遥测的唯一来源。"""
+        return self._tools.status_snapshot()
+
     def get_state(self) -> GroundStationState:
-        snapshot = self._tools.status_snapshot()
+        snapshot = self.snapshot()
         supervisor = self._supervisor_status_provider() if self._supervisor_status_provider else {}
         current_run = self._current_run_provider() if self._current_run_provider else None
         state = GroundStationState.from_tool_runtime(snapshot, supervisor=supervisor, current_run=current_run)
@@ -71,7 +83,7 @@ class ToolLinkManager:
 
     def connect(self, transport: str = "", endpoint: str = "", **params: Any) -> ManagerResult:
         payload = dict(params)
-        backend = str(self._tools.status_snapshot().get("backend") or "")
+        backend = str(self._telemetry.snapshot().get("backend") or "")
         transport_key = transport.strip().lower()
 
         if endpoint:
@@ -87,6 +99,11 @@ class ToolLinkManager:
         result = self._tools.execute("drone_connect", payload, dry_run=False, allow_reconnect=False)
         return _manager_result_from_tool(result)
 
+    def reconnect(self) -> ManagerResult:
+        """重连当前链路（用上一次的连接参数）。"""
+        result = self._tools.reconnect()
+        return _manager_result_from_tool(result)
+
     def disconnect(self, link_id: str = "") -> ManagerResult:
         result = self._tools.execute("drone_disconnect", {}, dry_run=False, allow_reconnect=False)
         return _manager_result_from_tool(result)
@@ -96,32 +113,28 @@ class ToolLinkManager:
 
 
 class ToolVehicleManager:
-    """Vehicle discovery backed by the core drone_list_vehicles tool."""
+    """机队清单：读遥测快照里的载具列表（**不额外打工具调用**）。
+
+    界面每 250ms 轮询一次状态，所以这里刻意不执行工具——旧实现每次都调
+    drone_get_status，等于每次轮询都往飞控发一次读请求。快照里没有 vehicles
+    时返回空列表：单机后端就是这个样子，界面把"没选"理解为"默认那一台"。
+    """
 
     def __init__(self, tools: ToolRuntime, telemetry: ToolTelemetryManager) -> None:
         self._tools = tools
         self._telemetry = telemetry
-        self._active_vehicle_id = ""
 
     def list_vehicles(self) -> list[dict[str, Any]]:
-        result = self._tools.execute("drone_list_vehicles", {}, dry_run=False)
-        vehicles = result.data.get("vehicles") if result.ok else []
-        return [dict(v) for v in vehicles] if isinstance(vehicles, list) else []
-
-    def active_vehicle_id(self) -> str:
-        if self._active_vehicle_id:
-            return self._active_vehicle_id
-        vehicle = self._telemetry.get_vehicle()
-        return vehicle.vehicle_id if vehicle else ""
-
-    def set_active_vehicle(self, vehicle_id: str) -> ManagerResult:
-        self._active_vehicle_id = vehicle_id.strip()
-        return ManagerResult(True, "active vehicle selected", {"vehicle_id": self._active_vehicle_id})
-
-    def remove_vehicle(self, vehicle_id: str) -> ManagerResult:
-        if vehicle_id == self._active_vehicle_id:
-            self._active_vehicle_id = ""
-        return ManagerResult(True, "vehicle removed from local selection", {"vehicle_id": vehicle_id})
+        snapshot = self._telemetry.snapshot()
+        vehicles = snapshot.get("vehicles")
+        entries: list[dict[str, Any]] = []
+        for item in vehicles or []:
+            if not isinstance(item, dict):
+                continue
+            entry = dict(item)
+            entry.setdefault("vehicle_id", str(entry.get("vehicle_name") or ""))
+            entries.append(entry)
+        return entries
 
 
 class ToolSafetyManager:
@@ -189,58 +202,73 @@ class ToolSafetyManager:
 
 
 class ToolCommandManager:
-    """High-level vehicle commands routed through safety validation."""
+    """设备动作的唯一入口：安全校验 → 运行时治理执行。
 
-    def __init__(self, tools: ToolRuntime, telemetry: ToolTelemetryManager, safety: ToolSafetyManager) -> None:
+    操作员的两条直接入口（``POST /api/control`` 与 ``POST /api/tool``）与 Agent 的
+    飞行步骤最终都走 ``_execute_agent_tool`` 这条治理入口，所以"手动点一下"和
+    "Agent 自己飞"共享同一套守卫（执行槽占用、编队冲突、真机审批、后端切换检查），
+    这里额外加的是 gcs 自己的急停门与安全校验。
+    """
+
+    # 设备级动作：会被本管理器接管（任务级动作如暂停/取消/急停属于 supervisor）。
+    DEVICE_TOOLS = (
+        "drone_arm",
+        "drone_disarm",
+        "drone_takeoff",
+        "drone_land",
+        "drone_hover",
+        "drone_set_mode",
+        "drone_fly_to",
+        "drone_move_relative",
+        "drone_fly_path",
+        "drone_rotate_to",
+    )
+
+    def __init__(
+        self,
+        tools: ToolRuntime,
+        telemetry: ToolTelemetryManager,
+        safety: ToolSafetyManager,
+        executor: Callable[..., Any] | None = None,
+    ) -> None:
         self._tools = tools
         self._telemetry = telemetry
         self._safety = safety
+        # 默认退回工具层；运行时注入 _execute_agent_tool（治理入口）。
+        self._executor = executor
 
-    def arm(self, vehicle_id: str = "") -> ManagerResult:
-        return self._execute("drone_arm", {}, vehicle_id=vehicle_id)
+    def execute_tool(
+        self,
+        tool: str,
+        params: dict[str, Any] | None = None,
+        vehicle_id: str = "",
+    ) -> Any:
+        """一次设备动作：校验通过后交给治理入口执行，返回 ToolCallResult。
 
-    def disarm(self, vehicle_id: str = "") -> ManagerResult:
-        return self._execute("drone_disarm", {}, vehicle_id=vehicle_id)
+        校验失败也返回 ToolCallResult（ok=False），调用方不必区分两种返回类型。
+        """
+        from src.agent.tool_executor import ToolCallResult
 
-    def takeoff(self, altitude_m: float, vehicle_id: str = "") -> ManagerResult:
-        return self._execute("drone_takeoff", {"altitude": altitude_m}, vehicle_id=vehicle_id)
-
-    def land(self, vehicle_id: str = "") -> ManagerResult:
-        return self._execute("drone_land", {}, vehicle_id=vehicle_id)
-
-    def hold(self, vehicle_id: str = "") -> ManagerResult:
-        return self._execute("drone_hover", {}, vehicle_id=vehicle_id)
-
-    def rtl(self, vehicle_id: str = "") -> ManagerResult:
-        return self.set_mode("RTL", vehicle_id=vehicle_id)
-
-    def set_mode(self, mode: str, vehicle_id: str = "") -> ManagerResult:
-        return self._execute("drone_set_mode", {"mode": mode}, vehicle_id=vehicle_id)
-
-    def goto(self, item: dict[str, Any], vehicle_id: str = "") -> ManagerResult:
-        payload = {
-            "x": float(item.get("x", 0.0)),
-            "y": float(item.get("y", 0.0)),
-            "z": float(item.get("z", -3.0)),
-            "velocity": float(item.get("velocity", item.get("speed_mps", 2.0)) or 2.0),
-        }
-        return self._execute("drone_fly_to", payload, vehicle_id=vehicle_id)
-
-    def _execute(self, tool: str, params: dict[str, Any], vehicle_id: str = "") -> ManagerResult:
+        payload = dict(params or {})
         if vehicle_id:
-            params = {**dict(params), "vehicle_name": vehicle_id}
+            payload["vehicle_name"] = vehicle_id
         state = self._telemetry.get_state()
         state.safety = self._safety.state()
-        validation = self._safety.validate_command(tool, params, state)
+        validation = self._safety.validate_command(tool, payload, state)
         if not validation.ok:
-            return validation
-        result = self._tools.execute(
-            tool,
-            params,
-            dry_run=False,
-            blocked_by_supervisor=state.safety.emergency_stop,
-        )
-        return _manager_result_from_tool(result)
+            return ToolCallResult(
+                tool,
+                payload,
+                False,
+                {"status": "error", "message": validation.message, **dict(validation.data or {})},
+                0.0,
+                0.0,
+                error_code="SAFETY_BLOCKED",
+            )
+        executor = self._executor
+        if callable(executor):
+            return executor(tool, payload, dry_run=False)
+        return self._tools.execute(tool, payload, dry_run=False)
 
 
 class ToolMissionManager:
@@ -252,6 +280,9 @@ class ToolMissionManager:
         self._safety = safety
         self._draft: MissionPlanDraft | None = None
         self._state = MissionState()
+        # 后台任务注册表（方案乙：多机非阻塞由编排层承担）
+        self._jobs: dict[str, dict[str, Any]] = {}
+        self._jobs_lock = threading.RLock()
 
     def get_draft(self) -> MissionPlanDraft | None:
         return self._draft
@@ -411,7 +442,7 @@ class ToolMissionManager:
         result = self._tools.execute(
             "drone_fly_path",
             {
-                "waypoints_json": json.dumps(waypoints),
+                "waypoints": json.dumps(waypoints),
                 "velocity": velocity,
                 # 面板选定的目标机（空串 = 后端默认机）；多机后端必须传递，
                 # 否则任务永远落在第一架车上
@@ -431,11 +462,14 @@ class ToolMissionManager:
         return str((self._draft.vehicle or "").strip()) if self._draft else ""
 
     def start_multi(self, assignments: list[dict[str, Any]] | None) -> ManagerResult:
-        """多机各自航线并发执行：每机先并发派发起飞，再各自派发自己的路径。
+        """多机各自航线：提交后台任务后立即返回，飞行在后台按机并发执行。
+
+        方案乙（2026-10-15）：不再使用 dispatch_* 工具（已删除）。"非阻塞"
+        语义由编排层承担——每架机一个后台工作线程调用阻塞工具
+        （drone_takeoff / drone_fly_path）；控制器内部已支持多机并发
+        （MAVLink 用线程本地目标，AirSim 用每机客户端），因此两套后端行为一致。
 
         assignments: [{"vehicle": "Drone1", "items": [MissionItem...]}, ...]
-        全程使用非阻塞派发工具（drone_dispatch_takeoff / drone_dispatch_path），
-        每架机执行完自己的航线后悬停等待，互不阻塞。
         """
         if not isinstance(assignments, list) or not assignments:
             return ManagerResult(False, "no mission assignments", {})
@@ -443,7 +477,7 @@ class ToolMissionManager:
         state.safety = self._safety.state()
         if state.safety.emergency_stop:
             return ManagerResult(False, "mission blocked by emergency stop", self._state.to_dict())
-        validation = self._safety.validate_command("drone_dispatch_path", {}, state)
+        validation = self._safety.validate_command("drone_fly_path", {}, state)
         if not validation.ok:
             return validation
 
@@ -471,124 +505,97 @@ class ToolMissionManager:
         if not plans:
             return ManagerResult(False, "没有非空的航线任务", {})
 
-        # 2. 阶段 A：对未在空中的机并发派发起飞（fire-and-forget）。
-        #    无非阻塞派发能力的后端（PX4 MAVLink / 真机）跳过本阶段，
-        #    起飞由阶段 C 的阻塞路径逐机负责。
-        controller = getattr(self._tools, "controller", None)
-        supports_dispatch = bool(
-            controller is not None
-            and callable(getattr(controller, "dispatch_move_on_path", None))
-            and callable(getattr(controller, "dispatch_takeoff", None))
+        # 2. 提交后台任务：立即返回，飞行在后台并发执行（进度见 progress().details.jobs）
+        job_id = self._submit_multi_job(plans)
+        summary = "、".join(f"{p['vehicle'] or '默认机'}({len(p['waypoints'])}点)" for p in plans)
+        message = f"多机任务已提交后台执行: {summary}"
+        self._state.running = True
+        self._state.message = message
+        self._state.details = {"execution_mode": "multi_vehicle_background", "job_id": job_id}
+        return ManagerResult(
+            True, message,
+            {"job_id": job_id, "assignments": plans, "mission": self._state.to_dict()},
         )
-        vehicles_state = {v.vehicle_id: v for v in state.vehicles}
-        dispatched_takeoffs: list[str] = []
-        if supports_dispatch:
-            for plan in plans:
-                vehicle = plan["vehicle"]
-                telemetry = vehicles_state.get(vehicle)
-                if telemetry is not None and telemetry.flying and telemetry.armed:
-                    continue
-                result = self._tools.execute(
-                    "drone_dispatch_takeoff",
-                    {"altitude": plan["takeoff_altitude"], "vehicle_name": vehicle},
-                    dry_run=False,
-                    blocked_by_supervisor=state.safety.emergency_stop,
-                )
-                if result.ok:
-                    dispatched_takeoffs.append(vehicle)
-                else:
-                    return ManagerResult(
-                        False,
-                        f"{vehicle or '默认机'} 起飞派发失败: {result.data.get('message', '')}",
-                        {"assignments": plans, "failed_takeoff": vehicle},
-                    )
 
-        # 3. 阶段 B：等待派发了起飞的机进入空中（有上限，不阻塞已空中的机）
-        if dispatched_takeoffs:
-            deadline = time.time() + 25.0
-            pending = set(dispatched_takeoffs)
-            while pending and time.time() < deadline:
-                time.sleep(1.0)
+    def _submit_multi_job(self, plans: list[dict[str, Any]]) -> str:
+        """每架机一个后台工作线程：确保空中 → 飞自己的航线（阻塞调用）。
+
+        急停：工具调用携带 blocked_by_supervisor；控制器的移动循环本身也会在
+        急停时中断（AirSim 的 _wait_move_arrival / MAVLink 的逐航点循环）。
+        """
+        job_id = f"multi_{int(time.time() * 1000)}"
+        record: dict[str, Any] = {
+            "job_id": job_id,
+            "kind": "multi_mission",
+            "status": "running",
+            "created_at": time.time(),
+            "vehicles": {},
+        }
+        with self._jobs_lock:
+            self._jobs[job_id] = record
+
+        def worker(plan: dict[str, Any]) -> None:
+            vehicle = str(plan.get("vehicle") or "")
+            label = vehicle or "默认机"
+            stop = bool(self._safety.state().emergency_stop) if self._safety is not None else False
+            if stop:
+                record["vehicles"][label] = {"ok": False, "phase": "blocked", "message": "emergency stop active"}
+                return
+            try:
                 snapshot = self._telemetry.get_state()
-                airborne = {v.vehicle_id for v in snapshot.vehicles if v.flying}
-                pending -= airborne
-            # 超时的机不再等，路径照常派发（AirSim 会在起飞完成后执行路径）
-
-        # 4. 阶段 C：逐机执行各自路径。
-        #    有非阻塞派发能力的后端（AirSim）fire-and-forget 互不阻塞；
-        #    没有的后端（PX4 MAVLink / 真机）走阻塞路径：已起飞的目标机直接
-        #    飞路径，未起飞的先起飞再飞路径（逐机顺序执行，确定性强）。
-        controller = getattr(self._tools, "controller", None)
-        supports_dispatch = bool(
-            controller is not None
-            and callable(getattr(controller, "dispatch_move_on_path", None))
-            and callable(getattr(controller, "dispatch_takeoff", None))
-        )
-        results: list[dict[str, Any]] = []
-        failed: list[str] = []
-        for plan in plans:
-            vehicle = plan["vehicle"]
-            if supports_dispatch:
-                result = self._tools.execute(
-                    "drone_dispatch_path",
-                    {
-                        "waypoints_json": json.dumps(plan["waypoints"]),
-                        "velocity": plan["velocity"],
-                        "vehicle_name": vehicle,
-                    },
-                    dry_run=False,
-                    blocked_by_supervisor=state.safety.emergency_stop,
-                )
-            else:
-                # PX4/真机：先确保目标机在任务高度（未起飞则起飞）
-                taked_off = True
-                telemetry = {v.vehicle_id: v for v in state.vehicles}.get(vehicle)
+                telemetry = None
+                if vehicle:
+                    telemetry = next((v for v in snapshot.vehicles if v.vehicle_id == vehicle), None)
+                else:
+                    telemetry = snapshot.vehicle
                 if telemetry is None or not (telemetry.flying and telemetry.armed):
                     takeoff = self._tools.execute(
                         "drone_takeoff",
                         {"altitude": plan["takeoff_altitude"], "vehicle_name": vehicle},
                         dry_run=False,
-                        blocked_by_supervisor=state.safety.emergency_stop,
+                        blocked_by_supervisor=stop,
                     )
-                    taked_off = bool(takeoff.ok)
-                if not taked_off:
-                    entry = {
-                        "vehicle": vehicle,
-                        "waypoint_count": len(plan["waypoints"]),
-                        "ok": False,
-                        "message": "takeoff failed before path",
-                    }
-                    results.append(entry)
-                    failed.append(vehicle or "默认机")
-                    continue
+                    if not takeoff.ok:
+                        record["vehicles"][label] = {
+                            "ok": False,
+                            "phase": "takeoff",
+                            "message": str((takeoff.data or {}).get("message") or "takeoff failed"),
+                        }
+                        return
                 result = self._tools.execute(
                     "drone_fly_path",
                     {
-                        "waypoints_json": json.dumps(plan["waypoints"]),
+                        "waypoints": json.dumps(plan["waypoints"]),
                         "velocity": plan["velocity"],
                         "vehicle_name": vehicle,
                     },
                     dry_run=False,
-                    blocked_by_supervisor=state.safety.emergency_stop,
+                    blocked_by_supervisor=stop,
                 )
-            entry = {
-                "vehicle": vehicle,
-                "waypoint_count": len(plan["waypoints"]),
-                "velocity": plan["velocity"],
-                "ok": bool(result.ok),
-                "message": result.data.get("message", ""),
-            }
-            results.append(entry)
-            if not result.ok:
-                failed.append(vehicle or "默认机")
+                record["vehicles"][label] = {
+                    "ok": bool(result.ok),
+                    "phase": "path",
+                    "waypoint_count": len(plan["waypoints"]),
+                    "message": str((result.data or {}).get("message") or ""),
+                }
+            except Exception as exc:  # 单机异常不影响其他机
+                record["vehicles"][label] = {"ok": False, "phase": "error", "message": str(exc)}
 
-        ok = not failed
-        summary = "、".join(f"{r['vehicle'] or '默认机'}({r['waypoint_count']}点)" for r in results)
-        message = f"多机任务已派发: {summary}" if ok else f"部分派发失败: {', '.join(failed)}"
-        self._state.running = True
-        self._state.message = message
-        self._state.details = {"execution_mode": "multi_vehicle_dispatch", "assignments": results}
-        return ManagerResult(ok, message, {"assignments": results, "mission": self._state.to_dict()})
+        def run() -> None:
+            threads = [
+                threading.Thread(target=worker, args=(plan,), daemon=True, name=f"gcs-multi-{job_id}-{index}")
+                for index, plan in enumerate(plans)
+            ]
+            for thread in threads:
+                thread.start()
+            for thread in threads:
+                thread.join()
+            outcome = record["vehicles"]
+            record["status"] = "completed" if outcome and all(v.get("ok") for v in outcome.values()) else "failed"
+            record["finished_at"] = time.time()
+
+        threading.Thread(target=run, daemon=True, name=f"gcs-{job_id}").start()
+        return job_id
 
     def _execute_local_path(self, waypoints: list[dict[str, float]], velocity: float) -> ManagerResult:
         if self._draft is None:
@@ -633,7 +640,7 @@ class ToolMissionManager:
         result = self._tools.execute(
             "drone_fly_path",
             {
-                "waypoints_json": json.dumps(waypoints),
+                "waypoints": json.dumps(waypoints),
                 "velocity": velocity,
                 "vehicle_name": target_vehicle,
             },
@@ -668,6 +675,10 @@ class ToolMissionManager:
         if self._draft:
             self._state.draft = self._draft
             self._state.total_items = len(self._draft.items)
+        with self._jobs_lock:
+            jobs = [dict(job) for job in self._jobs.values()][-3:]
+        if jobs:
+            self._state.details = {**self._state.details, "jobs": jobs}
         return self._state
 
     def _draft_to_local_path(self, draft: MissionPlanDraft) -> tuple[list[dict[str, float]], float]:
@@ -764,6 +775,7 @@ class GroundStationServices:
         tools: ToolRuntime,
         supervisor: Any | None = None,
         current_run_provider: CurrentRunProvider | None = None,
+        governed_executor: Callable[..., Any] | None = None,
     ) -> None:
         supervisor_status_provider = supervisor.get_status if supervisor and hasattr(supervisor, "get_status") else None
         self.telemetry = ToolTelemetryManager(
@@ -779,7 +791,9 @@ class GroundStationServices:
             supervisor=supervisor,
             supervisor_status_provider=supervisor_status_provider,
         )
-        self.command = ToolCommandManager(tools, self.telemetry, self.safety)
+        self.command = ToolCommandManager(
+            tools, self.telemetry, self.safety, executor=governed_executor
+        )
         self.mission = ToolMissionManager(tools, self.telemetry, self.safety)
 
     def state(self) -> GroundStationState:

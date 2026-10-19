@@ -38,10 +38,10 @@ def test_pending_placeholder_becomes_a_decision_row_when_model_gives_no_text():
         _PENDING_REASONING_PLACEHOLDERS=AgentRuntime._PENDING_REASONING_PLACEHOLDERS,
         _decision_line=AgentRuntime._decision_line,
     )
-    AgentRuntime._close_pending_reasoning(stub, run, "airsim_get_depth_map", {"query_points": "0.6,0.39"})
+    AgentRuntime._close_pending_reasoning(stub, run, "locate_image_point", {"points": "0.6,0.39"})
     item = run.process_trace[0]
     assert item["kind"] == "decision" and item["title"] == "模型决策"
-    assert item["body"].startswith("调用 airsim_get_depth_map(")
+    assert item["body"].startswith("调用 locate_image_point(")
 
 
 def test_close_pending_reasoning_keeps_real_text():

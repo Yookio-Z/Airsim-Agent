@@ -166,12 +166,12 @@ def test_tool_schema_uses_flight_constraints():
 
 def test_tool_schema_uses_required_flag_and_card_descriptions():
     parameters = {
-        "task_id": {"default": None, "annotation": "str", "required": True},
+        "vehicle_name": {"default": None, "annotation": "str", "required": True},
         "reason": {"default": None, "annotation": "str"},
     }
-    schema = tool_schema_from_spec("airsim_task_cancel", parameters, {"task_id": "The task to cancel"})
-    assert schema["required"] == ["task_id"]
-    assert schema["properties"]["task_id"]["description"] == "The task to cancel"
+    schema = tool_schema_from_spec("drone_hover", parameters, {"vehicle_name": "Target vehicle"})
+    assert schema["required"] == ["vehicle_name"]
+    assert schema["properties"]["vehicle_name"]["description"] == "Target vehicle"
 
 
 def test_function_envelope_and_anthropic_conversion():

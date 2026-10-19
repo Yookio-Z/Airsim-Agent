@@ -31,8 +31,11 @@ enters the high-frequency flight control loop.
   PX4 ROS2 backends.
 - **Multi-backend control** - unified ground-station services over AirSim RPC,
   MAVLink (UDP/TCP/serial), and a PX4 ROS2 gateway (HTTP bridge on `:8766`).
-- **Autonomy & safety** - supervisor, safety arbiter, policy engine, obstacle
-  avoidance, visual servoing, target lock, and YOLO-based perception.
+- **Autonomy & safety** - an execution supervisor (pause / resume / emergency
+  stop / approval gates), a runtime envelope watchdog, and task-level guards
+  (progress monitoring, approach vetos). Flight safety is enforced in the
+  runtime and bridge layers; perception is "vision model for semantics + depth
+  for metric distance" (no object detector).
 - **Web ground station** - MapLibre-based UI with mission management,
   telemetry, captures, approval gates, and a SKILL.md editor.
 - **Skills system** - editable `SKILL.md` documents loaded at runtime as LLM
@@ -50,9 +53,6 @@ Requires Python >= 3.10 and [uv](https://docs.astral.sh/uv/).
 uv sync
 
 # Start the web ground station (default backend: px4_mavlink)
-.\scripts\start_ui.ps1 -Backend px4_mavlink
-
-# Or start it directly
 uv run python -m src.ui.server --host 127.0.0.1 --port 8765 --backend px4_mavlink
 
 # Or the short form (same defaults)
@@ -69,11 +69,10 @@ surface for both the UI and the LLM planner.
 ## Project Structure
 
 ```text
-src/          Python package: agent runtime, autonomy, modules, tools, GCS, web UI
-ros2/         ROS2 package with the PX4 ROS2 gateway node
-skills/       Runtime-loaded SKILL.md guidance documents
-scripts/      Development launchers and smoke-test scripts
-tests/        Pytest suite (local development)
+src/            Python package: agent runtime, autonomy (supervisor only), modules, tools, GCS, web UI
+.airsim_agent/  Agent home: SYSTEM.md (system prompt) + skills/ (SKILL.md guidance); runtime data stays local
+ros2/           ROS2 package with the PX4 ROS2 gateway node (frozen path: not the active backend)
+tests/          Pytest suite (local development)
 ```
 
 Design, planning and experiment notes live in a local `docs/` folder that is

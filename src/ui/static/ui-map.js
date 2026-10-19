@@ -19,7 +19,6 @@ function cameraWindowParts(el) {
     imageEl: el.querySelector("[data-camera-role='image']"),
     placeholderEl: el.querySelector("[data-camera-role='placeholder']"),
     metaEl: el.querySelector("[data-camera-role='meta']"),
-    hudEl: el.querySelector("[data-camera-role='hud']"),
   };
 }
 
@@ -156,6 +155,7 @@ function initMissionMap() {
         "vehicle-track-source": { type: "geojson", data: { type: "FeatureCollection", features: [] } },
         "active-leg-source": { type: "geojson", data: { type: "FeatureCollection", features: [] } },
         "plan-source": { type: "geojson", data: { type: "FeatureCollection", features: [] } },
+        "agent-path-source": { type: "geojson", data: { type: "FeatureCollection", features: [] } },
       },
       layers: [
         { id: "tiles", type: "raster", source: "tiles", minzoom: 0, maxzoom: cfg.maxZoom },
@@ -205,6 +205,21 @@ function initMissionMap() {
         "line-width": 2,
         "line-opacity": 0.88,
         "line-dasharray": [2, 2],
+      },
+    });
+
+    // Agent 下发的飞行路径（drone_fly_path / drone_fly_to 的真实调用，局部 NED
+    // 换算成经纬度）：与"任务面板里的计划航线"分色——虚线紫 = Agent 实际在下发的。
+    maplibreMap.addLayer({
+      id: "agent-path",
+      type: "line",
+      source: "agent-path-source",
+      layout: { "line-join": "round", "line-cap": "round" },
+      paint: {
+        "line-color": "#c792ff",
+        "line-width": 2,
+        "line-opacity": 0.9,
+        "line-dasharray": [3, 2],
       },
     });
 
@@ -1047,7 +1062,7 @@ async function executeLocalPath() {
   await post("/api/tool", {
     tool: "drone_fly_path",
     params: {
-      waypoints_json: JSON.stringify(
+      waypoints: JSON.stringify(
         missionWaypoints.map((wp) => ({
           x: wp.x ?? 0,
           y: wp.y ?? 0,
@@ -1552,6 +1567,23 @@ function drawMissionPath() {
       addRoute(activeTarget, missionWaypoints);
     }
     setSourceData(planSource, { type: "FeatureCollection", features });
+  }
+
+  // Agent 实际下发的航线叠加层：数据来自运行的 process_trace（工具调用与参数本来
+  // 就随状态流到前端），局部 NED 用当前机位（GPS + position_ned）做原点换算。
+  const agentSource = maplibreMap.getSource("agent-path-source");
+  if (agentSource) {
+    const features = [];
+    const ref = agentPathReference();
+    const points = agentPathLocalPoints(latestState?.current_run);
+    if (ref && points.length >= 2) {
+      features.push({
+        type: "Feature",
+        properties: { kind: "agent-path" },
+        geometry: { type: "LineString", coordinates: points.map((p) => nedToLngLat(p.x, p.y, ref)) },
+      });
+    }
+    setSourceData(agentSource, { type: "FeatureCollection", features });
   }
 
   // 航点 GeoJSON features（id 用于 setFeatureState，type 用于 sprite 配色）
@@ -2459,6 +2491,29 @@ function drawDrone(ctx, px, py, heading) {
   ctx.restore();
 }
 
+// 解析 drone_fly_path 的 waypoints 参数：紧凑 "x,y,z;x,y,z" 或 JSON 数组。
+function parsePathWaypoints(raw) {
+  if (typeof raw !== "string" || !raw.trim()) return [];
+  const text = raw.trim();
+  if (text[0] === "[" || text[0] === "{") {
+    try {
+      const list = JSON.parse(text);
+      if (!Array.isArray(list)) return [];
+      return list.map((wp) => ({ x: Number(wp.x || 0), y: Number(wp.y || 0), z: Number(wp.z ?? -3) }));
+    } catch (_) {
+      return [];
+    }
+  }
+  const points = [];
+  for (const segment of text.split(";")) {
+    const parts = segment.split(",").map((part) => Number(part.trim()));
+    if (parts.length === 3 && parts.every((value) => Number.isFinite(value))) {
+      points.push({ x: parts[0], y: parts[1], z: parts[2] });
+    }
+  }
+  return points;
+}
+
 function extractPlanWaypoints(run) {
   if (!run || !run.plan) return [];
   const points = [];
@@ -2466,17 +2521,48 @@ function extractPlanWaypoints(run) {
     if (step.tool === "drone_fly_to") {
       points.push({ x: Number(step.params.x || 0), y: Number(step.params.y || 0), z: Number(step.params.z || -3) });
     }
-    if (step.tool === "drone_fly_path" && step.params.waypoints_json) {
-      try {
-        JSON.parse(step.params.waypoints_json).forEach((wp) => {
-          points.push({ x: Number(wp.x || 0), y: Number(wp.y || 0), z: Number(wp.z || -3) });
-        });
-      } catch (_) {
-        return points;
-      }
+    if (step.tool === "drone_fly_path" && step.params.waypoints) {
+      points.push(...parsePathWaypoints(step.params.waypoints));
     }
   }
   return points;
+}
+
+// Agent 实际下发的路径（局部 NED）：优先取运行 process_trace 里真实的工具调用，
+// 没有就退回计划的步骤。process_trace 正是聊天面板渲染"请求参数"用的同一份数据。
+function agentPathLocalPoints(run) {
+  if (!run) return [];
+  const live = [];
+  for (const entry of Array.isArray(run.process_trace) ? run.process_trace : []) {
+    if (!entry || entry.kind !== "tool") continue;
+    const params = entry.params || {};
+    if (entry.tool === "drone_fly_path") {
+      live.push(...parsePathWaypoints(params.waypoints));
+    } else if (entry.tool === "drone_fly_to") {
+      live.push({ x: Number(params.x || 0), y: Number(params.y || 0), z: Number(params.z ?? -3) });
+    }
+  }
+  if (live.length) return live;
+  return extractPlanWaypoints(run);
+}
+
+// 换算参考系：当前机位（GPS + 局部 NED 同源），两个坐标是同一时刻的绝对量。
+function agentPathReference() {
+  const runtime = latestState?.tool_runtime || {};
+  const drone = runtime.drone || {};
+  const geo = currentDroneGeo(drone, runtime);
+  const pos = drone.position_ned || {};
+  if (!geo || !Number.isFinite(Number(pos.x)) || !Number.isFinite(Number(pos.y))) return null;
+  return { lat: Number(geo.lat), lon: Number(geo.lon), x: Number(pos.x), y: Number(pos.y) };
+}
+
+// 局部 NED（x=North, y=East）→ 经纬度：以参考点做切平面近似，百米级航线足够准。
+function nedToLngLat(x, y, ref) {
+  const dNorth = Number(y) - Number(ref.y); // 注意：NED 的 y 是东向
+  const dEast = Number(x) - Number(ref.x);  // NED 的 x 是北向
+  const latPerM = 1 / 111320;
+  const lonPerM = 1 / (111320 * Math.cos((ref.lat * Math.PI) / 180));
+  return [ref.lon + dEast * lonPerM, ref.lat + dNorth * latPerM];
 }
 
 function initSplitters() {
@@ -2539,7 +2625,7 @@ function renderLoopTrace(loopState) {
   const results = Array.isArray(loopState?.results) ? loopState.results : [];
   if (!decisions.length && !results.length) return "";
   const rows = decisions.map((decision, index) => {
-    if (!decision.action || decision.action === "memory_store") return "";
+    if (!decision.action) return "";
     const result = results.find((item) => Number(item.step_index || 0) === index + 1);
     const action = decision.action || "complete";
     const state = decision.is_complete ? "completed" : result ? (result.ok ? "completed" : "failed") : "planned";

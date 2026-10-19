@@ -68,7 +68,7 @@ def _runtime() -> AgentRuntime:
 
 
 def test_observation_then_motion_requires_agent_loop() -> None:
-    plan = _plan(_step("airsim_take_photo"), _step("drone_move_relative"))
+    plan = _plan(_step("inspect_current_frame"), _step("drone_move_relative"))
     assert AgentRuntime._plan_has_observation_dependency(plan) is True
     assert AgentRuntime._plan_requires_agent_loop(plan) is True
 
@@ -80,18 +80,17 @@ def test_motion_only_plan_stays_plan_execute() -> None:
 
 
 def test_observation_only_plan_stays_plan_execute() -> None:
-    plan = _plan(_step("airsim_take_photo"), _step("inspect_current_frame"))
+    plan = _plan(_step("inspect_current_frame"), _step("locate_image_point"))
     assert AgentRuntime._plan_has_observation_dependency(plan) is False
 
 
 def test_observation_after_motion_does_not_count() -> None:
-    plan = _plan(_step("drone_move_relative"), _step("airsim_take_photo"))
+    plan = _plan(_step("drone_move_relative"), _step("inspect_current_frame"))
     assert AgentRuntime._plan_has_observation_dependency(plan) is False
 
 
 def test_frame_inspection_before_approach_routes_to_agent_loop() -> None:
     plan = _plan(
-        _step("airsim_take_photo"),
         _step("inspect_current_frame"),
         _step("drone_fly_to"),
     )
@@ -371,5 +370,5 @@ def test_agent_loop_declared_with_perception_status_runs_fixed_sequence() -> Non
 
 
 def test_agent_loop_declared_with_photo_still_runs_agent_loop() -> None:
-    plan = _plan(_step("drone_takeoff"), _step("airsim_take_photo"), execution_mode="agent_loop")
+    plan = _plan(_step("drone_takeoff"), _step("inspect_current_frame"), execution_mode="agent_loop")
     assert AgentRuntime._plan_requires_agent_loop(plan) is True

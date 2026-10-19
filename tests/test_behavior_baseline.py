@@ -73,11 +73,11 @@ GOLDEN_CORPUS: list[tuple[str, set[str], str]] = [
 
 # commands whose planned step sequence is asserted as a contract
 PLAN_CONTRACT_CORPUS: list[tuple[str, set[str]]] = [
-    ("起飞到 5 米高度", {"drone_connect", "drone_arm", "drone_takeoff", "drone_get_status", "memory_store"}),
+    ("起飞到 5 米高度", {"drone_connect", "drone_arm", "drone_takeoff", "drone_get_status"}),
     # plain land short-circuits before the generic status/memory tail
     ("降落", {"drone_hover", "drone_land"}),
-    ("前进 5 米", {"drone_connect", "drone_arm", "drone_takeoff", "drone_move_relative", "drone_get_status", "memory_store"}),
-    ("执行区域巡检", {"drone_connect", "drone_arm", "drone_takeoff", "drone_fly_path", "memory_store"}),
+    ("前进 5 米", {"drone_connect", "drone_arm", "drone_takeoff", "drone_move_relative", "drone_get_status"}),
+    ("执行区域巡检", {"drone_connect", "drone_arm", "drone_takeoff", "drone_fly_path"}),
 ]
 
 

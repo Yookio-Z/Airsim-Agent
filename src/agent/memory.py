@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import json
 import os
-import re
 import threading
 import time
 from pathlib import Path
@@ -96,9 +95,9 @@ class AgentMemory:
         """把被手改/损坏的记忆文件收敛回可用形状。
 
         以前只保证根是 dict 就返回，于是 `"missions": {}` 或某一行把 timestamp
-        写成字符串，会让 recall 里 float(row["timestamp"]) 抛 TypeError/ValueError
-        并顺着 memory_recall 工具把整个 run 打挂。这里逐行丢弃坏数据，而不是让
-        一行坏记录毁掉一次任务。
+        写成字符串，会让读取侧 float(row["timestamp"]) 抛 TypeError/ValueError，
+        并顺着调用方把整个 run 打挂（当年的记忆检索工具就是这样踩的坑）。这里
+        逐行丢弃坏数据，而不是让一行坏记录毁掉一次任务。
         """
         for key in cls._LIST_KEYS:
             rows = data.get(key)
@@ -272,23 +271,6 @@ class AgentMemory:
         candidate["updated_at"] = time.time()
         self._data["skill_candidates"] = candidates[-50:]
 
-    def remember_fact(self, key: str, value: str, tags: list[str] | None = None) -> None:
-        """Store a durable operator-stated fact for future runs (LLM-active)."""
-        key = str(key or "").strip()
-        if not key:
-            return
-        with self._lock:
-            facts = self._data.setdefault("facts", {})
-            facts[key] = {
-                "value": str(value or "")[:1000],
-                "tags": [str(item) for item in (tags or [])][:8],
-                "updated_at": time.time(),
-            }
-            if len(facts) > 50:
-                for stale in sorted(facts, key=lambda k: facts[k].get("updated_at", 0.0))[: len(facts) - 50]:
-                    facts.pop(stale, None)
-            self._save()
-
     def remember_transcript(
         self,
         run_id: str,
@@ -315,67 +297,6 @@ class AgentMemory:
             )
             self._data["runs"] = runs[-50:]
             self._save()
-
-    def recall(self, query: str, limit: int = 5) -> list[dict[str, Any]]:
-        """Keyword-overlap recall across facts, missions, lessons, and run
-        transcripts, with a recency bonus for records younger than 14 days.
-
-        Deliberately simple: no embeddings, no LLM involvement. CJK queries
-        match by bigrams, so recall works without a tokenizer.
-        """
-        query = str(query or "").strip()
-        if not query:
-            return []
-        tokens = self._recall_tokens(query)
-        scored: list[tuple[float, dict[str, Any]]] = []
-        now = time.time()
-
-        for key, fact in (self._data.get("facts") or {}).items():
-            if not isinstance(fact, dict):
-                continue
-            text = f"{key} {fact.get('value', '')}"
-            raw = self._score_text(tokens, text)
-            if raw > 0:
-                score = raw + 0.2  # facts are slightly favored over history rows
-                scored.append(
-                    (score, {"kind": "fact", "key": key, "value": fact.get("value", ""), "tags": fact.get("tags", []), "score": round(score, 3)})
-                )
-
-        for kind, field in (("mission", "command"), ("lesson", "summary"), ("run", "command")):
-            rows = self._data.get(kind + "s" if kind != "mission" else "missions") or []
-            for row in reversed(rows):
-                if not isinstance(row, dict):
-                    continue
-                text = f"{row.get(field) or ''} {row.get('summary') or ''}"
-                score = self._score_text(tokens, text)
-                if score > 0:
-                    age_days = (now - float(row.get("timestamp") or 0.0)) / 86400.0
-                    recency = max(0.0, 1.0 - age_days / 14.0)
-                    score += recency * 0.3
-                    scored.append((score, {**row, "kind": kind, "score": round(score, 3)}))
-
-        scored.sort(key=lambda item: (-item[0], float(item[1].get("timestamp") or 0.0)))
-        return [row for _, row in scored[: max(1, min(20, int(limit)))]]
-
-    @staticmethod
-    def _recall_tokens(query: str) -> list[str]:
-        lower = query.lower()
-        parts = [part for part in re.split(r"[^a-z0-9\u4e00-\u9fff]+", lower) if part]
-        tokens: list[str] = []
-        for part in parts:
-            if len(part) >= 2:
-                tokens.append(part)
-            if any("\u4e00" <= ch <= "\u9fff" for ch in part) and len(part) >= 2:
-                tokens.extend(part[i : i + 2] for i in range(len(part) - 1))
-        return list(dict.fromkeys(tokens))
-
-    @staticmethod
-    def _score_text(tokens: list[str], text: str) -> float:
-        if not tokens or not text:
-            return 0.0
-        lowered = text.lower()
-        hits = sum(1 for token in tokens if token in lowered)
-        return hits / len(tokens)
 
     def guidance(self) -> dict[str, Any]:
         """Turn raw memories into small actionable hints for routing and planning."""
@@ -453,13 +374,14 @@ class AgentMemory:
 
     @staticmethod
     def _skill_from_sequence(sequence: list[str], intent: str) -> str:
+        """把历史工具序列映射到当前唯一的技能面（skills/*/SKILL.md）。"""
         text = " ".join([intent, *sequence]).lower()
         if "airsim_search_target" in sequence:
-            return "skill:search"
+            return "skill:region-search"
         if "return" in text or "home" in text or "返航" in text or "返回" in text:
-            return "skill:return_home"
+            return "skill:flight-sequence"
         if any(tool in sequence for tool in ("drone_fly_to", "drone_move_relative", "drone_takeoff")):
-            return "skill:navigation"
+            return "skill:flight-sequence"
         return ""
 
     @staticmethod

@@ -3,7 +3,7 @@ routing (each real vehicle runs its own gateway on a separate port)."""
 
 from __future__ import annotations
 
-from src.modules.ros_gateway_controller import RosGatewayController
+from src.modules.backends.ros_gateway import RosGatewayController
 
 
 class _FakeBridgeClient:
@@ -43,7 +43,7 @@ class _Result:
 
 def _multi_gateway(monkeypatch) -> RosGatewayController:
     monkeypatch.setattr(
-        "src.modules.ros_gateway_controller.RosProviderBridgeClient",
+        "src.modules.backends.ros_gateway.RosProviderBridgeClient",
         _FakeBridgeClient,
     )
     return RosGatewayController(
@@ -90,7 +90,7 @@ def test_get_status_reads_default_endpoint(monkeypatch) -> None:
 
 def test_single_endpoint_behaves_like_before(monkeypatch) -> None:
     monkeypatch.setattr(
-        "src.modules.ros_gateway_controller.RosProviderBridgeClient",
+        "src.modules.backends.ros_gateway.RosProviderBridgeClient",
         _FakeBridgeClient,
     )
     controller = RosGatewayController(base_url="http://127.0.0.1:8766")

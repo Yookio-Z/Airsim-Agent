@@ -95,7 +95,7 @@ jobs:
       - uses: astral-sh/setup-uv@v5
       - run: uv sync --all-extras --frozen
       - name: Check formatting
-        run: uv run black --check src/ tests/ scripts/
+        run: uv run black --check src/ tests/
 
   typing:
     name: mypy (advisory)

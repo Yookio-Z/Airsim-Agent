@@ -273,22 +273,6 @@ def test_loop_tool_schemas_include_flight_constraints():
     assert fn["parameters"]["properties"]["altitude"]["maximum"] == 120
 
 
-def test_loop_tool_schemas_skip_memory_store():
-    planner = _planner()
-    schemas = planner._loop_tool_schemas(
-        [{"name": "memory_store", "purpose": "write"}, {"name": "drone_get_status", "purpose": "status"}],
-        None,
-    )
-    names = [s["function"]["name"] for s in schemas]
-    assert "memory_store" not in names
-    assert "drone_get_status" in names
-
-
-# ---------------------------------------------------------------------------
-# AgentLoop batch execution
-# ---------------------------------------------------------------------------
-
-
 class _FakeTools:
     READ_ONLY_TOOLS = {"drone_get_status", "airsim_take_photo"}
 

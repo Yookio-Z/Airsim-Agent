@@ -21,7 +21,7 @@ import math
 
 import pytest
 
-from src.modules.mavlink_controller import MavlinkController
+from src.modules.backends.mavlink import MavlinkController
 
 
 # Somewhere unambiguous and far from the code's simulation origin (Beijing):

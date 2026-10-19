@@ -327,35 +327,14 @@ FLIGHT_TOOL_CONSTRAINTS: dict[str, dict[str, dict[str, Any]]] = {
         "velocity": {"type": "number", "minimum": 0.2, "maximum": 20, "description": "Velocity in m/s"},
         "vehicle_name": {"type": "string", "description": "Set 'all' to command EVERY vehicle (全部/所有无人机); a specific id targets one vehicle; empty means the default vehicle only"},
     },
-    "drone_fly_velocity": {
-        "vx": {"type": "number", "minimum": -20, "maximum": 20, "description": "Body-frame forward velocity m/s"},
-        "vy": {"type": "number", "minimum": -20, "maximum": 20, "description": "Body-frame lateral velocity m/s"},
-        "vz": {"type": "number", "minimum": -20, "maximum": 20, "description": "Body-frame vertical velocity m/s"},
-    },
     "drone_fly_path": {
-        "waypoints_json": {"type": "string", "description": "JSON array of local NED waypoints"},
+        "waypoints": {"type": "string", "description": "Local NED waypoints: compact \"x,y,z;x,y,z\" (e.g. \"10,0,-5;20,0,-5\") or a JSON array of {x,y,z}"},
         "velocity": {"type": "number", "minimum": 0.2, "maximum": 20, "description": "Cruise velocity in m/s"},
     },
-    "skill:search": {
-        "target_class": {"type": "string", "enum": ["car", "person", "truck", "bus", "drone", "target"]},
-        "search_altitude": {"type": "number", "minimum": 0.5, "maximum": 120},
-        "search_radius": {"type": "number", "minimum": 1.0, "maximum": 500},
-        "max_steps": {"type": "integer", "minimum": 1, "maximum": 12},
-        "scene_description": {"type": "string"},
-    },
-    "airsim_take_photo": {
-        "image_type": {"type": "string", "enum": ["scene", "depth", "segmentation"]},
-        "auto_save": {"type": "boolean"},
-    },
-    "airsim_get_depth_map": {
-        "camera_name": {"type": "string"},
-        "return_vis": {"type": "boolean"},
-    },
-    "airsim_task_status": {
-        "task_id": {"type": "string"},
-    },
-    "airsim_task_cancel": {
-        "task_id": {"type": "string"},
+    "locate_image_point": {
+        "points": {"type": "string", "description": "Normalised 0~1 point(s): \"x,y\" or \"x,y;x,y\"; the first point gets distance + world_pos"},
+        "w": {"type": "number", "minimum": 0, "maximum": 1, "description": "Rough normalised width of the target at the first point (box cross-check)"},
+        "h": {"type": "number", "minimum": 0, "maximum": 1, "description": "Rough normalised height of the target at the first point"},
     },
     "formation_command": {
         "action": {

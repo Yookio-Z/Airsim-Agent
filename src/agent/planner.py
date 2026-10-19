@@ -253,7 +253,7 @@ class MissionPlanner:
             add("读取当前状态", "drone_get_status", layer="perception")
 
         if wants_connect and not requires_flight:
-            add("列出载具", "drone_list_vehicles", layer="perception")
+            add("读取机队状态", "drone_get_status", layer="perception")
             if not any(step.tool == "drone_get_status" for step in steps):
                 add("读取状态", "drone_get_status", layer="perception")
             return MissionPlan(run_id, normalized, "connect", "连接仿真并读取状态", steps, assumptions)
@@ -315,41 +315,40 @@ class MissionPlanner:
                 else:
                     assumptions.append("当前指令包含上传/规划语义，PX4 Mission 已生成但不会自动启动。")
                 if supports_image:
-                    add("巡检拍照", "airsim_take_photo", {"image_type": "scene"}, layer="perception")
+                    add("巡检拍照", "inspect_current_frame", {"question": "记录当前场景画面并简述主要目标", "save_frame": True}, layer="perception")
                 else:
                     assumptions.append("当前后端不支持图像采集，PX4 巡检任务仅包含飞控航点。")
             else:
                 add(
                     "执行区域巡检航线",
                     "drone_fly_path",
-                    {"waypoints_json": self._jsonish_waypoints(waypoints), "velocity": velocity},
+                    {"waypoints": self._jsonish_waypoints(waypoints), "velocity": velocity},
                     layer="action",
                 )
                 if supports_image:
-                    add("巡检拍照", "airsim_take_photo", {"image_type": "scene"}, layer="perception")
+                    add("巡检拍照", "inspect_current_frame", {"question": "记录当前场景画面并简述主要目标", "save_frame": True}, layer="perception")
                 else:
                     assumptions.append("当前后端不支持图像采集，巡检任务仅执行航线。")
 
         if effective_search:
             add(
-                "Run visual search skill",
-                "skill:search",
-                {
-                    "target_class": target_class,
-                    "search_altitude": altitude,
-                    "search_radius": radius,
-                    "scene_description": normalized,
-                    "max_steps": 4,
-                },
+                "激活区域搜索技能指导",
+                "skill:region-search",
+                {},
                 layer="planning",
             )
 
         if effective_track:
-            assumptions.append("Tracking execution is unavailable until skill:track_object gets a provider-backed executor.")
+            assumptions.append("跟踪暂无专用执行器：由 skill:region-search 的跟踪指导配合原子工具执行。")
 
         if effective_photo and not wants_patrol:
             photo_title = "采集目标确认图像" if search_with_camera else "采集视觉图像"
-            add(photo_title, "airsim_take_photo", {"image_type": "scene"}, layer="perception")
+            add(
+                photo_title,
+                "inspect_current_frame",
+                {"question": "画面里有什么目标？描述它们的位置与状态", "save_frame": True},
+                layer="perception",
+            )
             add(
                 "多模态确认目标" if search_with_camera else "多模态确认图像",
                 "inspect_current_frame",
@@ -364,7 +363,6 @@ class MissionPlanner:
             )
 
         add("读取最终状态", "drone_get_status", layer="perception")
-        add("写入任务记忆", "memory_store", {"source": "mission"}, layer="memory")
 
         intent = self._infer_intent(effective_search or search_with_camera, wants_patrol, effective_track, coordinate, effective_photo, wants_takeoff)
         if intent in {"general_mission", "takeoff"} and relative_moves:

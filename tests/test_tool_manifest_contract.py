@@ -12,18 +12,18 @@ from types import SimpleNamespace
 
 from src.agent.tool_cards import TOOL_CARDS
 from src.agent.tool_executor import ToolCollector
-from src.tools.core import register_core_tools
+from src.tools.flight import register_flight_tools
+from src.tools.mission import register_mission_tools
 from src.tools.manifest import TOOL_MANIFEST, list_tool_manifest
-from src.tools.perception import register_perception_tools
+from src.tools.sensors import register_sensor_tools
 from src.tools.perception_axis import register_perception_axis_tools
 from src.tools.providers import register_provider_tools
-from src.tools.vision import register_vision_tools
 
 
 def _capability_stub_controller() -> SimpleNamespace:
     """Controller stub exposing every capability-gated method, so all
     backend-neutral tools register. AirSim-only groups are excluded here
-    because register_perception_tools/register_vision_tools require an
+    because register_sensor_tools requires an
     actual AirSimController instance."""
     return SimpleNamespace(
         last_error="",
@@ -40,7 +40,8 @@ def _capability_stub_controller() -> SimpleNamespace:
 
 def _register_all_neutral_tools() -> set[str]:
     collector = ToolCollector()
-    register_core_tools(collector, _capability_stub_controller(), lambda data: "{}")
+    register_flight_tools(collector, _capability_stub_controller(), lambda data: "{}")
+    register_mission_tools(collector, _capability_stub_controller(), lambda data: "{}")
     register_provider_tools(collector, _capability_stub_controller(), lambda data: "{}")
 
     # Perception axis tools register when the axis is enabled (conditional
@@ -83,12 +84,8 @@ def test_airsim_atomic_tools_are_documented() -> None:
     # AirSimController, so they cannot register against a stub. Their names
     # are the documented contract of the airsim backend surface.
     airsim_atomics = {
-        "airsim_get_depth_map",
         "airsim_get_sensors",
-        "airsim_locate_point",
-        "airsim_take_photo",
-        "airsim_task_cancel",
-        "airsim_task_status",
+        "locate_image_point",
     }
     missing = sorted(airsim_atomics - set(TOOL_MANIFEST))
     assert missing == [], f"airsim atomic tools missing from TOOL_MANIFEST: {missing}"
@@ -104,12 +101,8 @@ def test_every_atomic_manifest_entry_has_a_registration_source() -> None:
     """
     neutral = _register_all_neutral_tools()
     airsim_atomics = {
-        "airsim_get_depth_map",
         "airsim_get_sensors",
-        "airsim_locate_point",
-        "airsim_take_photo",
-        "airsim_task_cancel",
-        "airsim_task_status",
+        "locate_image_point",
         # registered dynamically by ToolRuntime._ensure_formation_tools on the
         # AirSim backend (multi-vehicle formation control)
         "formation_command",
@@ -148,5 +141,6 @@ def test_all_tool_cards_are_documented_in_manifest() -> None:
 def test_internal_manifest_entries_are_not_registered_tools() -> None:
     neutral = _register_all_neutral_tools()
     internals = _manifest_by_kind("internal")
-    assert internals == {"memory_store"}, f"unexpected internal entries: {internals}"
+    # 记忆工具已删除（记忆是文件/注入，不是工具）；internal 类应保持为空。
+    assert internals == set(), f"unexpected internal entries: {internals}"
     assert not (internals & neutral), "internal entries must not be registered"

@@ -3,8 +3,8 @@ from types import SimpleNamespace
 import numpy as np
 import pytest
 
-from src.modules.airsim_controller import AirSimController
-from src.modules.frame_source import LazyControllerFrameSource
+from src.modules.backends.airsim import AirSimController
+from src.modules.perception.frame_source import LazyControllerFrameSource
 
 
 def test_raw_frame_preserves_bgr_order_and_owns_memory():

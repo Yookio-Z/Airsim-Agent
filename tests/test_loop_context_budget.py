@@ -5,7 +5,7 @@
    正文里不再重复一份 available_tool_cards（实测每轮 ~5.8k tokens 的重复）。
 2. 历史压缩成摘要，而不是原样重发或丢弃：`steps_digest` 一行一步、有行数上限。
 3. 记忆有界、按需取：逐轮只给"这次决策用得上"的几条；档案（facts/lessons）
-   交给 memory_recall 按需取，不再每轮注入。
+   只看有界摘要；全文去 NOTES.md 与运行记录面板看，不再每轮注入。
 4. token 账要能对得上：卡片/记忆/摘要都有硬上限，越界由各自的压缩函数兜住。
 """
 
@@ -118,9 +118,9 @@ def test_loop_payload_carries_a_bounded_steps_digest(monkeypatch):
     """轨迹要有摘要（一行一步），且条数有上限——历史靠摘要，不靠原样重发。"""
     results = [
         {
-            "tool": "airsim_get_depth_map",
+            "tool": "locate_image_point",
             "ok": True,
-            "params": {"query_points": "0.52,0.34"},
+            "params": {"points": "0.52,0.34"},
             "data": {"status": "ok", "distance_median_m": 72.0 - index, "image_base64": "A" * 5000},
         }
         for index in range(12)
@@ -133,7 +133,7 @@ def test_loop_payload_carries_a_bounded_steps_digest(monkeypatch):
 
     digest = captured["payload"]["loop_state"]["steps_digest"]
     assert len(digest) == 12
-    assert digest[0].startswith("1. airsim_get_depth_map ok")
+    assert digest[0].startswith("1. locate_image_point ok")
     assert "distance_median_m=72.0" in digest[0]
     # 摘要里不该出现图片负载
     assert all("base64" not in line for line in digest)
@@ -193,7 +193,7 @@ def test_context_pressure_switches_to_the_tight_digest(monkeypatch):
     兜底（那是丢内容，不是压缩）。
     """
     results = [
-        {"tool": "airsim_get_depth_map", "ok": True, "data": {"status": "ok", "distance_median_m": 10.0 + i}}
+        {"tool": "locate_image_point", "ok": True, "data": {"status": "ok", "distance_median_m": 10.0 + i}}
         for i in range(20)
     ]
     planner, captured, config = _planner_with_capturing_client(monkeypatch, native=True)
@@ -228,9 +228,9 @@ def test_active_skill_narrows_the_prompt_menu(monkeypatch):
     """
     cards = [
         {"name": "skill:visual-approach", "kind": "skill", "purpose": "靠近", "when_to_use": "靠近",
-         "inputs": {}, "subtools": ["inspect_current_frame", "airsim_get_depth_map", "drone_move_relative"]},
+         "inputs": {}, "subtools": ["inspect_current_frame", "locate_image_point", "drone_move_relative"]},
         {"name": "inspect_current_frame", "purpose": "看图", "when_to_use": "看", "inputs": {}},
-        {"name": "airsim_get_depth_map", "purpose": "测距", "when_to_use": "量", "inputs": {}},
+        {"name": "locate_image_point", "purpose": "测距", "when_to_use": "量", "inputs": {}},
         {"name": "drone_move_relative", "purpose": "移动", "when_to_use": "走", "inputs": {}},
         {"name": "drone_get_status", "purpose": "状态", "when_to_use": "读", "inputs": {}},
         {"name": "drone_upload_mission", "purpose": "航线", "when_to_use": "航线", "inputs": {}},

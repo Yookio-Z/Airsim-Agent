@@ -7,7 +7,7 @@ import time
 
 import pytest
 
-from src.modules.formation import (
+from src.modules.formation.controller import (
     FLIGHT_ACTIONS,
     FormationController,
     formation_offsets,

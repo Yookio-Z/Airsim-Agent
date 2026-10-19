@@ -59,8 +59,8 @@ def test_redact_value_caps_lists():
 def test_replay_rebuilds_summary(tmp_path):
     log = RunLog("run_replay", base_dir=tmp_path)
     log.write("run.start", {"command": "搜索目标", "model_id": "m1"})
-    log.write("loop.decision", {"action": "skill:search", "reason": "开始搜索"})
-    log.write("tool.result", {"tool": "skill:search", "ok": True, "data": {"status": "ok"}})
+    log.write("loop.decision", {"action": "skill:region-search", "reason": "开始搜索"})
+    log.write("tool.result", {"tool": "skill:region-search", "ok": True, "data": {"status": "ok"}})
     log.write("run.end", {"status": "completed", "summary": "搜索完成", "verification_status": "ok"})
     replay = RunLogReader("run_replay", base_dir=tmp_path).replay()
     assert replay["command"] == "搜索目标"

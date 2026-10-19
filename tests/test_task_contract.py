@@ -153,7 +153,7 @@ def test_verify_status_ok_and_photo():
     assert loop._verify_criterion({"metric": "status_ok"}, bad_state, LoopObservation(1, {}))["satisfied"] is False
 
     photo_state = _state()
-    photo_state.results.append(_result("airsim_take_photo", True, {"image_saved_to": "captures/a.png"}))
+    photo_state.results.append(_result("inspect_current_frame", True, {"status": "ok", "saved_path": "captures/a.png"}))
     assert loop._verify_criterion({"metric": "photo_taken"}, photo_state, LoopObservation(1, {}))["satisfied"] is True
 
 

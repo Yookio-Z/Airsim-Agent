@@ -1,118 +1,125 @@
-"""任务状态机 + 工具日志装饰器。
+"""任务工具组（GCS 专用）：航点任务的上传/下载/清空/启动/进度。
 
-从 dimOS 借鉴:
-  - @skill_logging: 替代 dimOS 的 @skill 装饰器，记录执行时间和结果
-  - MissionState: 任务状态枚举 + 合法转移表
+- 注册入口：``register_mission_tools(collector, controller, fmt)``
+- 调用方：``src/agent/tool_executor.py`` 的 ``ToolRuntime.ensure_ready()``；
+  实际使用者是地面站界面与 GCS 服务（``src/gcs/``），不是模型。
+
+（原文如下）任务工具（GCS 专用）：航点任务的上传/下载/清空/启动/进度。
+
+这五个工具只由地面站界面使用（任务面板、地图与多机任务编排），**不在模型的
+决策面里**——它们没有卡片，模型看不到也调不到。Agent 自己飞航线用
+`drone_fly_path`；要在界面上知道 Agent 飞到哪儿，看的是地图叠加层画的运行轨迹，
+不需要碰 Mission 协议。
 """
 
 from __future__ import annotations
 
-import functools
-import time
-from enum import Enum
-from typing import Callable, Optional
+import json
+from typing import Callable
 
-from src.logging_config import get_logger
-
-logger = get_logger(__name__)
+from src.modules.backends.base import FlightController
 
 
-# ═══════════════════════════════════════════════════════════
-# 任务状态机
-# ═══════════════════════════════════════════════════════════
+def register_mission_tools(
+    mcp,
+    controller: FlightController,
+    fmt_result: Callable[[dict], str],
+) -> None:
+    """Register the mission工具 group (upload/download/clear/start/progress)."""
+    @mcp.tool()
+    def drone_upload_mission(waypoints_json: str, vehicle_name: str = "") -> str:
+        """Upload a backend mission (vehicle_name: 空=默认机, 或具体载具名).
 
-class MissionState(Enum):
-    IDLE = "idle"
-    TAKEOFF = "takeoff"
-    SEARCHING = "searching"
-    DETECTED = "detected"
-    APPROACHING = "approaching"
-    VERIFYING = "verifying"
-    RETURNING = "returning"
-    LANDING = "landing"
-    ERROR = "error"
+        The payload can be an array of MissionItem objects or a MissionPlanDraft
+        object with `items` or `waypoints`.
+        """
+        method = getattr(controller, "upload_mission", None)
+        if not callable(method):
+            return fmt_result(
+                {
+                    "status": "error",
+                    "backend": controller.backend_name,
+                    "message": "mission upload is not supported by this backend",
+                }
+            )
+        try:
+            payload = json.loads(waypoints_json)
+        except json.JSONDecodeError as exc:
+            return fmt_result({"status": "error", "message": f"invalid mission JSON: {exc}"})
+        if isinstance(payload, dict):
+            waypoints = payload.get("items") or payload.get("waypoints") or []
+        else:
+            waypoints = payload
+        if not isinstance(waypoints, list):
+            return fmt_result({"status": "error", "message": "mission items must be a list"})
+        clean = [item for item in waypoints if isinstance(item, dict)]
+        try:
+            result = method(clean, vehicle_name=vehicle_name)
+        except TypeError:
+            # 旧控制器签名不支持按车上传
+            result = method(clean)
+        return fmt_result(dict(result))
 
+    @mcp.tool()
+    def drone_download_mission() -> str:
+        """Download the current backend mission."""
+        method = getattr(controller, "download_mission", None)
+        if not callable(method):
+            return fmt_result(
+                {
+                    "status": "error",
+                    "backend": controller.backend_name,
+                    "message": "mission download is not supported by this backend",
+                }
+            )
+        return fmt_result(dict(method()))
 
-# 合法状态转移
-_TRANSITIONS: dict[MissionState, list[MissionState]] = {
-    MissionState.IDLE: [MissionState.TAKEOFF],
-    MissionState.TAKEOFF: [MissionState.SEARCHING, MissionState.LANDING, MissionState.ERROR],
-    MissionState.SEARCHING: [MissionState.DETECTED, MissionState.RETURNING, MissionState.ERROR],
-    MissionState.DETECTED: [MissionState.APPROACHING, MissionState.SEARCHING],
-    MissionState.APPROACHING: [MissionState.VERIFYING, MissionState.SEARCHING, MissionState.ERROR],
-    MissionState.VERIFYING: [MissionState.RETURNING, MissionState.SEARCHING],
-    MissionState.RETURNING: [MissionState.LANDING, MissionState.ERROR],
-    MissionState.LANDING: [MissionState.IDLE, MissionState.ERROR],
-    MissionState.ERROR: [MissionState.IDLE, MissionState.RETURNING, MissionState.LANDING],
-}
+    @mcp.tool()
+    def drone_clear_mission(vehicle_name: str = "") -> str:
+        """Clear the current backend mission (vehicle_name: 空=默认机, 或具体载具名)."""
+        method = getattr(controller, "clear_mission", None)
+        if not callable(method):
+            return fmt_result(
+                {
+                    "status": "error",
+                    "backend": controller.backend_name,
+                    "message": "mission clear is not supported by this backend",
+                }
+            )
+        try:
+            result = method(vehicle_name=vehicle_name)
+        except TypeError:
+            result = method()
+        return fmt_result(dict(result))
 
+    @mcp.tool()
+    def drone_start_mission(vehicle_name: str = "") -> str:
+        """Start the mission already uploaded to the backend (vehicle_name: 空=默认机, 或具体载具名)."""
+        method = getattr(controller, "start_mission", None)
+        if not callable(method):
+            return fmt_result(
+                {
+                    "status": "error",
+                    "backend": controller.backend_name,
+                    "message": "mission start is not supported by this backend",
+                }
+            )
+        try:
+            result = method(vehicle_name=vehicle_name)
+        except TypeError:
+            result = method()
+        return fmt_result(dict(result))
 
-def can_transition(current: MissionState, target: MissionState) -> bool:
-    """检查状态转移是否合法。"""
-    return target in _TRANSITIONS.get(current, [])
-
-
-class MissionStateMachine:
-    """简单的任务状态机。"""
-
-    def __init__(self):
-        self._state = MissionState.IDLE
-        self._history: list[MissionState] = [MissionState.IDLE]
-
-    @property
-    def state(self) -> MissionState:
-        return self._state
-
-    def transition(self, target: MissionState) -> bool:
-        """尝试状态转移，返回是否成功。"""
-        if not can_transition(self._state, target):
-            return False
-        self._state = target
-        self._history.append(target)
-        return True
-
-    def force(self, target: MissionState) -> None:
-        """强制转移（不受规则限制）。"""
-        self._state = target
-        self._history.append(target)
-
-    @property
-    def history(self) -> list[MissionState]:
-        return list(self._history)
-
-
-# ═══════════════════════════════════════════════════════════
-# skill_logging 装饰器 (dimOS @skill 等价物)
-# ═══════════════════════════════════════════════════════════
-
-def skill_logging(name: Optional[str] = None):
-    """记录工具调用耗时和结果的装饰器。
-
-    用法:
-      @skill_logging("takeoff")
-      def airsim_takeoff(...): ...
-
-      @skill_logging()
-      def my_tool(...): ...
-    """
-    def decorator(func: Callable) -> Callable:
-        skill_name = name or func.__name__
-
-        @functools.wraps(func)
-        def wrapper(*args, **kwargs):
-            t0 = time.monotonic()
-            try:
-                result = func(*args, **kwargs)
-                elapsed_ms = (time.monotonic() - t0) * 1000
-                status = "OK"
-                if isinstance(result, str) and '"status": "error"' in result:
-                    status = "ERROR"
-                logger.info("skill_executed", name=skill_name, result=status, duration_ms=f"{elapsed_ms:.0f}")
-                return result
-            except Exception as e:
-                elapsed_ms = (time.monotonic() - t0) * 1000
-                logger.error("skill_exception", name=skill_name, error=str(e), duration_ms=f"{elapsed_ms:.0f}")
-                raise
-
-        return wrapper
-    return decorator
+    @mcp.tool()
+    def drone_get_mission_progress() -> str:
+        """Read current mission progress from the backend."""
+        method = getattr(controller, "get_mission_progress", None)
+        if not callable(method):
+            return fmt_result(
+                {
+                    "status": "error",
+                    "backend": controller.backend_name,
+                    "message": "mission progress is not supported by this backend",
+                }
+            )
+        return fmt_result(dict(method()))

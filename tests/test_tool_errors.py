@@ -46,7 +46,6 @@ def test_classify_exception_mappings():
 def test_retryable_read_tools_exclude_flight():
     retryable = ToolRuntime._RETRYABLE_READ_TOOLS
     assert "drone_get_status" in retryable
-    assert "airsim_task_status" in retryable
     assert "drone_takeoff" not in retryable
     assert "drone_move_relative" not in retryable
     assert "drone_fly_to" not in retryable

@@ -10,7 +10,7 @@ from __future__ import annotations
 import threading
 import time
 
-from src.modules.mavlink_controller import MavlinkController
+from src.modules.backends.mavlink import MavlinkController
 
 
 class _Message:
@@ -153,7 +153,7 @@ class _FakeStatus:
 
 
 def test_airsim_wait_move_arrival_preempts_on_stop() -> None:
-    from src.modules.airsim_controller import AirSimController
+    from src.modules.backends.airsim import AirSimController
 
     controller = AirSimController()
     flag = {"stop": False}
@@ -167,7 +167,7 @@ def test_airsim_wait_move_arrival_preempts_on_stop() -> None:
 
 
 def test_airsim_wait_move_arrival_completes_on_arrival() -> None:
-    from src.modules.airsim_controller import AirSimController
+    from src.modules.backends.airsim import AirSimController
 
     controller = AirSimController()
     controller.get_status = lambda name="drone_0": _FakeStatus(  # type: ignore[method-assign]
@@ -179,7 +179,7 @@ def test_airsim_wait_move_arrival_completes_on_arrival() -> None:
 
 
 def test_airsim_wait_move_arrival_detects_stall() -> None:
-    from src.modules.airsim_controller import AirSimController
+    from src.modules.backends.airsim import AirSimController
 
     controller = AirSimController()
     # hovering far from the target: simulator-side task ended without arrival
@@ -193,7 +193,7 @@ def test_airsim_wait_move_arrival_detects_stall() -> None:
 
 
 def test_airsim_wait_move_no_provider_no_behavior_change() -> None:
-    from src.modules.airsim_controller import AirSimController
+    from src.modules.backends.airsim import AirSimController
 
     controller = AirSimController()
     assert controller._stop_requested() is False

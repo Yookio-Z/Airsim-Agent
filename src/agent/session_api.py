@@ -137,15 +137,29 @@ class SessionMixin:
         except Exception as exc:
             return {"ok": False, "error": str(exc)}
 
+    @classmethod
     def _agent_instructions(cls) -> str:
-        """读取可编辑的 Agent 操作规范；文件不存在或为空就不注入。"""
-        try:
-            path = cls._AGENT_INSTRUCTIONS_PATH
-            if not path.is_file():
-                return ""
-            return path.read_text(encoding="utf-8").strip()[:4000]
-        except Exception:
-            return ""
+        """读取可编辑的 Agent 常驻上下文；文件不存在或为空就不注入。
+
+        两段拼起来，各有配额：
+        - ``SYSTEM.md``：操作规范（怎么飞、前置条件、禁止事项）；
+        - ``NOTES.md``：长期笔记（环境/机队事实、经验教训）——pi 的 AGENTS.md
+          那个角色：知识是自动注入的文件，不是模型主动调用的"记忆工具"。
+        """
+        parts: list[str] = []
+        for path, limit in (
+            (cls._AGENT_INSTRUCTIONS_PATH, 4000),
+            (cls._AGENT_NOTES_PATH, 2000),
+        ):
+            try:
+                if not path.is_file():
+                    continue
+                text = path.read_text(encoding="utf-8").strip()
+            except Exception:
+                continue
+            if text:
+                parts.append(text[:limit])
+        return "\n\n".join(parts)
 
     def application_settings(self) -> dict[str, Any]:
         """Return operator-facing application preferences."""
@@ -392,6 +406,7 @@ class SessionMixin:
                 data["messages"] = [m.to_dict() for m in self._messages]
             data["updated_at"] = time.time()
             self._save_session(data)
+            session_store.prune_sessions()
         except Exception:
             pass
 

@@ -1,28 +1,9 @@
 from __future__ import annotations
 
-import time
-from typing import Any
-
 from src.agent.tool_cards import cards_for_capabilities
-from src.agent.tool_executor import ToolCallResult, ToolRuntime
+from src.agent.tool_executor import ToolRuntime
 from src.agent.skill_registry import SkillRegistry
 from src.tools.manifest import manifest_for
-
-
-def _result(tool: str, ok: bool, data: dict[str, Any]) -> ToolCallResult:
-    now = time.time()
-    return ToolCallResult(tool, {}, ok, data, now, now)
-
-
-class FakeTools:
-    def __init__(self, names: list[str]) -> None:
-        self.names = list(names)
-
-    def list_tools(self) -> list[dict[str, Any]]:
-        return [{"name": name} for name in self.names]
-
-    def execute(self, name: str, params: dict[str, Any], **_: Any) -> ToolCallResult:
-        raise AssertionError(f"unexpected direct tool execution: {name} {params}")
 
 
 def test_tool_manifest_marks_core_commands_as_atomic() -> None:
@@ -46,7 +27,7 @@ def test_tool_manifest_marks_workflows_as_skill_candidates() -> None:
     assert search is not None
     assert search.kind == "workflow"
     assert search.recommended_layer == "skill"
-    assert search.replacement_skill == "skill:search"
+    assert search.replacement_skill == "skill:region-search"
 
     assert formation is not None
     assert formation.kind == "workflow"
@@ -92,9 +73,64 @@ def test_every_skill_has_a_usable_trigger_description() -> None:
         description = str(card.get("description") or "")
         assert description, f"{card['name']} has no description, so it can never trigger"
         assert len(description) <= 1024, f"{card['name']} description exceeds the 1024-char limit"
-        assert description.lower().startswith("use this skill"), (
-            f"{card['name']} description should be written imperatively ('Use this skill when ...')"
+        assert description.startswith("当"), (
+            f"{card['name']} description should be written imperatively ('当……时使用本技能')"
         )
+
+
+def test_skill_docs_map_chinese_section_headers(tmp_path) -> None:
+    """技能文档已中文化；中文节标题必须归一到卡片字段，而不是被静默丢弃。"""
+    from src.agent.skill_docs import parse_skill_doc
+
+    doc = tmp_path / "demo" / "SKILL.md"
+    doc.parent.mkdir()
+    doc.write_text(
+        "---\n"
+        "name: demo\n"
+        "display_name: 演示技能\n"
+        "description: 当演示场景出现时使用本技能\n"
+        "---\n"
+        "\n"
+        "# 演示技能\n"
+        "\n"
+        "## 目的\n"
+        "\n"
+        "这是目的段落。\n"
+        "\n"
+        "## 使用时机\n"
+        "\n"
+        "当演示场景出现时。\n"
+        "\n"
+        "## 失败处理\n"
+        "\n"
+        "出问题就停下上报。\n"
+        "\n"
+        "## 验证\n"
+        "\n"
+        "检查演示结果。\n"
+        "\n"
+        "## 输入\n"
+        "\n"
+        "- `demo_param`: 演示参数\n",
+        encoding="utf-8",
+    )
+
+    parsed = parse_skill_doc(doc)
+    overrides = parsed.to_card_overrides()
+
+    assert overrides["when_to_use"] == "当演示场景出现时。"
+    assert overrides["failure_policy"] == "出问题就停下上报。"
+    assert overrides["verification"] == "检查演示结果。"
+    assert overrides["parameters"] == {"demo_param": "演示参数"}
+
+
+def test_real_skill_docs_fill_fields_from_chinese_sections() -> None:
+    """回归：真实技能文档的中文节必须真的进入卡片字段（供模型与 UI 消费）。"""
+    registry = SkillRegistry()
+    docs = {card["name"]: card for card in registry.doc_cards()}
+
+    assert str(docs["skill:formation"].get("when_to_use") or "").strip()
+    assert str(docs["skill:visual-approach"].get("failure_policy") or "").strip()
 
 
 def test_catalog_lists_metadata_only_and_excludes_bodies() -> None:
@@ -171,40 +207,6 @@ def test_disabled_skill_is_hidden_and_not_activatable() -> None:
         registry._doc_overrides[action]["doc_status"] = original
 
 
-def test_skill_registry_can_opt_in_to_legacy_builtins_for_migration_tests() -> None:
-    registry = SkillRegistry(register_builtins=True)
-    cards = {card["name"]: card for card in registry.all_cards()}
-
-    assert "skill:navigation" in cards
-    assert "drone_takeoff" in cards["skill:navigation"]["subtools"]
-    assert cards["skill:navigation"]["kind"] == "skill"
-
-
-def test_workflow_tools_are_filtered_from_agent_tool_cards() -> None:
-    capabilities = {
-        "flight_control": True,
-        "telemetry": True,
-        "target_search": True,
-        "target_tracking": True,
-        "obstacle_avoidance": True,
-    }
-    available = {
-        "drone_get_status",
-        "airsim_search_target",
-        "airsim_track_object",
-        "airsim_check_obstacle",
-        "airsim_task_status",
-    }
-
-    cards = cards_for_capabilities(capabilities, available)
-    names = {card["name"] for card in cards}
-
-    assert "airsim_search_target" not in names
-    assert "airsim_track_object" not in names
-    assert "airsim_check_obstacle" not in names
-    assert "airsim_task_status" in names
-
-
 def test_tool_runtime_does_not_register_legacy_workflow_tools() -> None:
     runtime = ToolRuntime(backend_id="airsim")
     names = {spec["name"] for spec in runtime.list_tools()}
@@ -248,42 +250,3 @@ def test_px4_ros2_backend_exposes_core_and_provider_tools(monkeypatch) -> None:
     assert "provider_bridge_health" in tool_names
     assert "provider_validate_motion" in tool_names
 
-
-def test_search_skill_uses_atomic_visual_tools_not_legacy_search() -> None:
-    registry = SkillRegistry(register_builtins=True)
-    tools = FakeTools([
-        "drone_connect",
-        "drone_get_status",
-        "drone_arm",
-        "drone_takeoff",
-        "drone_rotate_to",
-        "airsim_take_photo",
-        "inspect_current_frame",
-    ])
-    calls: list[str] = []
-
-    def governed(tool: str, params: dict[str, Any], dry_run: bool) -> ToolCallResult:
-        calls.append(tool)
-        if tool == "drone_get_status":
-            return _result(tool, True, {"status": "ok", "armed": False, "flying": False})
-        if tool == "airsim_take_photo":
-            return _result(tool, True, {"status": "ok", "image_base64": "abc"})
-        if tool == "inspect_current_frame":
-            # 检测已移除：扫视的"找到了"证据来自视觉模型的 answer
-            return _result(tool, True, {"status": "ok", "answer": {"target_found": True, "target_candidates": [{"label": "car", "confidence": 0.9}]}})
-        return _result(tool, True, {"status": "ok"})
-
-    result = registry.execute(
-        "skill:search",
-        {"target_class": "car", "max_steps": 2},
-        tools,  # type: ignore[arg-type]
-        execute_tool=governed,
-    )
-
-    assert result.ok is True
-    assert result.data["target_found"] is True
-    assert result.data["provider"] == "inspect_current_frame"
-    assert "airsim_search_target" not in calls
-    assert calls[:4] == ["drone_connect", "drone_get_status", "drone_arm", "drone_takeoff"]
-    assert "airsim_take_photo" in calls
-    assert "inspect_current_frame" in calls

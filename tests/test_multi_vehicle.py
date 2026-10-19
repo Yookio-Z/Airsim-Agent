@@ -9,7 +9,7 @@ from src.agent.runtime import AgentRuntime
 from src.agent.tool_executor import ToolCollector, ToolRuntime
 from src.gcs.services import ToolCommandManager, ToolSafetyManager, ToolTelemetryManager
 from src.gcs.state import GroundStationState
-from src.tools.core import register_core_tools
+from src.tools.flight import register_flight_tools
 
 
 class _FleetController:
@@ -56,7 +56,7 @@ class _FleetController:
 
 def _fleet_tools(controller: _FleetController) -> ToolCollector:
     collector = ToolCollector()
-    register_core_tools(collector, controller, lambda data: data)
+    register_flight_tools(collector, controller, lambda data: data)
     return collector
 
 
@@ -223,8 +223,8 @@ def test_command_manager_forwards_vehicle_id() -> None:
     safety = ToolSafetyManager(tools)
     manager = ToolCommandManager(tools, telemetry, safety)
 
-    manager.takeoff(altitude_m=5.0, vehicle_id="Drone2")
-    manager.hold(vehicle_id="all")
+    manager.execute_tool("drone_takeoff", {"altitude": 5.0}, vehicle_id="Drone2")
+    manager.execute_tool("drone_hover", {}, vehicle_id="all")
 
     assert tools.executed == [
         ("drone_takeoff", {"altitude": 5.0, "vehicle_name": "Drone2"}),

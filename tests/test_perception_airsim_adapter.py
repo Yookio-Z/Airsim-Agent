@@ -11,7 +11,7 @@ from __future__ import annotations
 
 import numpy as np
 
-from src.modules.perception_airsim_adapter import build_depth_fn, build_frame_source, get_depth_image
+from src.modules.perception.airsim_adapter import build_depth_fn, build_frame_source, get_depth_image
 
 
 # ----------------------------------------------------------------------
@@ -96,7 +96,7 @@ def _depth_response(value=5.0, width=64, height=48):
 
 def test_frame_source_prefers_the_flight_controller_capture_path():
     """A provider must win: the controller's capture has a hard timeout."""
-    from src.modules.frame_source import LazyControllerFrameSource
+    from src.modules.perception.frame_source import LazyControllerFrameSource
 
     source = build_frame_source(frame_provider=lambda: object(), ip="127.0.0.1", port=41451)
     assert isinstance(source, LazyControllerFrameSource)
@@ -249,10 +249,10 @@ def test_perception_core_imports_without_airsim():
 
     probe = (
         "import sys\n"
-        "import src.modules.yolo_detection\n"
-        "import src.modules.target_tracker\n"
-        "import src.modules.perception_profile\n"
-        "import src.modules.perception_axis\n"
+        "import src.modules.dormant.yolo_detection\n"
+        "import src.modules.dormant.target_tracker\n"
+        "import src.modules.perception.profile\n"
+        "import src.modules.perception.axis\n"
         "leaked = sorted(m for m in sys.modules if m == 'airsim' or m.startswith('airsim.')"
         " or 'airsim_controller' in m)\n"
         "print('LEAKED:' + ','.join(leaked))\n"
@@ -281,7 +281,7 @@ def test_bbox_maps_through_angle_not_height_ratio():
     height ratio would sample the wrong depth row off-centre, so y is mapped
     through the actual angle. x stays linear because fov_h is shared.
     """
-    from src.modules.perception_airsim_adapter import _scale_bbox_to_depth
+    from src.modules.perception.airsim_adapter import _scale_bbox_to_depth
 
     frame = np.zeros((480, 640, 3), dtype=np.uint8)
     depth = np.zeros((144, 256), dtype=np.float32)
@@ -298,7 +298,7 @@ def test_bbox_maps_through_angle_not_height_ratio():
 
 def test_bbox_mapping_is_linear_when_aspects_match():
     """Same aspect ratio -> same vertical FOV -> plain linear scaling is correct."""
-    from src.modules.perception_airsim_adapter import _scale_bbox_to_depth
+    from src.modules.perception.airsim_adapter import _scale_bbox_to_depth
 
     frame = np.zeros((600, 800, 3), dtype=np.uint8)
     depth = np.zeros((192, 256), dtype=np.float32)  # both 4:3
@@ -309,7 +309,7 @@ def test_bbox_mapping_is_linear_when_aspects_match():
 
 
 def test_bbox_scaling_is_a_noop_at_equal_resolution():
-    from src.modules.perception_airsim_adapter import _scale_bbox_to_depth
+    from src.modules.perception.airsim_adapter import _scale_bbox_to_depth
 
     frame = np.zeros((480, 640, 3), dtype=np.uint8)
     depth = np.zeros((480, 640), dtype=np.float32)
@@ -318,7 +318,7 @@ def test_bbox_scaling_is_a_noop_at_equal_resolution():
 
 
 def test_bbox_scaling_tolerates_bad_input():
-    from src.modules.perception_airsim_adapter import _scale_bbox_to_depth
+    from src.modules.perception.airsim_adapter import _scale_bbox_to_depth
 
     frame = np.zeros((480, 640, 3), dtype=np.uint8)
     depth = np.zeros((144, 256), dtype=np.float32)
@@ -354,7 +354,7 @@ def test_vertical_fov_follows_aspect_ratio_not_a_constant():
     ~73.7 deg. A constant cannot be right for both, and the error grows with the
     off-axis angle -- exactly where a target sits while being approached.
     """
-    from src.modules.perception_airsim_adapter import _derive_fov_v
+    from src.modules.perception.airsim_adapter import _derive_fov_v
 
     four_three = _derive_fov_v(90.0, 640, 480)
     sixteen_nine = _derive_fov_v(90.0, 1280, 720)
@@ -367,7 +367,7 @@ def test_vertical_fov_follows_aspect_ratio_not_a_constant():
 
 
 def test_vertical_fov_is_robust_to_bad_input():
-    from src.modules.perception_airsim_adapter import _derive_fov_v
+    from src.modules.perception.airsim_adapter import _derive_fov_v
 
     assert _derive_fov_v(90.0, 0, 0) == 90.0
     assert _derive_fov_v(90.0, -5, 480) == 90.0

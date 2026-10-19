@@ -18,8 +18,8 @@ import numpy as np
 import pytest
 
 from _runtime_factories import tool_runtime
-from src.modules.perception_axis import PerceptionAxis
-from src.modules.perception_profile import PerceptionProfile
+from src.modules.perception.axis import PerceptionAxis
+from src.modules.perception.profile import PerceptionProfile
 
 
 class StubFrameSource:
@@ -261,7 +261,7 @@ def test_another_camera_view_never_runs_its_own_detection(monkeypatch):
         called.append("detect")
         raise AssertionError("预览路径不该自己跑检测")
 
-    monkeypatch.setattr("src.modules.yolo_detection.detect_objects_stateless", boom)
+    monkeypatch.setattr("src.modules.dormant.yolo_detection.detect_objects_stateless", boom)
 
     axis = StubAxis(camera_name="CameraImage")
     runtime = _runtime_with_axis(axis)
@@ -405,8 +405,8 @@ def test_detection_tools_are_gone_and_point_locate_is_the_geometry_path():
     axis = StubAxis(camera_name="CameraImage")
     calls: list[tuple] = []
 
-    def locate(x, y, vehicle_name="", hint_w=0.0, hint_h=0.0):
-        calls.append((x, y, vehicle_name))
+    def locate(x, y, vehicle_name="", hint_w=0.0, hint_h=0.0, extra_points=None):
+        calls.append((x, y, vehicle_name, tuple(extra_points or ())))
         return {"valid": True, "world_pos": {"x": 1.0, "y": 2.0, "z": -3.0}, "distance_m": 4.5}
 
     register_perception_axis_tools(
@@ -416,18 +416,28 @@ def test_detection_tools_are_gone_and_point_locate_is_the_geometry_path():
     names = set(collector.tools)
     for gone in ("perception_start", "perception_stop", "airsim_detect_objects", "drone_approach_target"):
         assert gone not in names, f"{gone} 应随 YOLO 一起移除"
-    assert {"perception_status", "inspect_current_frame", "airsim_locate_point"} <= names
+    assert {"perception_status", "inspect_current_frame", "locate_image_point"} <= names
 
-    payload = json.loads(collector.tools["airsim_locate_point"](0.55, 0.4))
+    payload = json.loads(collector.tools["locate_image_point"]("0.55,0.4"))
     assert payload["status"] == "ok"
     assert payload["valid"] is True
     assert payload["world_pos"]["z"] == -3.0
     assert payload["query_point"] == {"x": 0.55, "y": 0.4}
-    assert calls == [(0.55, 0.4, "")]
+    assert calls == [(0.55, 0.4, "", ())]
+
+    # 多点：第一个点是主点，其余点作为附加点透传给深度投影（一次取帧多点读数）
+    multi = json.loads(collector.tools["locate_image_point"]("0.55,0.4; 0.5,0.5;0.6,0.5"))
+    assert multi["status"] == "ok"
+    assert calls[-1] == (0.55, 0.4, "", ((0.5, 0.5), (0.6, 0.5)))
+
+    # 越界的像素坐标要给出可执行的错误，而不是静默读错位置
+    bad = json.loads(collector.tools["locate_image_point"]("440,312"))
+    assert bad["status"] == "error"
+    assert "归一化" in bad["message"]
 
     # 没注入投影回调时给一句可执行的话，而不是抛异常
     bare = ToolCollector()
     register_perception_axis_tools(bare, axis, lambda data: json.dumps(data, ensure_ascii=False))
-    failed = json.loads(bare.tools["airsim_locate_point"](0.5, 0.5))
+    failed = json.loads(bare.tools["locate_image_point"]("0.5,0.5"))
     assert failed["status"] == "error"
     assert "不支持" in failed["message"]

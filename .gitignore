@@ -7,8 +7,18 @@ __pycache__/
 
 # Runtime-local state and generated files
 .runtime/
-.airsim_agent/
 *.log
+
+# Agent 的家（.airsim_agent/）：手册入库、数据不入库——它也是**唯一**的运行期数据根。
+#   入库：SYSTEM.md（系统提示词）、NOTES.md（长期笔记）、skills/（技能）、README.md
+#   不入库：sessions/、session_memory/、task_runs/、runs/、attachments/、flightlog/、
+#           memory.json、settings.json、models.json、secrets.json
+#   结构同 pi 的 .pi/：tracked 内容 + gitignore 的本地状态，新文件默认忽略。
+.airsim_agent/*
+!.airsim_agent/SYSTEM.md
+!.airsim_agent/NOTES.md
+!.airsim_agent/README.md
+!.airsim_agent/skills/
 
 # Captured simulator images are served locally and can be regenerated.
 captures/
@@ -16,17 +26,15 @@ captures/
 # 旧目标检测权重（产品已移除 YOLO；见 models/README.md）。*.pt 一律不入库。
 *.pt
 
+# 飞行数据资产（本机，不入库）
+/data/
+
 # Runtime state, logs and caches (may contain local API keys / credentials).
-src/data/
 src/ui/static/tile_cache/
 logs/
 
 # Third-party source clones are vendored locally, not tracked.
 third_party/
-
-# One-off debug probes and dev-phase verification scripts.
-scripts/manual/
-scripts/verify_p*.py
 
 # Internal documents (design drafts, failure analyses, research notes, ideas)
 # are deliberately NOT tracked: the repository may be public and these are

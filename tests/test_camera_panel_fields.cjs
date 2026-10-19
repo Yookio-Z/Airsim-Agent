@@ -32,12 +32,11 @@ function cameraPanelHarness(source = 'airsim') {
     cameraImageTypeRow: field(),
     cameraImageType: { value: 'scene' },
     cameraTimeout: { value: '30' },
-    cameraAutoSave: { checked: false },
     cameraSourceHint: field(),
   };
   const context = vm.createContext({
     els,
-    cameraSettings: { source, transport: 'tcp', url: '', camera_name: '0', vehicle_name: '', image_type: 'scene', timeout_sec: 30, auto_save: false },
+    cameraSettings: { source, transport: 'tcp', url: '', camera_name: '0', vehicle_name: '', image_type: 'scene', timeout_sec: 30 },
     DEFAULT_CAMERA_SETTINGS: { transport: 'tcp', source: 'airsim', camera_name: '0', image_type: 'scene', timeout_sec: 30, url: '' },
   });
   vm.runInContext(

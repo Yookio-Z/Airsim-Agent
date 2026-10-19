@@ -20,9 +20,8 @@ CORRECTION_ATTEMPTS_MAX = 2
 CANCEL_ABORT_WINDOW_S = 30.0
 
 OBSERVATION_TOOLS = {
-    "airsim_take_photo",
     "inspect_current_frame",
-    "airsim_get_depth_map",
+    "locate_image_point",
 }
 
 STRUCTURED_PERCEPTION_TOOLS = {
@@ -64,16 +63,11 @@ _REAL_VEHICLE_APPROVAL_TOOLS = {
     "drone_fly_to",
     "drone_move_relative",
     "drone_fly_path",
-    "drone_fly_velocity",
     "drone_set_mode",
     "drone_disarm",
     "drone_upload_mission",
     "drone_start_mission",
     "drone_clear_mission",
-    "drone_dispatch_takeoff",
-    "drone_dispatch_path",
-    "drone_dispatch_land",
-    "drone_dispatch_return_land",
     # 真机上任何会真的挪动飞机的动作都要签字。抵近工具已随 YOLO 移除；现在
     # 靠近由 drone_move_relative（已在上面）完成，不再有单独的抵近工具。
 }

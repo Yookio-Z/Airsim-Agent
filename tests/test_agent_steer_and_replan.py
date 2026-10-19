@@ -36,7 +36,7 @@ class _FakeTools:
     def list_tools(self) -> list[dict]:
         return [
             {"name": name}
-            for name in ("inspect_current_frame", "airsim_get_depth_map", "drone_move_relative", "drone_get_status")
+            for name in ("inspect_current_frame", "locate_image_point", "drone_move_relative", "drone_get_status")
         ]
 
     def execute(self, name, params, dry_run=False, blocked_by_supervisor=False):
@@ -176,7 +176,7 @@ def test_repeated_deviation_eventually_skips_the_step(tmp_path):
     planner = _RecordingPlanner(
         [
             # 第一轮纠错：读深度（不是计划里的步骤，因此不会让计划"收敛"）
-            LoopDecision(action="airsim_get_depth_map", params={}, reason="先看看还有多远"),
+            LoopDecision(action="locate_image_point", params={"points": "0.5,0.5"}, reason="先看看还有多远"),
             LoopDecision(action="drone_move_relative", params={"forward_m": 1.0}, reason="再靠近"),
             LoopDecision(action="", reason="无法确认目标", is_complete=True),
         ]
@@ -195,7 +195,7 @@ def test_repeated_deviation_eventually_skips_the_step(tmp_path):
     executed = [name for name, _ in tools.calls]
     assert "跳过这一步" in joined, events
     assert executed.count("inspect_current_frame") == 1, executed  # 只跑过第一步；第二步被跳过
-    assert "airsim_get_depth_map" in executed, executed  # 第一次偏离交回模型纠错
+    assert "locate_image_point" in executed, executed  # 第一次偏离交回模型纠错
     assert "drone_move_relative" in executed, executed  # 跳过之后计划继续推进
     assert state.status == "completed"
 

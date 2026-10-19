@@ -11,7 +11,6 @@ from __future__ import annotations
 from .loop_types import LoopState
 from .planner import MissionStep
 from .run_state import RunState
-from .sub_agent import SubAgentRunner
 from .tool_executor import ToolCallResult
 from pathlib import Path
 from typing import Any
@@ -27,56 +26,10 @@ class AgentBridgeMixin:
     """Runtime methods for this domain; assembled into AgentRuntime in runtime.py."""
 
 
-    def _append_sub_agent_rows(self, run: RunState, loop: LoopState, sub_run_id: str) -> None:
-        """把子 Agent 的进度作为时间线行附到父任务下，不改写父 run 的任何状态。
-
-        子循环的 decisions/results 属于子任务，父 run 的 loop_state、进度、状态、
-        看门狗都必须保持自己的语义；这里只做可视化，并用已见计数去重（子循环
-        每次都回显完整列表）。
-        """
-        if not isinstance(run.agent_state, dict):
-            return
-        seen = run.agent_state.setdefault("_sub_agent_rows", {})
-        if not isinstance(seen, dict):
-            return
-        counts = seen.get(sub_run_id) or {"decisions": 0, "results": 0}
-        decisions = list(getattr(loop, "decisions", []) or [])
-        results = list(getattr(loop, "results", []) or [])
-        if len(decisions) > int(counts.get("decisions") or 0):
-            counts["decisions"] = len(decisions)
-            decision = decisions[-1]
-            self._append_process(
-                run,
-                f"子任务决策 {len(decisions)}",
-                self._loop_decision_public_text(decision)
-                or str(getattr(decision, "action", "") or "检查子任务是否完成"),
-                status="completed" if getattr(decision, "is_complete", False) else "running",
-                kind="reasoning",
-            )
-        if len(results) > int(counts.get("results") or 0):
-            counts["results"] = len(results)
-            result = results[-1]
-            self._append_process(
-                run,
-                f"子任务动作: {getattr(result, 'tool', '')}",
-                "子任务工具执行完成。" if getattr(result, "ok", False) else "子任务工具执行失败。",
-                status="completed" if getattr(result, "ok", False) else "failed",
-                kind="tool",
-            )
-        seen[sub_run_id] = counts
-
     def _on_agent_loop_state(self, loop: LoopState) -> None:
         with self._lock:
             run = self._current
             if not run or run.run_id != loop.run_id:
-                return
-            sub_run_id = str(getattr(loop, "sub_run_id", "") or "")
-            if sub_run_id:
-                # 子 Agent 的进度回显：只往时间线上补行。以前这里不区分回显，
-                # 子循环的 decisions/results 会整体覆盖父 run 的 loop_state、按
-                # 子循环的 max_steps 重算父进度，还会替父 run 启动包线看门狗。
-                self._append_sub_agent_rows(run, loop, sub_run_id)
-                self._publish_run_update(run)
                 return
             if run.status == "cancelled":
                 self._publish_run_update(run)
@@ -634,8 +587,8 @@ class AgentBridgeMixin:
         with self._lock:
             run = run or (self._current if caller_owns_run else None)
 
-        manual_safety_tools = {"drone_hover", "drone_land", "airsim_task_cancel"}
-        read_only_tools = set(self.tools.READ_ONLY_TOOLS) | {"airsim_task_status"}
+        manual_safety_tools = {"drone_hover", "drone_land"}
+        read_only_tools = set(self.tools.READ_ONLY_TOOLS)
         if self._execution_slot.locked() and not caller_owns_run and tool not in read_only_tools | manual_safety_tools:
             return self._blocked_tool_result(
                 tool,
@@ -653,7 +606,7 @@ class AgentBridgeMixin:
             callable(formation_active)
             and formation_active()
             and tool in self.tools.CONTROL_TOOLS
-            and tool not in {"drone_hover", "drone_land", "drone_get_status", "drone_disconnect", "drone_connect", "airsim_task_cancel"}
+            and tool not in {"drone_hover", "drone_land", "drone_get_status", "drone_disconnect", "drone_connect"}
         ):
             return self._blocked_tool_result(
                 tool,
@@ -663,12 +616,6 @@ class AgentBridgeMixin:
 
         if tool.startswith("skill:"):
             return self._execute_skill_tool(tool, params, dry_run=dry_run, run=run)
-        if tool == "agent_subtask":
-            return self._execute_sub_agent_tool(params, dry_run=dry_run, run=run)
-        if tool == "memory_recall":
-            return self._execute_memory_recall(params, dry_run=dry_run)
-        if tool == "memory_remember":
-            return self._execute_memory_remember(params, dry_run=dry_run)
         if dry_run:
             return self.tools.execute(tool, params, dry_run=True)
 
@@ -810,113 +757,6 @@ class AgentBridgeMixin:
                 f"(altitude {altitude:.2f} m, flying={bool(drone.get('flying'))}, armed={bool(drone.get('armed'))}). "
                 "Take off first and confirm flying=true before moving horizontally."
             ),
-        )
-
-    def _execute_memory_recall(self, params: dict[str, Any], dry_run: bool = False) -> ToolCallResult:
-        started = time.time()
-        query = str(params.get("query") or "").strip()
-        limit = 5
-        try:
-            limit = max(1, min(10, int(params.get("limit") or 5)))
-        except (TypeError, ValueError):
-            limit = 5
-        results = [] if dry_run else self.memory.recall(query, limit=limit)
-        data = {"status": "planned" if dry_run else "ok", "query": query, "count": len(results), "results": results}
-        return ToolCallResult("memory_recall", dict(params), True, data, started, time.time())
-
-    def _execute_memory_remember(self, params: dict[str, Any], dry_run: bool = False) -> ToolCallResult:
-        started = time.time()
-        key = str(params.get("key") or "").strip()
-        value = str(params.get("value") or "").strip()
-        if not key:
-            return ToolCallResult(
-                "memory_remember",
-                dict(params),
-                False,
-                {"status": "error", "message": "memory_remember requires a non-empty 'key'"},
-                started,
-                time.time(),
-                error_code="INVALID_PARAMS",
-            )
-        tags = params.get("tags")
-        if isinstance(tags, str):
-            tags = [item.strip() for item in tags.split(",") if item.strip()]
-        if not dry_run:
-            self.memory.remember_fact(key, value, tags)
-        data = {"status": "planned" if dry_run else "ok", "key": key, "message": f"fact '{key}' stored"}
-        return ToolCallResult("memory_remember", dict(params), True, data, started, time.time())
-
-    def _execute_sub_agent_tool(self, params: dict[str, Any], dry_run: bool = False, run: RunState | None = None) -> ToolCallResult:
-        """Delegate an open-ended subtask to a bounded sub-agent.
-
-        Runs synchronously in the caller's thread, so the execution slot and
-        approval context are shared with the parent loop. The sub-agent gets
-        its own run log and step budget; the parent only receives the report.
-        """
-        started = time.time()
-        goal = str(params.get("goal") or "").strip()
-        if not goal:
-            return ToolCallResult(
-                "agent_subtask",
-                dict(params),
-                False,
-                {"status": "error", "message": "agent_subtask requires a non-empty 'goal'"},
-                started,
-                time.time(),
-                error_code="INVALID_PARAMS",
-            )
-        max_steps = 6
-        try:
-            max_steps = max(2, min(12, int(params.get("max_steps") or 6)))
-        except (TypeError, ValueError):
-            max_steps = 6
-        model_id = str(params.get("model_id") or "").strip() or (run.model_id if run else "") or ""
-        if dry_run:
-            return ToolCallResult(
-                "agent_subtask",
-                dict(params),
-                True,
-                {"status": "planned", "goal": goal, "message": "dry run only"},
-                started,
-                time.time(),
-            )
-        tool_runtime = self.tools.status_snapshot()
-        capabilities = ((tool_runtime.get("backend_profile") or {}).get("capabilities")) or {}
-        tool_cards = self.tools.list_tool_cards()
-        parent_run_id = run.run_id if run else f"run_{int(time.time() * 1000)}"
-        runner = SubAgentRunner(
-            tools=self.tools,
-            planner=self.planner,
-            memory=self.memory,
-            execute_tool=lambda name, sub_params, sub_dry: self._execute_agent_tool(name, sub_params, dry_run=sub_dry, run=run),
-            should_stop=lambda: self.supervisor.is_emergency_stopped() or self._cancel_requested.is_set(),
-            should_pause=self.supervisor.should_pause,
-            on_ui_event=self._on_agent_event,
-            on_ui_state=self._on_agent_loop_state,
-            # 计数器必须由父级持有：runner 是每次调用新建的，自带计数器会从 0
-            # 重启，同一任务的第二个子任务又会去写 <parent>.sub1.jsonl（seq 重复、
-            # 两次子运行的审计记录交错在同一个文件里）。
-            sub_counter=self._sub_agent_counter,
-        )
-        report = runner.run(
-            parent_run_id,
-            goal,
-            constraints=str(params.get("constraints") or ""),
-            tool_cards=tool_cards,
-            capabilities=capabilities,
-            model_id=model_id or None,
-            max_steps=max_steps,
-        )
-        ok = report.get("status") == "completed"
-        error_code = "" if ok else ("BLOCKED" if report.get("status") == "blocked" else "TOOL_ERROR")
-        return ToolCallResult(
-            "agent_subtask",
-            dict(params),
-            ok,
-            {"status": "ok" if ok else "failed", **report},
-            started,
-            time.time(),
-            error_code=error_code,
         )
 
     def _execute_skill_tool(
@@ -1118,7 +958,7 @@ class AgentBridgeMixin:
             overview = self._thought_overview(run)
             self._append_thought(run, "理解任务", overview)
             self._append_process(run, "理解任务", overview, status="completed", kind="system")
-        tools = " → ".join(step.tool for step in run.plan.steps if step.tool and step.tool != "memory_store")
+        tools = " → ".join(step.tool for step in run.plan.steps if step.tool)
         if tools:
             self._append_thought(run, "工具选择", tools)
             self._append_process(run, "选择工具", tools, status="completed", kind="plan")
@@ -1138,8 +978,6 @@ class AgentBridgeMixin:
         index: int,
         total: int,
     ) -> None:
-        if step.tool == "memory_store":
-            return
         self._append_thought(
             run,
             f"调用 {step.tool}",
@@ -1197,8 +1035,6 @@ class AgentBridgeMixin:
         step: MissionStep,
         ok: bool,
     ) -> None:
-        if step.tool == "memory_store":
-            return
         message = ""
         if isinstance(step.result, dict):
             message = str(step.result.get("message") or step.result.get("status") or "")
@@ -1229,7 +1065,6 @@ class AgentBridgeMixin:
         labels = {
             "drone_connect": "Connect flight link",
             "drone_disconnect": "Disconnect flight link",
-            "drone_list_vehicles": "List vehicles",
             "drone_get_status": "Read vehicle status",
             "drone_arm": "Arm motors",
             "drone_disarm": "Disarm motors",
@@ -1238,7 +1073,6 @@ class AgentBridgeMixin:
             "drone_hover": "Hold position",
             "drone_fly_to": "Fly to local coordinate",
             "drone_move_relative": "Move in body frame",
-            "drone_fly_velocity": "Fly by velocity",
             "drone_fly_path": "Fly waypoint path",
             "drone_upload_mission": "Upload mission",
             "drone_download_mission": "Download mission",
@@ -1246,19 +1080,13 @@ class AgentBridgeMixin:
             "drone_start_mission": "Start mission",
             "drone_get_mission_progress": "Read mission progress",
             "drone_rotate_to": "Rotate heading",
-            "drone_release_yaw": "Release heading control to RC",
             "drone_set_mode": "Set flight mode",
-            "airsim_take_photo": "Capture image",
             "airsim_get_sensors": "Read sensors",
-            "airsim_get_depth_map": "Read depth map",
-            "airsim_locate_point": "Locate image point in world",
+            "locate_image_point": "Measure distance / locate image point",
             "inspect_current_frame": "Inspect current frame",
             "provider_bridge_health": "Check provider bridge",
             "provider_obstacle_summary": "Read obstacle provider",
             "provider_validate_motion": "Validate motion provider",
-            "airsim_task_status": "Read legacy task status",
-            "airsim_task_cancel": "Cancel legacy task",
-            "memory_store": "Store mission memory",
         }
         return labels.get(tool, tool.replace("_", " "))
 

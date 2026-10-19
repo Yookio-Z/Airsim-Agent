@@ -41,19 +41,10 @@ class LinkManager(Protocol):
 
 
 class VehicleManager(Protocol):
-    """Discovers and selects vehicles from link heartbeats."""
+    """机队清单（读遥测快照；单机后端可能为空 = "默认那一台"）。"""
 
     def list_vehicles(self) -> list[dict[str, Any]]:
-        """Return vehicles known to the ground station."""
-
-    def active_vehicle_id(self) -> str:
-        """Return the active vehicle id, or an empty string if none is active."""
-
-    def set_active_vehicle(self, vehicle_id: str) -> ManagerResult:
-        """Select the vehicle that UI and Agent commands target."""
-
-    def remove_vehicle(self, vehicle_id: str) -> ManagerResult:
-        """Forget a vehicle that is no longer connected."""
+        """Return the fleet as the panels see it (telemetry snapshot)."""
 
 
 class TelemetryManager(Protocol):
@@ -67,6 +58,15 @@ class TelemetryManager(Protocol):
 
     def refresh(self) -> GroundStationState:
         """Poll or consume backend telemetry and return the latest snapshot."""
+
+
+class CommandManager(Protocol):
+    """设备动作入口：先安全校验，再交运行时治理执行。"""
+
+    def execute_tool(
+        self, tool: str, params: dict[str, Any] | None = None, vehicle_id: str = ""
+    ) -> Any:
+        """Run one device action and return its ToolCallResult."""
 
 
 class MissionManager(Protocol):
@@ -101,34 +101,6 @@ class MissionManager(Protocol):
 
     def progress(self) -> MissionState:
         """Return mission execution progress."""
-
-
-class CommandManager(Protocol):
-    """Executes high-level vehicle commands after safety validation."""
-
-    def arm(self, vehicle_id: str = "") -> ManagerResult:
-        """Arm the active vehicle."""
-
-    def disarm(self, vehicle_id: str = "") -> ManagerResult:
-        """Disarm the active vehicle."""
-
-    def takeoff(self, altitude_m: float, vehicle_id: str = "") -> ManagerResult:
-        """Take off to a relative altitude."""
-
-    def land(self, vehicle_id: str = "") -> ManagerResult:
-        """Land the active vehicle."""
-
-    def hold(self, vehicle_id: str = "") -> ManagerResult:
-        """Hold/hover at the current position."""
-
-    def rtl(self, vehicle_id: str = "") -> ManagerResult:
-        """Return to launch/home when the backend supports it."""
-
-    def set_mode(self, mode: str, vehicle_id: str = "") -> ManagerResult:
-        """Set a flight mode such as GUIDED, LOITER, HOLD, or LAND."""
-
-    def goto(self, item: dict[str, Any], vehicle_id: str = "") -> ManagerResult:
-        """Command a one-shot navigation target."""
 
 
 class SafetyManager(Protocol):

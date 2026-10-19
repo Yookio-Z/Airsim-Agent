@@ -85,8 +85,6 @@ def _run(
         skills=FakeSkills(),
         on_event=on_event,
         on_state=on_state,
-        async_timeout=1.0,
-        async_poll_interval=0.05,
     )
     loop.run("run_x", "拍照", {"image_capture": True}, [{"name": n} for n in tools.handlers], max_steps=max_steps)
     return loop
@@ -301,7 +299,7 @@ def _state_after_confirmation() -> LoopState:
         {"status": "ok", "answer": {"summary_zh": "画面里有一辆浅蓝色汽车", "target_candidates": [{"label": "car", "confidence": 0.8}]}},
     ))
     state.results.append(LoopActionResult(
-        2, "airsim_get_depth_map", {}, True, {"status": "ok", "distance_median_m": 30.0},
+        2, "locate_image_point", {}, True, {"status": "ok", "distance_median_m": 30.0},
     ))
     return state
 
@@ -315,7 +313,7 @@ def _guard(tools: FakeTools, decision: LoopDecision) -> LoopDecision:
         _state_after_confirmation(),
         obs,
         decision,
-        set(tools.handlers) | {"drone_move_relative", "drone_approach_target", "airsim_get_depth_map", "inspect_current_frame"},
+        set(tools.handlers) | {"drone_move_relative", "drone_approach_target", "locate_image_point", "inspect_current_frame"},
         {"image_capture": True},
     )
 
@@ -365,10 +363,12 @@ def test_guard_decisions_are_tagged_as_guard():
     loop = AgentLoop(tools, SequencePlanner([]), FakeMemory(), skills=FakeSkills())
     obs = LoopObservation(step_index=1, world_state=tools.status_snapshot(), last_action_result=None,
                           elapsed_since_start=1.0, frame_age_s=None)
-    decision = LoopDecision(action="memory_store", params={}, reason="记一笔")
+    # 触发守卫的"交回模型"出口：这是视觉请求，但当前没有可用的看图工具。
+    # （记忆工具已删除——记忆不再是模型动作，守卫里那条"内部工具"分支随之消失。）
+    decision = LoopDecision(action="", params={}, reason="模型这一轮没有给出动作")
 
     out = loop._guard_decision(
-        _APPROACH_CMD, state, obs, decision, set(tools.handlers), {"image_capture": True}
+        "看一下画面里有什么", state, obs, decision, set(), {}
     )
 
     assert out.source == "guard", out.source

@@ -1,6 +1,6 @@
 """Append-only run event log: the audit trail for agent decision traces.
 
-Each run (or sub-run) appends JSONL events to
+Each run appends JSONL events to
 ``<data_dir>/runs/<run_id>.jsonl``. The log is the single source of truth for
 "what the agent saw and did" — the UI, diagnostics, and future replay all read
 from it. Sensitive payloads (image base64 frames) are redacted to a hash plus

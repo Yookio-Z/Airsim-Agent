@@ -18,7 +18,7 @@ import math
 import pytest
 from pymavlink import mavutil
 
-from src.modules.mavlink_controller import _mission_params_for_command
+from src.modules.backends.mavlink import _mission_params_for_command
 
 
 WAYPOINT = mavutil.mavlink.MAV_CMD_NAV_WAYPOINT

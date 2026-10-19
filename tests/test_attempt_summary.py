@@ -46,7 +46,7 @@ def test_summarize_attempt_uses_model_text_output(monkeypatch) -> None:
         "results": [
             {"tool": "drone_takeoff", "ok": True, "data": {}},
             {"tool": "drone_move_relative", "ok": True, "data": {}},
-            {"tool": "skill:search", "ok": False, "data": {"message": "target not found"}},
+            {"tool": "skill:region-search", "ok": False, "data": {"message": "target not found"}},
         ],
         "failure_reason": "agent loop reached max_steps=16",
         "observations": [
@@ -58,7 +58,7 @@ def test_summarize_attempt_uses_model_text_output(monkeypatch) -> None:
     user = captured["messages"][-1]["content"]
     assert "搜索红色车辆" in user
     assert "drone_takeoff: 成功" in user
-    assert "skill:search: 失败" in user
+    assert "skill:region-search: 失败" in user
     assert "agent loop reached max_steps=16" in user
     assert "position_ned" in user
     assert captured["max_tokens"] == 600

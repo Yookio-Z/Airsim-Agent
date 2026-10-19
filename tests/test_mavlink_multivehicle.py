@@ -5,7 +5,7 @@ from __future__ import annotations
 
 import time
 
-from src.modules.mavlink_controller import MavlinkController
+from src.modules.backends.mavlink import MavlinkController
 
 
 class _Message:

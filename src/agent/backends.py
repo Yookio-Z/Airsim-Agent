@@ -7,7 +7,7 @@ from dataclasses import dataclass, field
 from typing import Any, Callable
 
 from src.config import config
-from src.modules.flight_controller import FlightController
+from src.modules.backends.base import FlightController
 
 
 @dataclass(frozen=True)
@@ -145,7 +145,7 @@ class BackendRegistry:
 
 
 def _create_airsim_controller() -> FlightController:
-    from src.modules.airsim_controller import AirSimController
+    from src.modules.backends.airsim import AirSimController
 
     return AirSimController()
 
@@ -184,7 +184,7 @@ def read_airsim_origin_geopoint() -> dict[str, float] | None:
 
 
 def _create_px4_mavlink_controller() -> FlightController:
-    from src.modules.mavlink_controller import MavlinkController
+    from src.modules.backends.mavlink import MavlinkController
 
     return MavlinkController(
         connection_string=config.px4_connection_string,
@@ -194,7 +194,7 @@ def _create_px4_mavlink_controller() -> FlightController:
 
 
 def _create_px4_ros2_controller() -> FlightController:
-    from src.modules.ros_gateway_controller import RosGatewayController
+    from src.modules.backends.ros_gateway import RosGatewayController
 
     return RosGatewayController(base_url=_ros_bridge_url())
 

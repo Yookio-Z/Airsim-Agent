@@ -15,8 +15,29 @@ from typing import Any
 from .settings_store import REPO_ROOT
 
 
-SESSIONS_DIR = REPO_ROOT / "src" / "data" / "sessions"
+from src.paths import AGENT_HOME
+
+SESSIONS_DIR = AGENT_HOME / "sessions"
 SESSIONS_DIR.mkdir(parents=True, exist_ok=True)
+
+
+MAX_SESSIONS = 100
+
+
+def prune_sessions(keep: int = MAX_SESSIONS) -> int:
+    """删掉最旧的会话文件，只保留最近 keep 个（会话内联图片，单个可达十几 MB）。"""
+    try:
+        files = sorted(SESSIONS_DIR.glob("session_*.json"), key=lambda p: p.stat().st_mtime, reverse=True)
+    except OSError:
+        return 0
+    removed = 0
+    for stale in files[max(1, int(keep)):]:
+        try:
+            stale.unlink()
+            removed += 1
+        except OSError:
+            pass
+    return removed
 
 
 def sessions_dir() -> Path:

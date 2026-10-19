@@ -5,7 +5,7 @@ from unittest.mock import Mock
 
 import pytest
 
-from src.modules.mavlink_controller import MavlinkController
+from src.modules.backends.mavlink import MavlinkController
 
 
 def controller_at(global_alt=48.8, z=0.0, sysid=1):
@@ -66,8 +66,8 @@ def test_missing_reference_sends_no_native_command(monkeypatch):
 def test_native_takeoff_does_not_hover_at_first_altitude_crossing(monkeypatch):
     c = controller_at()
     clock = {'now': 100.0, 'samples': 0}
-    monkeypatch.setattr('src.modules.mavlink_controller.time.time', lambda: clock['now'])
-    monkeypatch.setattr('src.modules.mavlink_controller.time.monotonic', lambda: clock['now'])
+    monkeypatch.setattr('src.modules.backends.mavlink.time.time', lambda: clock['now'])
+    monkeypatch.setattr('src.modules.backends.mavlink.time.monotonic', lambda: clock['now'])
 
     def update(**kw):
         clock['now'] += 0.25
