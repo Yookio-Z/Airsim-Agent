@@ -2752,14 +2752,15 @@ class LLMMissionPlanner:
     def _loop_decision_system_prompt(self) -> str:
         return (
             "You are the decision layer of a UAV Agent Loop using ReAct / plan-execute-observe. "
-            "At each step, choose exactly one next FLIGHT action (or mark the task complete once the latest observation proves the goal is handled) AND, when useful, chain up to 2 read-only calls to verify it in the SAME response. "
-            "The actions array runs after the main action, in order, and all results come back together in one observation — this saves a round trip. Typical chains: drone_move_relative + locate_image_point (step, then re-measure); drone_rotate_to + inspect_current_frame (turn, then look); drone_takeoff + drone_get_status. "
-            "Only flight actions are one-per-turn: never put two flight-control tools in one response. "
+            "At each step, choose the action(s) you want to run next (or mark the task complete once the latest observation proves the goal is handled). "
+            "The 'action' is the first step; 'actions' holds additional steps executed AFTER it, in order, and ALL results come back together in one observation. You may chain any mix of read-only and flight tools, and you may chain several flight actions. "
+            "Typical chains: drone_takeoff → drone_rotate_to → inspect_current_frame (one thought, three steps); drone_move_relative → locate_image_point (step, then re-measure); drone_fly_path → drone_get_status. "
+            "The trade-off is yours to judge: you will NOT see intermediate results while the chain runs, so only chain steps you are already sure about. When the next step depends on a new observation (where is the target, how far is it now), stop the chain there and decide again after seeing the result. "
+            "Safety is still enforced per action: every chained action passes the same guard/sanitize/safety checks, and the chain stops at the first failure. "
             "CORRECTION DISCIPLINE: when entering a correction loop, FIRST read the current vehicle status (drone_get_status) and verify from the observation whether the goal action actually failed — never blindly repeat an action that the previous step already reported as completed (e.g. landing completed means the vehicle is on the ground; calling land again is wrong). If the observation shows the goal is already satisfied, mark is_complete=true instead of re-executing. "
             "NEVER declare is_complete=true while any planned motion step (takeoff/hover/move/fly/land/rotate) is still failed or unexecuted from a previous attempt: you must first successfully re-execute that action (fixing its cause first, e.g. climb to the safe altitude before a blocked horizontal move), or prove with fresh drone_get_status telemetry that the target state is genuinely reached. Declaring the task complete while a goal motion is still missing is a hard error and the run will be marked failed. "
-            "You may additionally batch up to 2 independent read-only tool calls (drone_get_status, airsim_get_sensors, locate_image_point, inspect_current_frame, perception_status) "
-            "in the 'actions' array (JSON mode) or as extra tool calls (native mode). "
-            "Never place flight-control tools (arm, disarm, takeoff, land, hover, fly, move, rotate, set_mode, mission upload/start) in that batch — one flight tool per turn. "
+            "In JSON mode put the chain in the 'actions' array; in native mode emit the extra tool calls in the same response. "
+            "Do not add steps that were not asked for just to fill the chain — a chain is for actions you would have taken anyway, without needing the intermediate result. "
             "TOOL SELECTION — pick by what you already know, not by habit. There is NO object detection in this system: semantics come from the "
             "vision model, metric distance from the depth image. To go to something you can see: (1) inspect_current_frame once — read the "
             "normalised point (and rough size) of the target from answer.target_candidates[].bbox_hint; (2) locate_image_point at that point "
@@ -2823,7 +2824,7 @@ class LLMMissionPlanner:
             "reflection": "optional brief public reflection on the latest observation/result",
             "actions": [
                 {
-                    "action": "read-only verification call executed AFTER the main action, results returned together (drone_get_status, airsim_get_sensors, locate_image_point, inspect_current_frame) — never flight-control tools",
+                    "action": "additional step executed AFTER the main action, in order; read-only or flight tools allowed; all results are returned together",
                     "params": {"name": "value"},
                     "reason": "optional short text",
                 }

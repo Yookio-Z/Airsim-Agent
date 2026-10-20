@@ -1217,11 +1217,8 @@ class AgentLoop:
         except Exception:
             return None
 
-    def _is_parallel_safe(self, name: str) -> bool:
-        """Batch actions are restricted to read-only tools so a batch can never
-        smuggle a flight-control call past the one-flight-tool-per-turn rule."""
-        read_only = getattr(self.tools, "READ_ONLY_TOOLS", set())
-        return name in read_only
+    # 一次决策里最多串联多少个后续动作（防畸形响应；正常用法 2~4 个）。
+    _BATCH_CHAIN_LIMIT = 8
 
     # Task-contract verification: machine-checkable completion criteria that
     # gate model-declared completion ("LLM 提议 + 确定性验证").
@@ -2010,10 +2007,21 @@ class AgentLoop:
         failure_count: int,
         unresolved_failure: bool,
     ) -> dict[str, Any]:
-        """Execute read-only batch actions one by one, each through the same
-        sanitize + guard pipeline as the main action. Returns the updated
-        failure counters so the caller keeps the 3-strike window semantics."""
-        for raw_action in raw_actions:
+        """Execute the decision's follow-up actions in order (read-only or flight).
+
+        每个动作都走与主动作相同的 sanitize + guard + 安全校验；任一动作失败就停止
+        后续动作，把控制权交回模型。链内看不到中间结果，这是模型自己的选择——它
+        应该在"下一步不依赖新观察"时才把多个动作串起来。上限只为防畸形响应。
+        """
+        chained = raw_actions[: self._BATCH_CHAIN_LIMIT]
+        if len(raw_actions) > self._BATCH_CHAIN_LIMIT:
+            self._event(
+                "warning",
+                "agent_loop",
+                f"Too many chained actions ({len(raw_actions)}), only the first {self._BATCH_CHAIN_LIMIT} run",
+                {"actions": [item.get("action") for item in raw_actions if isinstance(item, dict)]},
+            )
+        for raw_action in chained:
             if state.status == "failed":
                 break
             if not isinstance(raw_action, dict):
@@ -2031,15 +2039,6 @@ class AgentLoop:
             sub = self._sanitize_decision(sub, allowed_tools)
             if not sub.action:
                 self._event("warning", "agent_loop", f"Batch action skipped: {raw_action.get('action')}", sub.to_dict(), kind="loop.decision")
-                continue
-            if not self._is_parallel_safe(sub.action):
-                self._event(
-                    "warning",
-                    "agent_loop",
-                    f"Batch action rejected (flight-control tools are one per turn): {sub.action}",
-                    sub.to_dict(),
-                    kind="loop.decision",
-                )
                 continue
             guarded = self._guard_decision(command, state, observation, sub, allowed_tools, capabilities)
             if guarded is not None:

@@ -338,12 +338,10 @@ def test_loop_executes_batch_actions(tmp_path):
         max_steps=3,
     )
     executed = [name for name, _ in tools.calls]
-    assert "drone_get_status" in executed
-    assert "airsim_take_photo" in executed
-    # flight-control tool was rejected from the batch
-    assert "drone_land" not in executed
+    # 主动作 + 链内动作按顺序执行；飞行动作不再被链排除（每个动作仍逐个过安全校验）
+    assert executed[:3] == ["drone_get_status", "airsim_take_photo", "drone_land"], executed
     assert state.status in {"completed", "running"}
-    assert len(state.results) == 2
+    assert len(state.results) == 3
     assert all(result.ok for result in state.results)
 
 
@@ -430,3 +428,43 @@ def test_decision_can_chain_one_flight_action_with_read_only_verification(tmp_pa
     ], tools.calls
     executed = [item.tool for item in state.results]
     assert "drone_move_relative" in executed and "locate_image_point" in executed, executed
+
+
+def test_chain_can_run_several_flight_actions_in_order(tmp_path):
+    """链里允许连续多个飞行动作：模型确认信息后一次下发，按顺序执行。"""
+    from src.agent.memory import AgentMemory
+    from src.agent.skill_registry import SkillRegistry
+
+    tools = _FakeTools()
+    decision = LoopDecision(
+        action="drone_takeoff",
+        params={"altitude": 3.0},
+        reason="起飞后转向",
+        parallel_actions=[
+            {"action": "drone_rotate_to", "params": {"heading_deg": 90.0}},
+            {"action": "drone_get_status", "params": {}},
+        ],
+    )
+    loop = AgentLoop(
+        tools=tools,  # type: ignore[arg-type]
+        planner=_FakePlanner([decision, LoopDecision(action="", reason="done", is_complete=True)]),  # type: ignore[arg-type]
+        memory=AgentMemory(data_dir=tmp_path),
+        skills=SkillRegistry(overrides_path=tmp_path / "skills.json"),
+    )
+    state = loop.run(
+        run_id="run_chain_flight",
+        command="起飞到 3 米后转向 90 度",
+        capabilities={},
+        tool_cards=[
+            {"name": "drone_takeoff", "purpose": "takeoff"},
+            {"name": "drone_rotate_to", "purpose": "rotate"},
+            {"name": "drone_get_status", "purpose": "status"},
+        ],
+        max_steps=3,
+    )
+    assert tools.calls[:3] == [
+        ("drone_takeoff", {"altitude": 3.0}),
+        ("drone_rotate_to", {"heading_deg": 90.0}),
+        ("drone_get_status", {}),
+    ], tools.calls
+    assert {"drone_takeoff", "drone_rotate_to", "drone_get_status"} <= {row.tool for row in state.results}

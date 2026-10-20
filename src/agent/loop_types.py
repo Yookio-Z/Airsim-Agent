@@ -34,10 +34,12 @@ class LoopObservation:
 class LoopDecision:
     """The next high-level action selected by the agent loop.
 
-    ``parallel_actions`` carries additional read-only tool calls that arrived
-    in the same model response (native function calling batch). They are
-    executed after the main action, each through the same guard/sanitize
-    pipeline; flight-control tools are never admitted into the batch.
+    ``parallel_actions`` carries the additional steps the model returned in the
+    same response (native tool-call batch or the JSON ``actions`` array). They
+    run after the main action, in order, each through the same guard/sanitize
+    and safety pipeline; the chain stops at the first failure. Read-only and
+    flight tools are both allowed — the model is trusted to chain only steps it
+    is sure about, because it cannot see intermediate results.
     """
 
     action: str = ""
