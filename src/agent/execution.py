@@ -790,7 +790,12 @@ class ExecutionMixin:
             self._append_event("danger", "planner", "任务处理失败", {"error": str(e)})
         finally:
             if flightlog_session is not None:
-                self._stop_flightlog_session()
+                # 收尾顺序很关键：飞行记录只是旁路数据，它出任何错都不能跳过
+                # 后面的 run 收尾与执行槽释放——否则界面会一直报"旧任务未能及时停止"。
+                try:
+                    self._stop_flightlog_session()
+                except Exception as exc:  # noqa: BLE001
+                    self._append_event("warning", "flightlog", "飞行记录收尾失败", {"error": str(exc)})
             self._close_run_log(run_id, execute)
             if execute and self._execution_thread_id == threading.get_ident():
                 self._execution_thread_id = 0

@@ -96,10 +96,10 @@ class FlightLogMixin:
         self._append_event(
             "info",
             "flightlog",
-            f"飞行记录结束: {summary.name}（{summary.frame_count} 帧）",
-            summary.to_dict(),
+            f"飞行记录结束: {summary.get('name', '')}（{summary.get('frame_count', 0)} 帧）",
+            dict(summary),
         )
-        return summary.to_dict()
+        return dict(summary)
 
     def start_manual_flightlog(self, name: str = "") -> dict[str, Any]:
         """Manually start recording (no run_id needed, e.g. UI manual flights)."""
@@ -128,10 +128,10 @@ class FlightLogMixin:
         self._append_event(
             "info",
             "flightlog",
-            f"手动飞行记录结束: {summary.name}（{summary.frame_count} 帧）",
-            summary.to_dict(),
+            f"手动飞行记录结束: {summary.get('name', '')}（{summary.get('frame_count', 0)} 帧）",
+            dict(summary),
         )
-        return {"ok": True, **summary.to_dict()}
+        return {"ok": True, **summary}
 
     def flightlog_sessions(self) -> list[dict[str, Any]]:
         """列出录过的飞行记录（新 → 旧，含摘要索引）。"""
