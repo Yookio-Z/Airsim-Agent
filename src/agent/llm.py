@@ -2752,7 +2752,9 @@ class LLMMissionPlanner:
     def _loop_decision_system_prompt(self) -> str:
         return (
             "You are the decision layer of a UAV Agent Loop using ReAct / plan-execute-observe. "
-            "At each step, choose exactly one next tool action, or mark the task complete after the latest observation proves the goal is handled. "
+            "At each step, choose exactly one next FLIGHT action (or mark the task complete once the latest observation proves the goal is handled) AND, when useful, chain up to 2 read-only calls to verify it in the SAME response. "
+            "The actions array runs after the main action, in order, and all results come back together in one observation — this saves a round trip. Typical chains: drone_move_relative + locate_image_point (step, then re-measure); drone_rotate_to + inspect_current_frame (turn, then look); drone_takeoff + drone_get_status. "
+            "Only flight actions are one-per-turn: never put two flight-control tools in one response. "
             "CORRECTION DISCIPLINE: when entering a correction loop, FIRST read the current vehicle status (drone_get_status) and verify from the observation whether the goal action actually failed — never blindly repeat an action that the previous step already reported as completed (e.g. landing completed means the vehicle is on the ground; calling land again is wrong). If the observation shows the goal is already satisfied, mark is_complete=true instead of re-executing. "
             "NEVER declare is_complete=true while any planned motion step (takeoff/hover/move/fly/land/rotate) is still failed or unexecuted from a previous attempt: you must first successfully re-execute that action (fixing its cause first, e.g. climb to the safe altitude before a blocked horizontal move), or prove with fresh drone_get_status telemetry that the target state is genuinely reached. Declaring the task complete while a goal motion is still missing is a hard error and the run will be marked failed. "
             "You may additionally batch up to 2 independent read-only tool calls (drone_get_status, airsim_get_sensors, locate_image_point, inspect_current_frame, perception_status) "
@@ -2801,7 +2803,7 @@ class LLMMissionPlanner:
             "For open-ended 'what is in the photo' requests, use inspect_current_frame (vision-model analysis of the current perception frame). Use it whenever the user asks what the drone sees, the color/type/size of an object, or any '看看画面里.../描述当前画面' question. "
             "For return-to-start, use the first observed position when available instead of guessing home coordinates. "
             "For square/rectangle/orbit/circle/grid path tasks, prefer one drone_fly_path action with explicit local NED waypoints over many rotate-to-heading plus drone_move_relative turns. Use rotate_to only when camera orientation matters. "
-            "For multi-step goals, call one available tool per turn, then use the next observation to decide the following tool. "
+            "For multi-step goals, decide the next step only when it depends on a NEW observation; otherwise chain the action with its verification reads in the same response instead of spending a turn on each. "
             "Prefer status/readback after uncertain results. After a photo or visual sweep produces an image, call inspect_current_frame with a direct confirmation question before declaring a target found. "
             "Use memory_snapshot.guidance to prefer historically reliable skills/tools and to avoid repeating known failure patterns. "
             "An async tool is not complete when it returns started/running; wait for the runtime-provided terminal observation before declaring completion. "
@@ -2821,7 +2823,7 @@ class LLMMissionPlanner:
             "reflection": "optional brief public reflection on the latest observation/result",
             "actions": [
                 {
-                    "action": "additional read-only tool name (drone_get_status, airsim_get_sensors, locate_image_point, inspect_current_frame) — never flight-control tools",
+                    "action": "read-only verification call executed AFTER the main action, results returned together (drone_get_status, airsim_get_sensors, locate_image_point, inspect_current_frame) — never flight-control tools",
                     "params": {"name": "value"},
                     "reason": "optional short text",
                 }

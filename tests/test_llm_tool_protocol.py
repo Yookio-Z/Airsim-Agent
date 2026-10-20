@@ -274,7 +274,7 @@ def test_loop_tool_schemas_include_flight_constraints():
 
 
 class _FakeTools:
-    READ_ONLY_TOOLS = {"drone_get_status", "airsim_take_photo"}
+    READ_ONLY_TOOLS = {"drone_get_status", "airsim_take_photo", "locate_image_point"}
 
     def __init__(self) -> None:
         self.calls: list[tuple[str, dict]] = []
@@ -383,3 +383,50 @@ def test_loop_batch_failure_counts(tmp_path):
     assert photo_result and photo_result[0].ok is False
     # the batch failure stays unresolved, so a later "complete" decision fails the run
     assert state.status == "failed"
+
+
+def test_decision_can_chain_one_flight_action_with_read_only_verification(tmp_path):
+    """一次决策 = 一个飞行动作 + 只读复核；两个结果在同一轮返回（少一次往返）。
+
+    实测过每次移动后再花一整轮 LLM（36s）去读一次距离；这种"动作 + 复核"
+    链可以在同一个决策里给出。
+    """
+    from src.agent.memory import AgentMemory
+    from src.agent.skill_registry import SkillRegistry
+
+    class _AirborneTools(_FakeTools):
+        def status_snapshot(self) -> dict:
+            return {"drone": {"armed": True, "flying": True}, "connected": True}
+
+    tools = _AirborneTools()
+    decision = LoopDecision(
+        action="drone_move_relative",
+        params={"forward_m": 1.0},
+        reason="走一步",
+        parallel_actions=[
+            {"action": "locate_image_point", "params": {"points": "0.5,0.5"}, "reason": "复核距离"},
+        ],
+    )
+    loop = AgentLoop(
+        tools=tools,  # type: ignore[arg-type]
+        planner=_FakePlanner([decision, LoopDecision(action="", reason="done", is_complete=True)]),  # type: ignore[arg-type]
+        memory=AgentMemory(data_dir=tmp_path),
+        skills=SkillRegistry(overrides_path=tmp_path / "skills.json"),
+    )
+    state = loop.run(
+        run_id="run_chain",
+        command="向前飞一米",
+        capabilities={},
+        tool_cards=[
+            {"name": "drone_move_relative", "purpose": "move"},
+            {"name": "locate_image_point", "purpose": "measure"},
+        ],
+        max_steps=3,
+    )
+
+    assert tools.calls[:2] == [
+        ("drone_move_relative", {"forward_m": 1.0}),
+        ("locate_image_point", {"points": "0.5,0.5"}),
+    ], tools.calls
+    executed = [item.tool for item in state.results]
+    assert "drone_move_relative" in executed and "locate_image_point" in executed, executed
