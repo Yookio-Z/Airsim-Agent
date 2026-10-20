@@ -1875,13 +1875,77 @@ async function activateSelectedConnection() {
     showNotice(error.message || "Connection switch failed.", "error");
   }
   await loadConnectionSettings(true);
-  if (activeSystemSettingsSection === "parameters") {
-    await loadVehicleParameters(false);
-  }
   renderConnectionsList();
   renderConnectionDetail(selectedConnectionId);
   await refresh();
 }
+
+function renderConnectionsList() {
+  normalizeSystemSettingsCopy();
+  const list = els.connectionsList;
+  if (!list) return;
+  const connections = Array.isArray(connectionsCache) ? connectionsCache : [];
+  if (!connections.length) {
+    list.innerHTML = `<div class="empty" style="padding:12px 4px;color:var(--faint);font-size:12px;text-align:center;">No links yet. Add one below.</div>`;
+    return;
+  }
+  list.innerHTML = connections.map((conn) => {
+    const activeClass = conn.id === selectedConnectionId ? "active" : "";
+    const connectedClass = isConnectionActive(conn.id) ? "connected" : "";
+    return `
+      <div class="connection-item ${activeClass} ${connectedClass}" data-connection-id="${escapeHtml(conn.id)}" role="button" tabindex="0" aria-pressed="${conn.id === selectedConnectionId ? "true" : "false"}">
+        <span class="link-dot"></span>
+        <div class="connection-item-info">
+          <strong>${escapeHtml(conn.name || "Unnamed link")}</strong>
+          <span>${escapeHtml(connectionTypeLabel(conn.type))} / ${escapeHtml(connectionParamsSummary(conn.params || {}, conn.type))}</span>
+        </div>
+        <span class="link-chevron">&gt;</span>
+      </div>
+    `;
+  }).join("");
+}
+
+
+function renderConnectionDetail(connectionId) {
+  normalizeSystemSettingsCopy();
+  selectedConnectionId = connectionId || "";
+  renderConnectionsList();
+
+  const conn = selectedConnectionId ? connectionsCache.find((c) => c.id === selectedConnectionId) : null;
+  const form = els.connectionDetailForm;
+  if (!form) return;
+
+  if (!conn) {
+    form.reset();
+    if (els.connectionDetailId) els.connectionDetailId.value = "";
+    if (els.connectionDetailType) els.connectionDetailType.value = "udp";
+    updateConnectionDetailStatus(false);
+    if (els.connectionDetailConnect) els.connectionDetailConnect.textContent = "连接";
+    if (els.connectionDetailDelete) els.connectionDetailDelete.hidden = true;
+    updateConnectionTypeFields();
+    renderActualLinkCard();
+    return;
+  }
+
+  const params = conn.params || {};
+  if (els.connectionDetailId) els.connectionDetailId.value = conn.id || "";
+  if (els.connectionDetailName) els.connectionDetailName.value = conn.name || "";
+  if (els.connectionDetailType) els.connectionDetailType.value = conn.type || "udp";
+  if (els.connectionDetailPort) els.connectionDetailPort.value = params.port || "";
+  if (els.connectionDetailHost) els.connectionDetailHost.value = params.host || params.url || "";
+  if (els.connectionDetailAddress) els.connectionDetailAddress.value = params.address || "";
+  if (els.connectionDetailPortNumber) els.connectionDetailPortNumber.value = params.portNumber || params.baud || "";
+  if (els.connectionDetailRemotePort) els.connectionDetailRemotePort.value = params.remotePort || "";
+  if (els.connectionDetailRealVehicle) els.connectionDetailRealVehicle.checked = Boolean(params.realVehicle);
+  updateConnectionTypeFields();
+
+  const actuallyActive = isConnectionActive(conn.id);
+  updateConnectionDetailStatus(actuallyActive);
+  if (els.connectionDetailConnect) els.connectionDetailConnect.textContent = actuallyActive ? "断开" : "连接";
+  if (els.connectionDetailDelete) els.connectionDetailDelete.hidden = false;
+  renderActualLinkCard();
+}
+
 
 function renderSystemConnection(drone = {}, toolRuntime = {}) {
   const connected = Boolean(toolRuntime.connected) && !toolRuntime.stale_connection;
@@ -1910,8 +1974,5 @@ function renderSystemConnection(drone = {}, toolRuntime = {}) {
     updateConnectionDetailStatus(actuallyActive);
   }
   renderActualLinkCard();
-  if (activeSystemSettingsSection === "parameters") {
-    renderVehicleParametersPanel();
-  }
 }
 

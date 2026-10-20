@@ -336,19 +336,6 @@ document.addEventListener("click", async (event) => {
     return;
   }
 
-  const paramGroup = event.target.closest("[data-param-group]");
-  if (paramGroup && els.vehicleParameterSearch) {
-    els.vehicleParameterSearch.value = paramGroup.dataset.paramGroup || "";
-    loadVehicleParameters(false).catch(() => {});
-    return;
-  }
-
-  const paramSave = event.target.closest("[data-param-save]");
-  if (paramSave) {
-    await saveVehicleParameterFromRow(paramSave);
-    return;
-  }
-
   const button = event.target.closest("button");
   if (!button) return;
 
@@ -458,29 +445,6 @@ if (els.refreshFirmwareInfoBtn) {
       els.refreshFirmwareInfoBtn.disabled = false;
       els.refreshFirmwareInfoBtn.textContent = original || "刷新固件信息";
     }
-  });
-}
-if (els.refreshVehicleParametersBtn) {
-  els.refreshVehicleParametersBtn.addEventListener("click", async () => {
-    els.refreshVehicleParametersBtn.disabled = true;
-    const original = els.refreshVehicleParametersBtn.textContent;
-    els.refreshVehicleParametersBtn.textContent = "读取中...";
-    try {
-      await loadVehicleParameters(true);
-      const status = vehicleParametersCache?.status || "";
-      showNotice(status === "ready" ? "参数已刷新" : "参数读取未完整完成，已显示当前收到的数据", status === "ready" ? "success" : "info");
-    } finally {
-      els.refreshVehicleParametersBtn.disabled = false;
-      els.refreshVehicleParametersBtn.textContent = original || "刷新参数";
-    }
-  });
-}
-if (els.vehicleParameterSearch) {
-  els.vehicleParameterSearch.addEventListener("input", () => {
-    if (vehicleParameterSearchTimer) clearTimeout(vehicleParameterSearchTimer);
-    vehicleParameterSearchTimer = setTimeout(() => {
-      loadVehicleParameters(false).catch(() => {});
-    }, 220);
   });
 }
 if (els.settingsBackdrop) {
