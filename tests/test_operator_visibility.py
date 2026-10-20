@@ -393,7 +393,9 @@ def test_planner_accepts_the_new_stopping_metrics():
     )
 
     metrics = [item["metric"] for item in goal["success_criteria"]]
-    assert metrics == ["target_fill", "target_distance"], metrics
+    # 目标确认是接近类任务的前置条件，规划器会在 LLM 判据之外补上它
+    # （判据来自指令本身："飞向画面里的汽车"意味着先确认目标）。
+    assert metrics == ["target_fill", "target_distance", "target_confirmed"], metrics
     assert goal["success_criteria"][0]["min_fill"] == 0.3
     assert goal["success_criteria"][1]["max_m"] == 2.0
 

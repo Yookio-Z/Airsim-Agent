@@ -372,3 +372,60 @@ def test_agent_loop_declared_with_perception_status_runs_fixed_sequence() -> Non
 def test_agent_loop_declared_with_photo_still_runs_agent_loop() -> None:
     plan = _plan(_step("drone_takeoff"), _step("inspect_current_frame"), execution_mode="agent_loop")
     assert AgentRuntime._plan_requires_agent_loop(plan) is True
+
+
+# ── 计划形状与判据契约（2026-10-20） ──
+
+
+def test_plan_keeps_one_takeoff_one_land_and_approaches_before_landing() -> None:
+    """一次任务只允许一次起飞/降落；降落必须排在接近步骤之后。
+
+    真实事故：LLM 计划把 drone_land 排在接近之前，执行层照做 → 飞机中途落地、
+    再起飞，17 分钟的任务白跑还撞满步数。
+    """
+    planner = LLMMissionPlanner()
+    payload = {
+        "intent": "search_car_and_approach_landing",
+        "steps": [
+            {"tool": "drone_takeoff", "params": {"altitude": 3.0}},
+            {"tool": "drone_takeoff", "params": {"altitude": 5.0}},
+            {"tool": "inspect_current_frame", "params": {}},
+            {"tool": "drone_land", "params": {}},
+            {"tool": "drone_move_relative", "params": {"forward_m": 2.0}},
+            {"tool": "drone_land", "params": {}},
+            {"tool": "drone_get_status", "params": {}},
+        ],
+    }
+    command = "起飞后转向航角，来检测周遭环境信息，直到发现有汽车目标物后悬停确认其位置，并且飞向靠近然后降落"
+    plan = planner._plan_from_payload(
+        command, payload, {"drone_takeoff", "drone_land", "drone_move_relative", "inspect_current_frame", "drone_get_status"}
+    )
+    tools = [step.tool for step in plan.steps]
+    assert tools.count("drone_takeoff") == 1, tools
+    assert tools.count("drone_land") == 1, tools
+    approach_index = max(i for i, tool in enumerate(tools) if tool == "drone_move_relative")
+    assert tools.index("drone_land") > approach_index, tools
+
+
+def test_goal_derives_machine_checkable_criteria_from_the_command() -> None:
+    """LLM 没写 success_criteria 时，按指令里已说出的目标派生（不是按任务类型发明）。"""
+    planner = LLMMissionPlanner()
+    payload = {"steps": [{"tool": "drone_takeoff", "params": {"altitude": 3.0}}]}
+    plan = planner._plan_from_payload(
+        "发现汽车目标后靠近并降落",
+        payload,
+        {"drone_takeoff", "inspect_current_frame", "locate_image_point", "drone_move_relative", "drone_land", "drone_get_status"},
+    )
+    metrics = {item["metric"] for item in plan.goal.get("success_criteria") or []}
+    assert {"target_confirmed", "target_distance", "landed"} <= metrics, metrics
+    distance = next(item for item in plan.goal["success_criteria"] if item["metric"] == "target_distance")
+    assert distance["max_m"] <= 3.0
+
+
+def test_plain_takeoff_gets_no_target_criteria() -> None:
+    """纯飞行指令不能被塞进目标类判据（判据属于任务）。"""
+    planner = LLMMissionPlanner()
+    payload = {"steps": [{"tool": "drone_takeoff", "params": {"altitude": 5.0}}]}
+    plan = planner._plan_from_payload("起飞到 5 米高度", payload, {"drone_takeoff", "drone_get_status"})
+    metrics = {item["metric"] for item in plan.goal.get("success_criteria") or []}
+    assert not ({"target_confirmed", "target_distance"} & metrics), metrics

@@ -2697,6 +2697,12 @@ class LLMMissionPlanner:
             "The plan summary must state concrete numbers: vehicle count, coordinates, or altitude reached — never a bare '已完成/任务完成'. "
             # 输出纪律：规划模型的 reasoning 常花大量篇幅纠结输出格式/是否用循环，
             # 既慢又没信息量。这里明确约束，减少无效推理与重复步骤。
+            "PLAN SHAPE (hard rules): at most ONE drone_takeoff and ONE drone_land per plan. "
+            "Never place drone_land before the target is confirmed: for search/approach tasks the landing step must be the LAST step, after the approach steps. "
+            "The plan is a CHAIN: the runtime executes its steps without asking the model after each one, so put deterministic steps (status/arm/takeoff/rotate) into the plan and only mark genuinely visual steps needs_observation. "
+            "goal.success_criteria is MANDATORY and must be machine-checkable: for search/approach tasks include "
+            "{\"metric\": \"target_confirmed\"} and {\"metric\": \"target_distance\", \"max_m\": 3.0}; if the operator asks to land, also add {\"metric\": \"landed\"}. "
+            "The runtime will NOT invent criteria for you. "
             "OUTPUT DISCIPLINE: do not deliberate about the output format, tool list, or JSON schema in reasoning — the schema is fixed. "
             "Do NOT unroll loops: list a step ONCE even if it repeats (the runtime's agent loop handles repetition); 跟踪/搜索类任务只写一轮典型步骤，不要重复 2~3 遍。 "
             "Keep reasoning to 2-4 short sentences. Keep steps <= 12. Return JSON only. "
@@ -2783,8 +2789,7 @@ class LLMMissionPlanner:
             "the runtime should stop at, with numbers. Examples: \"靠近后悬停\" → {\"metric\": \"target_fill\", \"min_fill\": 0.25} "
             "or {\"metric\": \"target_distance\", \"max_m\": 3.0}; \"降落在 H 点上\" → {\"metric\": \"position_reached\", \"x\": …, \"y\": …, "
             "\"z\": -3.0, \"tolerance\": 0.5} plus {\"metric\": \"landed\"}; 定点悬停 → {\"metric\": \"flying_at\", \"altitude\": 3.0}. "
-            "If you declare nothing, the runtime falls back to a task-type default (approach tasks: target fills ≥25% of the "
-            "frame). Declaring it is how the operator gets a criterion that matches THIS task. "
+            "Declaring it is how the operator gets a criterion that matches THIS task; the runtime never invents one. "
             "Use only the tools provided to you (the native tool list, or available_tool_cards in JSON mode). Do not call unavailable tools. "
             "Parse the operator's full instruction yourself, including multi-step Chinese or English commands. Do not rely on keyword routing. "
             "Never bypass safety, never invent telemetry, and do not perform low-level continuous control. "
@@ -3972,11 +3977,45 @@ class LLMMissionPlanner:
                     except (TypeError, ValueError):
                         cleaned["hold_s"] = 0.0
                 criteria.append(cleaned)
+        # 判据必须存在：LLM 经常不写 success_criteria，于是任务只能撞步数上限
+        # （实测一次 17 分钟的任务就这样以 blocked 收尾）。这里只把**指令里
+        # 已经说出的目标**转成可校验项，不是按任务类型发明标准：
+        #   搜索/接近 → 目标确认 + 目标距离；明确说降落 → 已落地。
+        derived = self._criteria_from_command(command)
+        existing_metrics = {item["metric"] for item in criteria}
+        for item in derived:
+            if item["metric"] not in existing_metrics:
+                criteria.append(item)
+                existing_metrics.add(item["metric"])
         return {
             "objective": str(raw_goal.get("objective") or command)[:200],
             "target": str(raw_goal.get("target") or ""),
             "success_criteria": criteria,
         }
+
+    def _criteria_from_command(self, command: str) -> list[dict[str, Any]]:
+        """把指令里明确写出的完成目标转成可校验判据（规划器的确定性兜底）。
+
+        运行时仍然只评估任务声明的判据；这里做的是"把任务自己的话变成判据"。
+        """
+        try:
+            intents = extract_intents(command)
+        except Exception:
+            return []
+        criteria: list[dict[str, Any]] = []
+        wants_target = bool(intents.get("visual") and (intents.get("visual_approach") or intents.get("search")))
+        if wants_target:
+            criteria.append(
+                {
+                    "metric": "target_confirmed",
+                    "target": self._command_target_class(command),
+                    "required": True,
+                }
+            )
+            criteria.append({"metric": "target_distance", "max_m": 3.0, "required": True, "hold_s": 0.0})
+        if intents.get("land"):
+            criteria.append({"metric": "landed", "required": True})
+        return criteria
 
     def _normalize_steps(self, command: str, steps: list[MissionStep], known_tools: set[str]) -> list[MissionStep]:
         steps = self._filter_unsolicited_steps(command, steps)
@@ -4039,6 +4078,28 @@ class LLMMissionPlanner:
             )
             if not explicit_landing:
                 normalized = [step for step in normalized if step.tool != "drone_land"]
+
+        # 计划形状收口（确定性规则，与是哪个模型规划无关）：
+        #  1) 一次任务最多一次起飞；降落也只保留一次，并放到最后——
+        #     "目标还没确认就降落"会让任务失败，还会白白多一次起降
+        #     （实测一次 17 分钟的任务里出现了 降落 → 再起飞）。
+        intents = extract_intents(command)
+        needs_confirmation = bool(intents["visual"] and (intents["visual_approach"] or intents["search"]))
+        lands = [step for step in normalized if step.tool == "drone_land"]
+        if lands:
+            if needs_confirmation and not intents["land"]:
+                normalized = [step for step in normalized if step.tool != "drone_land"]
+            else:
+                normalized = [step for step in normalized if step.tool != "drone_land"] + [lands[-1]]
+        first_takeoff = next(
+            (index for index, step in enumerate(normalized) if step.tool == "drone_takeoff"), None
+        )
+        if first_takeoff is not None:
+            normalized = [
+                step
+                for index, step in enumerate(normalized)
+                if step.tool != "drone_takeoff" or index == first_takeoff
+            ]
 
         normalized = self._plan_visual_guidance(command, normalized, known_tools)
 
