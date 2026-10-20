@@ -1,0 +1,18 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "msgpack-rpc-python"
+version = "0.4.1"
+description = "MessagePack RPC (vendored: dependency metadata fixed to use msgpack>=1.1.2)"
+readme = "README.md"
+requires-python = ">=3.8"
+license = { text = "Apache-2.0" }
+dependencies = [
+    "msgpack>=1.1.2",
+    "tornado>=3,<5",
+]
+
+[tool.setuptools]
+packages = ["msgpackrpc", "msgpackrpc.transport"]

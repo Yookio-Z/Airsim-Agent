@@ -195,72 +195,131 @@ function renderTelemetry(drone, toolRuntime) {
   syncFlightModeControl(drone, toolRuntime);
 }
 
-// 飞行模式受限切换：控件可用性取决于后端（PX4 专有）与链路；选项来自后端白名单。
+// 飞行模式受限切换（PX4 专有）：白名单来自后端，切换前二次确认。
+// 它解决的是"任务之外人工接管"的场景：Agent 正忙/需要手动飞时，操作员可以
+// 切到 POSCTL/ALTCTL 自己控杆，或 LOITER/HOLD 原地稳住、RTL 返航。
+// AUTO/MISSION/OFFBOARD 不在白名单（前者会启动航线，后者需要连续 setpoint）。
+const FLIGHT_MODE_DESCRIPTIONS = {
+  POSCTL: "姿态增稳（手动油门）",
+  ALTCTL: "定高（手动水平移动）",
+  LOITER: "定点悬停（GPS）",
+  HOLD: "悬停保持",
+  RTL: "返航",
+};
+
 let flightModeAllowed = [];
 let flightModeInfoLoaded = false;
+let flightModeSupported = false;
 let lastKnownFlightMode = "";
+let flightModeMenuSig = "";
 
 async function loadFlightModeInfo() {
   if (flightModeInfoLoaded) return;
   try {
     const data = await api("/api/vehicle/mode");
     flightModeAllowed = Array.isArray(data?.allowed) ? data.allowed : [];
-    const select = document.getElementById("flightModeSelect");
-    if (select) {
-      select.innerHTML = "";
-      for (const mode of flightModeAllowed) {
-        const option = document.createElement("option");
-        option.value = mode;
-        option.textContent = mode;
-        select.appendChild(option);
-      }
-      select.dataset.supported = data?.supported ? "1" : "0";
-    }
+    flightModeSupported = Boolean(data?.supported);
     flightModeInfoLoaded = true;
+    renderFlightModeMenu(true);
   } catch (error) {
     // 后端未就绪：下一次渲染再试
   }
 }
 
+function renderFlightModeMenu(force = false) {
+  const menu = document.getElementById("flightModeMenu");
+  if (!menu || (menu.hidden && !force)) return;
+  const sig = [lastKnownFlightMode, ...flightModeAllowed].join("|");
+  if (!force && sig === flightModeMenuSig) return;
+  flightModeMenuSig = sig;
+  menu.innerHTML = `
+    <div class="flight-mode-head">飞行模式（受限）</div>
+    ${flightModeAllowed.map((mode) => `
+      <button type="button" role="option" aria-selected="${mode === lastKnownFlightMode}"
+              class="flight-mode-item ${mode === lastKnownFlightMode ? "active" : ""}" data-flight-mode="${escapeHtml(mode)}">
+        <span class="flight-mode-key">${escapeHtml(mode)}</span>
+        <span class="flight-mode-desc">${escapeHtml(FLIGHT_MODE_DESCRIPTIONS[mode] || "切换到此模式")}</span>
+      </button>
+    `).join("")}
+    <div class="flight-mode-foot">AUTO / OFFBOARD 由任务流程控制，不在此切换</div>
+  `;
+}
+
+function setFlightModeMenuOpen(open) {
+  const menu = document.getElementById("flightModeMenu");
+  const btn = document.getElementById("flightModeBtn");
+  if (!menu || !btn) return;
+  if (open) renderFlightModeMenu(true);
+  menu.hidden = !open;
+  btn.setAttribute("aria-expanded", String(open));
+  // 工具栏本身是 z-index:6 的层叠上下文；菜单展开时临时抬到 26，避免被
+  // 摄像头窗口（17..20）盖住，同时仍低于设置遮罩(29)/模态框(40)。
+  const toolbar = menu.closest ? menu.closest(".map-toolbar") : null;
+  if (toolbar) toolbar.style.zIndex = open ? "26" : "";
+}
+
+function closeFlightModeMenu() {
+  setFlightModeMenuOpen(false);
+}
+
+async function switchFlightMode(mode) {
+  const target = String(mode || "").trim().toUpperCase();
+  closeFlightModeMenu();
+  if (!target || target === lastKnownFlightMode.toUpperCase()) return;
+  const description = FLIGHT_MODE_DESCRIPTIONS[target] || "";
+  const confirmed = await confirmDialog({
+    title: "切换飞行模式",
+    message: `将把飞行模式切到 ${target}${description ? `（${description}）` : ""}。是否继续？`,
+    confirmLabel: "切换模式",
+    danger: false,
+  });
+  if (!confirmed) return;
+  try {
+    const result = await post("/api/vehicle/mode", { mode: target });
+    if (!result?.ok) throw new Error(result?.error || "切换模式失败");
+    showNotice(`飞行模式已切换到 ${target}`, "success");
+  } catch (error) {
+    showNotice(`切换模式失败：${error.message || "未知错误"}`, "error");
+  }
+}
+
 function syncFlightModeControl(drone, toolRuntime) {
-  const select = document.getElementById("flightModeSelect");
-  if (!select) return;
+  const control = document.getElementById("flightModeControl");
+  const btn = document.getElementById("flightModeBtn");
+  const label = document.getElementById("flightModeBtnLabel");
+  if (!control || !btn || !label) return;
   void loadFlightModeInfo();
   const connected = Boolean(toolRuntime?.connected) && !toolRuntime?.stale_connection;
-  const supported = select.dataset.supported === "1";
   const mode = String(drone?.mode || "");
   if (mode) lastKnownFlightMode = mode;
-  if (mode && Array.from(select.options).some((option) => option.value === mode)) {
-    select.value = mode;
-  }
-  select.disabled = !connected || !supported || flightModeAllowed.length === 0;
-  select.title = supported
-    ? `飞行模式：${mode || "未知"}（受限切换：${flightModeAllowed.join(" / ")}）`
+  label.textContent = mode ? mode.slice(0, 3) : "--";
+  // 非 PX4 后端没有模式切换能力：整个控件不出现，别给操作员一个点了没反应的按钮。
+  control.hidden = !flightModeSupported;
+  btn.disabled = !connected || !flightModeSupported || flightModeAllowed.length === 0;
+  btn.title = flightModeSupported
+    ? `飞行模式 ${mode || "未知"}；点击切换（${flightModeAllowed.join(" / ")}）`
     : "当前后端不支持模式切换（PX4 MAVLink 专有）";
+  if (btn.disabled) closeFlightModeMenu();
+  else renderFlightModeMenu();
 }
 
 {
-  const select = document.getElementById("flightModeSelect");
-  if (select) {
-    select.addEventListener("change", async () => {
-      const mode = String(select.value || "");
-      if (!mode) return;
-      const confirmed = await confirmDialog({
-        title: "切换飞行模式",
-        message: `将把飞行模式切到 ${mode}。是否继续？（AUTO/MISSION/OFFBOARD 不在白名单：前者会启动已上传航线，后者需要连续 setpoint 流。）`,
-        confirmLabel: "切换模式",
-        danger: false,
-      });
-      if (!confirmed) {
-        select.value = lastKnownFlightMode || select.value;
-        return;
-      }
-      try {
-        const result = await post("/api/vehicle/mode", { mode });
-        if (!result?.ok) throw new Error(result?.error || "切换模式失败");
-      } catch (error) {
-        select.value = lastKnownFlightMode || select.value;
-      }
+  const btn = document.getElementById("flightModeBtn");
+  const menu = document.getElementById("flightModeMenu");
+  if (btn && menu) {
+    btn.addEventListener("click", (event) => {
+      event.stopPropagation();
+      setFlightModeMenuOpen(menu.hidden);
+    });
+    menu.addEventListener("click", (event) => {
+      const item = event.target.closest("[data-flight-mode]");
+      if (item) switchFlightMode(item.dataset.flightMode);
+    });
+    document.addEventListener("click", (event) => {
+      if (!event.target.closest("#flightModeControl")) closeFlightModeMenu();
+    });
+    document.addEventListener("keydown", (event) => {
+      if (event.key === "Escape") closeFlightModeMenu();
     });
   }
 }

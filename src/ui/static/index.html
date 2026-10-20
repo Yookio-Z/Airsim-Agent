@@ -58,11 +58,17 @@
             <button class="tool-btn danger" data-control="emergency_stop"
                     data-control-latched="reset_emergency" data-testid="control-estop"
                     title="紧急停止 (Stop)" aria-pressed="false">!</button>
-            <!-- 飞行模式受限切换（PX4 专有）：选项来自后端白名单，只放悬停类安全模式；
-                 AUTO/MISSION（会启动已上传航线）与 OFFBOARD（需要 setpoint 流）不在白名单，
-                 只能由飞控端或航线流程切换。选择后需确认才会下发。 -->
-            <select class="tool-btn mode-select" id="flightModeSelect" data-testid="control-mode-select"
-                    title="飞行模式（受限切换）" aria-label="飞行模式"></select>
+            <!-- 飞行模式受限切换（PX4 专有）：原生 select 在暗色界面里弹出的
+                 白色列表既不美观也讲不清用途，改成按钮 + 暗色菜单；选项仍来自
+                 后端白名单（AUTO/OFFBOARD 只能由任务流程切换），切换前需确认。 -->
+            <div class="flight-mode-control" id="flightModeControl" hidden>
+              <button type="button" class="tool-btn mode-btn" id="flightModeBtn"
+                      data-testid="control-mode-select" aria-haspopup="listbox" aria-expanded="false"
+                      title="飞行模式（受限切换）" aria-label="飞行模式">
+                <span id="flightModeBtnLabel">--</span>
+              </button>
+              <div class="flight-mode-menu" id="flightModeMenu" role="listbox" aria-label="飞行模式" hidden></div>
+            </div>
           </div>
 
           <section id="cameraViewer" class="camera-viewer" aria-label="无人机摄像头视频流" data-state="idle" hidden>
@@ -87,13 +93,9 @@
             <div class="camera-viewer-controls">
               <label data-camera-role="cameraField">
                 <span>摄像头</span>
-                <select id="cameraViewerCamera" aria-label="选择摄像头">
-                  <option value="0">0 · 前视</option>
-                  <option value="1">1 · 前右</option>
-                  <option value="2">2 · 前左</option>
-                  <option value="3">3 · 下视</option>
-                  <option value="4">4 · 后视</option>
-                </select>
+                <!-- 选项由 /api/settings/camera 返回的 AirSim settings.json 相机清单填充；
+                     不再写死 0..4（那会让没有这些相机的场景也列出 5 个假选项）。 -->
+                <select id="cameraViewerCamera" aria-label="选择摄像头"></select>
               </label>
               <label data-camera-role="imageTypeField">
                 <span>图像</span>
@@ -445,7 +447,7 @@
             <nav id="systemSettingsNav" class="system-settings-nav" aria-label="系统设置导航">
               <span class="nav-group-label">Application Settings</span>
               <button class="active" type="button" data-system-section="links">通信链路</button>
-              <button type="button" data-system-section="camera">摄像头</button>
+              <button type="button" data-system-section="camera">视频流</button>
             </nav>
           </aside>
 
@@ -550,58 +552,20 @@
             <section class="system-settings-panel" data-system-panel="camera">
               <header class="camera-settings-head">
                 <div>
-                  <strong id="cameraSettingsTitle">摄像头</strong>
-                  <span>当前图像源：AirSim</span>
+                  <strong id="cameraSettingsTitle">视频流</strong>
+                  <span id="cameraCurrentSource">当前图像源：AirSim</span>
                 </div>
                 <div class="camera-settings-actions">
-                  <button type="button" id="cameraCaptureFromSettingsBtn" class="secondary">查看画面</button>
                   <button type="button" id="cameraSaveSettingsBtn" class="primary">保存</button>
                 </div>
               </header>
               <div class="camera-settings-grid">
                 <div class="form-row">
-                  <label for="cameraSource">图像源</label>
-                  <select id="cameraSource">
-                    <option value="airsim">AirSim</option>
-                    <option value="rtsp">RTSP 摄像头</option>
-                    <option value="local">本地摄像头</option>
-                  </select>
-                </div>
-                <div class="form-row" id="cameraRtspUrlRow" hidden>
-                  <label for="cameraRtspUrl">RTSP URL</label>
+                  <label for="cameraRtspUrl">RTSP 视频流地址</label>
                   <input type="text" id="cameraRtspUrl" placeholder="rtsp://user:pass@host:554/stream">
                 </div>
-                <div class="form-row" id="cameraRtspTransportRow" hidden>
-                  <label for="cameraRtspTransport">传输协议</label>
-                  <select id="cameraRtspTransport">
-                    <option value="tcp">TCP（更稳，推荐）</option>
-                    <option value="udp">UDP（延迟更低）</option>
-                  </select>
-                </div>
-                <div class="form-row" id="cameraNameRow">
-                  <label for="cameraName">相机 ID</label>
-                  <input type="text" id="cameraName" placeholder="0">
-                </div>
-                <div class="form-row" id="cameraVehicleRow">
-                  <label for="cameraVehicle">车辆名</label>
-                  <input type="text" id="cameraVehicle" list="vehicleOptions" placeholder="留空使用第一架">
-                  <datalist id="vehicleOptions"></datalist>
-                </div>
-                <div class="form-row" id="cameraImageTypeRow">
-                  <label for="cameraImageType">图像类型</label>
-                  <select id="cameraImageType">
-                    <option value="scene">Scene</option>
-                    <option value="depth">Depth</option>
-                    <option value="segmentation">Segmentation</option>
-                    <option value="infrared">Infrared</option>
-                  </select>
-                </div>
-                <div class="form-row">
-                  <label for="cameraTimeout">超时 (s)</label>
-                  <input type="number" id="cameraTimeout" min="3" max="120" step="1" placeholder="30">
-                </div>
               </div>
-              <p class="modal-hint" id="cameraSourceHint" hidden></p>
+              <p class="modal-hint">来源在摄像头面板切换；RTSP 源与 Agent 感知共用此地址。</p>
             </section>
           </div>
         </div>

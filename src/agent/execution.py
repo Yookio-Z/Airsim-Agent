@@ -522,9 +522,9 @@ class ExecutionMixin:
                 details("responding"),
             )
 
-        try:
-            answer = self.planner.chat_response_stream(
-                command=command,
+        def stream_answer(extra_instruction: str = "") -> str:
+            return self.planner.chat_response_stream(
+                command=(command + extra_instruction) if extra_instruction else command,
                 conversation=self._recent_chat_context(),
                 agent_state=agent_state,
                 memory=self.memory.snapshot(),
@@ -537,8 +537,31 @@ class ExecutionMixin:
                 execute_readonly_tool=execute_readonly_tool,
                 on_tool_call=on_tool_call,
             )
+
+        try:
+            answer = stream_answer()
             if not answer and buffer:
-                answer = "".join(buffer)
+                answer = "".join(buffer).strip()
+            if not answer and not cancelled():
+                # 推理模型偶尔只产出思考、没有正文（实测 minimax-m3.1-flash
+                # 经 OpenRouter 会这样）。空回复在界面上等于"Agent 没输出"，
+                # 且没有任何错误可看——重试一次并要求直接给结论；仍为空就
+                # 明确说明，绝不留一个只有思考块的空气泡。
+                self._append_event(
+                    "warning",
+                    "chat",
+                    "模型只返回了思考内容，没有正文，正在重试一次",
+                    {"model_id": model_id, "run_id": request_id},
+                )
+                buffer.clear()
+                reasoning_buffer.clear()
+                answer = stream_answer(
+                    "\n\n（上一轮只产生了思考、没有正文。请直接用一两句话回答，不要调用工具。）"
+                )
+                if not answer and buffer:
+                    answer = "".join(buffer).strip()
+            if not answer and not cancelled():
+                answer = "模型没有生成回答（只返回了思考内容）。请重试一次，或换一个模型。"
             if cancelled():
                 self._update_assistant_message(
                     request_id,

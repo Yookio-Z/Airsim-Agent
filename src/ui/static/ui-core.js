@@ -138,21 +138,9 @@ const els = {
   refreshVehicleParametersBtn: $("refreshVehicleParametersBtn"),
   vehicleParameterSummary: $("vehicleParameterSummary"),
   vehicleParametersPanel: $("vehicleParametersPanel"),
-  cameraSource: $("cameraSource"),
-  cameraRtspUrlRow: $("cameraRtspUrlRow"),
+  cameraCurrentSource: $("cameraCurrentSource"),
   cameraRtspUrl: $("cameraRtspUrl"),
-  cameraRtspTransportRow: $("cameraRtspTransportRow"),
-  cameraRtspTransport: $("cameraRtspTransport"),
-  cameraNameRow: $("cameraNameRow"),
-  cameraVehicleRow: $("cameraVehicleRow"),
-  cameraImageTypeRow: $("cameraImageTypeRow"),
-  cameraSourceHint: $("cameraSourceHint"),
-  cameraName: $("cameraName"),
-  cameraVehicle: $("cameraVehicle"),
-  cameraImageType: $("cameraImageType"),
-  cameraTimeout: $("cameraTimeout"),
   cameraSaveSettingsBtn: $("cameraSaveSettingsBtn"),
-  cameraCaptureFromSettingsBtn: $("cameraCaptureFromSettingsBtn"),
   appDensity: $("appDensity"),
   appMapLayer: $("appMapLayer"),
   appTelemetryRefresh: $("appTelemetryRefresh"),
@@ -400,6 +388,10 @@ let activeConnectionId = "";
 let selectedConnectionId = "";
 let detectedMavlinkLinksCache = [];
 let vehicleInfoCache = null;
+// 参数**列表** UI 已随后台端点移除，但参数**状态**仍在用：载具设置面板的
+// 参数徽标、parameterValueFromCache 的回退、以及"非 PX4 后端/未连接"的
+// 明确提示都从这里读。清理 params UI 时不要连这个状态一起删。
+let vehicleParametersCache = null;
 let vehicleSetupCache = null;
 let vehicleSetupLoading = false;
 let vehicleSetupPollTimer = null;
@@ -431,6 +423,9 @@ const DEFAULT_CAMERA_SETTINGS = {
 };
 let cameraSettings = { ...DEFAULT_CAMERA_SETTINGS };
 let cameraSettingsLoaded = false;
+// AirSim settings.json 声明的相机（/api/settings/camera 下发）：相机下拉的
+// 选项只认这份清单，不再按面板里写死的 0..4 猜。
+let airsimCameraCatalog = { by_vehicle: {}, default: [] };
 let cameraWindows = new Map();
 let cameraWindowCounter = 1;
 const CAMERA_STREAM_INTERVAL_MS = 90;

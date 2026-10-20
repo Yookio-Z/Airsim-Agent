@@ -369,7 +369,12 @@ class AgentRequestHandler(BaseHTTPRequestHandler):
 
     def _ep_api_settings_camera(self, req: "_Request") -> None:
         path, parsed, payload = req.path, req.parsed, req.payload
-        self._send_json({"ok": True, "camera": RUNTIME.camera_settings()})
+        self._send_json({
+            "ok": True,
+            "camera": RUNTIME.camera_settings(),
+            # 相机下拉的事实来源：AirSim settings.json 声明的相机，而不是前端写死的 0..4。
+            "airsim_cameras": RUNTIME.airsim_camera_catalog(),
+        })
         return
 
     def _ep_api_camera_preview(self, req: "_Request") -> None:

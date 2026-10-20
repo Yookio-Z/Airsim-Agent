@@ -22,6 +22,13 @@ classifiers = [
 dependencies = [
     "airsim>=1.8.0",
     "backports.ssl_match_hostname>=3.7.0.1",
+    # AirSim transfers float images as MessagePack lists of floats. The legacy
+    # msgpack-python 0.5.x used by msgpack-rpc-python has no C extension here,
+    # so a 256x144 depth frame costs ~85 ms in pure-Python pack/unpack. Pinning
+    # the C-accelerated distribution and the vendored metadata fix (see
+    # vendor/msgpack_rpc_python/README.md) removes that cost.
+    "msgpack==1.1.2",
+    "msgpack-rpc-python==0.4.1",
     "numpy>=1.20.0",
     "opencv-python-headless>=4.8.0",
     "pillow>=10.0.0",
@@ -29,6 +36,11 @@ dependencies = [
     "pymavlink>=2.4.0",
     "pyserial>=3.5",
     "ultralytics>=8.0.0",
+    # Perception inference runs on the RTX 4050. Declaring the CUDA build
+    # explicitly keeps `uv sync` from silently replacing it with the CPU wheel
+    # from PyPI (which made detect inference ~14x slower: 513 ms vs 37 ms).
+    "torch==2.12.1",
+    "torchvision==0.27.1",
 ]
 
 [project.optional-dependencies]
@@ -71,6 +83,21 @@ testpaths = ["tests"]
 python_files = ["test_*.py"]
 python_classes = ["Test*"]
 python_functions = ["test_*"]
+
+[[tool.uv.index]]
+# CUDA 13.0 wheels for the laptop GPU. `explicit` means only packages routed to
+# it below use this index; everything else still comes from PyPI.
+name = "pytorch-cu130"
+url = "https://download.pytorch.org/whl/cu130"
+explicit = true
+
+[tool.uv.sources]
+# Same code as upstream msgpack-rpc-python 0.4.1; only the declared dependency
+# changes from msgpack-python to msgpack>=1.1.2 so the two distributions cannot
+# shadow each other's `msgpack/` package directory.
+msgpack-rpc-python = { path = "vendor/msgpack_rpc_python" }
+torch = { index = "pytorch-cu130" }
+torchvision = { index = "pytorch-cu130" }
 
 [tool.uv.extra-build-dependencies]
 airsim = [

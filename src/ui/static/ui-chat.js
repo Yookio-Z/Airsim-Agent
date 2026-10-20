@@ -114,13 +114,6 @@ function setupCameraEventListeners() {
   if (els.cameraSaveSettingsBtn) {
     els.cameraSaveSettingsBtn.addEventListener("click", () => saveCameraSettings());
   }
-  if (els.cameraCaptureFromSettingsBtn) {
-    els.cameraCaptureFromSettingsBtn.addEventListener("click", () => {
-      const win = primaryCameraWindow();
-      if (win) win.settings = readCameraSettingsForm();
-      startCameraStream({ windowId: win?.id || "camera_1", settings: win?.settings || cameraSettings });
-    });
-  }
   window.addEventListener("resize", () => clampCameraViewerPosition());
   document.addEventListener("visibilitychange", () => {
     if (document.hidden) {
@@ -134,7 +127,9 @@ function setupCameraEventListeners() {
       if (win.streamActive && cameraViewerIsVisible(win)) scheduleCameraFrame(win, 0);
     });
   });
-  [els.cameraSource, els.cameraRtspUrl, els.cameraRtspTransport, els.cameraName, els.cameraVehicle, els.cameraImageType, els.cameraTimeout]
+  // 设置面板现在只有视频流地址一个输入；相机/机型/图像类型由摄像头面板
+  // 自己的控件维护（见 updateCameraViewerSelection）。
+  [els.cameraRtspUrl]
     .filter(Boolean)
     .forEach((control) => {
       control.addEventListener("change", () => {
@@ -2609,6 +2604,10 @@ function smoothQueueDelta(message) {
 // 渲染层取该消息当前应显示的内容（流式中的消息显示已释放部分）
 function smoothShownContent(message) {
   const id = message.id || message.run_id;
+  // 已结束的消息一律显示全文：平滑流只是"打字机"观感，不能让收尾状态
+  // 依赖某个事件是否把缓冲区清掉——一旦漏清，短回复就会永久空白。
+  const live = ["running", "responding", "queued", "planned", "awaiting_approval"];
+  if (!live.includes(String(message.status || ""))) return String(message.content || "");
   if (id && smoothStream.targets.has(id)) {
     const target = smoothStream.targets.get(id) || "";
     const shown = smoothStream.shown.get(id) || 0;
@@ -2679,8 +2678,14 @@ function handleStreamEvent(type, payload) {
 
   if (type === "message_create" || type === "message_update") {
     upsertMessage(payload);
-    if (payload.message && ["complete", "error", "cancelled"].includes(payload.message.status)) {
-      smoothFlushMessage(payload.message.id);
+    // message_create/message_update 的 payload 就是消息对象本身；只有
+    // message_delta 才把它放在 payload.message 里。这里曾按 payload.message
+    // 取状态，条件永远不成立 → 平滑流缓冲区从不释放，短回复（<24 字）在
+    // 完成时仍是 0 字，界面表现为"Agent 只思考不输出"。
+    const id = payload.id || payload.message?.id || "";
+    const status = String(payload.status || payload.message?.status || "");
+    if (id && ["complete", "error", "cancelled"].includes(status)) {
+      smoothFlushMessage(id);
     }
     scheduleChatRender();
     return;

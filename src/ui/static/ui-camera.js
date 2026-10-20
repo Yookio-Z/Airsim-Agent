@@ -71,39 +71,35 @@ function normalizeCameraSettings(raw = {}) {
   };
 }
 
-// 每种图像源只有一部分字段有意义：AirSim 才有相机 ID/车辆名/图像类型，
-// RTSP 才有 URL 和传输协议，本机摄像头只有索引。全铺出来会让操作员
-// 以为"填了就会生效"（例如给 RTSP 填图像类型）。
-function updateCameraSourceFields() {
-  const source = String(els.cameraSource?.value || cameraSettings.source || "airsim").toLowerCase();
-  const isAirSim = source === "airsim";
-  const isRtsp = source === "rtsp";
-  const isLocal = source === "local";
-  if (els.cameraRtspUrlRow) els.cameraRtspUrlRow.hidden = !isRtsp;
-  if (els.cameraRtspTransportRow) els.cameraRtspTransportRow.hidden = !isRtsp;
-  if (els.cameraNameRow) els.cameraNameRow.hidden = !(isAirSim || isLocal);
-  if (els.cameraVehicleRow) els.cameraVehicleRow.hidden = !isAirSim;
-  if (els.cameraImageTypeRow) els.cameraImageTypeRow.hidden = !isAirSim;
-  if (els.cameraNameRow) {
-    const label = els.cameraNameRow.querySelector("label");
-    if (label) label.textContent = isLocal ? "摄像头索引" : "相机 ID";
-    if (els.cameraName) {
-      els.cameraName.placeholder = isLocal ? "0" : "0";
-    }
-  }
-  const hint = els.cameraSourceHint;
-  if (hint) {
-    if (isRtsp) {
-      hint.hidden = false;
-      hint.textContent = "连不上或画面花屏时换另一种传输协议再试：TCP 走可靠传输更稳，UDP 延迟更低。改完点「保存」，再点「查看画面」验证。";
-    } else if (isLocal) {
-      hint.hidden = false;
-      hint.textContent = "本机摄像头用于在地面端验证视频链路，不参与真机图传。";
-    } else {
-      hint.hidden = true;
-      hint.textContent = "";
-    }
-  }
+function normalizeAirsimCameraCatalog(raw = {}) {
+  const source = raw && typeof raw === "object" ? raw : {};
+  const byVehicle = {};
+  const rawByVehicle = source.by_vehicle && typeof source.by_vehicle === "object" ? source.by_vehicle : {};
+  Object.entries(rawByVehicle).forEach(([vehicle, names]) => {
+    if (!Array.isArray(names)) return;
+    const clean = names.map((name) => String(name || "").trim()).filter(Boolean);
+    if (clean.length) byVehicle[vehicle] = clean;
+  });
+  const fallback = Array.isArray(source.default)
+    ? source.default.map((name) => String(name || "").trim()).filter(Boolean)
+    : [];
+  return { by_vehicle: byVehicle, default: fallback.length ? fallback : ["0"] };
+}
+
+function cameraOptionsForVehicle(vehicleName) {
+  const catalog = airsimCameraCatalog || {};
+  const byVehicle = catalog.by_vehicle || {};
+  const name = String(vehicleName || "").trim();
+  if (name && Array.isArray(byVehicle[name]) && byVehicle[name].length) return [...byVehicle[name]];
+  if (Array.isArray(catalog.default) && catalog.default.length) return [...catalog.default];
+  return ["0"];
+}
+
+const DEFAULT_CAMERA_LABELS = { "0": "前视", "1": "前右", "2": "前左", "3": "下视", "4": "后视" };
+
+function cameraOptionLabel(name) {
+  const key = String(name || "");
+  return DEFAULT_CAMERA_LABELS[key] ? `${key} · ${DEFAULT_CAMERA_LABELS[key]}` : key;
 }
 
 async function loadCameraSettings(force = false) {
@@ -114,6 +110,7 @@ async function loadCameraSettings(force = false) {
   try {
     const data = await api("/api/settings/camera");
     cameraSettings = normalizeCameraSettings(data.camera || {});
+    airsimCameraCatalog = normalizeAirsimCameraCatalog(data.airsim_cameras);
     cameraSettingsLoaded = true;
   } catch (error) {
     showNotice("摄像头设置加载失败: " + (error.message || "未知错误"), "error");
@@ -123,15 +120,11 @@ async function loadCameraSettings(force = false) {
 }
 
 function readCameraSettingsForm() {
-  const source = els.cameraSource?.value || cameraSettings.source;
+  // 设置面板现在只负责视频流地址；相机/机型/图像类型由摄像头面板自己的
+  // 控件维护并写进 cameraSettings，这里原样带回去，不能再用表单值覆盖。
   return normalizeCameraSettings({
-    source: source,
-    url: els.cameraRtspUrl?.value || cameraSettings.url || "",
-    transport: els.cameraRtspTransport?.value || cameraSettings.transport,
-    camera_name: els.cameraName?.value || cameraSettings.camera_name,
-    vehicle_name: els.cameraVehicle?.value || "",
-    image_type: els.cameraImageType?.value || cameraSettings.image_type,
-    timeout_sec: els.cameraTimeout?.value || cameraSettings.timeout_sec,
+    ...cameraSettings,
+    url: els.cameraRtspUrl ? els.cameraRtspUrl.value : cameraSettings.url,
   });
 }
 
@@ -395,9 +388,50 @@ function clearCameraWindowImage(win) {
   }
 }
 
+function syncCameraCameraOptions(win, currentName) {
+  const select = win?.cameraSelect;
+  if (!select) return "";
+  const vehicleName = win.vehicleSelect?.value || win.settings?.vehicle_name || "";
+  const names = cameraOptionsForVehicle(vehicleName);
+  let cameraName = String(currentName || win.settings?.camera_name || "").trim();
+  // 首次同步（或换机后）保存的相机不在真实清单里（默认 "0" 遇到
+  // CameraImage 这类命名配置）时，选清单里的第一台，不再凭空造一个
+  // "0 · custom"。
+  const vehicleChanged = win.cameraCatalogVehicle !== undefined && win.cameraCatalogVehicle !== vehicleName;
+  if ((!win.viewJoinedAxis || vehicleChanged) && !names.includes(cameraName)) {
+    cameraName = names[0] || cameraName;
+  }
+  win.cameraCatalogVehicle = vehicleName;
+  const entries = names.map((name) => ({ value: name, label: cameraOptionLabel(name) }));
+  if (cameraName && !names.includes(cameraName)) {
+    // 感知轴可能指向 settings.json 之外的相机（远端 AirSim）：保留为 custom，
+    // 否则会把轴的选择冲掉。
+    entries.push({ value: cameraName, label: `${cameraName} · custom` });
+  }
+  const existing = [...select.options].map((option) => `${option.value}\u0000${option.textContent}`);
+  const wanted = entries.map((entry) => `${entry.value}\u0000${entry.label}`);
+  if (existing.length !== wanted.length || existing.some((item, index) => item !== wanted[index])) {
+    const previous = select.value || cameraName;
+    select.textContent = "";
+    entries.forEach((entry) => select.add(new Option(entry.label, entry.value)));
+    select.value = entries.some((entry) => entry.value === previous) ? previous : (entries[0]?.value || "");
+  }
+  if (entries.some((entry) => entry.value === cameraName)) select.value = cameraName;
+  return cameraName;
+}
+
 function syncCameraWindowControls(win) {
   if (!win) return;
   if (win.sourceSelect) win.sourceSelect.value = String(win.settings.source || "airsim").toLowerCase();
+  if (win.vehicleSelect) {
+    const vehicleName = String(win.settings.vehicle_name || "");
+    if (vehicleName && ![...win.vehicleSelect.options].some((option) => option.value === vehicleName)) {
+      win.vehicleSelect.add(new Option(`${vehicleName} · custom`, vehicleName));
+    }
+    // 补选项和选中要在同一次同步里完成（原先 hasOption 是补之前算的，
+    // 新加的 custom 项要等下一次轮询才被选中，面板上就是标签来回跳）
+    win.vehicleSelect.value = vehicleName || win.vehicleSelect.value || "";
+  }
   if (win.cameraSelect) {
     let cameraName = String(win.settings.camera_name || "0");
     // 首次同步：面板加入感知轴当前的取景，而不是把它拽到面板默认的 0 号相机。
@@ -425,21 +459,11 @@ function syncCameraWindowControls(win) {
         win.viewJoinedAxis = true;
       }
     }
-    if (![...win.cameraSelect.options].some((option) => option.value === cameraName)) {
-      win.cameraSelect.add(new Option(`${cameraName} · custom`, cameraName));
-    }
+    cameraName = syncCameraCameraOptions(win, cameraName);
     win.cameraSelect.value = cameraName;
+    win.settings.camera_name = cameraName;
   }
   if (win.imageTypeSelect) win.imageTypeSelect.value = win.settings.image_type || "scene";
-  if (win.vehicleSelect) {
-    const vehicleName = String(win.settings.vehicle_name || "");
-    if (vehicleName && ![...win.vehicleSelect.options].some((option) => option.value === vehicleName)) {
-      win.vehicleSelect.add(new Option(`${vehicleName} · custom`, vehicleName));
-    }
-    // 补选项和选中要在同一次同步里完成（原先 hasOption 是补之前算的，
-    // 新加的 custom 项要等下一次轮询才被选中，面板上就是标签来回跳）
-    win.vehicleSelect.value = vehicleName || win.vehicleSelect.value || "";
-  }
   toggleCameraSourceSpecificFields(win);
 }
 
@@ -450,25 +474,18 @@ function axisViewCameraName() {
 }
 
 function renderCameraSettings() {
-  if (els.cameraSource) els.cameraSource.value = cameraSettings.source;
   if (els.cameraRtspUrl) els.cameraRtspUrl.value = cameraSettings.url || "";
-  if (els.cameraRtspTransport) els.cameraRtspTransport.value = cameraSettings.transport || DEFAULT_CAMERA_SETTINGS.transport;
-  if (els.cameraName) els.cameraName.value = cameraSettings.camera_name;
-  if (els.cameraVehicle) els.cameraVehicle.value = cameraSettings.vehicle_name;
-  if (els.cameraImageType) els.cameraImageType.value = cameraSettings.image_type;
-  if (els.cameraTimeout) els.cameraTimeout.value = String(Math.round(cameraSettings.timeout_sec));
-  updateCameraSourceFields();
+  if (els.cameraCurrentSource) {
+    els.cameraCurrentSource.textContent = `当前图像源：${cameraSourceLabel(cameraSettings)}`;
+  }
   cameraWindows.forEach(syncCameraWindowControls);
 }
 
 function cameraSourceLabel(settings) {
-  const source = String(settings.source || "airsim").toLowerCase();
+  const source = String((settings || {}).source || "airsim").toLowerCase();
   if (source === "airsim") return "AirSim";
   if (source === "local") return "本机摄像头";
-  if (source === "rtsp") {
-    const url = String(settings.url || "").trim();
-    return url ? `RTSP ${url.length > 28 ? url.slice(0, 27) + "…" : url}` : "RTSP";
-  }
+  if (source === "rtsp") return "RTSP 视频流";
   return source;
 }
 
@@ -558,9 +575,21 @@ function cameraViewerIsVisible(win = primaryCameraWindow()) {
   return Boolean(win?.el && !win.el.hidden);
 }
 
+// 摄像头窗口之间"谁在前面"的层级上限。必须低于设置遮罩(29)和模态框(40)：
+// 设置面板打开时一定要盖住摄像头画面。以前这里是
+// `20 + Date.now() % 100000`，实际值上千，直接把设置面板顶到了下面。
+const CAMERA_VIEWER_FOCUS_Z = 20;
+
 function focusCameraWindow(win) {
   if (!win?.el) return;
-  win.el.style.zIndex = String(20 + (Date.now() % 100000));
+  // 被点的窗口置顶，其余可见窗口按原顺序依次下排；z 始终落在 17..20。
+  const others = [...cameraWindows.values()]
+    .filter((item) => item.el && item !== win && !item.el.hidden)
+    .sort((a, b) => (Number(b.el.style.zIndex) || 8) - (Number(a.el.style.zIndex) || 8));
+  win.el.style.zIndex = String(CAMERA_VIEWER_FOCUS_Z);
+  others.forEach((item, index) => {
+    item.el.style.zIndex = String(CAMERA_VIEWER_FOCUS_Z - 1 - index);
+  });
 }
 
 function placeCameraViewerAtDefault(win = primaryCameraWindow()) {
@@ -835,8 +864,6 @@ async function captureCameraFrame({ notify = true, openViewer = true, windowId =
 
   win.captureInFlight = true;
   const seq = ++win.frameSeq;
-  const buttons = [els.cameraCaptureFromSettingsBtn].filter(Boolean);
-  buttons.forEach((button) => { button.disabled = true; });
   if (!win.imageEl?.src) setCameraViewerState(win, "loading", "正在连接视频流");
   const controller = new AbortController();
   const timeout = setTimeout(() => controller.abort(), 3600);
@@ -908,7 +935,6 @@ async function captureCameraFrame({ notify = true, openViewer = true, windowId =
   } finally {
     clearTimeout(timeout);
     win.captureInFlight = false;
-    buttons.forEach((button) => { button.disabled = false; });
     renderCameraLiveIndicator(win);
     if (win.streamActive) scheduleCameraFrame(win);
   }
@@ -949,13 +975,14 @@ function stopAllCameraStreams({ hide = false } = {}) {
   [...cameraWindows.values()].forEach((win) => stopCameraStream({ hide, windowId: win.id }));
 }
 
-function nextCameraName() {
-  const used = new Set(visibleCameraWindows().map((win) => String(win.settings.camera_name || "0")));
-  for (let index = 0; index <= 4; index += 1) {
-    const name = String(index);
-    if (!used.has(name)) return name;
-  }
-  return "0";
+function nextCameraName(sourceWindow = primaryCameraWindow()) {
+  const used = new Set(
+    visibleCameraWindows().map((win) => String(win.cameraSelect?.value || win.settings?.camera_name || ""))
+  );
+  const names = cameraOptionsForVehicle(
+    sourceWindow?.vehicleSelect?.value || sourceWindow?.settings?.vehicle_name || ""
+  );
+  return names.find((name) => !used.has(name)) || names[0] || "0";
 }
 
 async function createAdditionalCameraWindow(sourceWindow = primaryCameraWindow()) {

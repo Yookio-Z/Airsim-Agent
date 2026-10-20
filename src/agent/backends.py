@@ -150,24 +150,27 @@ def _create_airsim_controller() -> FlightController:
     return AirSimController()
 
 
+def _airsim_settings_path():
+    """AirSim settings.json 位置（与 AirSimController 同一套规则）。"""
+    from pathlib import Path
+
+    explicit = os.environ.get("AIRSIM_SETTINGS_PATH")
+    if explicit:
+        return Path(explicit)
+    home = Path(os.environ.get("USERPROFILE") or str(Path.home()))
+    return home / "Documents" / "AirSim" / "settings.json"
+
+
 def read_airsim_origin_geopoint() -> dict[str, float] | None:
     """从 AirSim settings.json 读 OriginGeopoint，不导入 airsim 包。
 
     刻意独立于 AirSimController：UI 要在仿真器还没起来时就知道地图该落在哪个
     城市，而 airsim 控制器模块顶层就 import airsim，没装仿真环境时导入即失败。
     """
-    from pathlib import Path
-
-    explicit = os.environ.get("AIRSIM_SETTINGS_PATH")
-    if explicit:
-        path = Path(explicit)
-    else:
-        home = Path(os.environ.get("USERPROFILE") or str(Path.home()))
-        path = home / "Documents" / "AirSim" / "settings.json"
     try:
         import json
 
-        origin = json.loads(path.read_text(encoding="utf-8")).get("OriginGeopoint")
+        origin = json.loads(_airsim_settings_path().read_text(encoding="utf-8")).get("OriginGeopoint")
         if not isinstance(origin, dict):
             return None
         lat = float(origin.get("Latitude"))
@@ -181,6 +184,54 @@ def read_airsim_origin_geopoint() -> dict[str, float] | None:
     except (TypeError, ValueError):
         alt = 0.0
     return {"lat": lat, "lon": lon, "alt": alt}
+
+
+# AirSim 没有"列出相机"的 RPC；settings.json 里没写 Cameras 时，模拟器建的是
+# 这五个默认相机（前/前右/前左/下/后）。
+DEFAULT_AIRSIM_CAMERAS: tuple[str, ...] = ("0", "1", "2", "3", "4")
+
+
+def read_airsim_camera_catalog() -> dict[str, Any]:
+    """settings.json 里每架载具实际声明的相机名。
+
+    事实来源是配置文件，不是面板里写死的一份列表：
+      - 载具写了 ``Cameras`` 块 → 只有这些相机存在；
+      - 没写 → AirSim 建默认相机 ``0``..``4``。
+    ``CaptureSettings`` 显式为空的相机不会出图（例如只留位不采集的
+    ``CameraDepth``），不列入可选列表；若整个 Cameras 块都不能采集，则保留
+    全部名字，让面板能如实展示配置而不是给出空列表。
+    """
+    import json
+
+    fallback = {"by_vehicle": {}, "default": list(DEFAULT_AIRSIM_CAMERAS)}
+    try:
+        data = json.loads(_airsim_settings_path().read_text(encoding="utf-8"))
+    except Exception:
+        return fallback
+    vehicles = data.get("Vehicles")
+    if not isinstance(vehicles, dict):
+        return fallback
+
+    by_vehicle: dict[str, list[str]] = {}
+    for vehicle_name, spec in vehicles.items():
+        if not isinstance(spec, dict):
+            continue
+        cameras = spec.get("Cameras")
+        if isinstance(cameras, dict) and cameras:
+            names = [
+                str(camera_name)
+                for camera_name, camera_spec in cameras.items()
+                if not (
+                    isinstance(camera_spec, dict)
+                    and isinstance(camera_spec.get("CaptureSettings"), list)
+                    and not camera_spec.get("CaptureSettings")
+                )
+            ]
+            by_vehicle[str(vehicle_name)] = names or [str(name) for name in cameras]
+        else:
+            by_vehicle[str(vehicle_name)] = list(DEFAULT_AIRSIM_CAMERAS)
+    first = next(iter(by_vehicle.values()), None)
+    return {"by_vehicle": by_vehicle, "default": list(first) if first else list(DEFAULT_AIRSIM_CAMERAS)}
 
 
 def _create_px4_mavlink_controller() -> FlightController:

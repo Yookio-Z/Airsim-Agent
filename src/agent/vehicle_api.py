@@ -8,6 +8,7 @@ the AirSim settings templates, and the operator's manual flight overrides
 from __future__ import annotations
 
 from . import settings_store
+from .backends import read_airsim_camera_catalog
 from .run_state import RunState
 from .tool_executor import ToolCallResult
 from .settings_store import (
@@ -882,6 +883,13 @@ class VehicleMixin:
     def camera_settings(self) -> dict[str, Any]:
         """Return current UI camera source settings."""
         return _camera_settings()
+
+    def airsim_camera_catalog(self) -> dict[str, Any]:
+        """AirSim settings.json 里各载具实际声明的相机（面板选项的事实来源）。"""
+        try:
+            return read_airsim_camera_catalog()
+        except Exception as exc:
+            return {"by_vehicle": {}, "default": [], "error": str(exc)}
 
     def save_connection_settings(self, payload: dict[str, Any] | None = None) -> dict[str, Any]:
         """Persist the connection list / active id / auto-connect flag."""

@@ -583,6 +583,130 @@ body.resizing .h-resizer::after {
   cursor: not-allowed;
 }
 
+/* 飞行模式：工具栏里唯一带文字的按钮。原生 select 在暗色界面会弹出白色列表，
+   而且只显示一个被截断的首字母；这里改成"模式缩写 + 暗色菜单"，菜单里带一句
+   中文说明，操作员能看懂每个模式是干什么的。 */
+.flight-mode-control {
+  position: relative;
+}
+
+.flight-mode-control[hidden] {
+  display: none;
+}
+
+.mode-btn {
+  width: 32px;
+  height: 32px;
+  padding: 0 0 5px;
+  font-family: ui-monospace, SFMono-Regular, Consolas, monospace;
+  font-size: 9px;
+  font-weight: 700;
+  letter-spacing: 0.2px;
+  color: var(--cyan);
+  border: 1px solid rgba(85, 223, 244, 0.28);
+  border-radius: 7px;
+  background: rgba(85, 223, 244, 0.08);
+}
+
+/* 小三角：让它看起来就是个下拉入口，而不是一个静态状态灯 */
+.mode-btn::after {
+  content: "";
+  position: absolute;
+  left: 50%;
+  bottom: 4px;
+  margin-left: -3px;
+  border-left: 3px solid transparent;
+  border-right: 3px solid transparent;
+  border-top: 4px solid currentColor;
+  opacity: 0.65;
+}
+
+.mode-btn:hover {
+  background: rgba(85, 223, 244, 0.16);
+}
+
+.mode-btn:disabled {
+  color: var(--faint);
+  border-color: var(--line);
+  background: transparent;
+}
+
+.flight-mode-menu {
+  position: absolute;
+  left: calc(100% + 10px);
+  top: -6px;
+  z-index: 25;
+  width: 212px;
+  padding: 5px;
+  border: 1px solid rgba(255, 255, 255, 0.14);
+  border-radius: 10px;
+  background: rgba(28, 31, 38, 0.97);
+  box-shadow: var(--shadow);
+  display: grid;
+  gap: 2px;
+}
+
+.flight-mode-menu[hidden] {
+  display: none;
+}
+
+.flight-mode-head {
+  padding: 5px 8px 6px;
+  color: var(--faint);
+  font-size: 10px;
+  font-weight: 700;
+  letter-spacing: 0.4px;
+  text-transform: uppercase;
+}
+
+.flight-mode-item {
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+  width: 100%;
+  padding: 6px 8px;
+  border: 0;
+  border-radius: 7px;
+  background: transparent;
+  color: var(--ink);
+  text-align: left;
+  cursor: pointer;
+}
+
+.flight-mode-item:hover {
+  background: rgba(255, 255, 255, 0.07);
+}
+
+.flight-mode-item.active {
+  background: rgba(85, 223, 244, 0.10);
+}
+
+.flight-mode-key {
+  min-width: 52px;
+  font-family: ui-monospace, SFMono-Regular, Consolas, monospace;
+  font-size: 11px;
+  font-weight: 700;
+  color: var(--cyan);
+}
+
+.flight-mode-item.active .flight-mode-key {
+  color: var(--ink);
+}
+
+.flight-mode-desc {
+  flex: 1 1 auto;
+  min-width: 0;
+  color: var(--muted);
+  font-size: 11px;
+}
+
+.flight-mode-foot {
+  padding: 5px 8px 3px;
+  color: var(--faint);
+  font-size: 10px;
+  line-height: 1.45;
+}
+
 .camera-viewer {
   position: absolute;
   left: 58px;
@@ -4862,7 +4986,9 @@ body[data-density="compact"] .bottom-tool-column button {
 
 .camera-settings-grid {
   display: grid;
-  grid-template-columns: repeat(2, minmax(0, 1fr));
+  /* 视频流设置只有 RTSP 地址一个字段（相机/机型/图像类型在摄像头面板里），
+     单列铺满，不再留半列空白。 */
+  grid-template-columns: minmax(0, 1fr);
   gap: 10px;
 }
 
