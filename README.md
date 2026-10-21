@@ -10,7 +10,7 @@ Web 地面站和 LLM 智能体共用同一套服务，高风险动作先过安�
 [![CI](https://github.com/Yookio-Z/Airsim-Agent/actions/workflows/ci.yml/badge.svg)](https://github.com/Yookio-Z/Airsim-Agent/actions/workflows/ci.yml)
 [![Python](https://img.shields.io/badge/python-3.10%2B-3776AB?logo=python&logoColor=white)](https://www.python.org/)
 
-<img src="assets/gifs/agent-session.gif" width="1000" alt="地面站全景：Agent 接收指令并读取实时遥测作答">
+<img src="assets/gifs/agent-demo.gif" width="1000" alt="地面站全景：Agent 接收指令并读取实时遥测作答">
 
 *上面是真实运行录制的动图：左边是整个地面站（卫星底图、实时遥测、飞行工具栏、高度剖面），
 右边是 Agent —— 切到 Chat 模式、输入「检查一下无人机当前状态和剩余电量」，
