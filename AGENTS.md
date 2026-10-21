@@ -19,11 +19,13 @@
 |---|---|---|
 | `src/` | 产品代码 | agent 运行时、原子工具、感知轴、编队控制器、GCS 服务、Web UI |
 | `.airsim_agent/` | **Agent 的家** | 手册入库：`SYSTEM.md`（常驻系统提示词）、`NOTES.md`（长期笔记，随 SYSTEM.md 每轮注入）、`skills/<名>/SKILL.md`（技能）、`README.md`；运行数据不入库（见下） |
-| `tests/` | 测试套件 | 68 个 pytest 文件（789 条用例）+ 7 个前端 `.cjs` 套件；**CI 每次 push 都跑它们**，不要移除 |
-| `assets/` | README 配图 | `gifs/` 一段真实交互动图 + `shots/` 若干静态截图；改 README 时一并更新，不要塞运行数据 |
+| `assets/` | README 配图 | `gifs/` 一段真实交互动图 + `screenshots/` 若干静态截图；改 README 时一并更新，不要塞运行数据 |
 | `ros2/` | px4_ros2 后端网关节点 | **冻结**：保留入库、不再维护；不要基于它做新功能 |
-| `.github/` | CI 质量门 | push/PR 时跑 pytest + 覆盖率门槛（fail_under 45）+ 前端测试，blocking；不要删 |
+| `vendor/` | msgpack-rpc-python 补丁副本 | `pyproject.toml` 里是 path 依赖（`uv sync` 装的就是这份），**删了装不上** |
 | 根文件 | `README.md`、`pyproject.toml`、`uv.lock`、`.coveragerc`、`.gitignore`、`AGENTS.md` | 说明、依赖、锁、覆盖率门槛、忽略规则 |
+
+> **公开仓库只放产品代码与手册**（2026-10-21 决定）：测试套件、CI 工作流、检测权重
+> 全部留在本机不入库。`.coveragerc` 随测试一起出库。恢复方式见 `.gitignore` 里那三行注释。
 
 **`src/tools/` 文件地图**（一个文件一个职责域；注册统一由 `src/agent/tool_executor.py`
 的 `ToolRuntime.ensure_ready()` 做，工具文件只依赖 `FlightController`/感知轴，绝不反向
@@ -52,7 +54,9 @@ import agent 层）：
 | `docs/` | 设计文档（49 份） | 故意出库；入口是 `docs/README.md` 索引 |
 | `.env` | 隐私配置（API key、端口等） | `src/config.py` 启动时读取；**永不入库** |
 | `third_party/` | 学习参考项目（11 个，596 MB） | 不参与构建；运行时仅读 qgroundcontrol 里一个 12 KB 的 json |
-| `models/` | 权重目录 | `README.md` 入库；`*.pt`（休眠的检测器权重）不上传 |
+| `models/` | 权重目录 | **整个目录不入库**（含说明文档）；`*.pt` 是休眠的检测器权重 |
+| `tests/` | 测试套件 | 68 个 pytest 文件（789 条用例）+ 7 个前端 `.cjs` 套件；**不入库**，但文件留在本机，`uv run pytest -q` 照跑 |
+| `.github/` | CI 工作流 | **不入库**：公开仓库不跑 CI，README 也没有 CI 徽章 |
 | `weights/` | CLIP 权重（338 MB） | 代码零引用 |
 | `PX4-Autopilot.zip` | 1.7 GB 下载件 | 本地保留，部署用 |
 | ~~`src/data/`~~ | 已删除（2026-10-19） | 数据统一迁到 `.airsim_agent/`；`src/` 只放代码 |
@@ -80,16 +84,17 @@ python -m src.ui.server --host 127.0.0.1 --port 8765
 # 或：uv run python -m src.ui.server --host 127.0.0.1 --port 8765 --backend px4_mavlink
 # 或：uv run python -m src
 
-uv run pytest -q                           # 全量测试，提交前必须全绿（当前 780+ 条）
+uv run pytest -q                           # 全量测试，提交前必须全绿（当前 789 条）
 ```
 
 ## 四、改动纪律（每一条都有历史代价）
 
 1. **测试**：新机制必须带回归用例；删代码时连带删掉只为它存在的测试；**提交前全量测试全绿**。
+   （测试套件只在本机、不入库，但纪律不变。）
 2. **判据属于任务**：完成标准由计划声明（`goal.success_criteria`），运行时只负责评估，
    不许替任务发明标准（"按任务类型兜底"已被操作员明确否决）。
 3. **不做检测前置**：飞行动作不设目标检测前置条件；感知走 VLM + 深度。检测能力处于
-   休眠状态（`models/README.md` 有说明），不要以它为依赖。
+   休眠状态（`src/modules/dormant/yolo_detection.py` 头部有说明），不要以它为依赖。
 4. **技能面只有 SKILL.md**：技能是操作知识、不是动作；只加载 `.airsim_agent/skills/*/SKILL.md`，
    `SYSTEM.md` 是常驻提示词、不参与技能加载。新增能力先分清它是**工具**还是**技能**——
    同一意图只保留一条权威路径。
@@ -117,7 +122,8 @@ uv run pytest -q                           # 全量测试，提交前必须全�
 
 ## 五、提交前自检
 
-- [ ] `uv run pytest -q` 全绿
-- [ ] `git status` 里没有 `docs/`、`.env`、`third_party/`、权重、`.airsim_agent/` 数据等本机专属内容
+- [ ] `uv run pytest -q` 全绿（测试在本机，不入库）
+- [ ] `git status` 里没有 `docs/`、`.env`、`third_party/`、权重、`.airsim_agent/` 数据、
+      `tests/`、`.github/`、`models/` 等本机专属内容
 - [ ] 新增/修改的技能文档通过：描述以"当"开头、节标题用规范中文名
 - [ ] 若改了行为：有对应测试或运行记录证据

@@ -7,7 +7,6 @@
 LLM 规划 → 判据契约 → 原子工具 → 飞行器。
 Web 地面站和 LLM 智能体共用同一套服务，高风险动作先过安全层和人工审批闸门。
 
-[![CI](https://github.com/Yookio-Z/Airsim-Agent/actions/workflows/ci.yml/badge.svg)](https://github.com/Yookio-Z/Airsim-Agent/actions/workflows/ci.yml)
 [![Python](https://img.shields.io/badge/python-3.10%2B-3776AB?logo=python&logoColor=white)](https://www.python.org/)
 
 <img src="assets/gifs/agent-demo.gif" width="1000" alt="地面站全景：Agent 接收指令并读取实时遥测作答">
@@ -61,14 +60,15 @@ uv run python -m src.ui.server --host 127.0.0.1 --port 8765 --backend px4_mavlin
 src/            产品代码：agent 运行时 / 工具层 / 多后端 / 地面站服务 / Web UI
 .airsim_agent/  Agent 的家：SYSTEM.md（系统提示词）+ NOTES.md + skills/
 ros2/           PX4 ROS2 网关（已冻结）
-tests/          pytest + 前端测试
+vendor/         msgpack-rpc-python 补丁副本（构建依赖）
 ```
 
 ## 说明
 
 - 仓库尚未指定开源许可证，默认保留全部权利。
 - `px4_ros2` 链路已冻结，不再维护；新功能走 PX4 MAVLink 或 AirSim 仿真。
-- `.env`、飞行数据、模型权重、第三方源码都不在版本库里。
+- 这个仓库只放**产品代码与手册**：测试套件、CI 工作流、检测权重、设计文档、飞行数据都留在本机，
+  不进版本库。
 
 ---
 

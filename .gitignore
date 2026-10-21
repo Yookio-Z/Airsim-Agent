@@ -29,6 +29,15 @@ captures/
 # 飞行数据资产（本机，不入库）
 /data/
 
+# 公开仓库瘦身：这三样只留本机，不上传（文件仍在本地，测试照跑）
+#   tests/   —— 回归测试套件（本地 `uv run pytest -q` 不受影响）
+#   models/  —— 旧检测权重目录（本就有 *.pt 规则，连说明文档也一并留本机）
+#   .github/ —— CI 工作流（公开仓库不再跑 CI，README 也没有 CI 徽章）
+# 想放回仓库：删掉下面三行，再 `git add tests models .github`
+tests/
+models/
+.github/
+
 # Runtime state, logs and caches (may contain local API keys / credentials).
 src/ui/static/tile_cache/
 logs/
