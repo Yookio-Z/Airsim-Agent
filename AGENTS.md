@@ -19,7 +19,8 @@
 |---|---|---|
 | `src/` | 产品代码 | agent 运行时、原子工具、感知轴、编队控制器、GCS 服务、Web UI |
 | `.airsim_agent/` | **Agent 的家** | 手册入库：`SYSTEM.md`（常驻系统提示词）、`NOTES.md`（长期笔记，随 SYSTEM.md 每轮注入）、`skills/<名>/SKILL.md`（技能）、`README.md`；运行数据不入库（见下） |
-| `tests/` | 测试套件 | 60 个 pytest 文件 + 3 个前端 `.cjs` 套件；**CI 每次 push 都跑它们**，不要移除 |
+| `tests/` | 测试套件 | 69 个 pytest 文件（789 条用例）+ 7 个前端 `.cjs` 套件；**CI 每次 push 都跑它们**，不要移除 |
+| `assets/` | README 配图 | 地面站真实截图 + 由真实 git 历史生成的提交图/活跃度图；改 README 时一并更新，不要塞运行数据 |
 | `ros2/` | px4_ros2 后端网关节点 | **冻结**：保留入库、不再维护；不要基于它做新功能 |
 | `.github/` | CI 质量门 | push/PR 时跑 pytest + 覆盖率门槛（fail_under 45）+ 前端测试，blocking；不要删 |
 | 根文件 | `README.md`、`pyproject.toml`、`uv.lock`、`.coveragerc`、`.gitignore`、`AGENTS.md` | 说明、依赖、锁、覆盖率门槛、忽略规则 |
