@@ -13,7 +13,7 @@
 [![Perception](https://img.shields.io/badge/perception-VLM%20%2B%20depth-7C3AED?logo=openai&logoColor=white)](https://github.com/Yookio-Z/Airsim-Agent)
 [![License](https://img.shields.io/badge/license-unspecified-lightgrey.svg)](#八许可与边界)
 
-[简体中文](#readme) · [English](#readme-en)
+[简体中文](#airsim-agent) · [English](#readme-en)
 
 </div>
 
@@ -117,7 +117,7 @@ flowchart TB
     subgraph SRC["Agent 的家 .airsim_agent/"]
         SYS["SYSTEM.md<br/>常驻系统提示词"]
         NOTE["NOTES.md<br/>长期笔记"]
-        SK["skills/*/SKILL.md<br/>操作知识"]
+        SK["skills/SKILL.md<br/>操作知识"]
     end
 
     subgraph DEV["飞行后端"]
