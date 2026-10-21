@@ -34,12 +34,12 @@ Web 地面站和 LLM 智能体共用同一套服务，高风险动作先过安�
 
 <table>
 <tr>
-<td width="50%"><img src="assets/shots/tools.png" alt="工具目录"><br><sub>工具目录：模型能调用什么，一眼看清</sub></td>
-<td width="50%"><img src="assets/shots/records.png" alt="任务复盘"><br><sub>任务复盘：每次任务的目标、路由与卡点</sub></td>
+<td width="50%"><img src="assets/screenshots/tools.png" alt="工具目录"><br><sub>工具目录：模型能调用什么，一眼看清</sub></td>
+<td width="50%"><img src="assets/screenshots/records.png" alt="任务复盘"><br><sub>任务复盘：每次任务的目标、路由与卡点</sub></td>
 </tr>
 <tr>
-<td width="50%"><img src="assets/shots/camera.png" alt="实时相机"><br><sub>机载相机实时画面</sub></td>
-<td width="50%"><img src="assets/shots/links.png" alt="链路设置"><br><sub>链路预设与当前实际连接</sub></td>
+<td width="50%"><img src="assets/screenshots/camera.png" alt="实时相机"><br><sub>机载相机实时画面</sub></td>
+<td width="50%"><img src="assets/screenshots/links.png" alt="链路设置"><br><sub>链路预设与当前实际连接</sub></td>
 </tr>
 </table>
 
