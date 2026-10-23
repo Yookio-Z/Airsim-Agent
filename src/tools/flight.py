@@ -8,11 +8,11 @@
 
 from __future__ import annotations
 
-import json
 import math
 from typing import Callable
 
 from src.modules.backends.base import FlightController
+from .waypoints import WaypointFormatError, normalize_waypoints
 
 
 def register_flight_tools(
@@ -334,38 +334,15 @@ def register_flight_tools(
     def drone_fly_path(waypoints: str, velocity: float = 2.0, vehicle_name: str = "") -> str:
         """Fly a local NED waypoint path (default vehicle; "all" for every vehicle).
 
-        `waypoints` 两种写法（快速调用用第一种）：
+        `waypoints` 三种写法：
         - 紧凑串 "x,y,z;x,y,z"：分号分段、逗号分轴，例如 "10,0,-5;20,0,-5;30,0,-5"；
-        - JSON 数组：[{"x":10,"y":0,"z":-5}, ...]（GCS/程序化调用用）。
+        - JSON 对象数组：[{"x":10,"y":0,"z":-5}, ...]（GCS/程序化调用用）；
+        - JSON 三元组数组：[[10,0,-5], [20,0,-5], ...]（也接受）。
         """
-        text = str(waypoints or "").strip()
-        if not text:
-            return fmt_result({"status": "error", "message": "waypoints must not be empty"})
-        if text[0] in "[{":
-            try:
-                waypoints = json.loads(text)
-            except json.JSONDecodeError as exc:
-                return fmt_result({"status": "error", "message": f"invalid waypoint JSON: {exc}"})
-        else:
-            parsed: list[dict] = []
-            for index, segment in enumerate(text.split(";")):
-                parts = [part.strip() for part in segment.split(",")]
-                if len(parts) != 3 or not segment.strip():
-                    return fmt_result({
-                        "status": "error",
-                        "message": f"waypoint #{index} 需要 'x,y,z'（或用 JSON 数组整段传入）: {segment!r}",
-                    })
-                try:
-                    parsed.append({"x": float(parts[0]), "y": float(parts[1]), "z": float(parts[2])})
-                except ValueError:
-                    return fmt_result({
-                        "status": "error",
-                        "message": f"waypoint #{index} 的坐标不是数字: {segment!r}",
-                    })
-            waypoints = parsed
-
-        if not isinstance(waypoints, list) or not waypoints:
-            return fmt_result({"status": "error", "message": "waypoints must be a non-empty list"})
+        try:
+            waypoints = normalize_waypoints(waypoints)
+        except WaypointFormatError as exc:
+            return fmt_result({"status": "error", "message": str(exc)})
 
         f_velocity = finite_float(velocity)
         if f_velocity is None:
@@ -374,29 +351,6 @@ def register_flight_tools(
                 "message": f"invalid parameters: velocity must be a finite number (got {velocity!r})",
             })
         velocity = f_velocity
-        # 航点值同样必须是有限数：NaN 会让 move_on_path 内部的到达判断永远为假，
-        # 飞机在"未到达"状态下无限等待；Inf 则被当成合法目标点直接下发。
-        cleaned_waypoints = []
-        for index, waypoint in enumerate(waypoints):
-            if not isinstance(waypoint, dict):
-                return fmt_result({
-                    "status": "error",
-                    "message": f"waypoint #{index} must be an object with x, y, z",
-                })
-            coords = {}
-            for axis in ("x", "y", "z"):
-                value = finite_float(waypoint.get(axis))
-                if value is None:
-                    return fmt_result({
-                        "status": "error",
-                        "message": (
-                            f"waypoint #{index} has a non-finite {axis}: "
-                            f"{waypoint.get(axis)!r}"
-                        ),
-                    })
-                coords[axis] = value
-            cleaned_waypoints.append({**waypoint, **coords})
-        waypoints = cleaned_waypoints
 
         ok, targets = _run_for_vehicles(vehicle_name, lambda name: controller.move_on_path(waypoints, velocity, name))
         payload = {

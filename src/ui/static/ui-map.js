@@ -2491,7 +2491,7 @@ function drawDrone(ctx, px, py, heading) {
   ctx.restore();
 }
 
-// 解析 drone_fly_path 的 waypoints 参数：紧凑 "x,y,z;x,y,z" 或 JSON 数组。
+// 解析 drone_fly_path 的 waypoints 参数：紧凑 "x,y,z;x,y,z"、JSON 对象数组或 [x,y,z] 三元组数组。
 function parsePathWaypoints(raw) {
   if (typeof raw !== "string" || !raw.trim()) return [];
   const text = raw.trim();
@@ -2499,7 +2499,12 @@ function parsePathWaypoints(raw) {
     try {
       const list = JSON.parse(text);
       if (!Array.isArray(list)) return [];
-      return list.map((wp) => ({ x: Number(wp.x || 0), y: Number(wp.y || 0), z: Number(wp.z ?? -3) }));
+      return list.map((wp) => {
+        if (Array.isArray(wp)) {
+          return { x: Number(wp[0] ?? 0), y: Number(wp[1] ?? 0), z: Number(wp[2] ?? -3) };
+        }
+        return { x: Number(wp?.x ?? 0), y: Number(wp?.y ?? 0), z: Number(wp?.z ?? -3) };
+      });
     } catch (_) {
       return [];
     }

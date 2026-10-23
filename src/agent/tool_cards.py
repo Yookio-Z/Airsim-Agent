@@ -167,7 +167,7 @@ TOOL_CARDS: dict[str, ToolCard] = {
         name="drone_fly_path",
         purpose="Fly a local NED waypoint path.",
         when_to_use="For AirSim local path missions, geometric paths such as square/rectangle/orbit/circle/grid, or converted local mission drafts.",
-        inputs={"waypoints": "紧凑 \"x,y,z;x,y,z\"（如 \"10,0,-5;20,0,-5\"）或 JSON 数组 [{x,y,z}]", "velocity": "m/s", "vehicle_name": "目标载具：空=默认机，all=全部，或具体载具名"},
+        inputs={"waypoints": "紧凑 \"x,y,z;x,y,z\"（如 \"10,0,-5;20,0,-5\"）或 JSON 对象数组 [{\"x\":10,\"y\":0,\"z\":-5}, ...]（也接受 [[x,y,z], ...]）", "velocity": "m/s", "vehicle_name": "目标载具：空=默认机，all=全部，或具体载具名"},
         outputs="Path execution result.",
         required_capabilities=["flight_control"],
         preconditions=["connected", "waypoints validated"],

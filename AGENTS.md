@@ -34,6 +34,7 @@ import agent 层）：
 | 文件 | 注册什么 | 模型可见 |
 |---|---|---|
 | `manifest.py` | 工具清单：名称/类别/能力/可见性依据（零依赖，契约测试的锚） | — |
+| `waypoints.py` | 共享航点解析：安全层与 `drone_fly_path` 的唯一格式定义（紧凑串 / 对象数组 / 三元组数组） | — |
 | `flight.py` | 飞行工具组：`drone_*` 链路/遥测/飞行指令（后端中立） | 是 |
 | `mission.py` | 任务工具组：上传/下载/清空/启动/进度 | 否（GCS 专用） |
 | `sensors.py` | AirSim 仿真传感器（`airsim_get_sensors`）+ captures 目录助手 | 是（仅 airsim） |

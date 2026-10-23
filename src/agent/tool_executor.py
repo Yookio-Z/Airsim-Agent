@@ -17,6 +17,7 @@ from src.config import config
 from src.modules.formation.controller import FLIGHT_ACTIONS, FormationController
 from src.modules.safety_validator import FlightConstraint, SafetyValidator, ValidationResult
 from src.tools.manifest import manifest_metadata, list_tool_manifest
+from src.tools.waypoints import WaypointFormatError, normalize_waypoints
 
 logger = logging.getLogger(__name__)
 
@@ -1977,15 +1978,15 @@ class ToolRuntime:
 
         elif name == "drone_fly_path":
             try:
-                waypoints = json.loads(str(params.get("waypoints", "[]")))
+                waypoints = normalize_waypoints(params.get("waypoints"))
                 changed = False
                 safe_waypoints = []
                 # 航点是折线，逐段检查是否穿越禁飞区（落点检查看不出穿越）。
                 previous: tuple[float, float, float] | None = self._current_position()
                 for wp in waypoints:
-                    x = float(wp.get("x", 0.0))
-                    y = float(wp.get("y", 0.0))
-                    z = float(wp.get("z", -3.0))
+                    x = float(wp["x"])
+                    y = float(wp["y"])
+                    z = float(wp["z"])
                     result = self.safety.validate_position(x, y, z)
                     merge(result)
                     if result.corrected:
@@ -1998,9 +1999,12 @@ class ToolRuntime:
                     safe_waypoints.append({"x": x, "y": y, "z": z})
                 if changed:
                     corrected["waypoints"] = json.dumps(safe_waypoints, ensure_ascii=False)
+            except WaypointFormatError as e:
+                level = "danger"
+                violations.append(f"waypoint format is invalid: {e}")
             except Exception as e:
                 level = "danger"
-                violations.append(f"waypoint JSON could not be parsed: {e}")
+                violations.append(f"waypoint validation failed: {e}")
 
         elif name == "drone_upload_mission":
             try:

@@ -28,6 +28,7 @@ from .llm_protocol import (
     estimate_messages,
     function_tool_schema,
     openai_tools_to_anthropic,
+    sanitize_function_name,
     tool_schema_from_spec,
 )
 from .loop_types import LoopDecision
@@ -1957,10 +1958,17 @@ class LLMMissionPlanner:
                 decision.reflection = f"LLM fallback: {message}"
             return decision
 
-        openai_tools = self._loop_tool_schemas(prompt_cards, tools) if native else []
+        if native:
+            openai_tools, tool_name_map = self._loop_tool_schemas(
+                prompt_cards, tools, include_name_map=True
+            )
+        else:
+            openai_tools, tool_name_map = [], {}
         if native and openai_tools:
             try:
-                decision = self._native_decision(config, build_messages(1.0), openai_tools, allowed_tools)
+                decision = self._native_decision(
+                    config, build_messages(1.0), openai_tools, allowed_tools, tool_name_map
+                )
                 self._record_usage(sent_messages[-1] if sent_messages else [], self.last_usage)
                 return decision
             except ToolCallUnsupportedError as exc:
@@ -1969,7 +1977,9 @@ class LLMMissionPlanner:
                 if is_context_overflow_error(e):
                     # tighter budget, then the JSON path below as the final fallback
                     try:
-                        decision = self._native_decision(config, build_messages(0.5), openai_tools, allowed_tools)
+                        decision = self._native_decision(
+                            config, build_messages(0.5), openai_tools, allowed_tools, tool_name_map
+                        )
                         self._record_usage(sent_messages[-1] if sent_messages else [], self.last_usage)
                         return decision
                     except ToolCallUnsupportedError as exc:
@@ -2065,22 +2075,36 @@ class LLMMissionPlanner:
         self,
         tool_cards: list[dict[str, Any]],
         tools: list[dict[str, Any]] | None,
-    ) -> list[dict[str, Any]]:
-        """Synthesize function-calling schemas from tool cards + runtime specs."""
+        include_name_map: bool = False,
+    ) -> list[dict[str, Any]] | tuple[list[dict[str, Any]], dict[str, str]]:
+        """Synthesize function-calling schemas from tool cards + runtime specs.
+
+        Skill cards are named ``skill:<name>`` internally, which providers reject
+        in ``tools[].function.name`` (they require ``^[a-zA-Z0-9_-]+$``). Build a
+        sanitized name and keep the reverse map so the tool call can be routed
+        back to the original action.
+        """
         specs = {str(t.get("name") or ""): t for t in (tools or []) if isinstance(t, dict)}
         schemas: list[dict[str, Any]] = []
+        name_map: dict[str, str] = {}
+        used_names: set[str] = set()
         for card in tool_cards[:40]:
             if not isinstance(card, dict):
                 continue
-            name = str(card.get("name") or "")
-            if not name:
+            original = str(card.get("name") or "")
+            if not original:
                 continue
-            spec = specs.get(name)
+            name = sanitize_function_name(original, used_names)
+            if name != original:
+                name_map[name] = original
+            spec = specs.get(original)
             parameters = spec.get("parameters") if spec else None
             inputs = card.get("inputs") if isinstance(card.get("inputs"), dict) else {}
             schema = tool_schema_from_spec(name, parameters or {}, inputs)
-            description = str(card.get("purpose") or (spec or {}).get("description") or name)
+            description = str(card.get("purpose") or (spec or {}).get("description") or original)
             schemas.append(function_tool_schema(name, description, schema))
+        if include_name_map:
+            return schemas, name_map
         return schemas
 
     def _native_decision(
@@ -2089,6 +2113,7 @@ class LLMMissionPlanner:
         messages: list[dict[str, Any]],
         openai_tools: list[dict[str, Any]],
         allowed_tools: set[str],
+        tool_name_map: dict[str, str] | None = None,
     ) -> LoopDecision:
         client = _create_client(config)
         if str(config.get("api_type") or "openai") == "anthropic":
@@ -2104,7 +2129,9 @@ class LLMMissionPlanner:
             self.last_reasoning = str(getattr(client, "last_reasoning", "") or "")
             self.last_usage = usage
             try:
-                decision = self._decision_from_tool_calls(tool_calls, text, allowed_tools)
+                decision = self._decision_from_tool_calls(
+                    tool_calls, text, allowed_tools, tool_name_map
+                )
             except LLMEmptyResponseError:
                 if attempt >= self._NATIVE_EMPTY_RETRIES:
                     raise
@@ -2119,8 +2146,13 @@ class LLMMissionPlanner:
         tool_calls: list[dict[str, Any]],
         text: str,
         allowed_tools: set[str],
+        tool_name_map: dict[str, str] | None = None,
     ) -> LoopDecision:
         """Native protocol: tool calls => actions; no tool calls => complete.
+
+        ``tool_name_map`` translates a sanitized provider function name back to
+        the internal action name (``skill_flight-sequence`` -> ``skill:flight-sequence``)
+        before the allowed-tool check.
 
         Unavailable tool calls are skipped (noted in reflection) instead of
         failing the whole turn — one hallucinated name must not kill the run.
@@ -2145,6 +2177,8 @@ class LLMMissionPlanner:
             name = str(call.get("name") or "").strip()
             if not name:
                 continue
+            if tool_name_map:
+                name = tool_name_map.get(name, name)
             arguments = call.get("arguments") or {}
             if not isinstance(arguments, dict):
                 arguments = {}

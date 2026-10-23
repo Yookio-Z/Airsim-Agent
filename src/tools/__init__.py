@@ -4,6 +4,7 @@
 没有任何工具文件反向 import agent 层（注册统一由 ``src/agent/tool_executor.py`` 做）：
 
     manifest.py          工具清单：名称/类别/能力/模型可见性的依据（零依赖，契约测试的锚）
+    waypoints.py         共享航点解析：安全层与 drone_fly_path 唯一的格式定义
     flight.py            飞行工具组：链路/遥测/飞行指令（drone_*，后端中立）
     mission.py           任务工具组：上传/下载/清空/启动/进度（GCS 专用，模型面没卡片）
     sensors.py           传感器工具组：AirSim 仿真传感器（airsim_get_sensors）

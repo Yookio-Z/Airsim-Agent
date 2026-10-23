@@ -328,7 +328,7 @@ FLIGHT_TOOL_CONSTRAINTS: dict[str, dict[str, dict[str, Any]]] = {
         "vehicle_name": {"type": "string", "description": "Set 'all' to command EVERY vehicle (全部/所有无人机); a specific id targets one vehicle; empty means the default vehicle only"},
     },
     "drone_fly_path": {
-        "waypoints": {"type": "string", "description": "Local NED waypoints: compact \"x,y,z;x,y,z\" (e.g. \"10,0,-5;20,0,-5\") or a JSON array of {x,y,z}"},
+        "waypoints": {"type": "string", "description": "Local NED waypoints: compact \"x,y,z;x,y,z\" (e.g. \"10,0,-5;20,0,-5\") or a JSON array of objects like [{\"x\":10,\"y\":0,\"z\":-5}, ...]; JSON arrays of [x,y,z] triples are also accepted"},
         "velocity": {"type": "number", "minimum": 0.2, "maximum": 20, "description": "Cruise velocity in m/s"},
     },
     "locate_image_point": {
@@ -415,6 +415,43 @@ def tool_schema_from_spec(
     if required:
         schema["required"] = required
     return schema
+
+
+_FUNCTION_NAME_INVALID_RE = re.compile(r"[^A-Za-z0-9_-]")
+_FUNCTION_NAME_VALID_RE = re.compile(r"[A-Za-z0-9_-]+")
+_FUNCTION_NAME_MAX = 64
+
+
+def sanitize_function_name(name: str, used: set[str] | None = None) -> str:
+    """Return a name accepted by OpenAI-compatible native tool calling.
+
+    Providers require ``^[a-zA-Z0-9_-]+$``. Skill actions are internally named
+    ``skill:<name>`` (see ``SkillDoc.action_name``), so passing them through
+    unchanged makes the whole tools payload fail with HTTP 400. The caller keeps
+    the returned-name -> original-action map and translates the model's tool
+    call back before dispatch.
+
+    Already-valid names are returned unchanged (important: flight-constraint
+    lookups and tests use the original tool name). ``used`` makes the result
+    unique when two different actions sanitize to the same string.
+    """
+    raw = str(name or "").strip()
+    if _FUNCTION_NAME_VALID_RE.fullmatch(raw) and len(raw) <= _FUNCTION_NAME_MAX:
+        cleaned = raw
+    else:
+        cleaned = _FUNCTION_NAME_INVALID_RE.sub("_", raw)
+        cleaned = re.sub(r"_+", "_", cleaned).strip("_") or "tool"
+        cleaned = cleaned[:_FUNCTION_NAME_MAX]
+    if used is None:
+        return cleaned
+    candidate = cleaned
+    index = 2
+    while candidate in used:
+        suffix = f"_{index}"
+        candidate = cleaned[: _FUNCTION_NAME_MAX - len(suffix)] + suffix
+        index += 1
+    used.add(candidate)
+    return candidate
 
 
 def function_tool_schema(name: str, description: str, parameters: dict[str, Any]) -> dict[str, Any]:
